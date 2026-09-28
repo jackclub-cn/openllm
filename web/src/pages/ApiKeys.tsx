@@ -149,7 +149,7 @@ export default function ApiKeys() {
         title={createdKey ? '密钥已创建' : '创建访问密钥'}
         open={open}
         onCancel={closeModal}
-        footer={createdKey ? <Button type="primary" onClick={closeModal}>完成</Button> : null}
+        footer={createdKey ? <Button type="primary" onClick={closeModal}>完成</Button> : undefined}
         onOk={createdKey ? closeModal : create}
         confirmLoading={saving}
         width={560}
