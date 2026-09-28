@@ -1,0 +1,166 @@
+const ADMIN_TOKEN_KEY = 'openllm-admin-token'
+
+export class ApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
+
+export function getAdminToken() {
+  return localStorage.getItem(ADMIN_TOKEN_KEY) || ''
+}
+
+export function setAdminToken(value: string) {
+  if (value.trim()) localStorage.setItem(ADMIN_TOKEN_KEY, value.trim())
+  else localStorage.removeItem(ADMIN_TOKEN_KEY)
+}
+
+async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (init?.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  const adminToken = getAdminToken()
+  if (adminToken) headers.set('x-admin-token', adminToken)
+
+  const response = await fetch(path, { ...init, headers })
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const body = await response.json()
+      message = body?.error?.message || message
+    } catch {
+      // Keep the HTTP status when the body is not JSON.
+    }
+    throw new ApiError(message, response.status)
+  }
+  if (response.status === 204) return undefined as T
+  return response.json() as Promise<T>
+}
+
+export const api = {
+  get: <T>(path: string) => request<T>(path),
+  post: <T>(path: string, body?: unknown) =>
+    request<T>(path, { method: 'POST', body: body === undefined ? undefined : JSON.stringify(body) }),
+  put: <T>(path: string, body: unknown) =>
+    request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
+  delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+}
+
+export type Provider = {
+  id: number
+  name: string
+  provider_type: 'openai' | 'anthropic' | 'ollama' | 'custom'
+  base_url: string
+  model_prefix: string
+  headers: Record<string, string>
+  enabled: boolean
+  api_key_set: boolean
+  models: string[]
+  models_synced_at?: string
+  models_sync_error?: string
+  created_at: string
+  updated_at: string
+}
+
+export type ProviderInput = {
+  name: string
+  provider_type: Provider['provider_type']
+  base_url: string
+  model_prefix: string
+  api_key?: string
+  headers: Record<string, string>
+  enabled: boolean
+  auto_sync_models: boolean
+  models: string[]
+}
+
+export type RouteTarget = {
+  id?: number
+  provider_id: number
+  provider_name?: string
+  provider_type?: string
+  upstream_model: string
+  model_prefix?: string
+  weight: number
+  priority: number
+  enabled: boolean
+}
+
+export type GatewayRoute = {
+  id: number
+  name: string
+  model_pattern: string
+  strategy: 'priority' | 'weighted' | 'round_robin'
+  enabled: boolean
+  targets: RouteTarget[]
+  created_at: string
+  updated_at: string
+}
+
+export type ApiKey = {
+  id: number
+  name: string
+  key_prefix: string
+  key_suffix: string
+  enabled: boolean
+  last_used_at?: string
+  created_at: string
+}
+
+export type UsageLog = {
+  id: number
+  request_id: string
+  api_key_id?: number
+  api_key_name?: string
+  route_id?: number
+  route_name?: string
+  provider_id?: number
+  provider_name?: string
+  requested_model: string
+  upstream_model?: string
+  endpoint: string
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  latency_ms: number
+  status_code: number
+  success: boolean
+  streamed: boolean
+  error_message?: string
+  response_preview?: string
+  created_at: string
+}
+
+export type Overview = {
+  requests_today: number
+  tokens_today: number
+  requests_total: number
+  tokens_total: number
+  success_rate: number
+  avg_latency_ms: number
+  active_providers: number
+  active_routes: number
+  recent_requests: UsageLog[]
+  provider_usage: Array<{
+    provider_id: number
+    provider_name: string
+    requests: number
+    tokens: number
+    success_rate: number
+    avg_latency_ms: number
+  }>
+  model_usage: Array<{ model: string; requests: number; tokens: number; success_rate: number; avg_latency_ms: number }>
+  daily_usage: Array<{ day: string; requests: number; tokens: number }>
+}
+
+export type Settings = {
+  admin_auth_enabled: boolean
+  database: string
+  version: string
+}
+
+export function formatError(error: unknown) {
+  return error instanceof Error ? error.message : String(error)
+}

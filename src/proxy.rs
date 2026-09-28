@@ -1,0 +1,2132 @@
+use std::io;
+use std::str::FromStr;
+use std::time::Instant;
+
+use axum::Json;
+use axum::body::{Body, Bytes};
+use axum::extract::State;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
+use globset::Glob;
+use rand::distributions::{Distribution, WeightedIndex};
+use reqwest::RequestBuilder;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::error::{AppError, AppResult};
+use crate::models::{
+    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteStrategy, RouteTarget, Usage,
+};
+use crate::state::AppState;
+
+const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+
+pub async fn public_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> AppResult<Json<ModelList>> {
+    authenticate_gateway(&state, &headers).await?;
+    let patterns = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT model_pattern FROM routes WHERE enabled = 1 ORDER BY model_pattern COLLATE NOCASE",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let synced_models = sqlx::query_scalar::<_, String>(
+        r#"
+        SELECT p.model_prefix || pm.model_name
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
+        WHERE p.enabled = 1
+        ORDER BY p.model_prefix || pm.model_name
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+    // A route pattern can coincide with a synced model name (for example an
+    // exact-match route for a prefixed model), so de-duplicate before exposing
+    // the list. Clients treat duplicate ids as distinct entries.
+    let mut ids = patterns;
+    ids.extend(synced_models);
+    ids.sort();
+    ids.dedup();
+    let data = ids
+        .into_iter()
+        .map(|id| PublicModel {
+            id,
+            object: "model",
+            created,
+            owned_by: "openllm",
+        })
+        .collect();
+    Ok(Json(ModelList {
+        object: "list",
+        data,
+    }))
+}
+
+pub async fn proxy_openai(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> AppResult<Response> {
+    let started = Instant::now();
+    let endpoint = uri.path().to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_json: Value = serde_json::from_slice(&body).map_err(|error| {
+        AppError::BadRequest(format!("request body must be valid JSON: {error}"))
+    })?;
+    let requested_model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .ok_or_else(|| AppError::BadRequest("request body must include a model".to_string()))?
+        .to_string();
+    let streamed = request_json
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let request_tokens = estimate_request_tokens(&request_json);
+
+    let api_key = authenticate_gateway(&state, &headers).await?;
+    let resolved = resolve_route(&state, &requested_model).await?;
+    let route_id = resolved.route_id;
+    let ordering_key = route_id.unwrap_or(-1);
+    let ordered_targets =
+        order_targets(&state, ordering_key, &resolved.strategy, resolved.targets).await?;
+
+    let mut last_error = None;
+    for target in ordered_targets {
+        if target.provider_type == "anthropic" && endpoint != OPENAI_CHAT_COMPLETIONS {
+            last_error = Some(format!(
+                "{} does not support the {} endpoint",
+                target.provider_name, endpoint
+            ));
+            continue;
+        }
+
+        match forward_to_target(
+            &state,
+            &request_id,
+            &endpoint,
+            &requested_model,
+            &request_json,
+            &body,
+            target,
+            streamed,
+            request_tokens,
+            api_key.as_ref(),
+            started,
+        )
+        .await
+        {
+            Ok(response) => return Ok(response),
+            Err(AppError::BadRequest(message)) => {
+                last_error = Some(message);
+            }
+            Err(AppError::Upstream(message)) => {
+                last_error = Some(message);
+            }
+            Err(error) => {
+                last_error = Some(error.to_string());
+            }
+        }
+    }
+
+    let message = last_error.unwrap_or_else(|| "all configured route targets failed".to_string());
+    log_usage(
+        &state,
+        UsageLogEntry {
+            request_id: &request_id,
+            api_key_id: api_key.as_ref().map(|key| key.id),
+            route_id,
+            provider_id: None,
+            requested_model: &requested_model,
+            upstream_model: None,
+            endpoint: &endpoint,
+            usage: Usage {
+                prompt_tokens: request_tokens,
+                completion_tokens: 0,
+                total_tokens: request_tokens,
+            },
+            latency_ms: started.elapsed().as_millis() as i64,
+            status_code: 502,
+            success: false,
+            streamed,
+            error_message: Some(&message),
+            response_preview: None,
+        },
+    )
+    .await;
+    Err(AppError::Upstream(message))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn forward_to_target(
+    state: &AppState,
+    request_id: &str,
+    endpoint: &str,
+    requested_model: &str,
+    request_json: &Value,
+    _raw_body: &Bytes,
+    target: RouteTarget,
+    streamed: bool,
+    request_tokens: i64,
+    api_key: Option<&ApiKeyRecord>,
+    started: Instant,
+) -> AppResult<Response> {
+    let provider_type =
+        ProviderType::from_str(&target.provider_type).map_err(AppError::BadRequest)?;
+
+    let (url, request_body) = match provider_type {
+        ProviderType::Anthropic => (
+            join_upstream_url(&target.base_url, "/v1/messages"),
+            convert_request_to_anthropic(request_json, &target.upstream_model, streamed),
+        ),
+        ProviderType::Openai | ProviderType::Ollama | ProviderType::Custom => {
+            let mut body = request_json.clone();
+            body["model"] = json!(target.upstream_model);
+            (join_upstream_url(&target.base_url, endpoint), body)
+        }
+    };
+
+    let mut request = state
+        .client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&request_body);
+
+    request = match provider_type {
+        ProviderType::Anthropic => {
+            if let Some(key) = &target.api_key {
+                request = request
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01");
+            }
+            request
+        }
+        _ => {
+            if let Some(key) = &target.api_key {
+                request = request.bearer_auth(key);
+            }
+            request
+        }
+    };
+    request = apply_custom_headers(request, &target.provider_headers)?;
+
+    let response = request.send().await.map_err(|error| {
+        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+    })?;
+    let status = response.status();
+
+    if !status.is_success() {
+        let response_headers = response.headers().clone();
+        let response_body = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let message = String::from_utf8_lossy(&response_body)
+            .chars()
+            .take(600)
+            .collect::<String>();
+
+        if retryable_status(status) {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                %status,
+                "upstream failed, trying next route target"
+            );
+            return Err(AppError::Upstream(format!(
+                "{} returned {}: {}",
+                target.provider_name, status, message
+            )));
+        }
+
+        let preview = response_preview(&response_body);
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint,
+                usage: Usage {
+                    prompt_tokens: request_tokens,
+                    completion_tokens: 0,
+                    total_tokens: request_tokens,
+                },
+                latency_ms: started.elapsed().as_millis() as i64,
+                status_code: status.as_u16() as i64,
+                success: false,
+                streamed,
+                error_message: Some(&message),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+
+        let mut builder = Response::builder().status(status);
+        if let Some(value) = response_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+        {
+            builder = builder.header(reqwest::header::CONTENT_TYPE, value);
+        }
+        return Ok(builder
+            .body(Body::from(response_body))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
+    }
+
+    let response_content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+
+    if provider_type == ProviderType::Anthropic {
+        if streamed {
+            return Ok(anthropic_stream_response(
+                state.clone(),
+                response,
+                request_id.to_string(),
+                requested_model.to_string(),
+                target,
+                request_tokens,
+                api_key.cloned(),
+                started,
+            ));
+        }
+
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let upstream_json: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::Upstream(format!("invalid JSON from Anthropic: {error}")))?;
+        let (converted, usage) = convert_anthropic_response(&upstream_json);
+        let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
+        let preview = response_preview(&converted_bytes);
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint,
+                usage: fill_usage(usage, request_tokens, &converted),
+                latency_ms: started.elapsed().as_millis() as i64,
+                status_code: status.as_u16() as i64,
+                success: true,
+                streamed: false,
+                error_message: None,
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+        return Ok(Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(converted_bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
+    }
+
+    if streamed {
+        return Ok(passthrough_stream_response(
+            state.clone(),
+            response,
+            response_content_type,
+            endpoint.to_string(),
+            request_id.to_string(),
+            requested_model.to_string(),
+            target,
+            request_tokens,
+            api_key.cloned(),
+            started,
+        ));
+    }
+
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Upstream(error.to_string()))?;
+    let usage = extract_usage_from_json(&response_bytes)
+        .unwrap_or_else(|| estimated_completion_usage(request_tokens, &response_bytes));
+    let response_text = String::from_utf8_lossy(&response_bytes)
+        .chars()
+        .take(600)
+        .collect::<String>();
+    let preview = response_preview(&response_bytes);
+    // Detach: the caller should not wait on a SQLite write to receive the
+    // upstream response they already paid for.
+    log_usage_detached(
+        state.clone(),
+        OwnedUsageLogEntry {
+            request_id: request_id.to_string(),
+            api_key_id: api_key.map(|key| key.id),
+            route_id: target.route_id,
+            provider_id: Some(target.provider_id),
+            requested_model: requested_model.to_string(),
+            upstream_model: Some(target.upstream_model.clone()),
+            endpoint: endpoint.to_string(),
+            usage,
+            latency_ms: started.elapsed().as_millis() as i64,
+            status_code: status.as_u16() as i64,
+            success: true,
+            streamed: false,
+            error_message: None,
+            response_preview: preview,
+        },
+    );
+
+    Ok(Response::builder()
+        .status(status)
+        .header(reqwest::header::CONTENT_TYPE, response_content_type)
+        .body(Body::from(response_bytes))
+        .unwrap_or_else(|_| {
+            AppError::Upstream(format!("could not forward response: {response_text}"))
+                .into_response()
+        }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn passthrough_stream_response(
+    state: AppState,
+    response: reqwest::Response,
+    content_type: String,
+    endpoint: String,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let mut upstream = response.bytes_stream();
+        let mut parser = UsageParser::default();
+        let mut stream_error = None;
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    parser.push(&bytes);
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    let _ = tx.send(Err(io::Error::other(error))).await;
+                    break;
+                }
+            }
+        }
+        let usage = parser
+            .finish()
+            .map(|mut usage| {
+                if usage.prompt_tokens == 0 {
+                    usage.prompt_tokens = request_tokens;
+                }
+                usage.normalized()
+            })
+            .unwrap_or_else(|| Usage {
+                prompt_tokens: request_tokens,
+                completion_tokens: 1,
+                total_tokens: request_tokens + 1,
+            });
+        let preview = parser.preview();
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: &endpoint,
+                usage,
+                latency_ms: started.elapsed().as_millis() as i64,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anthropic_stream_response(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut output_chars = 0usize;
+        let mut sent_role = false;
+        let mut saw_tool_use = false;
+        // Anthropic numbers every content block (text and tools alike), while
+        // OpenAI numbers only tool calls. Track the mapping so a text block
+        // before a tool call does not shift the tool index.
+        let mut next_tool_index = 0usize;
+        let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+        let mut stream_error = None;
+        let mut text = String::new();
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                process_anthropic_line(
+                    &line,
+                    &mut event_name,
+                    &mut usage,
+                    &mut output_chars,
+                    &mut text,
+                    &mut sent_role,
+                    &mut saw_tool_use,
+                    &mut next_tool_index,
+                    &mut tool_indices,
+                    &message_id,
+                    &requested_model,
+                    &tx,
+                )
+                .await;
+            }
+        }
+
+        if !buffer.is_empty() {
+            process_anthropic_line(
+                &buffer,
+                &mut event_name,
+                &mut usage,
+                &mut output_chars,
+                &mut text,
+                &mut sent_role,
+                &mut saw_tool_use,
+                &mut next_tool_index,
+                &mut tool_indices,
+                &message_id,
+                &requested_model,
+                &tx,
+            )
+            .await;
+        }
+
+        // Prefer the real token counts Anthropic reported (message_start /
+        // message_delta) and only fall back to our estimate when absent.
+        let prompt_tokens = if usage.prompt_tokens > 0 {
+            usage.prompt_tokens
+        } else {
+            request_tokens
+        };
+        let completion_tokens = if usage.completion_tokens > 0 {
+            usage.completion_tokens
+        } else {
+            (output_chars / 4) as i64
+        };
+        usage.prompt_tokens = prompt_tokens;
+        usage.completion_tokens = completion_tokens;
+        usage.total_tokens = prompt_tokens + completion_tokens;
+
+        // Emit the terminal choice first so clients observe `finish_reason`
+        // (`tool_calls` triggers tool execution in the OpenAI SDKs), then send
+        // usage in a separate chunk — a usage-bearing chunk carries no choices
+        // and would otherwise swallow the finish reason entirely.
+        let final_chunk = openai_stream_chunk(
+            &message_id,
+            &requested_model,
+            json!({}),
+            Some(if saw_tool_use { "tool_calls" } else { "stop" }),
+            None,
+        );
+        let usage_chunk = openai_stream_chunk(
+            &message_id,
+            &requested_model,
+            json!({}),
+            None,
+            Some(json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": usage.total_tokens
+            })),
+        );
+        let _ = tx
+            .send(Ok(Bytes::from(format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                serde_json::to_string(&final_chunk).unwrap_or_default(),
+                serde_json::to_string(&usage_chunk).unwrap_or_default()
+            ))))
+            .await;
+        let preview = response_preview(text.as_bytes());
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: OPENAI_CHAT_COMPLETIONS,
+                usage: usage.normalized(),
+                latency_ms: started.elapsed().as_millis() as i64,
+                status_code: 200,
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_anthropic_line(
+    line: &[u8],
+    event_name: &mut String,
+    usage: &mut Usage,
+    output_chars: &mut usize,
+    text_acc: &mut String,
+    sent_role: &mut bool,
+    saw_tool_use: &mut bool,
+    next_tool_index: &mut usize,
+    tool_indices: &mut std::collections::HashMap<i64, usize>,
+    message_id: &str,
+    model: &str,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if let Some(event) = line.strip_prefix("event:") {
+        *event_name = event.trim().to_string();
+        return;
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+
+    match event_name.as_str() {
+        "message_start" => {
+            if let Some(input_tokens) = value
+                .pointer("/message/usage/input_tokens")
+                .and_then(Value::as_i64)
+            {
+                usage.prompt_tokens = input_tokens;
+            }
+            if !*sent_role {
+                *sent_role = true;
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({"role": "assistant", "content": ""}),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "content_block_delta" => {
+            if let Some(delta_text) = value.pointer("/delta/text").and_then(Value::as_str) {
+                *output_chars += delta_text.chars().count();
+                push_preview_text(text_acc, delta_text);
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({"content": delta_text}),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+            // Tool call arguments stream as JSON fragments; OpenAI expects
+            // them accumulated under `tool_calls[].function.arguments`.
+            if value.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta")
+                && let Some(partial) = value.pointer("/delta/partial_json").and_then(Value::as_str)
+            {
+                let block_index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let index = *tool_indices.get(&block_index).unwrap_or(&0);
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({
+                        "tool_calls": [{
+                            "index": index,
+                            "function": { "arguments": partial }
+                        }]
+                    }),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "content_block_start" => {
+            if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
+                let id = value
+                    .pointer("/content_block/id")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let name = value
+                    .pointer("/content_block/name")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                // Parallel tool calls arrive as separate content blocks; the
+                // OpenAI `index` must distinguish them or clients merge them.
+                let block_index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
+                let index = *next_tool_index;
+                *next_tool_index += 1;
+                tool_indices.insert(block_index, index);
+                *saw_tool_use = true;
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({
+                        "tool_calls": [{
+                            "index": index,
+                            "id": id,
+                            "type": "function",
+                            "function": { "name": name, "arguments": "" }
+                        }]
+                    }),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "message_delta" => {
+            if let Some(output_tokens) = value
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_i64)
+            {
+                usage.completion_tokens = output_tokens;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn convert_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> Value {
+    let mut output = json!({
+        "model": model,
+        "max_tokens": input.get("max_tokens")
+            .or_else(|| input.get("max_completion_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or(4096),
+        "stream": streamed
+    });
+
+    let mut system = Vec::new();
+    let mut messages = Vec::new();
+    if let Some(items) = input.get("messages").and_then(Value::as_array) {
+        for message in items {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let content = message.get("content").cloned().unwrap_or(Value::Null);
+            if role == "system" || role == "developer" {
+                if let Some(text) = content_text(&content) {
+                    system.push(text);
+                }
+                continue;
+            }
+
+            // A tool result carries its association through `tool_call_id`.
+            // Anthropic expects a user message holding a `tool_result` block.
+            if role == "tool" {
+                let tool_use_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": content_text(&content).unwrap_or_default()
+                    }]
+                }));
+                continue;
+            }
+
+            let anthropic_role = if role == "assistant" {
+                "assistant"
+            } else {
+                "user"
+            };
+            let mut blocks = convert_anthropic_content(&content);
+            // An assistant turn may request tools; Anthropic represents those
+            // as `tool_use` blocks alongside any text.
+            if role == "assistant"
+                && let Some(calls) = message.get("tool_calls").and_then(Value::as_array)
+                && let Some(array) = blocks.as_array_mut()
+            {
+                // An assistant turn that only calls tools has no text content;
+                // drop the placeholder empty block so Anthropic does not reject it.
+                array.retain(|block| {
+                    block.get("type").and_then(Value::as_str) != Some("text")
+                        || block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.is_empty())
+                });
+                for call in calls {
+                    let function = call.get("function").unwrap_or(call);
+                    let Ok(arguments) = function
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .unwrap_or("{}")
+                        .parse::<Value>()
+                    else {
+                        continue;
+                    };
+                    array.push(json!({
+                        "type": "tool_use",
+                        "id": call.get("id").cloned().unwrap_or(Value::Null),
+                        "name": function.get("name").cloned().unwrap_or(Value::Null),
+                        "input": arguments
+                    }));
+                }
+            }
+            messages.push(json!({
+                "role": anthropic_role,
+                "content": blocks
+            }));
+        }
+    }
+
+    if !system.is_empty() {
+        output["system"] = json!(system.join("\n\n"));
+    }
+    output["messages"] = json!(messages);
+
+    if let Some(temperature) = input.get("temperature") {
+        output["temperature"] = temperature.clone();
+    }
+    if let Some(top_p) = input.get("top_p") {
+        output["top_p"] = top_p.clone();
+    }
+    if let Some(stop) = input.get("stop") {
+        output["stop_sequences"] = match stop {
+            Value::String(value) => json!([value]),
+            Value::Array(_) => stop.clone(),
+            _ => Value::Null,
+        };
+    }
+
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        let anthropic_tools = tools
+            .iter()
+            .filter_map(|tool| {
+                let function = tool.get("function").unwrap_or(tool);
+                let name = function.get("name")?.as_str()?;
+                Some(json!({
+                    "name": name,
+                    "description": function.get("description").cloned().unwrap_or(Value::Null),
+                    "input_schema": function.get("parameters").cloned()
+                        .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !anthropic_tools.is_empty() {
+            output["tools"] = json!(anthropic_tools);
+        }
+    }
+    output
+}
+
+fn convert_anthropic_content(content: &Value) -> Value {
+    match content {
+        Value::String(text) => json!([{"type": "text", "text": text}]),
+        Value::Array(items) => {
+            let mut blocks = Vec::new();
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str) {
+                            blocks.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                    Some("image_url") => {
+                        if let Some(url) = item.pointer("/image_url/url").and_then(Value::as_str) {
+                            if let Some((meta, data)) = url.split_once(',') {
+                                let media_type = meta
+                                    .strip_prefix("data:")
+                                    .and_then(|value| value.split(';').next())
+                                    .unwrap_or("image/png");
+                                blocks.push(json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": data
+                                    }
+                                }));
+                            } else {
+                                blocks.push(json!({
+                                    "type": "image",
+                                    "source": {"type": "url", "url": url}
+                                }));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if blocks.is_empty() {
+                json!([{"type": "text", "text": ""}])
+            } else {
+                json!(blocks)
+            }
+        }
+        _ => json!([{"type": "text", "text": ""}]),
+    }
+}
+
+fn convert_anthropic_response(value: &Value) -> (Value, Usage) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(blocks) = value.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(part) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(part);
+                    }
+                }
+                Some("tool_use") => {
+                    tool_calls.push(json!({
+                        "id": block.get("id").cloned().unwrap_or_else(|| json!(format!("call_{}", uuid::Uuid::new_v4().simple()))),
+                        "type": "function",
+                        "function": {
+                            "name": block.get("name").cloned().unwrap_or(Value::Null),
+                            "arguments": serde_json::to_string(
+                                block.get("input").unwrap_or(&Value::Null)
+                            ).unwrap_or_else(|_| "{}".to_string())
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let finish_reason = match value.get("stop_reason").and_then(Value::as_str) {
+        Some("max_tokens") => "length",
+        Some("tool_use") => "tool_calls",
+        _ => "stop",
+    };
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) }
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    let prompt_tokens = value
+        .pointer("/usage/input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let completion_tokens = value
+        .pointer("/usage/output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let usage = Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens: prompt_tokens + completion_tokens,
+    };
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
+    let model = value.get("model").cloned().unwrap_or(Value::Null);
+
+    (
+        json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": chrono::Utc::now().timestamp(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason
+            }],
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
+        }),
+        usage,
+    )
+}
+
+fn openai_stream_chunk(
+    id: &str,
+    model: &str,
+    delta: Value,
+    finish_reason: Option<&str>,
+    usage: Option<Value>,
+) -> Value {
+    let mut value = json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason
+        }]
+    });
+    if let Some(usage) = usage {
+        value["usage"] = usage;
+        value["choices"] = json!([]);
+    }
+    value
+}
+
+async fn authenticate_gateway(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<Option<ApiKeyRecord>> {
+    // Presence of any configured key enables gateway auth. Counting only
+    // enabled keys would silently fall back to anonymous access when every
+    // key is disabled, which is the opposite of the operator's intent.
+    // Copy the cached value out in its own statement: keeping the read guard
+    // alive across the match would deadlock when a write lock is requested
+    // below (tokio's RwLock is write-preferring).
+    let cached = *state.auth_required.read().await;
+    let auth_required = match cached {
+        Some(cached) => cached,
+        None => {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
+                .fetch_one(&state.pool)
+                .await?;
+            let required = count > 0;
+            *state.auth_required.write().await = Some(required);
+            required
+        }
+    };
+    if !auth_required {
+        return Ok(None);
+    }
+
+    let supplied = bearer_token(headers)
+        .or_else(|| {
+            headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok())
+        })
+        .ok_or_else(|| {
+            AppError::Unauthorized("missing gateway API key in Authorization header".to_string())
+        })?;
+    let hash = hash_secret(supplied);
+    let record = sqlx::query_as::<_, ApiKeyRecord>(
+        "SELECT * FROM api_keys WHERE key_hash = ? AND enabled = 1",
+    )
+    .bind(hash)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::Unauthorized("invalid gateway API key".to_string()))?;
+
+    // Writing on every request would take a SQLite write lock each time.
+    // Once a minute per key is plenty for a "last used" display.
+    let should_touch = {
+        let mut touched = state.key_touched.lock().await;
+        match touched.get(&record.id) {
+            Some(last) if last.elapsed() < std::time::Duration::from_secs(60) => false,
+            _ => {
+                touched.insert(record.id, std::time::Instant::now());
+                true
+            }
+        }
+    };
+    if should_touch
+        && let Err(error) = sqlx::query(
+            "UPDATE api_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(record.id)
+        .execute(&state.pool)
+        .await
+    {
+        tracing::warn!(%error, key_id = record.id, "failed to update API key last_used_at");
+    }
+    Ok(Some(record))
+}
+
+struct ResolvedRoute {
+    route_id: Option<i64>,
+    strategy: String,
+    targets: Vec<RouteTarget>,
+}
+
+async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute> {
+    if let Some(route) = find_explicit_route(state, model).await? {
+        let targets = load_targets(state, route.id).await?;
+        if targets.is_empty() {
+            return Err(AppError::Upstream(
+                "the matched route has no enabled provider targets".to_string(),
+            ));
+        }
+        return Ok(ResolvedRoute {
+            route_id: Some(route.id),
+            strategy: route.strategy,
+            targets,
+        });
+    }
+
+    let targets = find_prefixed_targets(state, model).await?;
+    Ok(ResolvedRoute {
+        route_id: None,
+        strategy: "priority".to_string(),
+        targets,
+    })
+}
+
+async fn find_explicit_route(state: &AppState, model: &str) -> AppResult<Option<Route>> {
+    let routes = sqlx::query_as::<_, Route>(
+        r#"
+        SELECT * FROM routes
+        WHERE enabled = 1
+        ORDER BY
+            CASE WHEN instr(model_pattern, '*') = 0 AND instr(model_pattern, '?') = 0 THEN 0 ELSE 1 END,
+            length(model_pattern) DESC,
+            id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    for route in routes {
+        let Ok(glob) = Glob::new(&route.model_pattern) else {
+            tracing::warn!(pattern = %route.model_pattern, "ignoring invalid route pattern");
+            continue;
+        };
+        if glob.compile_matcher().is_match(model) {
+            return Ok(Some(route));
+        }
+    }
+
+    Ok(None)
+}
+
+async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<RouteTarget>> {
+    let prefixed = sqlx::query_as::<_, RouteTarget>(
+        r#"
+        SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
+               p.name AS provider_name, p.provider_type, p.base_url,
+               p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.model_name AS upstream_model,
+               100 AS weight, 0 AS priority, 1 AS enabled
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
+        WHERE p.enabled = 1
+          AND p.model_prefix <> ''
+          AND substr(?, 1, length(p.model_prefix)) = p.model_prefix
+          AND substr(?, length(p.model_prefix) + 1) = pm.model_name
+        ORDER BY p.id, pm.model_name
+        "#,
+    )
+    .bind(model)
+    .bind(model)
+    .fetch_all(&state.pool)
+    .await?;
+
+    if !prefixed.is_empty() {
+        return Ok(prefixed);
+    }
+
+    let unprefixed = sqlx::query_as::<_, RouteTarget>(
+        r#"
+        SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
+               p.name AS provider_name, p.provider_type, p.base_url,
+               p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.model_name AS upstream_model,
+               100 AS weight, 0 AS priority, 1 AS enabled
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
+        WHERE p.enabled = 1
+          AND p.model_prefix = ''
+          AND pm.model_name = ?
+        ORDER BY p.id
+        LIMIT 2
+        "#,
+    )
+    .bind(model)
+    .fetch_all(&state.pool)
+    .await?;
+
+    if unprefixed.len() > 1 {
+        return Err(AppError::Conflict(format!(
+            "model '{model}' exists on multiple providers; configure a model prefix or an explicit route"
+        )));
+    }
+    if unprefixed.is_empty() {
+        return Err(AppError::NotFound(format!(
+            "no enabled route or provider model matches '{model}'"
+        )));
+    }
+    Ok(unprefixed)
+}
+
+async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTarget>> {
+    Ok(sqlx::query_as::<_, RouteTarget>(
+        r#"
+        SELECT rt.*, p.name AS provider_name, p.provider_type,
+               p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.enabled AS provider_enabled
+        FROM route_targets rt
+        JOIN providers p ON p.id = rt.provider_id
+        WHERE rt.route_id = ? AND rt.enabled = 1 AND p.enabled = 1
+        ORDER BY rt.priority ASC, rt.id
+        "#,
+    )
+    .bind(route_id)
+    .fetch_all(&state.pool)
+    .await?)
+}
+
+async fn order_targets(
+    state: &AppState,
+    route_id: i64,
+    strategy: &str,
+    mut targets: Vec<RouteTarget>,
+) -> AppResult<Vec<RouteTarget>> {
+    let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
+    match strategy {
+        RouteStrategy::Priority => {
+            targets.sort_by_key(|target| (target.priority, target.id));
+        }
+        RouteStrategy::Weighted => {
+            let mut rng = rand::thread_rng();
+            let mut selected = Vec::with_capacity(targets.len());
+            while !targets.is_empty() {
+                let weights = targets
+                    .iter()
+                    .map(|target| target.weight.max(1) as u32)
+                    .collect::<Vec<_>>();
+                let index = WeightedIndex::new(&weights)
+                    .map(|distribution| distribution.sample(&mut rng))
+                    .unwrap_or(0);
+                selected.push(targets.remove(index));
+            }
+            targets = selected;
+        }
+        RouteStrategy::RoundRobin => {
+            let mut cursors = state.round_robin.lock().await;
+            let cursor = cursors.entry(route_id).or_default();
+            let offset = *cursor % targets.len();
+            targets.rotate_left(offset);
+            *cursor = cursor.wrapping_add(1);
+        }
+    }
+    Ok(targets)
+}
+
+#[derive(Default)]
+struct UsageParser {
+    buffer: Vec<u8>,
+    usage: Option<Usage>,
+    output_chars: usize,
+    text: String,
+}
+
+impl UsageParser {
+    fn push(&mut self, chunk: &[u8]) {
+        self.buffer.extend_from_slice(chunk);
+        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
+            let line = self.buffer.drain(..=position).collect::<Vec<_>>();
+            self.parse_line(&line);
+        }
+    }
+
+    fn finish(&mut self) -> Option<Usage> {
+        if !self.buffer.is_empty() {
+            let line = std::mem::take(&mut self.buffer);
+            self.parse_line(&line);
+        }
+        let estimated =
+            (self.output_chars / 4).max(if self.output_chars > 0 { 1 } else { 0 }) as i64;
+        match self.usage.take() {
+            Some(mut usage) => {
+                if usage.completion_tokens == 0 {
+                    usage.completion_tokens = estimated.max(1);
+                }
+                Some(usage.normalized())
+            }
+            // No usage frame was sent: fall back to the characters we actually
+            // saw streamed, not a fixed constant.
+            None if self.output_chars > 0 => Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: estimated,
+                total_tokens: 0,
+            }),
+            None => None,
+        }
+    }
+
+    fn preview(&self) -> Option<String> {
+        response_preview(self.text.as_bytes())
+    }
+
+    fn parse_line(&mut self, line: &[u8]) {
+        let line = String::from_utf8_lossy(line);
+        let Some(data) = line.trim().strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        if let Some(usage) = usage_from_value(&value) {
+            self.usage = Some(usage);
+        }
+        if let Some(content) = value
+            .pointer("/choices/0/delta/content")
+            .and_then(Value::as_str)
+        {
+            self.output_chars += content.chars().count();
+            push_preview_text(&mut self.text, content);
+        }
+        // Legacy `/v1/completions` streams put the text in `choices[0].text`
+        // instead of a delta object.
+        if let Some(text) = value.pointer("/choices/0/text").and_then(Value::as_str) {
+            self.output_chars += text.chars().count();
+            push_preview_text(&mut self.text, text);
+        }
+        if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+            self.output_chars += text.chars().count();
+            push_preview_text(&mut self.text, text);
+        }
+        // Responses API streams `response.output_text.delta` events whose text
+        // lives in a top-level `delta` string rather than a choices array.
+        if value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "response.output_text.delta")
+            && let Some(delta) = value.get("delta").and_then(Value::as_str)
+        {
+            self.output_chars += delta.chars().count();
+            push_preview_text(&mut self.text, delta);
+        }
+    }
+}
+
+fn extract_usage_from_json(bytes: &[u8]) -> Option<Usage> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    usage_from_value(&value)
+}
+
+fn usage_from_value(value: &Value) -> Option<Usage> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.pointer("/response/usage"))?;
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(prompt_tokens + completion_tokens);
+    Some(
+        Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+        }
+        .normalized(),
+    )
+}
+
+fn estimated_completion_usage(request_tokens: i64, bytes: &[u8]) -> Usage {
+    let completion_tokens = (bytes.len() / 4).max(1) as i64;
+    Usage {
+        prompt_tokens: request_tokens,
+        completion_tokens,
+        total_tokens: request_tokens + completion_tokens,
+    }
+}
+
+fn estimate_request_tokens(value: &Value) -> i64 {
+    let text = value
+        .get("messages")
+        .or_else(|| value.get("input"))
+        .or_else(|| value.get("prompt"))
+        .map(Value::to_string)
+        .unwrap_or_default();
+    (text.chars().count() / 4).max(1) as i64
+}
+
+fn fill_usage(usage: Usage, request_tokens: i64, response: &Value) -> Usage {
+    let mut usage = usage;
+    if usage.prompt_tokens == 0 {
+        usage.prompt_tokens = request_tokens;
+    }
+    if usage.completion_tokens == 0 {
+        usage.completion_tokens = (response.to_string().chars().count() / 4).max(1) as i64;
+    }
+    usage.normalized()
+}
+
+fn content_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
+}
+
+fn join_upstream_url(base: &str, path: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let path = format!("/{}", path.trim_start_matches('/'));
+    if base.ends_with("/v1") && path.starts_with("/v1/") {
+        format!("{base}{}", &path[3..])
+    } else {
+        format!("{base}{path}")
+    }
+}
+
+pub(crate) fn apply_custom_headers(
+    mut request: RequestBuilder,
+    headers: &str,
+) -> AppResult<RequestBuilder> {
+    let Ok(headers) = serde_json::from_str::<Value>(headers) else {
+        return Ok(request);
+    };
+    let Some(headers) = headers.as_object() else {
+        return Ok(request);
+    };
+    for (name, value) in headers {
+        let Some(value) = value.as_str() else {
+            continue;
+        };
+        let name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            AppError::BadRequest(format!("invalid header name '{name}': {error}"))
+        })?;
+        let value = HeaderValue::from_str(value).map_err(|error| {
+            AppError::BadRequest(format!("invalid value for header '{name}': {error}"))
+        })?;
+        request = request.header(name, value);
+    }
+    Ok(request)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+fn hash_secret(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("{digest:x}")
+}
+
+fn retryable_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
+}
+
+/// Keep a short, human-readable slice of the response for later debugging
+/// without storing unbounded payloads.
+fn response_preview(bytes: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(bytes);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let preview = trimmed.chars().take(2000).collect::<String>();
+    Some(preview)
+}
+
+/// Upper bound on how much streamed text is retained for the preview. Anything
+/// beyond this is discarded as it arrives, so a very long generation does not
+/// buffer its entire output in memory just to store 2000 characters.
+const PREVIEW_CHAR_LIMIT: usize = 2000;
+
+/// Appends `chunk` to `target` only while the preview budget allows it.
+fn push_preview_text(target: &mut String, chunk: &str) {
+    let remaining = PREVIEW_CHAR_LIMIT.saturating_sub(target.chars().count());
+    if remaining == 0 {
+        return;
+    }
+    target.extend(chunk.chars().take(remaining));
+}
+
+struct UsageLogEntry<'a> {
+    request_id: &'a str,
+    api_key_id: Option<i64>,
+    route_id: Option<i64>,
+    provider_id: Option<i64>,
+    requested_model: &'a str,
+    upstream_model: Option<&'a str>,
+    endpoint: &'a str,
+    usage: Usage,
+    latency_ms: i64,
+    status_code: i64,
+    success: bool,
+    streamed: bool,
+    error_message: Option<&'a str>,
+    response_preview: Option<&'a str>,
+}
+
+/// Owned mirror of [`UsageLogEntry`]; needed when the log is written from a
+/// detached task that outlives the request's borrowed values.
+struct OwnedUsageLogEntry {
+    request_id: String,
+    api_key_id: Option<i64>,
+    route_id: Option<i64>,
+    provider_id: Option<i64>,
+    requested_model: String,
+    upstream_model: Option<String>,
+    endpoint: String,
+    usage: Usage,
+    latency_ms: i64,
+    status_code: i64,
+    success: bool,
+    streamed: bool,
+    error_message: Option<String>,
+    response_preview: Option<String>,
+}
+
+impl OwnedUsageLogEntry {
+    fn as_borrowed(&self) -> UsageLogEntry<'_> {
+        UsageLogEntry {
+            request_id: &self.request_id,
+            api_key_id: self.api_key_id,
+            route_id: self.route_id,
+            provider_id: self.provider_id,
+            requested_model: &self.requested_model,
+            upstream_model: self.upstream_model.as_deref(),
+            endpoint: &self.endpoint,
+            usage: self.usage,
+            latency_ms: self.latency_ms,
+            status_code: self.status_code,
+            success: self.success,
+            streamed: self.streamed,
+            error_message: self.error_message.as_deref(),
+            response_preview: self.response_preview.as_deref(),
+        }
+    }
+}
+
+/// Writes the usage row off the response path so a slow SQLite write lock does
+/// not inflate the latency the caller observes.
+fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
+    tokio::spawn(async move {
+        log_usage(&state, entry.as_borrowed()).await;
+    });
+}
+
+async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
+    let usage = entry.usage.normalized();
+    let result = sqlx::query(
+        r#"
+        INSERT INTO usage_logs (
+            request_id, api_key_id, route_id, provider_id, requested_model,
+            upstream_model, endpoint, prompt_tokens, completion_tokens,
+            total_tokens, latency_ms, status_code, success, streamed, error_message,
+            response_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(entry.request_id)
+    .bind(entry.api_key_id)
+    .bind(entry.route_id)
+    .bind(entry.provider_id)
+    .bind(entry.requested_model)
+    .bind(entry.upstream_model)
+    .bind(entry.endpoint)
+    .bind(usage.prompt_tokens)
+    .bind(usage.completion_tokens)
+    .bind(usage.total_tokens)
+    .bind(entry.latency_ms)
+    .bind(entry.status_code)
+    .bind(entry.success as i64)
+    .bind(entry.streamed as i64)
+    .bind(entry.error_message)
+    .bind(entry.response_preview)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(result) => {
+            let _ = state.events.send(crate::state::UsageEvent {
+                id: result.last_insert_rowid(),
+                request_id: entry.request_id.to_string(),
+                success: entry.success,
+                streamed: entry.streamed,
+            });
+        }
+        Err(error) => {
+            tracing::error!(%error, request_id = %entry.request_id, "failed to write usage log");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn joins_base_and_path_without_double_v1() {
+        assert_eq!(
+            join_upstream_url("https://api.openai.com/v1", "/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_upstream_url("https://api.openai.com", "/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_upstream_url("http://localhost:11434/v1", "/models"),
+            "http://localhost:11434/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn prefix_matching_is_literal_and_case_sensitive() {
+        // A pooled `sqlite::memory:` database gives each connection its own
+        // empty database, so pin the pool to a single connection.
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE providers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model_prefix TEXT NOT NULL DEFAULT '',
+                api_key TEXT,
+                headers TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                models_synced_at TEXT,
+                models_sync_error TEXT,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE provider_models (
+                provider_id INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url, model_prefix)
+             VALUES (1, 'underscore', 'openai', 'http://upstream', 'a_b/')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO provider_models (provider_id, model_name) VALUES (1, 'x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let state = AppState::new(pool, None);
+
+        // `_` must be treated literally, not as a single-character wildcard.
+        let literal = find_prefixed_targets(&state, "a_b/x").await.unwrap();
+        assert_eq!(literal.len(), 1);
+        assert_eq!(literal[0].upstream_model, "x");
+        assert!(find_prefixed_targets(&state, "aXb/x").await.is_err());
+
+        // Prefix comparison must stay case-sensitive so `A_B/x` cannot reach a
+        // provider registered as `a_b`.
+        assert!(find_prefixed_targets(&state, "A_B/x").await.is_err());
+    }
+
+    #[test]
+    fn retries_only_transient_statuses() {
+        for status in [408, 409, 425, 429, 500, 502, 503] {
+            assert!(
+                retryable_status(StatusCode::from_u16(status).unwrap()),
+                "{status} should be retryable"
+            );
+        }
+        for status in [400, 401, 403, 404, 422] {
+            assert!(
+                !retryable_status(StatusCode::from_u16(status).unwrap()),
+                "{status} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn extracts_openai_usage() {
+        let usage = usage_from_value(&json!({
+            "usage": { "prompt_tokens": 12, "completion_tokens": 7, "total_tokens": 19 }
+        }))
+        .expect("usage should parse");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (12, 7, 19)
+        );
+    }
+
+    #[test]
+    fn extracts_nested_responses_usage() {
+        let usage = usage_from_value(&json!({
+            "type": "response.completed",
+            "response": { "usage": { "input_tokens": 88, "output_tokens": 42, "total_tokens": 130 } }
+        }))
+        .expect("nested responses usage should parse");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (88, 42, 130)
+        );
+    }
+
+    #[test]
+    fn derives_total_when_upstream_omits_it() {
+        let usage = usage_from_value(&json!({
+            "usage": { "prompt_tokens": 5, "completion_tokens": 3 }
+        }))
+        .expect("usage should parse");
+        assert_eq!(usage.total_tokens, 8);
+    }
+
+    #[test]
+    fn stream_parser_counts_chat_completion_text() {
+        let mut parser = UsageParser::default();
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n");
+        parser.push(
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
+        );
+        let usage = parser.finish().expect("usage should be parsed");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (2, 2));
+    }
+
+    #[test]
+    fn stream_parser_counts_responses_api_deltas() {
+        let mut parser = UsageParser::default();
+        parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n");
+        parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n");
+        let usage = parser
+            .finish()
+            .expect("estimated usage should be produced from streamed text");
+        assert!(
+            usage.completion_tokens > 0,
+            "estimated completion tokens should be non-zero"
+        );
+    }
+
+    #[test]
+    fn stream_parser_counts_legacy_completions_text() {
+        let mut parser = UsageParser::default();
+        parser.push(b"data: {\"choices\":[{\"text\":\"hello \"}]}\n\n");
+        parser.push(b"data: {\"choices\":[{\"text\":\"world\"}]}\n\n");
+        let usage = parser
+            .finish()
+            .expect("legacy completions text should produce an estimate");
+        assert!(
+            usage.completion_tokens >= 2,
+            "legacy completions text should be counted, got {}",
+            usage.completion_tokens
+        );
+    }
+
+    #[test]
+    fn stream_preview_is_bounded() {
+        let mut parser = UsageParser::default();
+        // Feed far more text than the preview budget across many frames.
+        for _ in 0..200 {
+            let frame = format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                "x".repeat(100)
+            );
+            parser.push(frame.as_bytes());
+        }
+        let preview = parser.preview().expect("preview should exist");
+        assert!(
+            preview.chars().count() <= PREVIEW_CHAR_LIMIT,
+            "preview should be capped at {PREVIEW_CHAR_LIMIT}, got {}",
+            preview.chars().count()
+        );
+    }
+
+    #[test]
+    fn anthropic_response_converts_to_openai_shape() {
+        let (converted, usage) = convert_anthropic_response(&json!({
+            "id": "msg_1",
+            "model": "claude-x",
+            "stop_reason": "end_turn",
+            "content": [{ "type": "text", "text": "hi there" }],
+            "usage": { "input_tokens": 30, "output_tokens": 12 }
+        }));
+        assert_eq!(converted["object"], "chat.completion");
+        assert_eq!(converted["choices"][0]["message"]["content"], "hi there");
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (30, 12));
+    }
+
+    #[test]
+    fn converts_openai_tool_calls_and_results_to_anthropic() {
+        let converted = convert_request_to_anthropic(
+            &json!({
+                "messages": [
+                    { "role": "user", "content": "weather in Paris?" },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "get_weather", "arguments": "{\"city\":\"Paris\"}" }
+                        }]
+                    },
+                    { "role": "tool", "tool_call_id": "call_1", "content": "18C" }
+                ]
+            }),
+            "claude-x",
+            false,
+        );
+
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+
+        let assistant = &messages[1]["content"];
+        let blocks = assistant.as_array().expect("assistant content blocks");
+        assert_eq!(blocks.len(), 1, "empty text block should be dropped");
+        assert_eq!(blocks[0]["type"], "tool_use");
+        assert_eq!(blocks[0]["id"], "call_1");
+        assert_eq!(blocks[0]["name"], "get_weather");
+        assert_eq!(blocks[0]["input"]["city"], "Paris");
+
+        let tool_result = &messages[2]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "call_1");
+        assert_eq!(tool_result["content"], "18C");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_tool_use_becomes_openai_tool_calls() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut output_chars = 0usize;
+        let mut text = String::new();
+        let mut sent_role = false;
+        let mut saw_tool_use = false;
+        let mut next_tool_index = 0usize;
+        let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+
+        // Anthropic emits a tool_use block start followed by JSON argument deltas.
+        for line in [
+            b"event: content_block_start\n".as_slice(),
+            b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"get_weather\"}}\n".as_slice(),
+        ] {
+            process_anthropic_line(
+                line,
+                &mut event_name,
+                &mut usage,
+                &mut output_chars,
+                &mut text,
+                &mut sent_role,
+                &mut saw_tool_use,
+                &mut next_tool_index,
+                &mut tool_indices,
+                "chatcmpl_test",
+                "claude-x",
+                &tx,
+            )
+            .await;
+        }
+        for line in [
+            b"event: content_block_delta\n".as_slice(),
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"city\\\":\\\"Paris\\\"}\"}}\n".as_slice(),
+        ] {
+            process_anthropic_line(
+                line,
+                &mut event_name,
+                &mut usage,
+                &mut output_chars,
+                &mut text,
+                &mut sent_role,
+                &mut saw_tool_use,
+                &mut next_tool_index,
+                &mut tool_indices,
+                "chatcmpl_test",
+                "claude-x",
+                &tx,
+            )
+            .await;
+        }
+        drop(tx);
+
+        let mut frames = Vec::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            frames.push(String::from_utf8_lossy(&bytes).to_string());
+        }
+        let joined = frames.join("");
+
+        assert!(saw_tool_use, "tool_use block start should be detected");
+        assert!(
+            joined.contains("\"tool_calls\""),
+            "should emit tool_calls delta: {joined}"
+        );
+        assert!(
+            joined.contains("toolu_1"),
+            "should carry the tool call id: {joined}"
+        );
+        assert!(
+            joined.contains("get_weather"),
+            "should carry the function name: {joined}"
+        );
+        assert!(
+            joined.contains("Paris"),
+            "should carry streamed arguments: {joined}"
+        );
+    }
+
+    #[tokio::test]
+    async fn parallel_anthropic_tool_calls_keep_distinct_indices() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut output_chars = 0usize;
+        let mut text = String::new();
+        let mut sent_role = false;
+        let mut saw_tool_use = false;
+        let mut next_tool_index = 0usize;
+        let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+
+        let lines: [&[u8]; 8] = [
+            b"event: content_block_start\n",
+            b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"get_weather\"}}\n",
+            b"event: content_block_start\n",
+            b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"get_time\"}}\n",
+            b"event: content_block_delta\n",
+            b"data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
+            b"event: message_delta\n",
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n",
+        ];
+        for line in lines {
+            process_anthropic_line(
+                line,
+                &mut event_name,
+                &mut usage,
+                &mut output_chars,
+                &mut text,
+                &mut sent_role,
+                &mut saw_tool_use,
+                &mut next_tool_index,
+                &mut tool_indices,
+                "chatcmpl_test",
+                "claude-x",
+                &tx,
+            )
+            .await;
+        }
+        drop(tx);
+
+        let mut joined = String::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            joined.push_str(&String::from_utf8_lossy(&bytes));
+        }
+
+        assert!(joined.contains("toolu_a"), "first tool call should appear");
+        assert!(joined.contains("toolu_b"), "second tool call should appear");
+        assert!(
+            joined.contains("\"index\":1"),
+            "second tool call should keep index 1 rather than collapsing to 0: {joined}"
+        );
+        assert!(
+            joined.contains("get_time"),
+            "second tool name should appear"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_block_before_tools_does_not_shift_tool_indices() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut output_chars = 0usize;
+        let mut text = String::new();
+        let mut sent_role = false;
+        let mut saw_tool_use = false;
+        let mut next_tool_index = 0usize;
+        let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+
+        // Anthropic block 0 is text; the tool calls are blocks 1 and 2.
+        // OpenAI must renumber the tool calls to 0 and 1.
+        let lines: [&[u8]; 10] = [
+            b"event: content_block_start\n",
+            b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n",
+            b"event: content_block_start\n",
+            b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_a\",\"name\":\"get_weather\"}}\n",
+            b"event: content_block_start\n",
+            b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"get_time\"}}\n",
+            b"event: content_block_delta\n",
+            b"data: {\"type\":\"content_block_delta\",\"index\":2,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{}\"}}\n",
+            b"event: message_delta\n",
+            b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":3}}\n",
+        ];
+        for line in lines {
+            process_anthropic_line(
+                line,
+                &mut event_name,
+                &mut usage,
+                &mut output_chars,
+                &mut text,
+                &mut sent_role,
+                &mut saw_tool_use,
+                &mut next_tool_index,
+                &mut tool_indices,
+                "chatcmpl_test",
+                "claude-x",
+                &tx,
+            )
+            .await;
+        }
+        drop(tx);
+
+        let mut joined = String::new();
+        while let Some(Ok(bytes)) = rx.recv().await {
+            joined.push_str(&String::from_utf8_lossy(&bytes));
+        }
+
+        assert!(
+            joined.contains("toolu_a") && joined.contains("get_weather"),
+            "first tool call should appear: {joined}"
+        );
+        assert!(
+            joined.contains("\"index\":0") && joined.contains("\"index\":1"),
+            "tool calls should be renumbered to 0 and 1: {joined}"
+        );
+        assert!(
+            !joined.contains("\"index\":2"),
+            "OpenAI tool indices must not include Anthropic text-block offsets: {joined}"
+        );
+    }
+}
