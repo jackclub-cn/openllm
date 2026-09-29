@@ -532,7 +532,7 @@ export default function Providers() {
               render: (value: string) => value ? <Typography.Text code>{value}</Typography.Text> : <Typography.Text type="secondary">无</Typography.Text>,
             },
             {
-              title: 'Responses 工具搜索',
+              title: '工具搜索兼容',
               dataIndex: 'tool_search_supported',
               width: 150,
               render: (value: boolean) => (
@@ -665,7 +665,7 @@ export default function Providers() {
           )}
           <Form.Item
             name="tool_search_supported"
-            label="上游支持 Responses tool_search"
+            label="上游支持 tool_search"
             valuePropName="checked"
             extra="上游明确拒绝该工具时会自动关闭；上游升级后可在编辑页重新打开。"
           >

@@ -18,7 +18,7 @@
 - 每个路由可配置多个上游目标，支持优先级、加权随机和轮询策略。
 - 上游失败时按候选顺序自动切换，并记录最终结果。
 - 提供 OpenAI 兼容的 `/v1/models`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 和 `/v1/responses` 接口。
-- 上游不识别 Responses 的 `tool_search` 工具时，网关会记录提供商兼容状态并自动移除后重试；后续请求直接按兼容模式发送，也可在提供商编辑页重新启用。
+- 上游不识别 `tool_search` 工具时，网关会记录提供商兼容状态并自动移除后重试；该兼容逻辑覆盖 OpenAI 的 Responses 和 Chat Completions 转发，后续请求直接按兼容模式发送，也可在提供商编辑页重新启用。
 - 支持流式响应转发；Anthropic 流会转换为 OpenAI SSE 格式。
 - 控制台通过 SSE 实时获取新请求事件，日志与仪表盘自动刷新。
 - 控制台内置模型调试台，可直接验证路由、鉴权与流式输出。

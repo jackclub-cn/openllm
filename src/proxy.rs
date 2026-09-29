@@ -27,6 +27,7 @@ use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+#[cfg(test)]
 const OPENAI_RESPONSES: &str = "/v1/responses";
 
 pub async fn public_models(
@@ -1893,8 +1894,7 @@ async fn forward_to_target(
         }
     };
 
-    if endpoint == OPENAI_RESPONSES
-        && target.tool_search_supported == 0
+    if target.tool_search_supported == 0
         && let Some(compat_body) = strip_tool_search_tools(&request_body)
     {
         request_body = compat_body;
@@ -1914,9 +1914,10 @@ async fn forward_to_target(
             .bytes()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))?;
-        if status == StatusCode::BAD_REQUEST
-            && endpoint == OPENAI_RESPONSES
-            && upstream_rejects_tool_search(&response_body)
+        if matches!(
+            status,
+            StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+        ) && upstream_rejects_tool_search(&response_body)
         {
             if let Some(compat_body) = strip_tool_search_tools(&request_body) {
                 tracing::warn!(
@@ -5893,7 +5894,7 @@ mod tests {
         let error = br#"{
             "type": "BadRequest",
             "code": "InvalidParameter",
-            "message": "The parameter `tool.type` is not valid: unknown tool type: tool_search."
+            "message": "The parameter `tool.type` specified in the request are not valid: The parameter `type` specified in the request are not valid: unknown tool type: tool_search."
         }"#;
         assert!(upstream_rejects_tool_search(error));
         assert!(!upstream_rejects_tool_search(
@@ -5902,144 +5903,168 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retries_responses_without_tool_search_when_upstream_rejects_it() {
+    async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let attempts = Arc::new(AtomicUsize::new(0));
-        let app = axum::Router::new().route(
-            OPENAI_RESPONSES,
-            axum::routing::post({
-                let attempts = attempts.clone();
-                move |Json(body): Json<Value>| {
+        for (endpoint, request_json, success_body) in [
+            (
+                OPENAI_RESPONSES,
+                json!({
+                    "model": "requested-model",
+                    "input": "hello",
+                    "tools": [{"type": "tool_search", "execution": "client"}]
+                }),
+                json!({
+                    "id": "ok",
+                    "object": "response",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12
+                    }
+                }),
+            ),
+            (
+                OPENAI_CHAT_COMPLETIONS,
+                json!({
+                    "model": "requested-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "tools": [{"type": "tool_search", "execution": "client"}]
+                }),
+                json!({
+                    "id": "ok",
+                    "object": "chat.completion",
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "total_tokens": 12
+                    }
+                }),
+            ),
+        ] {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let success_body = success_body.clone();
+            let app = axum::Router::new().route(
+                endpoint,
+                axum::routing::post({
                     let attempts = attempts.clone();
-                    async move {
-                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                            assert!(
-                                body["tools"]
-                                    .as_array()
-                                    .unwrap()
-                                    .iter()
-                                    .any(|tool| tool["type"] == "tool_search")
-                            );
-                            (
-                                StatusCode::BAD_REQUEST,
-                                Json(json!({
-                                    "type": "BadRequest",
-                                    "code": "InvalidParameter",
-                                    "message": "unknown tool type: tool_search"
-                                })),
-                            )
-                        } else {
-                            assert!(body.get("tools").is_none());
-                            (
-                                StatusCode::OK,
-                                Json(json!({
-                                    "id": "ok",
-                                    "object": "response",
-                                    "usage": {
-                                        "input_tokens": 10,
-                                        "output_tokens": 2,
-                                        "total_tokens": 12
-                                    }
-                                })),
-                            )
+                    move |Json(body): Json<Value>| {
+                        let attempts = attempts.clone();
+                        let success_body = success_body.clone();
+                        async move {
+                            if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                assert!(
+                                    body["tools"]
+                                        .as_array()
+                                        .unwrap()
+                                        .iter()
+                                        .any(|tool| tool["type"] == "tool_search")
+                                );
+                                (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(json!({
+                                        "type": "BadRequest",
+                                        "code": "InvalidParameter",
+                                        "message": "The parameter `tool.type` specified in the request are not valid: The parameter `type` specified in the request are not valid: unknown tool type: tool_search."
+                                    })),
+                                )
+                            } else {
+                                assert!(body.get("tools").is_none());
+                                (StatusCode::OK, Json(success_body))
+                            }
                         }
                     }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
 
-        let pool = sqlx::sqlite::SqlitePoolOptions::new()
-            .max_connections(1)
-            .connect("sqlite::memory:")
-            .await
-            .unwrap();
-        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        sqlx::query(
-            "INSERT INTO providers (id, name, provider_type, base_url)
-             VALUES (1, 'mock', 'openai', ?)",
-        )
-        .bind(format!("http://{address}"))
-        .execute(&pool)
-        .await
-        .unwrap();
-        let state = AppState::new(pool.clone(), None);
-        let mut target = RouteTarget {
-            id: 1,
-            route_id: None,
-            provider_id: 1,
-            provider_name: "mock".to_string(),
-            provider_type: "openai".to_string(),
-            base_url: format!("http://{address}"),
-            model_prefix: String::new(),
-            api_key: None,
-            provider_headers: "{}".to_string(),
-            supported_endpoints: None,
-            tool_search_supported: 1,
-            provider_health: None,
-            upstream_model: "upstream".to_string(),
-            weight: 100,
-            priority: 0,
-            enabled: 1,
-        };
-
-        let request_json = json!({
-            "model": "requested-model",
-            "input": "hello",
-            "tools": [{"type": "tool_search", "execution": "client"}]
-        });
-        let response = forward_to_target(
-            &state,
-            "tool-search-retry",
-            OPENAI_RESPONSES,
-            "requested-model",
-            &request_json,
-            &Bytes::new(),
-            target.clone(),
-            false,
-            10,
-            None,
-            Instant::now(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-        let tool_search_supported: i64 =
-            sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
-                .fetch_one(&pool)
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect("sqlite::memory:")
                 .await
                 .unwrap();
-        assert_eq!(tool_search_supported, 0);
+            sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO providers (id, name, provider_type, base_url)
+                 VALUES (1, 'mock', 'openai', ?)",
+            )
+            .bind(format!("http://{address}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+            let state = AppState::new(pool.clone(), None);
+            let mut target = RouteTarget {
+                id: 1,
+                route_id: None,
+                provider_id: 1,
+                provider_name: "mock".to_string(),
+                provider_type: "openai".to_string(),
+                base_url: format!("http://{address}"),
+                model_prefix: String::new(),
+                api_key: None,
+                provider_headers: "{}".to_string(),
+                supported_endpoints: None,
+                tool_search_supported: 1,
+                provider_health: None,
+                upstream_model: "upstream".to_string(),
+                weight: 100,
+                priority: 0,
+                enabled: 1,
+            };
 
-        target.tool_search_supported = 0;
-        let response = forward_to_target(
-            &state,
-            "tool-search-cached",
-            OPENAI_RESPONSES,
-            "requested-model",
-            &request_json,
-            &Bytes::new(),
-            target,
-            false,
-            10,
-            None,
-            Instant::now(),
-            None,
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+            let response = forward_to_target(
+                &state,
+                "tool-search-retry",
+                endpoint,
+                "requested-model",
+                &request_json,
+                &Bytes::new(),
+                target.clone(),
+                false,
+                10,
+                None,
+                Instant::now(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            let tool_search_supported: i64 =
+                sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(tool_search_supported, 0);
 
-        server.abort();
+            target.tool_search_supported = 0;
+            let response = forward_to_target(
+                &state,
+                "tool-search-cached",
+                endpoint,
+                "requested-model",
+                &request_json,
+                &Bytes::new(),
+                target,
+                false,
+                10,
+                None,
+                Instant::now(),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+            server.abort();
+        }
     }
 
     #[test]
