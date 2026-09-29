@@ -2839,6 +2839,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
         FROM providers p
@@ -2864,6 +2865,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
         FROM providers p
@@ -2897,6 +2899,7 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
@@ -2913,6 +2916,14 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
     .bind(route_id)
     .fetch_all(&state.pool)
     .await?)
+}
+
+fn provider_health_rank(health: Option<i64>) -> u8 {
+    match health {
+        Some(0) => 2,
+        Some(_) => 0,
+        None => 1,
+    }
 }
 
 async fn order_targets(
@@ -2949,6 +2960,10 @@ async fn order_targets(
             *cursor = cursor.wrapping_add(1);
         }
     }
+    // Keep strategy order within each health group, but try explicitly failed
+    // providers last. Unknown health stays ahead of failed providers so a
+    // previously-tested outage does not permanently suppress a recovery.
+    targets.sort_by_key(|target| provider_health_rank(target.provider_health));
     Ok(targets)
 }
 
@@ -3876,6 +3891,7 @@ mod tests {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 models_synced_at TEXT,
                 models_sync_error TEXT,
+                last_test_ok INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -3958,6 +3974,7 @@ mod tests {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 models_synced_at TEXT,
                 models_sync_error TEXT,
+                last_test_ok INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -4286,6 +4303,14 @@ mod tests {
                 "{status} should not be retryable"
             );
         }
+    }
+
+    #[test]
+    fn health_ranking_prefers_known_good_then_unknown_then_failed() {
+        assert_eq!(provider_health_rank(Some(1)), 0);
+        assert_eq!(provider_health_rank(None), 1);
+        assert_eq!(provider_health_rank(Some(0)), 2);
+        assert_eq!(provider_health_rank(Some(7)), 0);
     }
 
     fn barrel_with_output_limit(output_limit: Option<i64>) -> BarrelEnvelope {

@@ -198,6 +198,8 @@ pub struct RouteTarget {
     pub model_prefix: String,
     pub api_key: Option<String>,
     pub provider_headers: String,
+    /// Most recent provider health result; `Some(0)` means explicitly failed.
+    pub provider_health: Option<i64>,
     pub upstream_model: String,
     pub weight: i64,
     pub priority: i64,
