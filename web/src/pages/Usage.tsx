@@ -3,6 +3,7 @@ import {
   CheckCircleOutlined,
   CloseCircleOutlined,
   CopyOutlined,
+  DownloadOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
@@ -61,6 +62,7 @@ export default function Usage() {
   const [cleanupOpen, setCleanupOpen] = useState(false)
   const [cleanupDays, setCleanupDays] = useState<number | null>(30)
   const [cleaning, setCleaning] = useState(false)
+  const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
   const queryRef = useRef({ page, pageSize, model, providerId, success, dates, autoScroll })
   queryRef.current = { page, pageSize, model, providerId, success, dates, autoScroll }
@@ -191,6 +193,31 @@ export default function Usage() {
     }
   }
 
+  const exportCsv = async () => {
+    setExporting(true)
+    try {
+      const params = new URLSearchParams()
+      if (model) params.set('model', model)
+      if (requestId) params.set('request_id', requestId)
+      if (providerId) params.set('provider_id', String(providerId))
+      if (success !== undefined) params.set('success', String(success))
+      if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
+      if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
+      const blob = await api.download(`/api/usage/export?${params}`)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `openllm-usage-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
+      link.click()
+      URL.revokeObjectURL(url)
+      message.success('CSV 已导出')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -233,6 +260,13 @@ export default function Usage() {
               onClick={() => void autoRefresh.manualRefresh()}
             >
               刷新
+            </Button>
+            <Button
+              icon={<DownloadOutlined />}
+              loading={exporting}
+              onClick={() => void exportCsv()}
+            >
+              导出 CSV
             </Button>
             <Button onClick={() => setCleanupOpen(true)}>清理历史</Button>
           </>

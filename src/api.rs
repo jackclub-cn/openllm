@@ -4,7 +4,7 @@ use std::str::FromStr;
 use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
@@ -1024,6 +1024,110 @@ pub async fn list_usage(
     }))
 }
 
+const USAGE_EXPORT_LIMIT: i64 = 100_000;
+
+pub async fn export_usage(
+    State(state): State<AppState>,
+    Query(query): Query<UsageQuery>,
+) -> AppResult<Response> {
+    let mut items = QueryBuilder::<Sqlite>::new(
+        r#"
+        SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
+               u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
+               u.completion_tokens, u.total_tokens, u.cache_read_tokens,
+               u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
+               u.status_code, u.success, u.streamed, u.error_message,
+               u.created_at, u.first_token_ms, NULL AS response_preview,
+               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
+        FROM usage_logs u
+        LEFT JOIN api_keys k ON k.id = u.api_key_id
+        LEFT JOIN routes r ON r.id = u.route_id
+        LEFT JOIN providers p ON p.id = u.provider_id
+        WHERE 1 = 1
+        "#,
+    );
+    apply_usage_filters(&mut items, &query);
+    items
+        .push(" ORDER BY u.created_at DESC, u.id DESC LIMIT ")
+        .push_bind(USAGE_EXPORT_LIMIT);
+    let rows = items
+        .build_query_as::<UsageLogDetailRow>()
+        .fetch_all(&state.pool)
+        .await?;
+    let truncated = rows.len() as i64 == USAGE_EXPORT_LIMIT;
+
+    let mut csv = String::from(
+        "\u{feff}created_at,request_id,api_key,provider,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,success,streamed,error_message\r\n",
+    );
+    for row in rows {
+        let item = UsageLogView::from(row);
+        csv.push_str(&usage_csv_row(&item));
+        csv.push_str("\r\n");
+    }
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"openllm-usage.csv\"",
+        );
+    if truncated {
+        response = response.header("x-openllm-export-truncated", "true");
+    }
+    Ok(response
+        .body(Body::from(csv))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
+fn usage_csv_row(item: &UsageLogView) -> String {
+    let text = |value: Option<&str>| value.unwrap_or_default().to_string();
+    let number = |value: Option<i64>| value.map(|value| value.to_string()).unwrap_or_default();
+    let cost = item
+        .estimated_cost_micros
+        .map(|value| format!("{:.6}", value as f64 / 1_000_000.0))
+        .unwrap_or_default();
+    let tps = item
+        .output_tps
+        .map(|value| format!("{value:.2}"))
+        .unwrap_or_default();
+    [
+        item.created_at.clone(),
+        item.request_id.clone(),
+        text(item.api_key_name.as_deref()),
+        text(item.provider_name.as_deref()),
+        text(item.route_name.as_deref()),
+        item.requested_model.clone(),
+        text(item.upstream_model.as_deref()),
+        item.endpoint.clone(),
+        item.prompt_tokens.to_string(),
+        item.completion_tokens.to_string(),
+        item.total_tokens.to_string(),
+        item.cache_read_tokens.to_string(),
+        item.cache_write_tokens.to_string(),
+        cost,
+        item.latency_ms.to_string(),
+        number(item.first_token_ms),
+        tps,
+        item.status_code.to_string(),
+        if item.success { "true" } else { "false" }.to_string(),
+        if item.streamed { "true" } else { "false" }.to_string(),
+        text(item.error_message.as_deref()),
+    ]
+    .into_iter()
+    .map(|value| csv_field(&value))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\r') || value.contains('\n') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 pub async fn get_usage_detail(
     State(state): State<AppState>,
     Path(request_id): Path<String>,
@@ -1938,6 +2042,14 @@ mod tests {
             Some(10_000)
         );
         assert!(normalize_api_key_limit("token", Some(-1)).is_err());
+    }
+
+    #[test]
+    fn escapes_csv_fields() {
+        assert_eq!(csv_field("plain"), "plain");
+        assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
+        assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
     }
 
     #[test]

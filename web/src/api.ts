@@ -39,6 +39,24 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function requestBlob(path: string): Promise<Blob> {
+  const headers = new Headers()
+  const adminToken = getAdminToken()
+  if (adminToken) headers.set('x-admin-token', adminToken)
+  const response = await fetch(path, { headers })
+  if (!response.ok) {
+    let message = `${response.status} ${response.statusText}`
+    try {
+      const body = await response.json()
+      message = body?.error?.message || message
+    } catch {
+      // Keep the HTTP status when the body is not JSON.
+    }
+    throw new ApiError(message, response.status)
+  }
+  return response.blob()
+}
+
 export const api = {
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, body?: unknown) =>
@@ -46,6 +64,7 @@ export const api = {
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+  download: (path: string) => requestBlob(path),
 }
 
 export type Provider = {

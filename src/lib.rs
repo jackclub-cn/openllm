@@ -21,8 +21,8 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::{
     admin_auth, cleanup_usage, create_api_key, create_provider, create_route, delete_api_key,
-    delete_provider, delete_route, event_stream, get_settings, get_usage_detail, health,
-    list_api_keys, list_models, list_provider_model_limits, list_providers, list_routes,
+    delete_provider, delete_route, event_stream, export_usage, get_settings, get_usage_detail,
+    health, list_api_keys, list_models, list_provider_model_limits, list_providers, list_routes,
     list_usage, overview, sync_provider_models, test_provider, update_api_key, update_provider,
     update_provider_model_limits, update_route,
 };
@@ -80,6 +80,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))
         .route("/usage", get(list_usage))
+        .route("/usage/export", get(export_usage))
         .route("/usage/cleanup", post(cleanup_usage))
         .route("/usage/{request_id}", get(get_usage_detail))
         .route_layer(axum::middleware::from_fn_with_state(
