@@ -147,9 +147,20 @@ export default function Providers() {
     const key = `provider-test-${id}`
     message.loading({ content: '正在测试连接...', key })
     try {
-      const result = await api.post<{ ok: boolean; latency_ms: number; message: string }>(`/api/providers/${id}/test`)
-      if (result.ok) message.success({ content: `连接成功，耗时 ${result.latency_ms} ms`, key })
-      else message.error({ content: result.message, key, duration: 6 })
+      const result = await api.post<{
+        ok: boolean
+        latency_ms: number
+        message: string
+        checked: 'inference' | 'models'
+      }>(`/api/providers/${id}/test`)
+      if (result.ok) {
+        // Say whether credentials were actually exercised: a listing-only pass
+        // does not prove the key works.
+        const scope = result.checked === 'inference' ? '凭证已校验' : '仅验证主机可达'
+        message.success({ content: `连接成功（${scope}），耗时 ${result.latency_ms} ms`, key })
+      } else {
+        message.error({ content: result.message, key, duration: 6 })
+      }
     } catch (error) {
       message.error({ content: formatError(error), key })
     }

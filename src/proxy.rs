@@ -3144,7 +3144,7 @@ fn content_text(value: &Value) -> Option<String> {
     }
 }
 
-fn join_upstream_url(base: &str, path: &str) -> String {
+pub(crate) fn join_upstream_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = format!("/{}", path.trim_start_matches('/'));
     if base.ends_with("/v1") && path.starts_with("/v1/") {

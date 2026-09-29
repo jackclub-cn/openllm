@@ -15,7 +15,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::models_dev;
-use crate::proxy::apply_custom_headers;
+use crate::proxy::{apply_custom_headers, join_upstream_url};
 use crate::state::AppState;
 
 pub async fn health() -> Json<Value> {
@@ -311,6 +311,66 @@ pub async fn test_provider(
         ProviderType::from_str(&provider.provider_type).map_err(AppError::BadRequest)?;
     let started = std::time::Instant::now();
 
+    // A model listing is often reachable without credentials (verified against
+    // a live provider whose /models returns 200 for a bogus key), so on its own
+    // it cannot tell the operator whether their key works. When a model is
+    // known, probe the inference endpoint instead: it is the one that actually
+    // enforces auth, so a bad key fails the test instead of looking healthy.
+    let model = sqlx::query_scalar::<_, String>(
+        "SELECT model_name FROM provider_models WHERE provider_id = ? AND enabled = 1 \
+         ORDER BY model_name LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if let Some(model) = model {
+        let (url, body) = match provider_type {
+            ProviderType::Anthropic => (
+                join_upstream_url(&provider.base_url, "/v1/messages"),
+                json!({
+                    "model": model,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}]
+                }),
+            ),
+            // Ollama's native tags endpoint needs no auth either, so probe its
+            // chat endpoint for the same reason.
+            _ => (
+                join_upstream_url(&provider.base_url, "/v1/chat/completions"),
+                json!({
+                    "model": model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 1
+                }),
+            ),
+        };
+        let mut request = state
+            .client
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .json(&body);
+        request = match provider_type {
+            ProviderType::Anthropic => {
+                let request = request.header("anthropic-version", "2023-06-01");
+                match &provider.api_key {
+                    Some(key) => request.header("x-api-key", key),
+                    None => request,
+                }
+            }
+            _ => match &provider.api_key {
+                Some(key) => request.bearer_auth(key),
+                None => request,
+            },
+        };
+        request = apply_custom_headers(request, &provider.headers)?;
+        return Ok(Json(
+            probe_provider(request, started, "inference", &model).await,
+        ));
+    }
+
+    // No model synced yet, so fall back to listing. This only proves the host
+    // is reachable, which the message says explicitly.
     let url = match provider_type {
         ProviderType::Anthropic => format!("{}/v1/models", provider.base_url.trim_end_matches('/')),
         ProviderType::Ollama => format!("{}/api/tags", ollama_root(&provider.base_url)),
@@ -328,28 +388,44 @@ pub async fn test_provider(
     }
     request = apply_custom_headers(request, &provider.headers)?;
 
+    Ok(Json(probe_provider(request, started, "models", "").await))
+}
+
+/// Sends the probe and turns the outcome into a test result.
+async fn probe_provider(
+    request: reqwest::RequestBuilder,
+    started: std::time::Instant,
+    checked: &str,
+    model: &str,
+) -> ProviderTestResult {
     match request.send().await {
         Ok(response) => {
             let status = response.status();
             let latency_ms = started.elapsed().as_millis() as i64;
             let message = if status.is_success() {
-                "connection successful".to_string()
+                if checked == "inference" {
+                    format!("上游已接受请求（模型 {model}），凭证有效")
+                } else {
+                    "上游可达，但尚未同步模型，未校验调用凭证".to_string()
+                }
             } else {
                 let body = response.text().await.unwrap_or_default();
                 let summary = body.chars().take(300).collect::<String>();
                 format!("upstream returned {status}: {summary}")
             };
-            Ok(Json(ProviderTestResult {
+            ProviderTestResult {
                 ok: status.is_success(),
                 latency_ms,
                 message,
-            }))
+                checked: checked.to_string(),
+            }
         }
-        Err(error) => Ok(Json(ProviderTestResult {
+        Err(error) => ProviderTestResult {
             ok: false,
             latency_ms: started.elapsed().as_millis() as i64,
             message: error.to_string(),
-        })),
+            checked: checked.to_string(),
+        },
     }
 }
 
@@ -1468,6 +1544,28 @@ mod tests {
         assert_eq!(normalize_model_prefix("openai/").unwrap(), "openai/");
         assert_eq!(normalize_model_prefix("  /local/  ").unwrap(), "local/");
         assert_eq!(normalize_model_prefix("").unwrap(), "");
+    }
+
+    #[test]
+    fn provider_test_urls_reuse_the_shared_joiner() {
+        // The probe must hit the inference endpoint, which is what enforces
+        // credentials, and must not double up `/v1`.
+        assert_eq!(
+            join_upstream_url(
+                "https://api.commandcode.ai/provider/v1",
+                "/v1/chat/completions"
+            ),
+            "https://api.commandcode.ai/provider/v1/chat/completions"
+        );
+        assert_eq!(
+            join_upstream_url("https://api.anthropic.com", "/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        // A base without `/v1` keeps the full path.
+        assert_eq!(
+            join_upstream_url("http://localhost:8000", "/v1/chat/completions"),
+            "http://localhost:8000/v1/chat/completions"
+        );
     }
 
     #[test]

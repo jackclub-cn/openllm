@@ -757,6 +757,9 @@ pub struct ProviderTestResult {
     pub ok: bool,
     pub latency_ms: i64,
     pub message: String,
+    /// Which check produced this result, so the UI can explain that a passing
+    /// test actually exercised credentials rather than a public listing.
+    pub checked: String,
 }
 
 #[derive(Debug, Serialize)]
