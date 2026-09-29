@@ -50,12 +50,24 @@ type ProviderForm = ProviderInput & {
   modelsText: string
 }
 
+type ModelSyncPreview = {
+  provider_id: number
+  added: string[]
+  removed: string[]
+  retained: number
+  disabled_retained: number
+}
+
 export default function Providers() {
   const { message } = App.useApp()
   const [items, setItems] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testingAll, setTestingAll] = useState(false)
+  const [previewingSync, setPreviewingSync] = useState(false)
+  const [applyingSync, setApplyingSync] = useState(false)
+  const [syncTarget, setSyncTarget] = useState<Provider>()
+  const [syncPreview, setSyncPreview] = useState<ModelSyncPreview>()
   const [editing, setEditing] = useState<Provider>()
   const [open, setOpen] = useState(false)
   const [limitsOpen, setLimitsOpen] = useState(false)
@@ -206,15 +218,35 @@ export default function Providers() {
     }
   }
 
-  const sync = async (id: number) => {
+  const applySync = async (id: number) => {
     const key = `provider-sync-${id}`
-    message.loading({ content: '正在从上游同步模型...', key })
+    setApplyingSync(true)
+    message.loading({ content: '正在应用模型同步...', key })
     try {
       const result = await api.post<{ ok: boolean; count: number; message: string }>(`/api/providers/${id}/models/sync`)
       message.success({ content: `已同步 ${result.count} 个模型`, key })
+      setSyncPreview(undefined)
+      setSyncTarget(undefined)
       await load()
     } catch (error) {
       message.error({ content: formatError(error), key, duration: 6 })
+    } finally {
+      setApplyingSync(false)
+    }
+  }
+
+  const previewSync = async (provider: Provider) => {
+    setSyncTarget(provider)
+    setPreviewingSync(true)
+    try {
+      setSyncPreview(
+        await api.post<ModelSyncPreview>(`/api/providers/${provider.id}/models/preview`),
+      )
+    } catch (error) {
+      message.error(formatError(error))
+      setSyncTarget(undefined)
+    } finally {
+      setPreviewingSync(false)
     }
   }
 
@@ -404,8 +436,12 @@ export default function Providers() {
               fixed: 'right',
               render: (_, record) => (
                 <Space>
-                  <Tooltip title="从上游同步模型">
-                    <Button type="text" icon={<SyncOutlined />} onClick={() => sync(record.id)} />
+                  <Tooltip title="预览模型同步">
+                    <Button
+                      type="text"
+                      icon={<SyncOutlined />}
+                      onClick={() => void previewSync(record)}
+                    />
                   </Tooltip>
                   <Tooltip title="测试连接">
                     <Button type="text" icon={<ThunderboltOutlined />} onClick={() => test(record.id)} />
@@ -649,6 +685,65 @@ export default function Providers() {
             },
           ]}
         />
+      </Modal>
+
+      <Modal
+        title={syncTarget ? `同步预览 · ${syncTarget.name}` : '同步预览'}
+        open={Boolean(syncTarget)}
+        onCancel={() => {
+          setSyncTarget(undefined)
+          setSyncPreview(undefined)
+        }}
+        onOk={() => syncTarget && void applySync(syncTarget.id)}
+        confirmLoading={previewingSync || applyingSync}
+        okButtonProps={{ disabled: !syncPreview }}
+        okText="应用同步"
+        width={640}
+        destroyOnHidden
+      >
+        {syncPreview && (
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <Space wrap>
+              <Tag color="green">新增 {syncPreview.added.length}</Tag>
+              <Tag color="red">移除 {syncPreview.removed.length}</Tag>
+              <Tag color="blue">保留 {syncPreview.retained}</Tag>
+              <Tag>停用保留 {syncPreview.disabled_retained}</Tag>
+            </Space>
+            {[
+              ['新增模型', syncPreview.added, 'green'],
+              ['移除模型', syncPreview.removed, 'red'],
+            ].map(([label, models, color]) =>
+              (models as string[]).length ? (
+                <div key={label as string}>
+                  <Typography.Text strong>{label as string}</Typography.Text>
+                  <div
+                    style={{
+                      maxHeight: 180,
+                      overflow: 'auto',
+                      marginTop: 6,
+                      border: '1px solid #f0f0f0',
+                      borderRadius: 6,
+                      padding: 8,
+                    }}
+                  >
+                    <Space wrap size={[4, 4]}>
+                      {(models as string[]).map((model) => (
+                        <Tag key={model} color={color as string}>
+                          {model}
+                        </Tag>
+                      ))}
+                    </Space>
+                  </div>
+                </div>
+              ) : null,
+            )}
+            {!syncPreview.added.length && !syncPreview.removed.length && (
+              <Typography.Text type="secondary">
+                上游模型列表与本地一致，应用后不会改变模型数量。
+              </Typography.Text>
+            )}
+          </Space>
+        )}
       </Modal>
     </>
   )

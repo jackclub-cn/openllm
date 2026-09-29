@@ -507,6 +507,64 @@ pub async fn sync_provider_models(
     Ok(Json(sync_provider(state, id).await?))
 }
 
+pub async fn preview_provider_model_sync(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<ModelSyncPreview>> {
+    let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
+    let entries = fetch_provider_entries(&state, &provider).await?;
+    let existing = sqlx::query_as::<_, (String, i64)>(
+        "SELECT model_name, enabled FROM provider_models WHERE provider_id = ?",
+    )
+    .bind(id)
+    .fetch_all(&state.pool)
+    .await?
+    .into_iter()
+    .collect::<HashMap<_, _>>();
+
+    Ok(Json(build_model_sync_preview(id, &entries, &existing)))
+}
+
+fn build_model_sync_preview(
+    provider_id: i64,
+    entries: &[(String, UpstreamModelInfo)],
+    existing: &HashMap<String, i64>,
+) -> ModelSyncPreview {
+    let upstream = entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<HashSet<_>>();
+    let added = entries
+        .iter()
+        .filter(|(name, _)| !existing.contains_key(name))
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
+    let removed = existing
+        .keys()
+        .filter(|name| !upstream.contains(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    let retained = entries
+        .iter()
+        .filter(|(name, _)| existing.contains_key(name))
+        .count();
+    let disabled_retained = existing
+        .iter()
+        .filter(|(name, enabled)| **enabled == 0 && upstream.contains(*name))
+        .count();
+    ModelSyncPreview {
+        provider_id,
+        added,
+        removed,
+        retained,
+        disabled_retained,
+    }
+}
+
 pub async fn list_provider_model_limits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -624,26 +682,10 @@ fn validate_limit(name: &str, value: Option<i64>) -> AppResult<()> {
     Ok(())
 }
 
-async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
-    let result = sync_provider_inner(&state, id).await;
-    if let Err(error) = &result {
-        let _ = sqlx::query(
-            "UPDATE providers SET models_sync_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
-        )
-        .bind(error.to_string())
-        .bind(id)
-        .execute(&state.pool)
-        .await;
-    }
-    result
-}
-
-async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncResult> {
-    let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
+async fn fetch_provider_entries(
+    state: &AppState,
+    provider: &Provider,
+) -> AppResult<Vec<(String, UpstreamModelInfo)>> {
     let provider_type =
         ProviderType::from_str(&provider.provider_type).map_err(AppError::BadRequest)?;
     let (url, ollama_style) = match provider_type {
@@ -706,6 +748,30 @@ async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncRe
             "upstream model list did not contain any recognizable models".to_string(),
         ));
     }
+    Ok(entries)
+}
+
+async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
+    let result = sync_provider_inner(&state, id).await;
+    if let Err(error) = &result {
+        let _ = sqlx::query(
+            "UPDATE providers SET models_sync_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        )
+        .bind(error.to_string())
+        .bind(id)
+        .execute(&state.pool)
+        .await;
+    }
+    result
+}
+
+async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncResult> {
+    let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
+    let entries = fetch_provider_entries(state, &provider).await?;
     let models = entries
         .iter()
         .map(|(name, _)| name.clone())
@@ -2244,6 +2310,26 @@ mod tests {
         .unwrap();
         assert_eq!(stored, r#"["gpt-*","claude-*"]"#);
         assert!(normalize_allowed_models(Some(vec!["unclosed[".to_string()])).is_err());
+    }
+
+    #[test]
+    fn builds_model_sync_preview() {
+        let entries = vec![
+            ("new-model".to_string(), UpstreamModelInfo::default()),
+            ("kept-model".to_string(), UpstreamModelInfo::default()),
+            ("disabled-model".to_string(), UpstreamModelInfo::default()),
+        ];
+        let existing = HashMap::from([
+            ("kept-model".to_string(), 1),
+            ("disabled-model".to_string(), 0),
+            ("removed-model".to_string(), 1),
+        ]);
+        let preview = build_model_sync_preview(7, &entries, &existing);
+        assert_eq!(preview.provider_id, 7);
+        assert_eq!(preview.added, vec!["new-model"]);
+        assert_eq!(preview.removed, vec!["removed-model"]);
+        assert_eq!(preview.retained, 2);
+        assert_eq!(preview.disabled_retained, 1);
     }
 
     #[test]
