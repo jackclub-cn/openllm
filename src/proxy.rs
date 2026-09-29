@@ -46,12 +46,21 @@ async fn public_models_inner(
     headers: &HeaderMap,
     uri: &Uri,
 ) -> AppResult<Response> {
-    authenticate_gateway(state, headers).await?;
+    let api_key = authenticate_gateway(state, headers).await?;
+    let model_patterns = api_key_model_patterns(api_key.as_ref())?;
     if wants_anthropic_models(headers) {
-        return anthropic_models(state, uri).await;
+        return anthropic_models(state, uri, model_patterns.as_deref()).await;
     }
-    let routes = crate::registry::route_models(&state.pool).await?;
-    let synced = crate::registry::synced_models(&state.pool).await?;
+    let routes = filter_allowed_models(
+        model_patterns.as_deref(),
+        crate::registry::route_models(&state.pool).await?,
+        |model| model.id.as_str(),
+    );
+    let synced = filter_allowed_models(
+        model_patterns.as_deref(),
+        crate::registry::synced_models(&state.pool).await?,
+        |model| model.id.as_str(),
+    );
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
@@ -141,9 +150,21 @@ fn anthropic_beta_of(headers: &HeaderMap) -> Option<String> {
 ///
 /// Anthropic returns `data` entries of `{type, id, display_name, created_at}`
 /// plus cursor fields, rather than OpenAI's `{id, object, created, owned_by}`.
-async fn anthropic_models(state: &AppState, uri: &Uri) -> AppResult<Response> {
-    let routes = crate::registry::route_models(&state.pool).await?;
-    let synced = crate::registry::synced_models(&state.pool).await?;
+async fn anthropic_models(
+    state: &AppState,
+    uri: &Uri,
+    model_patterns: Option<&[String]>,
+) -> AppResult<Response> {
+    let routes = filter_allowed_models(
+        model_patterns,
+        crate::registry::route_models(&state.pool).await?,
+        |model| model.id.as_str(),
+    );
+    let synced = filter_allowed_models(
+        model_patterns,
+        crate::registry::synced_models(&state.pool).await?,
+        |model| model.id.as_str(),
+    );
     let mut models = Vec::new();
     // Routes first, matching the precedence used by the OpenAI-shaped list.
     for model in routes {
@@ -2720,28 +2741,45 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
     Ok(())
 }
 
+fn api_key_model_patterns(api_key: Option<&ApiKeyRecord>) -> AppResult<Option<Vec<String>>> {
+    let Some(raw) = api_key.and_then(|api_key| api_key.allowed_models.as_deref()) else {
+        return Ok(None);
+    };
+    let patterns = serde_json::from_str::<Vec<String>>(raw)
+        .map_err(|_| AppError::Forbidden("API key model permissions are invalid".to_string()))?;
+    Ok((!patterns.is_empty()).then_some(patterns))
+}
+
+fn model_matches_patterns(patterns: Option<&[String]>, model: &str) -> bool {
+    patterns.is_none_or(|patterns| {
+        patterns.iter().any(|pattern| {
+            Glob::new(pattern)
+                .map(|glob| glob.compile_matcher().is_match(model))
+                .unwrap_or(false)
+        })
+    })
+}
+
+fn filter_allowed_models<T>(
+    patterns: Option<&[String]>,
+    models: Vec<T>,
+    model_id: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    models
+        .into_iter()
+        .filter(|model| model_matches_patterns(patterns, model_id(model)))
+        .collect()
+}
+
 fn enforce_api_key_model_access(
     api_key: Option<&ApiKeyRecord>,
     requested_model: &str,
 ) -> AppResult<()> {
-    let Some(api_key) = api_key else {
-        return Ok(());
-    };
-    if let Some(raw) = api_key.allowed_models.as_deref() {
-        let patterns = serde_json::from_str::<Vec<String>>(raw).map_err(|_| {
-            AppError::Forbidden("API key model permissions are invalid".to_string())
-        })?;
-        if !patterns.is_empty()
-            && !patterns.iter().any(|pattern| {
-                Glob::new(pattern)
-                    .map(|glob| glob.compile_matcher().is_match(requested_model))
-                    .unwrap_or(false)
-            })
-        {
-            return Err(AppError::Forbidden(format!(
-                "API key is not allowed to call model '{requested_model}'"
-            )));
-        }
+    let patterns = api_key_model_patterns(api_key)?;
+    if !model_matches_patterns(patterns.as_deref(), requested_model) {
+        return Err(AppError::Forbidden(format!(
+            "API key is not allowed to call model '{requested_model}'"
+        )));
     }
     Ok(())
 }
@@ -4365,6 +4403,83 @@ mod tests {
             enforce_api_key_model_access(Some(&malformed), "gpt-5.4"),
             Err(AppError::Forbidden(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn public_model_list_respects_api_key_model_permissions() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Scoped', 'openai', 'https://example.com/v1', 'vendor/', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'gpt-5', 1), (1, 'claude-4', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let raw_key = "sk-openllm-scoped-model-list";
+        sqlx::query(
+            "INSERT INTO api_keys (
+                name, key_hash, key_prefix, key_suffix, enabled, allowed_models
+             ) VALUES ('scoped', ?, 'sk-openllm-s', 'list', 1, '[\"vendor/gpt-*\"]')",
+        )
+        .bind(hash_secret(raw_key))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+
+        let mut openai_headers = HeaderMap::new();
+        openai_headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+        );
+        let uri: Uri = "/v1/models".parse().unwrap();
+        let response = public_models_inner(&state, &openai_headers, &uri)
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let ids = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["vendor/gpt-5"]);
+
+        let mut anthropic_headers = openai_headers.clone();
+        anthropic_headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static("2023-06-01"),
+        );
+        let response = public_models_inner(&state, &anthropic_headers, &uri)
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        let ids = value["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|model| model["id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["vendor/gpt-5"]);
     }
 
     #[test]
