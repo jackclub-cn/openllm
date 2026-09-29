@@ -591,6 +591,8 @@ pub struct ApiKeyRecord {
     pub created_at: String,
     pub daily_token_limit: Option<i64>,
     pub daily_cost_limit_micros: Option<i64>,
+    pub requests_per_minute: Option<i64>,
+    pub max_concurrency: Option<i64>,
     pub allowed_models: Option<String>,
     pub expires_at: Option<String>,
 }
@@ -610,9 +612,13 @@ pub struct ApiKeyView {
     pub unpriced_requests: i64,
     pub daily_token_limit: Option<i64>,
     pub daily_cost_limit_micros: Option<i64>,
+    pub requests_per_minute: Option<i64>,
+    pub max_concurrency: Option<i64>,
     pub today_requests: i64,
     pub today_tokens: i64,
     pub today_cost_micros: Option<i64>,
+    pub requests_this_minute: i64,
+    pub current_in_flight: i64,
     pub allowed_models: Vec<String>,
     pub expires_at: Option<String>,
 }
@@ -632,9 +638,13 @@ pub struct ApiKeyStatsRow {
     pub unpriced_requests: i64,
     pub daily_token_limit: Option<i64>,
     pub daily_cost_limit_micros: Option<i64>,
+    pub requests_per_minute: Option<i64>,
+    pub max_concurrency: Option<i64>,
     pub today_requests: i64,
     pub today_tokens: i64,
     pub today_cost_micros: Option<i64>,
+    pub requests_this_minute: i64,
+    pub current_in_flight: i64,
     pub allowed_models: Option<String>,
     pub expires_at: Option<String>,
 }
@@ -646,6 +656,10 @@ pub struct ApiKeyInput {
     pub daily_token_limit: Option<i64>,
     #[serde(default)]
     pub daily_cost_limit_micros: Option<i64>,
+    #[serde(default)]
+    pub requests_per_minute: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]
@@ -659,6 +673,10 @@ pub struct ApiKeyUpdate {
     pub daily_token_limit: Option<i64>,
     #[serde(default)]
     pub daily_cost_limit_micros: Option<i64>,
+    #[serde(default)]
+    pub requests_per_minute: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]

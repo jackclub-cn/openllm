@@ -7,7 +7,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use futures_util::StreamExt;
 use globset::Glob;
 use rand::distributions::{Distribution, WeightedIndex};
@@ -2914,7 +2914,7 @@ async fn authenticate_gateway(
     Ok(Some(record))
 }
 
-/// Checks a key's soft daily quotas before any upstream work begins.
+/// Checks a key's soft quotas before any upstream work begins.
 ///
 /// Usage is committed after the response completes, so concurrent requests can
 /// overshoot by at most the work already in flight. The guard still prevents a
@@ -2923,40 +2923,81 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
     let Some(api_key) = api_key else {
         return Ok(());
     };
-    if api_key.daily_token_limit.is_none() && api_key.daily_cost_limit_micros.is_none() {
+    if api_key.daily_token_limit.is_none()
+        && api_key.daily_cost_limit_micros.is_none()
+        && api_key.requests_per_minute.is_none()
+        && api_key.max_concurrency.is_none()
+    {
         return Ok(());
     }
 
-    let day_start = Utc::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .expect("midnight is valid")
-        .and_utc()
-        .to_rfc3339();
-    let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
-        "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
-         FROM usage_logs WHERE api_key_id = ? AND created_at >= ? AND in_flight = 0",
-    )
-    .bind(api_key.id)
-    .bind(day_start)
-    .fetch_one(&state.pool)
-    .await?;
+    if api_key.daily_token_limit.is_some() || api_key.daily_cost_limit_micros.is_some() {
+        let day_start = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .expect("midnight is valid")
+            .and_utc()
+            .to_rfc3339();
+        let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
+            "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
+             FROM usage_logs WHERE api_key_id = ? AND created_at >= ? AND in_flight = 0",
+        )
+        .bind(api_key.id)
+        .bind(day_start)
+        .fetch_one(&state.pool)
+        .await?;
 
-    if let Some(limit) = api_key.daily_token_limit
-        && tokens >= limit
-    {
-        return Err(AppError::TooManyRequests(format!(
-            "daily token limit reached for this API key ({tokens}/{limit})"
-        )));
+        if let Some(limit) = api_key.daily_token_limit
+            && tokens >= limit
+        {
+            return Err(AppError::TooManyRequests(format!(
+                "daily token limit reached for this API key ({tokens}/{limit})"
+            )));
+        }
+        if let Some(limit) = api_key.daily_cost_limit_micros
+            && cost_micros.unwrap_or(0) >= limit
+        {
+            return Err(AppError::TooManyRequests(format!(
+                "daily cost limit reached for this API key (${:.4}/${:.4})",
+                cost_micros.unwrap_or(0) as f64 / 1_000_000.0,
+                limit as f64 / 1_000_000.0
+            )));
+        }
     }
-    if let Some(limit) = api_key.daily_cost_limit_micros
-        && cost_micros.unwrap_or(0) >= limit
-    {
-        return Err(AppError::TooManyRequests(format!(
-            "daily cost limit reached for this API key (${:.4}/${:.4})",
-            cost_micros.unwrap_or(0) as f64 / 1_000_000.0,
-            limit as f64 / 1_000_000.0
-        )));
+
+    if let Some(limit) = api_key.requests_per_minute {
+        let minute_start = Utc::now()
+            .with_second(0)
+            .and_then(|value| value.with_nanosecond(0))
+            .expect("current minute start is valid")
+            .to_rfc3339();
+        let requests = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM usage_logs \
+             WHERE api_key_id = ? AND created_at >= ?",
+        )
+        .bind(api_key.id)
+        .bind(minute_start)
+        .fetch_one(&state.pool)
+        .await?;
+        if requests >= limit {
+            return Err(AppError::TooManyRequests(format!(
+                "requests per minute limit reached for this API key ({requests}/{limit})"
+            )));
+        }
+    }
+
+    if let Some(limit) = api_key.max_concurrency {
+        let in_flight = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM usage_logs WHERE api_key_id = ? AND in_flight = 1",
+        )
+        .bind(api_key.id)
+        .fetch_one(&state.pool)
+        .await?;
+        if in_flight >= limit {
+            return Err(AppError::TooManyRequests(format!(
+                "concurrency limit reached for this API key ({in_flight}/{limit})"
+            )));
+        }
     }
     Ok(())
 }
@@ -5362,6 +5403,8 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: Some(10),
             daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
             allowed_models: None,
             expires_at: None,
         };
@@ -5500,6 +5543,8 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: None,
             daily_cost_limit_micros: Some(2),
+            requests_per_minute: None,
+            max_concurrency: None,
             allowed_models: None,
             expires_at: None,
         };
@@ -5508,6 +5553,132 @@ mod tests {
             enforce_api_key_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn api_key_requests_per_minute_quota_blocks_after_limit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage_logs (
+                api_key_id INTEGER,
+                in_flight INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (api_key_id, created_at) VALUES
+                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 minutes'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "rate-limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: Some(2),
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+        };
+        let state = AppState::new(pool, None);
+        assert!(matches!(
+            enforce_api_key_quota(&state, Some(&key)).await,
+            Err(AppError::TooManyRequests(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_key_concurrency_quota_blocks_at_limit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage_logs (
+                api_key_id INTEGER,
+                in_flight INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (api_key_id, in_flight, created_at)
+             VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "concurrency-limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: Some(1),
+            allowed_models: None,
+            expires_at: None,
+        };
+        let state = AppState::new(pool.clone(), None);
+        assert!(matches!(
+            enforce_api_key_quota(&state, Some(&key)).await,
+            Err(AppError::TooManyRequests(_))
+        ));
+
+        sqlx::query("UPDATE usage_logs SET in_flight = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_key_without_limits_skips_quota_queries() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "unlimited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+        };
+        let state = AppState::new(pool, None);
+        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
     }
 
     #[tokio::test]
@@ -5547,6 +5718,8 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: Some(10),
             daily_cost_limit_micros: Some(1),
+            requests_per_minute: None,
+            max_concurrency: None,
             allowed_models: None,
             expires_at: None,
         };
@@ -5624,6 +5797,8 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: Some(1),
             daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
             allowed_models: None,
             expires_at: None,
         };
@@ -5663,6 +5838,8 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: None,
             daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
             allowed_models: Some(r#"["gpt-*","claude-sonnet-*"]"#.to_string()),
             expires_at: None,
         };

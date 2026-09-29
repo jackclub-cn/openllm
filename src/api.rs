@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1476,18 +1476,34 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
 }
 
 pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<ApiKeyView>>> {
+    let now = Utc::now();
     let day_start = Utc::now()
         .date_naive()
         .and_hms_opt(0, 0, 0)
         .expect("midnight is valid")
         .and_utc()
         .to_rfc3339();
+    let minute_start = now
+        .with_second(0)
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("current minute start is valid")
+        .to_rfc3339();
     let keys = sqlx::query_as::<_, ApiKeyStatsRow>(
         r#"
         SELECT
             k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
             k.last_used_at, k.created_at,
-            k.daily_token_limit, k.daily_cost_limit_micros, k.allowed_models, k.expires_at,
+            k.daily_token_limit, k.daily_cost_limit_micros,
+            k.requests_per_minute, k.max_concurrency,
+            k.allowed_models, k.expires_at,
+            (
+                SELECT COUNT(*) FROM usage_logs rate
+                WHERE rate.api_key_id = k.id AND rate.created_at >= ?
+            ) AS requests_this_minute,
+            (
+                SELECT COUNT(*) FROM usage_logs active
+                WHERE active.api_key_id = k.id AND active.in_flight = 1
+            ) AS current_in_flight,
             COUNT(CASE WHEN u.id IS NOT NULL AND u.created_at >= ? THEN 1 END) AS today_requests,
             COALESCE(SUM(
                 CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
@@ -1508,10 +1524,12 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         LEFT JOIN usage_logs u ON u.api_key_id = k.id AND u.in_flight = 0
         GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
                  k.last_used_at, k.created_at, k.daily_token_limit,
-                 k.daily_cost_limit_micros, k.allowed_models, k.expires_at
+                 k.daily_cost_limit_micros, k.requests_per_minute,
+                 k.max_concurrency, k.allowed_models, k.expires_at
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
+    .bind(&minute_start)
     .bind(&day_start)
     .bind(&day_start)
     .bind(&day_start)
@@ -1546,6 +1564,9 @@ pub async fn create_api_key(
     let daily_token_limit = normalize_api_key_limit("daily token", input.daily_token_limit)?;
     let daily_cost_limit_micros =
         normalize_api_key_limit("daily cost", input.daily_cost_limit_micros)?;
+    let requests_per_minute =
+        normalize_api_key_limit("requests per minute", input.requests_per_minute)?;
+    let max_concurrency = normalize_api_key_limit("max concurrency", input.max_concurrency)?;
     let allowed_models = normalize_allowed_models(input.allowed_models)?;
     let expires_at = normalize_expiration(input.expires_at)?;
 
@@ -1554,8 +1575,9 @@ pub async fn create_api_key(
     let result = sqlx::query(
         "INSERT INTO api_keys (
             name, key_hash, key_prefix, key_suffix, enabled,
-            daily_token_limit, daily_cost_limit_micros, allowed_models, expires_at
-         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
+            daily_token_limit, daily_cost_limit_micros, requests_per_minute,
+            max_concurrency, allowed_models, expires_at
+         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(key_hash)
@@ -1563,6 +1585,8 @@ pub async fn create_api_key(
     .bind(key_suffix)
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
+    .bind(requests_per_minute)
+    .bind(max_concurrency)
     .bind(allowed_models)
     .bind(expires_at)
     .execute(&state.pool)
@@ -1645,6 +1669,14 @@ pub async fn update_api_key(
         Some(value) => normalize_api_key_limit("daily cost", Some(value))?,
         None => current.daily_cost_limit_micros,
     };
+    let requests_per_minute = match input.requests_per_minute {
+        Some(value) => normalize_api_key_limit("requests per minute", Some(value))?,
+        None => current.requests_per_minute,
+    };
+    let max_concurrency = match input.max_concurrency {
+        Some(value) => normalize_api_key_limit("max concurrency", Some(value))?,
+        None => current.max_concurrency,
+    };
     let allowed_models = match input.allowed_models {
         Some(value) => normalize_allowed_models(Some(value))?,
         None => current.allowed_models,
@@ -1656,12 +1688,15 @@ pub async fn update_api_key(
     let result = sqlx::query(
         "UPDATE api_keys \
              SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ?, \
-             allowed_models = ?, expires_at = ? \
+             requests_per_minute = ?, max_concurrency = ?, allowed_models = ?, \
+             expires_at = ? \
          WHERE id = ?",
     )
     .bind(input.enabled as i64)
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
+    .bind(requests_per_minute)
+    .bind(max_concurrency)
     .bind(allowed_models)
     .bind(expires_at)
     .bind(id)
@@ -2853,9 +2888,13 @@ impl From<ApiKeyRecord> for ApiKeyView {
             unpriced_requests: 0,
             daily_token_limit: value.daily_token_limit,
             daily_cost_limit_micros: value.daily_cost_limit_micros,
+            requests_per_minute: value.requests_per_minute,
+            max_concurrency: value.max_concurrency,
             today_requests: 0,
             today_tokens: 0,
             today_cost_micros: None,
+            requests_this_minute: 0,
+            current_in_flight: 0,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
             expires_at: value.expires_at,
         }
@@ -2878,9 +2917,13 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             unpriced_requests: value.unpriced_requests,
             daily_token_limit: value.daily_token_limit,
             daily_cost_limit_micros: value.daily_cost_limit_micros,
+            requests_per_minute: value.requests_per_minute,
+            max_concurrency: value.max_concurrency,
             today_requests: value.today_requests,
             today_tokens: value.today_tokens,
             today_cost_micros: value.today_cost_micros,
+            requests_this_minute: value.requests_this_minute,
+            current_in_flight: value.current_in_flight,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
             expires_at: value.expires_at,
         }
@@ -3045,6 +3088,72 @@ mod tests {
             Some(10_000)
         );
         assert!(normalize_api_key_limit("token", Some(-1)).is_err());
+    }
+
+    #[tokio::test]
+    async fn persists_and_reports_api_key_rate_limits() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool.clone(), None);
+
+        let (_, Json(created)) = create_api_key(
+            State(state.clone()),
+            Json(ApiKeyInput {
+                name: "limited".to_string(),
+                daily_token_limit: None,
+                daily_cost_limit_micros: None,
+                requests_per_minute: Some(120),
+                max_concurrency: Some(5),
+                allowed_models: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.item.requests_per_minute, Some(120));
+        assert_eq!(created.item.max_concurrency, Some(5));
+
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, api_key_id, requested_model, endpoint,
+                status_code, in_flight, success, created_at
+             ) VALUES (
+                'active', ?, 'model', '/v1/chat/completions',
+                0, 1, 0, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+        )
+        .bind(created.item.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
+        assert_eq!(items[0].requests_per_minute, Some(120));
+        assert_eq!(items[0].max_concurrency, Some(5));
+        assert_eq!(items[0].requests_this_minute, 1);
+        assert_eq!(items[0].current_in_flight, 1);
+
+        let Json(updated) = update_api_key(
+            State(state),
+            Path(created.item.id),
+            Json(ApiKeyUpdate {
+                enabled: true,
+                daily_token_limit: None,
+                daily_cost_limit_micros: None,
+                requests_per_minute: Some(0),
+                max_concurrency: Some(2),
+                allowed_models: None,
+                expires_at: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.requests_per_minute, None);
+        assert_eq!(updated.max_concurrency, Some(2));
     }
 
     #[test]

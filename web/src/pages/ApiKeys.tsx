@@ -34,6 +34,8 @@ type ApiKeyForm = {
   name: string
   daily_token_limit?: number | null
   daily_cost_limit_usd?: number | null
+  requests_per_minute?: number | null
+  max_concurrency?: number | null
   allowed_models_text?: string
   expires_at?: Dayjs | null
 }
@@ -75,6 +77,8 @@ export default function ApiKeys() {
           values.daily_cost_limit_usd != null
             ? Math.round(values.daily_cost_limit_usd * 1_000_000)
             : 0,
+        requests_per_minute: values.requests_per_minute ?? 0,
+        max_concurrency: values.max_concurrency ?? 0,
         allowed_models: (values.allowed_models_text || '')
           .split('\n')
           .map((value) => value.trim())
@@ -136,6 +140,8 @@ export default function ApiKeys() {
         record.daily_cost_limit_micros != null
           ? record.daily_cost_limit_micros / 1_000_000
           : null,
+      requests_per_minute: record.requests_per_minute ?? null,
+      max_concurrency: record.max_concurrency ?? null,
       allowed_models_text: record.allowed_models.join('\n'),
       expires_at: record.expires_at ? dayjs(record.expires_at) : null,
     })
@@ -154,6 +160,8 @@ export default function ApiKeys() {
           values.daily_cost_limit_usd != null
             ? Math.round(values.daily_cost_limit_usd * 1_000_000)
             : 0,
+        requests_per_minute: values.requests_per_minute ?? 0,
+        max_concurrency: values.max_concurrency ?? 0,
         allowed_models: (values.allowed_models_text || '')
           .split('\n')
           .map((value) => value.trim())
@@ -189,7 +197,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 1420 }}
+          scroll={{ x: 1620 }}
           columns={[
             {
               title: '名称',
@@ -271,6 +279,34 @@ export default function ApiKeys() {
                   </Space>
                 ) : (
                   <Typography.Text type="secondary">今日无消耗</Typography.Text>
+                )
+              },
+            },
+            {
+              title: '速率限制',
+              width: 180,
+              render: (_, record) => {
+                const limits: string[] = []
+                if (record.requests_per_minute != null) {
+                  limits.push(
+                    `${record.requests_this_minute} / ${record.requests_per_minute} 次/分钟`,
+                  )
+                }
+                if (record.max_concurrency != null) {
+                  limits.push(
+                    `并发 ${record.current_in_flight} / ${record.max_concurrency}`,
+                  )
+                } else if (record.current_in_flight > 0) {
+                  limits.push(`并发 ${record.current_in_flight}`)
+                }
+                return limits.length ? (
+                  <Space direction="vertical" size={0}>
+                    {limits.map((limit) => (
+                      <Typography.Text key={limit}>{limit}</Typography.Text>
+                    ))}
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary">不限</Typography.Text>
                 )
               },
             },
@@ -395,6 +431,20 @@ export default function ApiKeys() {
               >
                 <InputNumber min={0} precision={4} style={{ width: '100%' }} />
               </Form.Item>
+              <Form.Item
+                name="requests_per_minute"
+                label="每分钟请求上限"
+                extra="按 UTC 自然分钟统计，留空或 0 表示不限制。"
+              >
+                <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
+              <Form.Item
+                name="max_concurrency"
+                label="最大并发请求数"
+                extra="统计已进入上游调用的请求，留空或 0 表示不限制。"
+              >
+                <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+              </Form.Item>
             </div>
             <Form.Item
               name="allowed_models_text"
@@ -447,6 +497,20 @@ export default function ApiKeys() {
             extra="费用为预估值；无定价请求不会计入费用上限。"
           >
             <InputNumber min={0} precision={4} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="requests_per_minute"
+            label="每分钟请求上限"
+            extra="按 UTC 自然分钟统计，留空或 0 表示不限制。"
+          >
+            <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="max_concurrency"
+            label="最大并发请求数"
+            extra="统计已进入上游调用的请求，留空或 0 表示不限制。"
+          >
+            <InputNumber min={0} precision={0} style={{ width: '100%' }} />
           </Form.Item>
         </Form>
       </Modal>

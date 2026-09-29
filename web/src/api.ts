@@ -206,9 +206,13 @@ export type ApiKey = {
   unpriced_requests: number
   daily_token_limit?: number | null
   daily_cost_limit_micros?: number | null
+  requests_per_minute?: number | null
+  max_concurrency?: number | null
   today_requests: number
   today_tokens: number
   today_cost_micros?: number | null
+  requests_this_minute: number
+  current_in_flight: number
   allowed_models: string[]
   expires_at?: string | null
 }
