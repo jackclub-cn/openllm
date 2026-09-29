@@ -125,6 +125,8 @@ export type UsageLog = {
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
   latency_ms: number
   first_token_ms?: number
   status_code: number
@@ -138,8 +140,13 @@ export type UsageLog = {
 export type Overview = {
   requests_today: number
   tokens_today: number
+  cache_read_today: number
+  cache_write_today: number
+  cache_hit_rate: number
   requests_total: number
   tokens_total: number
+  cache_read_total: number
+  cache_write_total: number
   success_rate: number
   avg_latency_ms: number
   active_providers: number

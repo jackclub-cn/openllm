@@ -414,6 +414,8 @@ struct AnthropicStreamState {
     finish_reason: Option<String>,
     input_tokens: i64,
     output_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     text: String,
 }
 
@@ -519,6 +521,14 @@ async fn process_openai_line_for_anthropic(
         }
         if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_i64) {
             state.output_tokens = completion;
+        }
+        let cache_read = cache_read_of(usage);
+        if cache_read > 0 {
+            state.cache_read_tokens = cache_read;
+        }
+        let cache_write = cache_write_of(usage);
+        if cache_write > 0 {
+            state.cache_write_tokens = cache_write;
         }
     }
     if let Some(reason) = value
@@ -712,6 +722,8 @@ fn openai_stream_to_anthropic(
             },
             completion_tokens: stream_state.output_tokens,
             total_tokens: stream_state.input_tokens + stream_state.output_tokens,
+            cache_read_tokens: stream_state.cache_read_tokens,
+            cache_write_tokens: stream_state.cache_write_tokens,
         }
         .normalized();
         let preview = response_preview(stream_state.text.as_bytes());
@@ -880,11 +892,7 @@ async fn proxy_anthropic_inner(
             requested_model: &requested_model,
             upstream_model: None,
             endpoint: &endpoint,
-            usage: Usage {
-                prompt_tokens: request_tokens,
-                completion_tokens: 0,
-                total_tokens: request_tokens,
-            },
+            usage: Usage::new(request_tokens, 0),
             latency_ms: started.elapsed().as_millis() as i64,
             first_token_ms: None,
             status_code: 502,
@@ -958,11 +966,7 @@ async fn forward_anthropic_native(
                 requested_model,
                 upstream_model: Some(&target.upstream_model),
                 endpoint: ANTHROPIC_MESSAGES,
-                usage: Usage {
-                    prompt_tokens: request_tokens,
-                    completion_tokens: 0,
-                    total_tokens: request_tokens,
-                },
+                usage: Usage::new(request_tokens, 0),
                 latency_ms: started.elapsed().as_millis() as i64,
                 first_token_ms: None,
                 status_code: status.as_u16() as i64,
@@ -1099,11 +1103,7 @@ async fn forward_openai_as_anthropic(
                 requested_model,
                 upstream_model: Some(&target.upstream_model),
                 endpoint: ANTHROPIC_MESSAGES,
-                usage: Usage {
-                    prompt_tokens: request_tokens,
-                    completion_tokens: 0,
-                    total_tokens: request_tokens,
-                },
+                usage: Usage::new(request_tokens, 0),
                 latency_ms: started.elapsed().as_millis() as i64,
                 first_token_ms: None,
                 status_code: status.as_u16() as i64,
@@ -1265,11 +1265,7 @@ pub async fn proxy_openai(
             requested_model: &requested_model,
             upstream_model: None,
             endpoint: &endpoint,
-            usage: Usage {
-                prompt_tokens: request_tokens,
-                completion_tokens: 0,
-                total_tokens: request_tokens,
-            },
+            usage: Usage::new(request_tokens, 0),
             latency_ms: started.elapsed().as_millis() as i64,
             first_token_ms: None,
             status_code: 502,
@@ -1377,11 +1373,7 @@ async fn forward_to_target(
                 requested_model,
                 upstream_model: Some(&target.upstream_model),
                 endpoint,
-                usage: Usage {
-                    prompt_tokens: request_tokens,
-                    completion_tokens: 0,
-                    total_tokens: request_tokens,
-                },
+                usage: Usage::new(request_tokens, 0),
                 latency_ms: started.elapsed().as_millis() as i64,
                 first_token_ms: None,
                 status_code: status.as_u16() as i64,
@@ -1581,6 +1573,8 @@ fn passthrough_stream_response(
                 prompt_tokens: request_tokens,
                 completion_tokens: 1,
                 total_tokens: request_tokens + 1,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             });
         let preview = parser.preview();
         log_usage(
@@ -1817,11 +1811,15 @@ async fn process_anthropic_line(
 
     match event_name.as_str() {
         "message_start" => {
-            if let Some(input_tokens) = value
-                .pointer("/message/usage/input_tokens")
-                .and_then(Value::as_i64)
-            {
-                usage.prompt_tokens = input_tokens;
+            if let Some(message_usage) = value.pointer("/message/usage") {
+                if let Some(input_tokens) =
+                    message_usage.get("input_tokens").and_then(Value::as_i64)
+                {
+                    usage.prompt_tokens = input_tokens;
+                }
+                // Anthropic reports cache traffic on the initial message too.
+                usage.cache_read_tokens = cache_read_of(message_usage);
+                usage.cache_write_tokens = cache_write_of(message_usage);
             }
             if !*sent_role {
                 *sent_role = true;
@@ -1936,6 +1934,17 @@ async fn process_anthropic_line(
                 .and_then(Value::as_i64)
             {
                 usage.completion_tokens = output_tokens;
+            }
+            // `message_delta` may also repeat cache counters; keep them in sync.
+            if let Some(delta_usage) = value.get("usage") {
+                let cache_read = cache_read_of(delta_usage);
+                if cache_read > 0 {
+                    usage.cache_read_tokens = cache_read;
+                }
+                let cache_write = cache_write_of(delta_usage);
+                if cache_write > 0 {
+                    usage.cache_write_tokens = cache_write;
+                }
             }
         }
         _ => {}
@@ -2161,19 +2170,27 @@ fn convert_anthropic_response(value: &Value) -> (Value, Usage) {
         message["tool_calls"] = json!(tool_calls);
     }
 
-    let prompt_tokens = value
-        .pointer("/usage/input_tokens")
-        .and_then(Value::as_i64)
+    // Reuse the shared reader so cache counters (`cache_read_input_tokens`,
+    // `cache_creation_input_tokens`) are captured for native Anthropic too.
+    let usage = value
+        .get("usage")
+        .map(|usage| {
+            Usage {
+                prompt_tokens: usage
+                    .get("input_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                completion_tokens: usage
+                    .get("output_tokens")
+                    .and_then(Value::as_i64)
+                    .unwrap_or_default(),
+                total_tokens: 0,
+                cache_read_tokens: cache_read_of(usage),
+                cache_write_tokens: cache_write_of(usage),
+            }
+            .normalized()
+        })
         .unwrap_or_default();
-    let completion_tokens = value
-        .pointer("/usage/output_tokens")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let usage = Usage {
-        prompt_tokens,
-        completion_tokens,
-        total_tokens: prompt_tokens + completion_tokens,
-    };
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -2537,6 +2554,8 @@ impl UsageParser {
                 prompt_tokens: 0,
                 completion_tokens: estimated,
                 total_tokens: 0,
+                cache_read_tokens: 0,
+                cache_write_tokens: 0,
             }),
             None => None,
         }
@@ -2575,6 +2594,19 @@ impl UsageParser {
                         previous.completion_tokens
                     },
                     total_tokens: 0,
+                    // Cache counts arrive alongside input tokens in the same
+                    // event, so take the newer value but keep the older one
+                    // when this event simply did not mention caching.
+                    cache_read_tokens: if usage.cache_read_tokens > 0 {
+                        usage.cache_read_tokens
+                    } else {
+                        previous.cache_read_tokens
+                    },
+                    cache_write_tokens: if usage.cache_write_tokens > 0 {
+                        usage.cache_write_tokens
+                    } else {
+                        previous.cache_write_tokens
+                    },
                 }
                 .normalized(),
                 None => usage,
@@ -2646,27 +2678,79 @@ fn usage_from_value(value: &Value) -> Option<Usage> {
         .or_else(|| usage.get("output_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or_default();
+    let cache_read_tokens = cache_read_of(usage);
+    let cache_write_tokens = cache_write_of(usage);
+    // Normalise input accounting across providers.
+    //
+    // OpenAI-style responses already fold cache traffic into `prompt_tokens`
+    // (verified: prompt_tokens stays constant while `cached_tokens` rises), so
+    // the value is used as-is. Anthropic reports the cache numbers *besides*
+    // `input_tokens`, so the totals only add up once they are included.
+    // The discriminator is placement: nested under `prompt_tokens_details` means
+    // already counted; top-level means additional.
+    let cache_included_in_prompt = usage.pointer("/prompt_tokens_details").is_some()
+        || usage.pointer("/input_tokens_details").is_some();
+    let prompt_tokens = if cache_included_in_prompt {
+        prompt_tokens
+    } else {
+        prompt_tokens + cache_read_tokens + cache_write_tokens
+    };
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_i64)
-        .unwrap_or(prompt_tokens + completion_tokens);
+        .unwrap_or(prompt_tokens + completion_tokens)
+        .max(prompt_tokens + completion_tokens);
     Some(
         Usage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
         }
         .normalized(),
     )
 }
 
+/// Reads cache-read tokens across provider shapes.
+///
+/// Anthropic reports `cache_read_input_tokens` at the top level; OpenAI-style
+/// providers nest `cached_tokens` (and, on some gateways,
+/// `cache_read_input_tokens`) under `prompt_tokens_details`.
+fn cache_read_of(usage: &Value) -> i64 {
+    [
+        usage.get("cache_read_input_tokens"),
+        usage.pointer("/prompt_tokens_details/cached_tokens"),
+        usage.pointer("/prompt_tokens_details/cache_read_input_tokens"),
+        usage.pointer("/input_tokens_details/cached_tokens"),
+        usage.get("cache_read_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_i64)
+    .unwrap_or_default()
+}
+
+/// Reads cache-write tokens across provider shapes. Anthropic calls these
+/// `cache_creation_input_tokens`; some OpenAI-compatible gateways use
+/// `cache_write_tokens`.
+fn cache_write_of(usage: &Value) -> i64 {
+    [
+        usage.get("cache_creation_input_tokens"),
+        usage.get("cache_write_tokens"),
+        usage.pointer("/prompt_tokens_details/cache_write_tokens"),
+        usage.pointer("/prompt_tokens_details/cache_creation_input_tokens"),
+        usage.pointer("/input_tokens_details/cache_write_tokens"),
+    ]
+    .into_iter()
+    .flatten()
+    .find_map(Value::as_i64)
+    .unwrap_or_default()
+}
+
 fn estimated_completion_usage(request_tokens: i64, bytes: &[u8]) -> Usage {
     let completion_tokens = (bytes.len() / 4).max(1) as i64;
-    Usage {
-        prompt_tokens: request_tokens,
-        completion_tokens,
-        total_tokens: request_tokens + completion_tokens,
-    }
+    Usage::new(request_tokens, completion_tokens)
 }
 
 fn estimate_request_tokens(value: &Value) -> i64 {
@@ -2946,9 +3030,10 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
         INSERT INTO usage_logs (
             request_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
-            total_tokens, latency_ms, first_token_ms, status_code, success, streamed,
-            error_message, response_preview
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
+            first_token_ms, status_code, success, streamed, error_message,
+            response_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(entry.request_id)
@@ -2961,6 +3046,8 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     .bind(usage.prompt_tokens)
     .bind(usage.completion_tokens)
     .bind(usage.total_tokens)
+    .bind(usage.cache_read_tokens)
+    .bind(usage.cache_write_tokens)
     .bind(entry.latency_ms)
     .bind(entry.first_token_ms)
     .bind(entry.status_code)
@@ -3408,6 +3495,68 @@ mod tests {
             ),
             (12, 7, 19)
         );
+    }
+
+    #[test]
+    fn reads_openai_cache_tokens_without_double_counting() {
+        // Shape verified against a live CommandCode response: `cached_tokens`
+        // lives under prompt_tokens_details and is *already included* in
+        // prompt_tokens (638 stays constant while cached_tokens rises 0 -> 512).
+        let usage = usage_from_value(&json!({
+            "usage": {
+                "prompt_tokens": 638,
+                "completion_tokens": 32,
+                "total_tokens": 670,
+                "prompt_tokens_details": { "cached_tokens": 512 }
+            }
+        }))
+        .expect("usage should parse");
+        assert_eq!(usage.prompt_tokens, 638, "must not add cached on top");
+        assert_eq!(usage.cache_read_tokens, 512);
+        assert_eq!(usage.total_tokens, 670);
+    }
+
+    #[test]
+    fn reads_anthropic_cache_tokens_as_additional_input() {
+        // Anthropic reports input_tokens *excluding* cache traffic, so the
+        // cache counts must be folded in for the total input to be correct.
+        let usage = usage_from_value(&json!({
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 800,
+                "cache_creation_input_tokens": 50
+            }
+        }))
+        .expect("usage should parse");
+        assert_eq!(usage.cache_read_tokens, 800);
+        assert_eq!(usage.cache_write_tokens, 50);
+        assert_eq!(usage.prompt_tokens, 950, "100 fresh + 800 read + 50 write");
+    }
+
+    #[test]
+    fn cache_fields_default_to_zero_when_absent() {
+        let usage = usage_from_value(&json!({
+            "usage": { "prompt_tokens": 10, "completion_tokens": 2 }
+        }))
+        .unwrap();
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
+        assert_eq!(usage.prompt_tokens, 10);
+    }
+
+    #[test]
+    fn negative_cache_counts_are_clamped() {
+        let usage = Usage {
+            prompt_tokens: 5,
+            completion_tokens: 1,
+            total_tokens: 6,
+            cache_read_tokens: -10,
+            cache_write_tokens: -3,
+        }
+        .normalized();
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_write_tokens, 0);
     }
 
     #[test]

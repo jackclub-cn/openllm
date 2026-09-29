@@ -743,7 +743,8 @@ pub async fn list_usage(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
-               u.completion_tokens, u.total_tokens, u.latency_ms, u.status_code,
+               u.completion_tokens, u.total_tokens, u.cache_read_tokens,
+               u.cache_write_tokens, u.latency_ms, u.status_code,
                u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
@@ -816,6 +817,18 @@ pub async fn cleanup_usage(
     }))
 }
 
+/// Share of prompt tokens served from cache, as a percentage.
+///
+/// `prompt_tokens` must be the total input count (fresh + cached), so the ratio
+/// cannot exceed 100. A zero denominator yields 0 rather than NaN so the
+/// dashboard needs no special case.
+fn cache_hit_rate(prompt_tokens: i64, cache_read: i64) -> f64 {
+    if prompt_tokens <= 0 {
+        return 0.0;
+    }
+    (cache_read as f64 / prompt_tokens as f64 * 100.0).clamp(0.0, 100.0)
+}
+
 pub async fn overview(
     State(state): State<AppState>,
     Query(query): Query<OverviewQuery>,
@@ -839,6 +852,9 @@ pub async fn overview(
         SELECT
             COUNT(*) AS requests_total,
             COALESCE(SUM(total_tokens), 0) AS tokens_total,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_total,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_total,
+            COALESCE(SUM(cache_write_tokens), 0) AS cache_write_total,
             COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
             COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
@@ -849,7 +865,10 @@ pub async fn overview(
 
     let today = sqlx::query(
         r#"
-        SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens
+        SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt,
+               COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+               COALESCE(SUM(cache_write_tokens), 0) AS cache_write
         FROM usage_logs
         WHERE created_at >= ? AND created_at < ?
         "#,
@@ -871,7 +890,8 @@ pub async fn overview(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
-               u.completion_tokens, u.total_tokens, u.latency_ms, u.status_code,
+               u.completion_tokens, u.total_tokens, u.cache_read_tokens,
+               u.cache_write_tokens, u.latency_ms, u.status_code,
                u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
@@ -958,8 +978,13 @@ pub async fn overview(
     Ok(Json(Overview {
         requests_today: today.get("requests"),
         tokens_today: today.get("tokens"),
+        cache_read_today: today.get("cache_read"),
+        cache_write_today: today.get("cache_write"),
+        cache_hit_rate: cache_hit_rate(today.get("prompt"), today.get("cache_read")),
         requests_total: totals.get("requests_total"),
         tokens_total: totals.get("tokens_total"),
+        cache_read_total: totals.get("cache_read_total"),
+        cache_write_total: totals.get("cache_write_total"),
         success_rate: totals.get("success_rate"),
         avg_latency_ms: totals.get("avg_latency_ms"),
         active_providers,

@@ -7,7 +7,7 @@ type Props = {
   suffix?: string
   precision?: number
   icon: ReactNode
-  tone: 'blue' | 'cyan' | 'green' | 'orange'
+  tone: 'blue' | 'cyan' | 'green' | 'orange' | 'purple'
 }
 
 export default function MetricCard({ label, value, suffix, precision, icon, tone }: Props) {
@@ -21,4 +21,3 @@ export default function MetricCard({ label, value, suffix, precision, icon, tone
     </Card>
   )
 }
-

@@ -146,6 +146,11 @@ body {
   background: #fff7e6;
 }
 
+.metric-icon-purple {
+  color: #722ed1;
+  background: #f9f0ff;
+}
+
 .metric-copy {
   min-width: 0;
 }

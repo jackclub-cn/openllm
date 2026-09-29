@@ -351,11 +351,25 @@ export default function Usage() {
             {
               title: '令牌',
               width: 150,
-              render: (_, record) => (
-                <Tooltip title={`输入 ${record.prompt_tokens} / 输出 ${record.completion_tokens}`}>
-                  <span>{record.total_tokens}</span>
-                </Tooltip>
-              ),
+              render: (_, record) => {
+                const cached = (record.cache_read_tokens || 0) + (record.cache_write_tokens || 0)
+                return (
+                  <div>
+                    <Tooltip title={`输入 ${record.prompt_tokens} / 输出 ${record.completion_tokens}`}>
+                      <span>{record.total_tokens}</span>
+                    </Tooltip>
+                    {cached > 0 && (
+                      <div>
+                        <Tooltip title={`缓存读取 ${record.cache_read_tokens} / 缓存写入 ${record.cache_write_tokens}`}>
+                          <Typography.Text type="success" style={{ fontSize: 12 }}>
+                            缓存 {record.cache_read_tokens}
+                          </Typography.Text>
+                        </Tooltip>
+                      </div>
+                    )}
+                  </div>
+                )
+              },
             },
             { title: '延迟', dataIndex: 'latency_ms', width: 100, render: (value: number) => `${value} ms` },
             {
@@ -456,6 +470,12 @@ export default function Usage() {
               </Descriptions.Item>
               <Descriptions.Item label="输入 tokens">
                 {detail.prompt_tokens}
+              </Descriptions.Item>
+              <Descriptions.Item label="缓存读取 tokens">
+                {detail.cache_read_tokens > 0 ? detail.cache_read_tokens : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="缓存写入 tokens">
+                {detail.cache_write_tokens > 0 ? detail.cache_write_tokens : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="输出 tokens">
                 {detail.completion_tokens}

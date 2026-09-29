@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   ApiOutlined,
   ClockCircleOutlined,
+  DatabaseOutlined,
   NodeIndexOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
@@ -94,6 +95,42 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard label="平均延迟" value={data.avg_latency_ms} suffix="ms" icon={<ClockCircleOutlined />} tone="orange" />
+        </Col>
+      </Row>
+      <Row gutter={[16, 16]} className="section-row">
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label="缓存命中率"
+            value={data.cache_hit_rate}
+            precision={1}
+            suffix="%"
+            icon={<DatabaseOutlined />}
+            tone="purple"
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label="今日缓存读取"
+            value={data.cache_read_today}
+            icon={<DatabaseOutlined />}
+            tone="green"
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label="今日缓存写入"
+            value={data.cache_write_today}
+            icon={<DatabaseOutlined />}
+            tone="cyan"
+          />
+        </Col>
+        <Col xs={24} sm={12} xl={6}>
+          <MetricCard
+            label="累计缓存读取"
+            value={data.cache_read_total}
+            icon={<DatabaseOutlined />}
+            tone="blue"
+          />
         </Col>
       </Row>
 

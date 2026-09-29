@@ -457,6 +457,8 @@ pub struct UsageLog {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub latency_ms: i64,
     /// Time to first streamed content token, in milliseconds. `None` for
     /// non-streamed requests or when the upstream sent no content at all.
@@ -485,6 +487,8 @@ pub struct UsageLogView {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
     pub status_code: i64,
@@ -512,6 +516,8 @@ impl From<UsageLog> for UsageLogView {
             prompt_tokens: value.prompt_tokens,
             completion_tokens: value.completion_tokens,
             total_tokens: value.total_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            cache_write_tokens: value.cache_write_tokens,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
             status_code: value.status_code,
@@ -540,6 +546,8 @@ pub struct UsageLogDetailRow {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
     pub status_code: i64,
@@ -567,6 +575,8 @@ impl From<UsageLogDetailRow> for UsageLogView {
             prompt_tokens: value.prompt_tokens,
             completion_tokens: value.completion_tokens,
             total_tokens: value.total_tokens,
+            cache_read_tokens: value.cache_read_tokens,
+            cache_write_tokens: value.cache_write_tokens,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
             status_code: value.status_code,
@@ -628,8 +638,14 @@ pub struct OverviewQuery {
 pub struct Overview {
     pub requests_today: i64,
     pub tokens_today: i64,
+    /// Prompt tokens served from cache today, and the resulting hit ratio.
+    pub cache_read_today: i64,
+    pub cache_write_today: i64,
+    pub cache_hit_rate: f64,
     pub requests_total: i64,
     pub tokens_total: i64,
+    pub cache_read_total: i64,
+    pub cache_write_total: i64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
     pub active_providers: i64,
@@ -700,13 +716,32 @@ pub struct Usage {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
     pub total_tokens: i64,
+    /// Prompt tokens served from the provider's cache, billed at a discount.
+    pub cache_read_tokens: i64,
+    /// Prompt tokens written into the cache for later reuse.
+    pub cache_write_tokens: i64,
 }
 
 impl Usage {
+    /// Convenience constructor for the common case with no cache traffic.
+    pub fn new(prompt_tokens: i64, completion_tokens: i64) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+        }
+    }
+
     pub fn normalized(mut self) -> Self {
         if self.total_tokens == 0 {
             self.total_tokens = self.prompt_tokens + self.completion_tokens;
         }
+        // Defensive: a provider reporting a negative or absurd cache count must
+        // not corrupt aggregates.
+        self.cache_read_tokens = self.cache_read_tokens.max(0);
+        self.cache_write_tokens = self.cache_write_tokens.max(0);
         self
     }
 }
