@@ -1122,7 +1122,16 @@ async fn proxy_anthropic_inner(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
-    enforce_api_key_quota(state, api_key.as_ref()).await?;
+    enforce_quota_or_log(
+        state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+    )
+    .await?;
     let resolved = resolve_route(state, &requested_model).await?;
     let route_id = resolved.route_id;
     let requested_output_tokens = request_json.get("max_tokens").and_then(Value::as_i64);
@@ -1502,7 +1511,16 @@ pub async fn proxy_openai(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(&state, &headers).await?;
-    enforce_api_key_quota(&state, api_key.as_ref()).await?;
+    enforce_quota_or_log(
+        &state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+    )
+    .await?;
     let resolved = resolve_route(&state, &requested_model).await?;
     let route_id = resolved.route_id;
     // Barrel mode: clamp the requested output length to the strictest common
@@ -2667,6 +2685,45 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
     Ok(())
 }
 
+async fn enforce_quota_or_log(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+    request_id: &str,
+    requested_model: &str,
+    endpoint: &str,
+    streamed: bool,
+    started: Instant,
+) -> AppResult<()> {
+    match enforce_api_key_quota(state, api_key).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            log_usage(
+                state,
+                UsageLogEntry {
+                    request_id,
+                    api_key_id: api_key.map(|key| key.id),
+                    route_id: None,
+                    provider_id: None,
+                    requested_model,
+                    upstream_model: None,
+                    endpoint,
+                    usage: Usage::default(),
+                    latency_ms: started.elapsed().as_millis() as i64,
+                    first_token_ms: None,
+                    status_code: 429,
+                    success: false,
+                    streamed,
+                    error_message: Some(&message),
+                    response_preview: None,
+                },
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
 struct ResolvedRoute {
     route_id: Option<i64>,
     strategy: String,
@@ -3436,11 +3493,15 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
 
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
-    let estimated_cost_micros = match (entry.provider_id, entry.upstream_model) {
-        (Some(provider_id), Some(upstream_model)) if usage.has_tokens() => {
-            estimate_usage_cost(state, provider_id, upstream_model, usage).await
+    let estimated_cost_micros = if entry.status_code == 429 && entry.provider_id.is_none() {
+        Some(0)
+    } else {
+        match (entry.provider_id, entry.upstream_model) {
+            (Some(provider_id), Some(upstream_model)) if usage.has_tokens() => {
+                estimate_usage_cost(state, provider_id, upstream_model, usage).await
+            }
+            _ => None,
         }
-        _ => None,
     };
     let result = sqlx::query(
         r#"
@@ -4055,6 +4116,90 @@ mod tests {
             enforce_api_key_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn quota_rejection_is_logged_as_zero_usage() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE usage_logs (
+                request_id TEXT NOT NULL,
+                api_key_id INTEGER,
+                route_id INTEGER,
+                provider_id INTEGER,
+                requested_model TEXT NOT NULL,
+                upstream_model TEXT,
+                endpoint TEXT NOT NULL,
+                prompt_tokens INTEGER NOT NULL DEFAULT 0,
+                completion_tokens INTEGER NOT NULL DEFAULT 0,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_micros INTEGER,
+                first_token_ms INTEGER,
+                status_code INTEGER NOT NULL,
+                success INTEGER NOT NULL,
+                streamed INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT,
+                response_preview TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, api_key_id, requested_model, endpoint,
+                total_tokens, status_code, success, created_at
+             ) VALUES (
+                'seed', 1, 'seed', '/v1/chat/completions', 1, 200, 1,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: Some(1),
+            daily_cost_limit_micros: None,
+        };
+        let state = AppState::new(pool.clone(), None);
+        assert!(
+            enforce_quota_or_log(
+                &state,
+                Some(&key),
+                "rejected",
+                "model",
+                "/v1/chat/completions",
+                false,
+                Instant::now(),
+            )
+            .await
+            .is_err()
+        );
+        let row: (i64, i64, Option<i64>, i64) = sqlx::query_as(
+            "SELECT total_tokens, status_code, estimated_cost_micros, success \
+             FROM usage_logs WHERE request_id = 'rejected'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row, (0, 429, Some(0), 0));
     }
 
     #[test]
