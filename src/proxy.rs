@@ -25,8 +25,12 @@ use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 
-pub async fn public_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    match public_models_inner(&state, &headers).await {
+pub async fn public_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+) -> Response {
+    match public_models_inner(&state, &headers, &uri).await {
         Ok(response) => response,
         // Match the error envelope to the protocol the caller speaks, so both
         // client families can parse failures with their own error handling.
@@ -35,10 +39,14 @@ pub async fn public_models(State(state): State<AppState>, headers: HeaderMap) ->
     }
 }
 
-async fn public_models_inner(state: &AppState, headers: &HeaderMap) -> AppResult<Response> {
+async fn public_models_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+) -> AppResult<Response> {
     authenticate_gateway(state, headers).await?;
     if wants_anthropic_models(headers) {
-        return anthropic_models(state).await;
+        return anthropic_models(state, uri).await;
     }
     let routes = crate::registry::route_models(&state.pool).await?;
     let synced = crate::registry::synced_models(&state.pool).await?;
@@ -129,7 +137,7 @@ fn anthropic_beta_of(headers: &HeaderMap) -> Option<String> {
 ///
 /// Anthropic returns `data` entries of `{type, id, display_name, created_at}`
 /// plus cursor fields, rather than OpenAI's `{id, object, created, owned_by}`.
-async fn anthropic_models(state: &AppState) -> AppResult<Response> {
+async fn anthropic_models(state: &AppState, uri: &Uri) -> AppResult<Response> {
     let routes = crate::registry::route_models(&state.pool).await?;
     let synced = crate::registry::synced_models(&state.pool).await?;
     let mut models = Vec::new();
@@ -156,15 +164,67 @@ async fn anthropic_models(state: &AppState) -> AppResult<Response> {
             "created_at": Value::Null,
         }));
     }
+    let page = ModelPageQuery::parse(uri);
+    let (models, has_more) = paginate_models(models, &page);
     let first = models.first().and_then(|m| m.get("id")).cloned();
     let last = models.last().and_then(|m| m.get("id")).cloned();
     Ok(Json(json!({
         "data": models,
-        "has_more": false,
+        "has_more": has_more,
         "first_id": first,
         "last_id": last,
     }))
     .into_response())
+}
+
+/// Applies Anthropic's cursor pagination to an ordered model list.
+///
+/// Returns the requested window plus whether more entries remain beyond it. An
+/// unknown cursor yields an empty page rather than an error, matching how
+/// Anthropic treats a cursor that is no longer valid.
+fn paginate_models(models: Vec<Value>, page: &ModelPageQuery) -> (Vec<Value>, bool) {
+    let id_of = |model: &Value| {
+        model
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+
+    let mut start = 0usize;
+    if let Some(after) = &page.after_id {
+        // Resume strictly after the cursor.
+        start = match models.iter().position(|model| id_of(model) == *after) {
+            Some(index) => index + 1,
+            None => return (Vec::new(), false),
+        };
+    }
+
+    let mut end = models.len();
+    if let Some(before) = &page.before_id {
+        // Walk backward from the cursor: the page ends just before it.
+        end = match models.iter().position(|model| id_of(model) == *before) {
+            Some(index) => index,
+            None => return (Vec::new(), false),
+        };
+        // Keep the last `limit` entries before the cursor.
+        start = end.saturating_sub(page.page_size());
+    }
+
+    if start >= end {
+        return (Vec::new(), false);
+    }
+    let size = page.page_size();
+    let window_end = (start + size).min(end);
+    // `has_more` consistently means "entries exist after `last_id`", so a
+    // client can always continue forward with `after_id=last_id` and terminate.
+    let has_more = window_end < models.len();
+    let window = models
+        .into_iter()
+        .skip(start)
+        .take(window_end - start)
+        .collect();
+    (window, has_more)
 }
 
 // ===== Inbound Anthropic Messages API compatibility =====
@@ -859,6 +919,92 @@ fn openai_stream_to_anthropic(
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Pagination parameters accepted by Anthropic's model list endpoint.
+///
+/// Anthropic uses opaque cursor pagination rather than offsets: `after_id`
+/// walks forward and `before_id` walks backward. Both are optional, and
+/// `limit` defaults to 20 with a maximum of 1000.
+#[derive(Debug, Default)]
+struct ModelPageQuery {
+    limit: Option<usize>,
+    after_id: Option<String>,
+    before_id: Option<String>,
+}
+
+/// Anthropic's documented default and maximum page sizes.
+const ANTHROPIC_DEFAULT_PAGE_SIZE: usize = 20;
+const ANTHROPIC_MAX_PAGE_SIZE: usize = 1000;
+
+impl ModelPageQuery {
+    /// Parses the raw query string, ignoring malformed parameters rather than
+    /// failing the request: an unrecognized `limit` should not take down the
+    /// model list.
+    fn parse(uri: &Uri) -> Self {
+        let mut query = Self::default();
+        for (key, value) in uri
+            .query()
+            .unwrap_or_default()
+            .split('&')
+            .filter_map(|pair| {
+                let (key, value) = pair.split_once('=')?;
+                Some((key, value))
+            })
+        {
+            let decoded = percent_decode(value);
+            match key {
+                "limit" => query.limit = decoded.trim().parse::<usize>().ok(),
+                "after_id" if !decoded.trim().is_empty() => query.after_id = Some(decoded),
+                "before_id" if !decoded.trim().is_empty() => query.before_id = Some(decoded),
+                _ => {}
+            }
+        }
+        query
+    }
+
+    /// Effective page size, clamped to Anthropic's bounds.
+    fn page_size(&self) -> usize {
+        self.limit
+            .unwrap_or(ANTHROPIC_DEFAULT_PAGE_SIZE)
+            .clamp(1, ANTHROPIC_MAX_PAGE_SIZE)
+    }
+}
+
+/// Minimal percent-decoding for cursor values.
+///
+/// Model ids routinely contain `/` (for example `cmd/deepseek/v4`), which
+/// clients percent-encode; without decoding, the cursor would never match.
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'%' if index + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).ok();
+                match hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                    Some(byte) => {
+                        out.push(byte);
+                        index += 3;
+                    }
+                    None => {
+                        out.push(bytes[index]);
+                        index += 1;
+                    }
+                }
+            }
+            b'+' => {
+                out.push(b' ');
+                index += 1;
+            }
+            byte => {
+                out.push(byte);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Anthropic token-counting endpoint (`POST /v1/messages/count_tokens`).
@@ -3384,6 +3530,123 @@ mod tests {
         let mut blank = HeaderMap::new();
         blank.insert("anthropic-beta", HeaderValue::from_static("   "));
         assert_eq!(anthropic_beta_of(&blank), None);
+    }
+
+    /// Builds a page of model entries with the given ids, matching the shape
+    /// `anthropic_models` produces.
+    fn model_page(ids: &[&str]) -> Vec<Value> {
+        ids.iter()
+            .map(|id| json!({"type": "model", "id": id, "display_name": id, "created_at": Value::Null}))
+            .collect()
+    }
+
+    fn ids_of(models: &[Value]) -> Vec<String> {
+        models
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str))
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn paginates_forward_with_after_id() {
+        let models = model_page(&["a", "b", "c", "d", "e"]);
+        let query = ModelPageQuery {
+            limit: Some(2),
+            after_id: Some("b".to_string()),
+            before_id: None,
+        };
+        let (window, has_more) = paginate_models(models, &query);
+        assert_eq!(ids_of(&window), vec!["c", "d"]);
+        assert!(has_more, "e remains beyond the window");
+    }
+
+    #[test]
+    fn paginates_backward_with_before_id() {
+        let models = model_page(&["a", "b", "c", "d", "e"]);
+        let query = ModelPageQuery {
+            limit: Some(2),
+            after_id: None,
+            before_id: Some("d".to_string()),
+        };
+        let (window, has_more) = paginate_models(models, &query);
+        // The page ends just before the cursor, keeping the last two entries.
+        assert_eq!(ids_of(&window), vec!["b", "c"]);
+        // `d`/`e` still sit after `last_id`, so the client can page forward.
+        assert!(has_more);
+    }
+
+    #[test]
+    fn reports_has_more_on_a_partial_first_page() {
+        let models = model_page(&["a", "b", "c"]);
+        let query = ModelPageQuery {
+            limit: Some(2),
+            after_id: None,
+            before_id: None,
+        };
+        let (window, has_more) = paginate_models(models, &query);
+        assert_eq!(ids_of(&window), vec!["a", "b"]);
+        assert!(has_more);
+    }
+
+    #[test]
+    fn returns_last_page_without_claiming_more() {
+        let models = model_page(&["a", "b", "c"]);
+        let query = ModelPageQuery {
+            limit: Some(10),
+            after_id: None,
+            before_id: None,
+        };
+        let (window, has_more) = paginate_models(models, &query);
+        assert_eq!(ids_of(&window), vec!["a", "b", "c"]);
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn unknown_cursor_yields_an_empty_page() {
+        let models = model_page(&["a", "b"]);
+        let query = ModelPageQuery {
+            limit: Some(2),
+            after_id: Some("missing".to_string()),
+            before_id: None,
+        };
+        let (window, has_more) = paginate_models(models, &query);
+        assert!(window.is_empty());
+        assert!(!has_more);
+    }
+
+    #[test]
+    fn page_size_defaults_and_clamps_to_anthropic_bounds() {
+        assert_eq!(
+            ModelPageQuery::default().page_size(),
+            ANTHROPIC_DEFAULT_PAGE_SIZE
+        );
+        let tiny = ModelPageQuery {
+            limit: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(tiny.page_size(), 1, "zero clamps up");
+        let huge = ModelPageQuery {
+            limit: Some(99999),
+            ..Default::default()
+        };
+        assert_eq!(huge.page_size(), ANTHROPIC_MAX_PAGE_SIZE, "clamps down");
+    }
+
+    #[test]
+    fn parses_pagination_params_including_slashes() {
+        // Model ids contain '/', which clients percent-encode.
+        let uri: Uri = "/v1/models?limit=5&after_id=cmd%2Fdeepseek%2Fv4&ignored=x"
+            .parse()
+            .unwrap();
+        let query = ModelPageQuery::parse(&uri);
+        assert_eq!(query.limit, Some(5));
+        assert_eq!(query.after_id.as_deref(), Some("cmd/deepseek/v4"));
+        assert_eq!(query.before_id, None);
+
+        // A malformed limit is ignored rather than rejecting the request.
+        let bad: Uri = "/v1/models?limit=abc".parse().unwrap();
+        assert_eq!(ModelPageQuery::parse(&bad).limit, None);
     }
 
     #[test]
