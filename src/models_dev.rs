@@ -33,6 +33,12 @@ pub struct Catalog {
     providers: HashMap<String, ProviderEntry>,
     /// model name -> (models.dev provider id, capabilities)
     by_model: HashMap<String, Vec<(String, ModelCapabilities)>>,
+    /// Normalized model name -> keys into `by_model`.
+    ///
+    /// Vendors spell the same model differently ("Qwen/Qwen3.7-Flash" vs
+    /// "qwen3.7-flash"), so an exact-key lookup alone misses metadata that is
+    /// actually present. This index lets a normalized match find it.
+    by_normalized: HashMap<String, Vec<String>>,
 }
 
 impl Catalog {
@@ -65,6 +71,18 @@ impl Catalog {
                         .entry(model_name.clone())
                         .or_default()
                         .push((id.clone(), parse_capabilities(model)));
+                    // Index by the normalized full name and by the vendor-less
+                    // leaf, since the same model appears as "qwen3.7-flash"
+                    // upstream and "Qwen/Qwen3.7-Flash" (or vice versa).
+                    for candidate in [model_name.as_str(), model_leaf(model_name.as_str())] {
+                        let keys = catalog
+                            .by_normalized
+                            .entry(normalize(candidate))
+                            .or_default();
+                        if !keys.contains(model_name) {
+                            keys.push(model_name.clone());
+                        }
+                    }
                 }
             }
         }
@@ -131,7 +149,38 @@ impl Catalog {
     /// vendor's entry wins; otherwise the most authoritative copy is chosen
     /// deterministically (canonical entries first, then provider id).
     pub fn lookup(&self, provider_hint: Option<&str>, model: &str) -> Option<ModelCapabilities> {
-        let candidates = self.by_model.get(model)?;
+        // Prefer an exact key match; fall back to a normalized one so vendors
+        // that spell a model differently still resolve to the same metadata.
+        let candidates = match self.by_model.get(model) {
+            Some(candidates) => candidates,
+            None => {
+                let keys = self
+                    .by_normalized
+                    .get(&normalize(model_leaf(model)))
+                    .or_else(|| self.by_normalized.get(&normalize(model)))?;
+                // Collect every candidate behind the matched names, preserving
+                // the provider-preference logic below.
+                let merged = keys
+                    .iter()
+                    .filter_map(|key| self.by_model.get(key))
+                    .flatten()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if merged.is_empty() {
+                    return None;
+                }
+                return Self::pick(&merged, provider_hint);
+            }
+        };
+        Self::pick(candidates, provider_hint)
+    }
+
+    /// Chooses the best candidate for a model: the caller's own vendor when it
+    /// is known, otherwise a canonical entry, then a deterministic fallback.
+    fn pick(
+        candidates: &[(String, ModelCapabilities)],
+        provider_hint: Option<&str>,
+    ) -> Option<ModelCapabilities> {
         if let Some(hint) = provider_hint
             && let Some((_, capabilities)) =
                 candidates.iter().find(|(provider, _)| provider == hint)
@@ -146,6 +195,13 @@ impl Catalog {
         });
         sorted.first().map(|(_, capabilities)| capabilities.clone())
     }
+}
+
+/// The model name with any vendor prefix removed, e.g. `Qwen/Qwen3.7-Flash`
+/// -> `Qwen3.7-Flash`. Providers are inconsistent about including the vendor
+/// prefix, so matching happens on the leaf.
+fn model_leaf(model: &str) -> &str {
+    model.rsplit('/').next().unwrap_or(model)
 }
 
 fn normalize(value: &str) -> String {
@@ -181,7 +237,11 @@ fn parse_capabilities(model: &Value) -> ModelCapabilities {
         release_date: string_field(model, "release_date"),
         last_updated: string_field(model, "last_updated"),
         canonical_model_id: string_field(model, "canonical_model_id"),
+        total_context_tokens: None,
     }
+    // models.dev also publishes both a window and a smaller input cap; collapse
+    // them so the gateway never advertises two different context numbers.
+    .with_effective_input_limit()
 }
 
 /// Reads `modalities.input` / `modalities.output` and flattens each to a list of
@@ -309,5 +369,46 @@ mod tests {
             Some(128000)
         );
         assert!(catalog.lookup(None, "missing-model").is_none());
+    }
+
+    #[test]
+    fn matches_models_across_naming_styles() {
+        // models.dev stores "qwen3.7-flash"; the provider exposes
+        // "Qwen/Qwen3.7-Flash". An exact lookup misses it and the model wrongly
+        // appeared to have no metadata.
+        let bytes = br#"{
+          "alibaba": {
+            "id": "alibaba",
+            "name": "Alibaba",
+            "models": {
+              "qwen3.7-flash": {
+                "id": "qwen3.7-flash",
+                "limit": {"context": 1000000, "output": 65536}
+              }
+            }
+          }
+        }"#
+        .to_vec();
+        let catalog = Catalog::parse(&bytes).unwrap();
+
+        // Exact key still works.
+        assert_eq!(
+            catalog.lookup(None, "qwen3.7-flash").unwrap().output_limit,
+            Some(65536)
+        );
+        // Vendor-prefixed and differently-cased/spaced spellings now resolve.
+        for spelling in [
+            "Qwen/Qwen3.7-Flash",
+            "qwen/Qwen3.7-flash",
+            "Qwen3.7-Flash",
+            "qwen3.7-flash",
+        ] {
+            let found = catalog
+                .lookup(None, spelling)
+                .unwrap_or_else(|| panic!("{spelling} should resolve"));
+            assert_eq!(found.output_limit, Some(65536), "{spelling}");
+        }
+        // A genuinely unknown model still reports nothing.
+        assert!(catalog.lookup(None, "totally-unknown-model").is_none());
     }
 }

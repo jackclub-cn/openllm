@@ -75,7 +75,9 @@ async fn public_models_inner(
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
-                display_name: None,
+                // The route's own name is the friendly label, matching the
+                // Anthropic shape so both agree.
+                display_name: model.display_name,
             }
             .with_flat_limits(),
         );
@@ -146,8 +148,10 @@ async fn anthropic_models(state: &AppState, uri: &Uri) -> AppResult<Response> {
         models.push(json!({
             "type": "model",
             "id": model.id,
-            "display_name": Value::Null,
-            "created_at": Value::Null,
+            // A route's own name is the sensible label; it was previously left
+            // null, so alias entries showed no name in clients.
+            "display_name": model.display_name,
+            "created_at": model.created_at,
         }));
     }
     for model in synced {
@@ -161,7 +165,7 @@ async fn anthropic_models(state: &AppState, uri: &Uri) -> AppResult<Response> {
             "type": "model",
             "id": model.id,
             "display_name": display_name,
-            "created_at": Value::Null,
+            "created_at": model.created_at,
         }));
     }
     let page = ModelPageQuery::parse(uri);

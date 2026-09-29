@@ -18,6 +18,9 @@ pub struct SyncedModel {
     pub provider_name: String,
     /// Provider-supplied label, when it differs from the model id.
     pub display_name: Option<String>,
+    /// When the model row was created, so the Anthropic shape can report a
+    /// real `created_at` instead of null.
+    pub created_at: Option<String>,
     pub capabilities: Option<ModelCapabilities>,
 }
 
@@ -26,6 +29,11 @@ pub struct SyncedModel {
 #[derive(Debug, Clone)]
 pub struct RouteModel {
     pub id: String,
+    /// The route's human name, used as the display label (e.g. "Hermes").
+    pub display_name: Option<String>,
+    /// When the route was created, so the Anthropic shape can report a real
+    /// `created_at` instead of null.
+    pub created_at: Option<String>,
     pub target_count: usize,
     pub capabilities: Option<ModelCapabilities>,
     /// True when at least one target is missing metadata, meaning the
@@ -85,7 +93,12 @@ impl CapabilityRow {
             release_date: self.release_date,
             last_updated: self.last_updated,
             canonical_model_id: self.canonical_model_id,
+            total_context_tokens: None,
         };
+        // Collapse the window/input distinction at the read boundary so every
+        // consumer sees one consistent, conservative input cap even for rows
+        // written before this rule existed.
+        let capabilities = capabilities.with_effective_input_limit();
         (!capabilities.is_empty()).then_some(capabilities)
     }
 }
@@ -115,6 +128,7 @@ struct SyncedRow {
     upstream_model: String,
     provider_name: String,
     display_name: Option<String>,
+    created_at: Option<String>,
     #[sqlx(flatten)]
     capabilities: CapabilityRow,
 }
@@ -133,6 +147,7 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
                pm.model_name AS upstream_model,
                p.name AS provider_name,
                pm.display_name AS display_name,
+               pm.created_at AS created_at,
                {CAPABILITY_COLUMNS}
         FROM providers p
         JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
@@ -150,6 +165,7 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
             upstream_model: row.upstream_model,
             provider_name: row.provider_name,
             display_name: row.display_name,
+            created_at: row.created_at,
             capabilities: row.capabilities.into_capabilities(),
         })
         .collect())
@@ -208,14 +224,15 @@ pub async fn barrel_for_targets(
 }
 
 pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
-    let routes = sqlx::query_as::<_, (i64, String)>(
-        "SELECT id, model_pattern FROM routes WHERE enabled = 1 ORDER BY model_pattern COLLATE NOCASE",
+    let routes = sqlx::query_as::<_, (i64, String, String, String)>(
+        "SELECT id, model_pattern, name, created_at FROM routes WHERE enabled = 1 \
+         ORDER BY model_pattern COLLATE NOCASE",
     )
     .fetch_all(pool)
     .await?;
 
     let mut models = Vec::with_capacity(routes.len());
-    for (route_id, pattern) in routes {
+    for (route_id, pattern, route_name, route_created_at) in routes {
         let query = format!(
             r#"
             SELECT {CAPABILITY_COLUMNS}
@@ -243,6 +260,8 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
         let known = capabilities.iter().flatten().collect::<Vec<_>>();
         models.push(RouteModel {
             id: pattern,
+            display_name: Some(route_name),
+            created_at: Some(route_created_at),
             target_count,
             capabilities: ModelCapabilities::intersect(known),
             incomplete,
@@ -276,6 +295,8 @@ fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
         release_date: row.release_date.clone(),
         last_updated: row.last_updated.clone(),
         canonical_model_id: row.canonical_model_id.clone(),
+        total_context_tokens: None,
     };
+    let capabilities = capabilities.with_effective_input_limit();
     (!capabilities.is_empty()).then_some(capabilities)
 }

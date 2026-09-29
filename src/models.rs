@@ -326,9 +326,41 @@ pub struct ModelCapabilities {
     pub last_updated: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub canonical_model_id: Option<String>,
+    /// The model's full context window, when it is larger than the input the
+    /// client may actually send.
+    ///
+    /// `context_limit` reports the safe input capacity so every context-named
+    /// key tells a client the same thing. The raw window is kept here so the
+    /// information is not lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_context_tokens: Option<i64>,
 }
 
 impl ModelCapabilities {
+    /// Collapses the window/input distinction into one conservative input cap.
+    ///
+    /// Providers report both a total window and a (smaller) maximum input, and
+    /// clients read either key to decide how much to send. Exposing different
+    /// numbers invites a client to pick the optimistic one and exceed the real
+    /// limit, so both are published as the smaller value; the untouched window
+    /// moves to `total_context_tokens`.
+    pub fn with_effective_input_limit(mut self) -> Self {
+        if let Some(window) = self.context_limit {
+            // A declared input limit is authoritative when it is the stricter
+            // of the two; otherwise the window is the cap.
+            let effective = match self.input_limit {
+                Some(input) => input.min(window),
+                None => window,
+            };
+            if effective != window {
+                self.total_context_tokens = Some(window);
+            }
+            self.context_limit = Some(effective);
+            self.input_limit = Some(effective);
+        }
+        self
+    }
+
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -374,6 +406,9 @@ impl ModelCapabilities {
             release_date: None,
             last_updated: None,
             canonical_model_id: None,
+            // The raw window is intersected like any other ceiling so a route
+            // never advertises a larger window than its narrowest target.
+            total_context_tokens: min(|c| c.total_context_tokens),
         };
         (!capabilities.is_empty()).then_some(capabilities)
     }
@@ -936,5 +971,49 @@ mod capability_tests {
         // A first-token stamp beyond the total must not underflow into a
         // nonsensical negative duration.
         assert_eq!(output_tps_of(10, 100, Some(5000)), None);
+    }
+
+    #[test]
+    fn effective_input_limit_collapses_window_and_input() {
+        // The reported bug: window 1050000 but only 922000 inputs accepted.
+        // Both context-named keys must agree on the safe value.
+        let capabilities = ModelCapabilities {
+            context_limit: Some(1_050_000),
+            input_limit: Some(922_000),
+            ..Default::default()
+        }
+        .with_effective_input_limit();
+        assert_eq!(capabilities.context_limit, Some(922_000));
+        assert_eq!(capabilities.input_limit, Some(922_000));
+        // The raw window is preserved rather than discarded.
+        assert_eq!(capabilities.total_context_tokens, Some(1_050_000));
+    }
+
+    #[test]
+    fn effective_input_limit_is_conservative_when_input_exceeds_window() {
+        // Also reported: window 400000 with a larger declared input (922000).
+        // The smaller of the two is the safe ceiling.
+        let capabilities = ModelCapabilities {
+            context_limit: Some(400_000),
+            input_limit: Some(922_000),
+            ..Default::default()
+        }
+        .with_effective_input_limit();
+        assert_eq!(capabilities.context_limit, Some(400_000));
+        assert_eq!(capabilities.input_limit, Some(400_000));
+    }
+
+    #[test]
+    fn effective_input_limit_keeps_equal_values_untouched() {
+        let capabilities = ModelCapabilities {
+            context_limit: Some(128_000),
+            input_limit: Some(128_000),
+            ..Default::default()
+        }
+        .with_effective_input_limit();
+        assert_eq!(capabilities.context_limit, Some(128_000));
+        assert_eq!(capabilities.input_limit, Some(128_000));
+        // Nothing was hidden, so no raw window needs recording.
+        assert_eq!(capabilities.total_context_tokens, None);
     }
 }
