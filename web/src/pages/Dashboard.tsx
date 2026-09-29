@@ -94,7 +94,14 @@ export default function Dashboard() {
           <MetricCard label="成功率" value={data.success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="平均延迟" value={data.avg_latency_ms} suffix="ms" icon={<ClockCircleOutlined />} tone="orange" />
+          <MetricCard
+            label="平均延迟"
+            value={data.avg_latency_ms}
+            precision={0}
+            suffix="ms"
+            icon={<ClockCircleOutlined />}
+            tone="orange"
+          />
         </Col>
       </Row>
       <Row gutter={[16, 16]} className="section-row">
