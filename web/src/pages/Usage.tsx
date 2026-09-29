@@ -29,7 +29,7 @@ import {
 import type { Dayjs } from 'dayjs'
 import dayjs from 'dayjs'
 import { api, formatError, type Provider, type UsageLog } from '../api'
-import { formatCompact, formatExact } from '../format'
+import { formatCompact, formatCostMicros, formatExact } from '../format'
 import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
@@ -376,7 +376,18 @@ export default function Usage() {
                 )
               },
             },
-            { title: '延迟', dataIndex: 'latency_ms', width: 100, render: (value: number) => `${value} ms` },
+            {
+              title: '延迟',
+              dataIndex: 'latency_ms',
+              width: 100,
+              render: (value: number) => `${value} ms`,
+            },
+            {
+              title: '费用',
+              dataIndex: 'estimated_cost_micros',
+              width: 90,
+              render: (value: number | null) => formatCostMicros(value),
+            },
             {
               title: '首 token',
               dataIndex: 'first_token_ms',
@@ -524,6 +535,9 @@ export default function Usage() {
                 <Tooltip title={formatExact(detail.total_tokens)}>
                   {formatCompact(detail.total_tokens)}
                 </Tooltip>
+              </Descriptions.Item>
+              <Descriptions.Item label="预估费用">
+                {formatCostMicros(detail.estimated_cost_micros)}
               </Descriptions.Item>
             </Descriptions>
             {detail.error_message && (

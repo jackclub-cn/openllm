@@ -3,6 +3,7 @@ import {
   ApiOutlined,
   ClockCircleOutlined,
   DatabaseOutlined,
+  DollarOutlined,
   NodeIndexOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
@@ -15,7 +16,7 @@ import { Area } from '@ant-design/plots'
 import { api, formatError, type Overview } from '../api'
 import PageHeader from '../components/PageHeader'
 import MetricCard from '../components/MetricCard'
-import { formatCompact, formatExact } from '../format'
+import { formatCompact, formatCostMicros, formatExact } from '../format'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
 
@@ -112,7 +113,7 @@ export default function Dashboard() {
             value={data.cache_hit_rate}
             precision={1}
             suffix="%"
-            icon={<DatabaseOutlined />}
+            icon={<DollarOutlined />}
             tone="purple"
           />
         </Col>
@@ -136,9 +137,10 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计缓存读取"
-            value={data.cache_read_total}
-            compact
+            label="今日费用"
+            value={data.cost_today_micros / 1_000_000}
+            precision={4}
+            suffix="USD"
             icon={<DatabaseOutlined />}
             tone="blue"
           />
@@ -178,6 +180,12 @@ export default function Dashboard() {
                     ellipsis: true,
                   },
                   { title: '请求', dataIndex: 'requests', width: 70 },
+                  {
+                    title: '费用',
+                    dataIndex: 'cost_micros',
+                    width: 86,
+                    render: (value: number | null) => formatCostMicros(value),
+                  },
                   {
                     title: '成功率',
                     dataIndex: 'success_rate',
@@ -246,6 +254,12 @@ export default function Dashboard() {
                   ),
                 },
                 {
+                  title: '费用',
+                  dataIndex: 'estimated_cost_micros',
+                  width: 90,
+                  render: (value: number | null) => formatCostMicros(value),
+                },
+                {
                   title: '延迟',
                   dataIndex: 'latency_ms',
                   width: 100,
@@ -284,6 +298,26 @@ export default function Dashboard() {
                   </Tooltip>
                 </div>
               </div>
+              <div>
+                <Typography.Text type="secondary">累计缓存读取</Typography.Text>
+                <div className="stat-line">
+                  <Tooltip title={formatExact(data.cache_read_total)}>
+                    <strong>{formatCompact(data.cache_read_total)}</strong>
+                  </Tooltip>
+                </div>
+              </div>
+              <div>
+                <Typography.Text type="secondary">累计费用</Typography.Text>
+                <div className="stat-line">
+                  <strong>{formatCostMicros(data.cost_total_micros)}</strong>
+                  {data.unpriced_total > 0 && (
+                    <Typography.Text type="secondary">
+                      {' '}
+                      {data.unpriced_total} 条未定价
+                    </Typography.Text>
+                  )}
+                </div>
+              </div>
               <Progress percent={Math.round(data.success_rate)} status="active" strokeColor="#52c41a" />
             </Space>
           </Card>
@@ -313,6 +347,12 @@ export default function Dashboard() {
               render: (value: number) => (
                 <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
               ),
+            },
+            {
+              title: '费用',
+              dataIndex: 'cost_micros',
+              width: 100,
+              render: (value: number | null) => formatCostMicros(value),
             },
             {
               title: '成功率',

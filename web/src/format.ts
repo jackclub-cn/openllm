@@ -54,3 +54,15 @@ export function formatExact(value: number): string {
 export function compactWithExact(value: number): { text: string; exact: string } {
   return { text: formatCompact(value), exact: formatExact(value) }
 }
+
+/**
+ * Formats a micro-dollar amount (1 USD = 1,000,000) for cost displays.
+ * Unknown pricing stays visibly distinct from a real zero-cost request.
+ */
+export function formatCostMicros(value?: number | null): string {
+  if (value == null || !Number.isFinite(value)) return '-'
+  const usd = value / 1_000_000
+  if (usd === 0) return '$0'
+  if (Math.abs(usd) < 0.01) return `$${usd.toFixed(4)}`
+  return `$${usd.toFixed(2)}`
+}

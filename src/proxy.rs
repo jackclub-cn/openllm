@@ -19,6 +19,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteStrategy, RouteTarget, Usage,
+    estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -3384,15 +3385,21 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
 
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
+    let estimated_cost_micros = match (entry.provider_id, entry.upstream_model) {
+        (Some(provider_id), Some(upstream_model)) if usage.has_tokens() => {
+            estimate_usage_cost(state, provider_id, upstream_model, usage).await
+        }
+        _ => None,
+    };
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logs (
             request_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
-            first_token_ms, status_code, success, streamed, error_message,
-            response_preview
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            estimated_cost_micros, first_token_ms, status_code, success,
+            streamed, error_message, response_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(entry.request_id)
@@ -3408,6 +3415,7 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     .bind(usage.cache_read_tokens)
     .bind(usage.cache_write_tokens)
     .bind(entry.latency_ms)
+    .bind(estimated_cost_micros)
     .bind(entry.first_token_ms)
     .bind(entry.status_code)
     .bind(entry.success as i64)
@@ -3430,6 +3438,27 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             tracing::error!(%error, request_id = %entry.request_id, "failed to write usage log");
         }
     }
+}
+
+async fn estimate_usage_cost(
+    state: &AppState,
+    provider_id: i64,
+    upstream_model: &str,
+    usage: Usage,
+) -> Option<i64> {
+    let raw = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT cost FROM provider_models \
+         WHERE provider_id = ? AND model_name = ? AND enabled = 1",
+    )
+    .bind(provider_id)
+    .bind(upstream_model)
+    .fetch_optional(&state.pool)
+    .await
+    .ok()
+    .flatten()
+    .flatten()?;
+    let cost = serde_json::from_str::<Value>(&raw).ok()?;
+    estimate_cost_micros(Some(&cost), usage)
 }
 
 #[cfg(test)]

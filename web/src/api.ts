@@ -146,6 +146,7 @@ export type UsageLog = {
   total_tokens: number
   cache_read_tokens: number
   cache_write_tokens: number
+  estimated_cost_micros?: number | null
   latency_ms: number
   first_token_ms?: number
   /** Output tokens per second. For streams this excludes the first-token wait. */
@@ -168,6 +169,10 @@ export type Overview = {
   tokens_total: number
   cache_read_total: number
   cache_write_total: number
+  cost_today_micros: number
+  cost_total_micros: number
+  unpriced_today: number
+  unpriced_total: number
   success_rate: number
   avg_latency_ms: number
   active_providers: number
@@ -178,10 +183,18 @@ export type Overview = {
     provider_name: string
     requests: number
     tokens: number
+    cost_micros?: number | null
     success_rate: number
     avg_latency_ms: number
   }>
-  model_usage: Array<{ model: string; requests: number; tokens: number; success_rate: number; avg_latency_ms: number }>
+  model_usage: Array<{
+    model: string
+    requests: number
+    tokens: number
+    cost_micros?: number | null
+    success_rate: number
+    avg_latency_ms: number
+  }>
   daily_usage: Array<{ day: string; requests: number; tokens: number }>
 }
 

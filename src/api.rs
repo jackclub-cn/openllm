@@ -939,7 +939,7 @@ pub async fn list_usage(
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
-               u.cache_write_tokens, u.latency_ms, u.status_code,
+               u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
@@ -1050,6 +1050,8 @@ pub async fn overview(
             COALESCE(SUM(prompt_tokens), 0) AS prompt_total,
             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_total,
             COALESCE(SUM(cache_write_tokens), 0) AS cache_write_total,
+            COALESCE(SUM(estimated_cost_micros), 0) AS cost_total_micros,
+            COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced_total,
             COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
             COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
@@ -1063,7 +1065,9 @@ pub async fn overview(
         SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
                COALESCE(SUM(prompt_tokens), 0) AS prompt,
                COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
-               COALESCE(SUM(cache_write_tokens), 0) AS cache_write
+               COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+               COALESCE(SUM(estimated_cost_micros), 0) AS cost_micros,
+               COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced
         FROM usage_logs
         WHERE created_at >= ? AND created_at < ?
         "#,
@@ -1086,7 +1090,7 @@ pub async fn overview(
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
-               u.cache_write_tokens, u.latency_ms, u.status_code,
+               u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
@@ -1106,6 +1110,7 @@ pub async fn overview(
         SELECT p.id AS provider_id, p.name AS provider_name,
                COUNT(u.id) AS requests,
                COALESCE(SUM(u.total_tokens), 0) AS tokens,
+               SUM(u.estimated_cost_micros) AS cost_micros,
                COALESCE(AVG(CASE WHEN u.success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(u.latency_ms), 0.0) AS avg_latency_ms
         FROM providers p
@@ -1157,6 +1162,7 @@ pub async fn overview(
         SELECT requested_model AS model,
                COUNT(*) AS requests,
                COALESCE(SUM(total_tokens), 0) AS tokens,
+               SUM(estimated_cost_micros) AS cost_micros,
                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
@@ -1180,6 +1186,10 @@ pub async fn overview(
         tokens_total: totals.get("tokens_total"),
         cache_read_total: totals.get("cache_read_total"),
         cache_write_total: totals.get("cache_write_total"),
+        cost_today_micros: today.get("cost_micros"),
+        cost_total_micros: totals.get("cost_total_micros"),
+        unpriced_today: today.get("unpriced"),
+        unpriced_total: totals.get("unpriced_total"),
         success_rate: totals.get("success_rate"),
         avg_latency_ms: totals.get("avg_latency_ms"),
         active_providers,

@@ -529,6 +529,7 @@ pub struct UsageLog {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    pub estimated_cost_micros: Option<i64>,
     pub latency_ms: i64,
     /// Time to first streamed content token, in milliseconds. `None` for
     /// non-streamed requests or when the upstream sent no content at all.
@@ -559,6 +560,8 @@ pub struct UsageLogView {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    /// Estimated request cost in micro-US dollars; `None` means unpriced.
+    pub estimated_cost_micros: Option<i64>,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
     /// Generation throughput in tokens per second.
@@ -601,6 +604,7 @@ impl From<UsageLog> for UsageLogView {
             total_tokens: value.total_tokens,
             cache_read_tokens: value.cache_read_tokens,
             cache_write_tokens: value.cache_write_tokens,
+            estimated_cost_micros: value.estimated_cost_micros,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
             output_tps,
@@ -632,6 +636,7 @@ pub struct UsageLogDetailRow {
     pub total_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_write_tokens: i64,
+    pub estimated_cost_micros: Option<i64>,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
     pub status_code: i64,
@@ -666,6 +671,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
             total_tokens: value.total_tokens,
             cache_read_tokens: value.cache_read_tokens,
             cache_write_tokens: value.cache_write_tokens,
+            estimated_cost_micros: value.estimated_cost_micros,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
             output_tps,
@@ -736,6 +742,10 @@ pub struct Overview {
     pub tokens_total: i64,
     pub cache_read_total: i64,
     pub cache_write_total: i64,
+    pub cost_today_micros: i64,
+    pub cost_total_micros: i64,
+    pub unpriced_today: i64,
+    pub unpriced_total: i64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
     pub active_providers: i64,
@@ -752,6 +762,7 @@ pub struct ProviderUsage {
     pub provider_name: String,
     pub requests: i64,
     pub tokens: i64,
+    pub cost_micros: Option<i64>,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
 }
@@ -761,6 +772,7 @@ pub struct ModelUsage {
     pub model: String,
     pub requests: i64,
     pub tokens: i64,
+    pub cost_micros: Option<i64>,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
 }
@@ -837,6 +849,77 @@ impl Usage {
         self.cache_write_tokens = self.cache_write_tokens.max(0);
         self
     }
+
+    pub fn has_tokens(&self) -> bool {
+        self.prompt_tokens > 0 || self.completion_tokens > 0
+    }
+}
+
+/// Estimates a request's cost in micro-US dollars from models.dev pricing.
+///
+/// Prices are expressed per million tokens, so multiplying a token count by
+/// the price directly yields micro-dollars. Cache traffic is separated from
+/// fresh input because providers bill it at different rates. Tiered context
+/// pricing uses the largest published tier that the prompt has crossed.
+pub fn estimate_cost_micros(cost: Option<&serde_json::Value>, usage: Usage) -> Option<i64> {
+    let cost = cost?;
+    let usage = usage.normalized();
+    let selected = select_cost_tier(cost, usage.prompt_tokens);
+    let input = cost_price(selected, cost, "input");
+    let output = cost_price(selected, cost, "output");
+    let cache_read = cost_price(selected, cost, "cache_read").or(input);
+    let cache_write = cost_price(selected, cost, "cache_write").or(input);
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return None;
+    }
+
+    let prompt = usage.prompt_tokens.max(0);
+    let read = usage.cache_read_tokens.max(0).min(prompt);
+    let write = usage.cache_write_tokens.max(0).min(prompt - read);
+    let fresh = prompt - read - write;
+    let completion = usage.completion_tokens.max(0);
+
+    let amount = (fresh as f64) * input.unwrap_or(0.0)
+        + (read as f64) * cache_read.unwrap_or(0.0)
+        + (write as f64) * cache_write.unwrap_or(0.0)
+        + (completion as f64) * output.unwrap_or(0.0);
+    Some(amount.round().max(0.0).min(i64::MAX as f64) as i64)
+}
+
+fn select_cost_tier(cost: &serde_json::Value, prompt_tokens: i64) -> &serde_json::Value {
+    let Some(tiers) = cost.get("tiers").and_then(serde_json::Value::as_array) else {
+        return cost;
+    };
+    let mut selected = cost;
+    let mut selected_size = -1;
+    for tier in tiers {
+        let Some(size) = tier
+            .pointer("/tier/size")
+            .and_then(serde_json::Value::as_i64)
+        else {
+            continue;
+        };
+        if tier
+            .pointer("/tier/type")
+            .and_then(serde_json::Value::as_str)
+            != Some("context")
+            || size > prompt_tokens
+            || size < selected_size
+        {
+            continue;
+        }
+        selected = tier;
+        selected_size = size;
+    }
+    selected
+}
+
+fn cost_price(selected: &serde_json::Value, base: &serde_json::Value, key: &str) -> Option<f64> {
+    selected
+        .get(key)
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| base.get(key).and_then(serde_json::Value::as_f64))
+        .filter(|value| value.is_finite() && *value >= 0.0)
 }
 
 /// Derives output throughput from a completed request.
@@ -1050,5 +1133,47 @@ mod capability_tests {
         assert_eq!(capabilities.input_limit, Some(128_000));
         // Nothing was hidden, so no raw window needs recording.
         assert_eq!(capabilities.total_context_tokens, None);
+    }
+
+    #[test]
+    fn estimates_cost_with_cache_prices() {
+        let cost = serde_json::json!({
+            "input": 1.0,
+            "output": 2.0,
+            "cache_read": 0.1,
+            "cache_write": 1.25
+        });
+        let usage = Usage {
+            prompt_tokens: 1_000_000,
+            completion_tokens: 1_000_000,
+            total_tokens: 2_000_000,
+            cache_read_tokens: 400_000,
+            cache_write_tokens: 100_000,
+        };
+        // 500K fresh input + 400K cache read + 100K cache write + 1M output.
+        assert_eq!(
+            estimate_cost_micros(Some(&cost), usage),
+            Some(500_000 + 40_000 + 125_000 + 2_000_000)
+        );
+    }
+
+    #[test]
+    fn applies_context_price_tier() {
+        let cost = serde_json::json!({
+            "input": 1.0,
+            "output": 2.0,
+            "tiers": [
+                { "input": 5.0, "output": 10.0, "tier": { "type": "context", "size": 1000 } }
+            ]
+        });
+        let usage = Usage::new(2_000, 0);
+        assert_eq!(estimate_cost_micros(Some(&cost), usage), Some(10_000));
+    }
+
+    #[test]
+    fn cost_is_unknown_without_numeric_prices() {
+        let cost = serde_json::json!({ "currency": "USD" });
+        assert_eq!(estimate_cost_micros(Some(&cost), Usage::new(100, 50)), None);
+        assert_eq!(estimate_cost_micros(None, Usage::new(100, 50)), None);
     }
 }
