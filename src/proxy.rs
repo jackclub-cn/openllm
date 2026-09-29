@@ -907,6 +907,47 @@ async fn finish_anthropic_stream(
     send_anthropic_event(tx, "message_stop", json!({"type": "message_stop"})).await;
 }
 
+const USAGE_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Refreshes a streaming request's activity timestamp at a bounded rate.
+struct UsageHeartbeat {
+    state: AppState,
+    request_id: String,
+    last_touch: Instant,
+}
+
+impl UsageHeartbeat {
+    fn new(state: AppState, request_id: String) -> Self {
+        Self {
+            state,
+            request_id,
+            last_touch: Instant::now() - USAGE_HEARTBEAT_INTERVAL,
+        }
+    }
+
+    async fn touch(&mut self) {
+        if self.last_touch.elapsed() < USAGE_HEARTBEAT_INTERVAL {
+            return;
+        }
+        self.last_touch = Instant::now();
+        if let Err(error) = sqlx::query(
+            "UPDATE usage_logs \
+             SET last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE request_id = ? AND in_flight = 1",
+        )
+        .bind(&self.request_id)
+        .execute(&self.state.pool)
+        .await
+        {
+            tracing::warn!(
+                %error,
+                request_id = self.request_id,
+                "failed to update streaming activity heartbeat"
+            );
+        }
+    }
+}
+
 /// Rewrites an OpenAI SSE stream into the Anthropic event protocol.
 #[allow(clippy::too_many_arguments)]
 fn openai_stream_to_anthropic(
@@ -931,10 +972,14 @@ fn openai_stream_to_anthropic(
         let mut buffer = Vec::<u8>::new();
         let mut stream_error = None;
         let mut done = false;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
 
         while !done && let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
-                Ok(chunk) => chunk,
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
                 Err(error) => {
                     stream_error = Some(error.to_string());
                     break;
@@ -2248,9 +2293,11 @@ fn passthrough_stream_response(
         let mut upstream = response.bytes_stream();
         let mut parser = UsageParser::new(started);
         let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
         while let Some(chunk) = upstream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    heartbeat.touch().await;
                     parser.push(&bytes);
                     if tx.send(Ok(bytes)).await.is_err() {
                         break;
@@ -2344,10 +2391,14 @@ fn anthropic_stream_response(
         let mut stream_error = None;
         let mut text = String::new();
         let mut first_token_ms = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
 
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
-                Ok(chunk) => chunk,
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
                 Err(error) => {
                     stream_error = Some(error.to_string());
                     break;
@@ -3101,10 +3152,11 @@ async fn reserve_api_key_rate_limit(
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
-            success, streamed, error_message, response_preview
+            success, streamed, error_message, response_preview, last_activity_at
         )
         SELECT ?, ?, NULL, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0,
-               NULL, NULL, 0, 1, 0, ?, NULL, NULL
+               NULL, NULL, 0, 1, 0, ?, NULL, NULL,
+               strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE (
             ? IS NULL OR (
                 SELECT COUNT(*) FROM usage_logs
@@ -4594,8 +4646,11 @@ async fn log_usage_started(
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
-            success, streamed, error_message, response_preview
-        ) VALUES (?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?, NULL, NULL)
+            success, streamed, error_message, response_preview, last_activity_at
+        ) VALUES (
+            ?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?,
+            NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        )
         ON CONFLICT(request_id) DO UPDATE SET
             route_id = excluded.route_id,
             requested_model = excluded.requested_model,
@@ -4603,6 +4658,7 @@ async fn log_usage_started(
             prompt_tokens = excluded.prompt_tokens,
             total_tokens = excluded.total_tokens,
             streamed = excluded.streamed,
+            last_activity_at = excluded.last_activity_at,
             in_flight = 1
         WHERE usage_logs.in_flight = 1
         "#,
@@ -4653,7 +4709,8 @@ async fn log_usage_target(
     upstream_model: &str,
 ) {
     if let Err(error) = sqlx::query(
-        "UPDATE usage_logs SET provider_id = ?, upstream_model = ? \
+        "UPDATE usage_logs SET provider_id = ?, upstream_model = ?, \
+             last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE request_id = ? AND in_flight = 1",
     )
     .bind(provider_id)
@@ -4686,8 +4743,11 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
-            success, streamed, error_message, response_preview
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+            success, streamed, error_message, response_preview, last_activity_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+        )
         ON CONFLICT(request_id) DO UPDATE SET
             api_key_id = excluded.api_key_id,
             route_id = excluded.route_id,
@@ -4708,7 +4768,8 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             success = excluded.success,
             streamed = excluded.streamed,
             error_message = excluded.error_message,
-            response_preview = excluded.response_preview
+            response_preview = excluded.response_preview,
+            last_activity_at = excluded.last_activity_at
         "#,
     )
     .bind(entry.request_id)
@@ -6182,6 +6243,7 @@ mod tests {
                 streamed INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,
                 response_preview TEXT,
+                last_activity_at TEXT,
                 created_at TEXT NOT NULL DEFAULT ''
             )
             "#,

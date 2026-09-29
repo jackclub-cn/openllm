@@ -586,15 +586,8 @@ pub async fn run_due_provider_model_syncs(state: AppState) {
     .await;
 }
 
-pub async fn run_due_usage_retention(state: AppState) {
-    {
-        let last_run = state.retention_last_run.lock().await;
-        if last_run.is_some_and(|last_run| last_run.elapsed() < USAGE_RETENTION_CHECK_INTERVAL) {
-            return;
-        }
-    }
-
-    let stale_cutoff = (Utc::now() - Duration::days(1)).to_rfc3339();
+pub async fn reconcile_stale_usage_requests(state: AppState) {
+    let stale_cutoff = (Utc::now() - Duration::minutes(15)).to_rfc3339();
     if let Err(error) = finish_interrupted_usage_requests(
         &state,
         Some(&stale_cutoff),
@@ -603,6 +596,15 @@ pub async fn run_due_usage_retention(state: AppState) {
     .await
     {
         tracing::warn!(%error, "failed to reconcile stale in-flight usage logs");
+    }
+}
+
+pub async fn run_due_usage_retention(state: AppState) {
+    {
+        let last_run = state.retention_last_run.lock().await;
+        if last_run.is_some_and(|last_run| last_run.elapsed() < USAGE_RETENTION_CHECK_INTERVAL) {
+            return;
+        }
     }
 
     let raw = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
@@ -683,7 +685,7 @@ async fn finish_interrupted_usage_requests(
     "#;
     let result = match cutoff {
         Some(cutoff) => {
-            let query = format!("{base} AND created_at < ?");
+            let query = format!("{base} AND COALESCE(last_activity_at, created_at) < ?");
             sqlx::query(&query)
                 .bind(message)
                 .bind(cutoff)
@@ -3919,6 +3921,48 @@ mod tests {
                 ("recent".to_string(), 0, 499),
                 ("stale".to_string(), 0, 499),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_reconciliation_uses_last_activity_for_long_streams() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let old_created = (Utc::now() - Duration::hours(2)).to_rfc3339();
+        let active = Utc::now().to_rfc3339();
+        let stale_activity = (Utc::now() - Duration::minutes(20)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code, in_flight,
+                success, created_at, last_activity_at
+             ) VALUES
+                ('active', 'm', '/v1/chat/completions', 0, 1, 0, ?, ?),
+                ('stale', 'm', '/v1/chat/completions', 0, 1, 0, ?, ?)",
+        )
+        .bind(&old_created)
+        .bind(active)
+        .bind(&old_created)
+        .bind(stale_activity)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool.clone(), None);
+        reconcile_stale_usage_requests(state).await;
+        let rows = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT request_id, in_flight, status_code
+             FROM usage_logs ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![("active".to_string(), 1, 0), ("stale".to_string(), 0, 499)]
         );
     }
 }
