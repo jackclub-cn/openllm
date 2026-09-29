@@ -77,6 +77,7 @@ export type Provider = {
   headers: Record<string, string>
   enabled: boolean
   api_key_set: boolean
+  tool_search_supported: boolean
   models: string[]
   models_synced_at?: string
   models_sync_error?: string
@@ -100,6 +101,7 @@ export type ProviderInput = {
   api_key?: string
   headers: Record<string, string>
   enabled: boolean
+  tool_search_supported: boolean
   auto_sync_models: boolean
   models: string[]
   health_check_interval_minutes?: number | null

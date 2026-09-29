@@ -1761,6 +1761,19 @@ fn upstream_rejects_tool_search(body: &[u8]) -> bool {
         && (message.contains("unknown tool type") || message.contains("tool.type"))
 }
 
+async fn mark_provider_tool_search_unsupported(state: &AppState, provider_id: i64) {
+    if let Err(error) = sqlx::query(
+        "UPDATE providers SET tool_search_supported = 0 \
+         WHERE id = ? AND tool_search_supported <> 0",
+    )
+    .bind(provider_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(%error, provider_id, "failed to persist tool_search compatibility");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn upstream_error_response(
     state: &AppState,
@@ -1859,6 +1872,13 @@ async fn forward_to_target(
         }
     };
 
+    if endpoint == OPENAI_RESPONSES
+        && target.tool_search_supported == 0
+        && let Some(compat_body) = strip_tool_search_tools(&request_body)
+    {
+        request_body = compat_body;
+    }
+
     let mut response = build_upstream_request(state, &url, provider_type, &target, &request_body)?
         .send()
         .await
@@ -1883,6 +1903,7 @@ async fn forward_to_target(
                     model = %target.upstream_model,
                     "upstream rejected tool_search; retrying without it"
                 );
+                mark_provider_tool_search_unsupported(state, target.provider_id).await;
                 request_body = compat_body;
                 response =
                     build_upstream_request(state, &url, provider_type, &target, &request_body)?
@@ -3128,6 +3149,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -3154,6 +3176,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -3188,6 +3211,7 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
@@ -4286,6 +4310,7 @@ mod tests {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 models_synced_at TEXT,
                 models_sync_error TEXT,
+                tool_search_supported INTEGER NOT NULL DEFAULT 1,
                 last_test_ok INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
@@ -4369,6 +4394,7 @@ mod tests {
                 enabled INTEGER NOT NULL DEFAULT 1,
                 models_synced_at TEXT,
                 models_sync_error TEXT,
+                tool_search_supported INTEGER NOT NULL DEFAULT 1,
                 last_test_ok INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
@@ -5117,8 +5143,16 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
-        let state = AppState::new(pool, None);
-        let target = RouteTarget {
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'mock', 'openai', ?)",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool.clone(), None);
+        let mut target = RouteTarget {
             id: 1,
             route_id: None,
             provider_id: 1,
@@ -5128,6 +5162,7 @@ mod tests {
             model_prefix: String::new(),
             api_key: None,
             provider_headers: "{}".to_string(),
+            tool_search_supported: 1,
             provider_health: None,
             upstream_model: "upstream".to_string(),
             weight: 100,
@@ -5135,16 +5170,43 @@ mod tests {
             enabled: 1,
         };
 
+        let request_json = json!({
+            "model": "requested-model",
+            "input": "hello",
+            "tools": [{"type": "tool_search", "execution": "client"}]
+        });
         let response = forward_to_target(
             &state,
             "tool-search-retry",
             OPENAI_RESPONSES,
             "requested-model",
-            &json!({
-                "model": "requested-model",
-                "input": "hello",
-                "tools": [{"type": "tool_search", "execution": "client"}]
-            }),
+            &request_json,
+            &Bytes::new(),
+            target.clone(),
+            false,
+            10,
+            None,
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        let tool_search_supported: i64 =
+            sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(tool_search_supported, 0);
+
+        target.tool_search_supported = 0;
+        let response = forward_to_target(
+            &state,
+            "tool-search-cached",
+            OPENAI_RESPONSES,
+            "requested-model",
+            &request_json,
             &Bytes::new(),
             target,
             false,
@@ -5156,7 +5218,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
 
         server.abort();
     }

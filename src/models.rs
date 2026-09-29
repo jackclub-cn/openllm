@@ -77,6 +77,7 @@ pub struct Provider {
     pub api_key: Option<String>,
     pub headers: String,
     pub enabled: i64,
+    pub tool_search_supported: i64,
     pub models_synced_at: Option<String>,
     pub models_sync_error: Option<String>,
     pub last_test_at: Option<String>,
@@ -102,6 +103,7 @@ pub struct ProviderView {
     pub headers: serde_json::Value,
     pub enabled: bool,
     pub api_key_set: bool,
+    pub tool_search_supported: bool,
     pub models: Vec<String>,
     pub models_synced_at: Option<String>,
     pub models_sync_error: Option<String>,
@@ -131,6 +133,8 @@ pub struct ProviderInput {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]
+    pub tool_search_supported: bool,
+    #[serde(default = "default_true")]
     pub auto_sync_models: bool,
     #[serde(default)]
     pub models: Vec<String>,
@@ -152,6 +156,7 @@ pub struct ProviderUpdate {
     pub clear_api_key: Option<bool>,
     pub headers: Option<serde_json::Value>,
     pub enabled: Option<bool>,
+    pub tool_search_supported: Option<bool>,
     pub auto_sync_models: Option<bool>,
     pub models: Option<Vec<String>>,
     #[serde(default)]
@@ -214,6 +219,7 @@ pub struct RouteTarget {
     pub model_prefix: String,
     pub api_key: Option<String>,
     pub provider_headers: String,
+    pub tool_search_supported: i64,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
     pub upstream_model: String,
@@ -1104,6 +1110,7 @@ impl From<Provider> for ProviderView {
             headers,
             enabled: value.enabled != 0,
             api_key_set: value.api_key.as_deref().is_some_and(|key| !key.is_empty()),
+            tool_search_supported: value.tool_search_supported != 0,
             models: Vec::new(),
             models_synced_at: value.models_synced_at,
             models_sync_error: value.models_sync_error,

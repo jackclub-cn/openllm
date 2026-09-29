@@ -201,9 +201,9 @@ pub async fn create_provider(
     let result = sqlx::query(
         "INSERT INTO providers (
             name, provider_type, base_url, model_prefix, models_dev_id,
-            api_key, headers, enabled, health_check_interval_minutes,
-            models_sync_interval_minutes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            api_key, headers, enabled, tool_search_supported,
+            health_check_interval_minutes, models_sync_interval_minutes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -213,6 +213,7 @@ pub async fn create_provider(
     .bind(api_key)
     .bind(headers)
     .bind(input.enabled as i64)
+    .bind(input.tool_search_supported as i64)
     .bind(health_check_interval_minutes)
     .bind(models_sync_interval_minutes)
     .execute(&mut *tx)
@@ -267,6 +268,9 @@ pub async fn update_provider(
             .unwrap_or(current.model_prefix.as_str()),
     )?;
     let enabled = input.enabled.unwrap_or(current.enabled != 0);
+    let tool_search_supported = input
+        .tool_search_supported
+        .unwrap_or(current.tool_search_supported != 0);
     let health_check_interval_minutes = match input.health_check_interval_minutes {
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.health_check_interval_minutes,
@@ -299,7 +303,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -309,6 +313,7 @@ pub async fn update_provider(
     .bind(api_key)
     .bind(headers)
     .bind(enabled as i64)
+    .bind(tool_search_supported as i64)
     .bind(health_check_interval_minutes)
     .bind(models_sync_interval_minutes)
     .bind(id)
@@ -2051,6 +2056,7 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt

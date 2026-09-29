@@ -120,6 +120,7 @@ export default function Providers() {
       api_key: '',
       clear_api_key: false,
       enabled: true,
+      tool_search_supported: true,
       auto_sync_models: true,
       health_check_interval_minutes: 0,
       models_sync_interval_minutes: 0,
@@ -160,6 +161,7 @@ export default function Providers() {
       clear_api_key: editing?.api_key_set ? Boolean(values.clear_api_key) : undefined,
       headers,
       enabled: values.enabled,
+      tool_search_supported: values.tool_search_supported,
       auto_sync_models: values.auto_sync_models,
       models: values.modelsText.split('\n').map((item) => item.trim()).filter(Boolean),
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
@@ -386,7 +388,7 @@ export default function Providers() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 1040 }}
+          scroll={{ x: 1190 }}
           columns={[
             {
               title: '提供商',
@@ -474,6 +476,24 @@ export default function Providers() {
               dataIndex: 'model_prefix',
               width: 120,
               render: (value: string) => value ? <Typography.Text code>{value}</Typography.Text> : <Typography.Text type="secondary">无</Typography.Text>,
+            },
+            {
+              title: 'Responses 工具搜索',
+              dataIndex: 'tool_search_supported',
+              width: 150,
+              render: (value: boolean) => (
+                <Tooltip
+                  title={
+                    value
+                      ? '直接转发 tool_search'
+                      : '转发前自动移除 tool_search，避免不支持该工具的上游返回 400'
+                  }
+                >
+                  <Tag color={value ? 'blue' : 'orange'}>
+                    {value ? '原生支持' : '自动兼容'}
+                  </Tag>
+                </Tooltip>
+              ),
             },
             {
               title: '状态',
@@ -589,6 +609,14 @@ export default function Providers() {
               </Checkbox>
             </Form.Item>
           )}
+          <Form.Item
+            name="tool_search_supported"
+            label="上游支持 Responses tool_search"
+            valuePropName="checked"
+            extra="上游明确拒绝该工具时会自动关闭；上游升级后可在编辑页重新打开。"
+          >
+            <Switch />
+          </Form.Item>
           <Form.Item
             name="auto_sync_models"
             label="保存后自动从上游同步模型"
