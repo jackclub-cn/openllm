@@ -202,15 +202,26 @@ export default function ApiKeys() {
               ),
             },
             {
-              title: '每日限额',
-              width: 160,
+              title: '今日用量 / 限额',
+              width: 190,
               render: (_, record) => {
                 const limits: string[] = []
+                if (record.today_requests > 0) {
+                  limits.push(`请求 ${record.today_requests}`)
+                }
                 if (record.daily_token_limit != null) {
-                  limits.push(`token ${formatCompact(record.daily_token_limit)}`)
+                  limits.push(
+                    `token ${formatCompact(record.today_tokens)} / ${formatCompact(record.daily_token_limit)}`,
+                  )
+                } else if (record.today_tokens > 0) {
+                  limits.push(`token ${formatCompact(record.today_tokens)}`)
                 }
                 if (record.daily_cost_limit_micros != null) {
-                  limits.push(formatCostMicros(record.daily_cost_limit_micros))
+                  limits.push(
+                    `${formatCostMicros(record.today_cost_micros)} / ${formatCostMicros(record.daily_cost_limit_micros)}`,
+                  )
+                } else if (record.today_cost_micros != null) {
+                  limits.push(formatCostMicros(record.today_cost_micros))
                 }
                 return limits.length ? (
                   <Space direction="vertical" size={0}>
@@ -219,7 +230,7 @@ export default function ApiKeys() {
                     ))}
                   </Space>
                 ) : (
-                  <Typography.Text type="secondary">不限</Typography.Text>
+                  <Typography.Text type="secondary">今日无消耗</Typography.Text>
                 )
               },
             },

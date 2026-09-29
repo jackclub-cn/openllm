@@ -833,12 +833,27 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
 }
 
 pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<ApiKeyView>>> {
+    let day_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+        .to_rfc3339();
     let keys = sqlx::query_as::<_, ApiKeyStatsRow>(
         r#"
         SELECT
             k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
             k.last_used_at, k.created_at,
             k.daily_token_limit, k.daily_cost_limit_micros,
+            COUNT(CASE WHEN u.id IS NOT NULL AND u.created_at >= ? THEN 1 END) AS today_requests,
+            COALESCE(SUM(
+                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
+                     THEN u.total_tokens ELSE 0 END
+            ), 0) AS today_tokens,
+            SUM(
+                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
+                     THEN u.estimated_cost_micros END
+            ) AS today_cost_micros,
             COUNT(u.id) AS requests,
             COALESCE(SUM(u.total_tokens), 0) AS tokens,
             SUM(u.estimated_cost_micros) AS cost_micros,
@@ -854,6 +869,9 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
+    .bind(&day_start)
+    .bind(&day_start)
+    .bind(&day_start)
     .fetch_all(&state.pool)
     .await?;
     Ok(Json(keys.into_iter().map(Into::into).collect()))
@@ -1877,6 +1895,9 @@ impl From<ApiKeyRecord> for ApiKeyView {
             unpriced_requests: 0,
             daily_token_limit: value.daily_token_limit,
             daily_cost_limit_micros: value.daily_cost_limit_micros,
+            today_requests: 0,
+            today_tokens: 0,
+            today_cost_micros: None,
         }
     }
 }
@@ -1897,6 +1918,9 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             unpriced_requests: value.unpriced_requests,
             daily_token_limit: value.daily_token_limit,
             daily_cost_limit_micros: value.daily_cost_limit_micros,
+            today_requests: value.today_requests,
+            today_tokens: value.today_tokens,
+            today_cost_micros: value.today_cost_micros,
         }
     }
 }
