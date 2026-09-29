@@ -1248,6 +1248,25 @@ pub async fn update_route(
     Ok(Json(get_route(&state, id).await?))
 }
 
+pub async fn diagnose_route(
+    State(state): State<AppState>,
+    Json(input): Json<RouteDiagnoseInput>,
+) -> AppResult<Json<RouteDiagnoseView>> {
+    let model = input.model.trim();
+    if model.is_empty() {
+        return Err(AppError::BadRequest("model is required".to_string()));
+    }
+    let endpoint = input.endpoint.trim().trim_end_matches('/');
+    if !endpoint.starts_with('/') {
+        return Err(AppError::BadRequest(
+            "endpoint must start with '/'".to_string(),
+        ));
+    }
+    Ok(Json(
+        crate::proxy::diagnose_route(&state, model, endpoint).await?,
+    ))
+}
+
 pub async fn delete_route(
     State(state): State<AppState>,
     Path(id): Path<i64>,

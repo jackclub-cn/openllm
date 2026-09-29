@@ -297,6 +297,41 @@ pub struct RouteTargetInput {
     pub enabled: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct RouteDiagnoseInput {
+    pub model: String,
+    pub endpoint: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteDiagnoseView {
+    pub model: String,
+    pub endpoint: String,
+    pub matched: bool,
+    pub resolved: bool,
+    pub match_type: String,
+    pub route_id: Option<i64>,
+    pub route_name: Option<String>,
+    pub strategy: Option<String>,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub barrel: Option<ModelCapabilities>,
+    pub barrel_incomplete: bool,
+    pub targets: Vec<RouteDiagnoseTarget>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteDiagnoseTarget {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub provider_type: String,
+    pub upstream_model: String,
+    pub eligible: bool,
+    pub reason: String,
+    pub supported_endpoints: Vec<String>,
+    pub provider_health: Option<bool>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PublicModel {
     pub id: String,

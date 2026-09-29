@@ -19,8 +19,8 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteStrategy, RouteTarget, Usage,
-    estimate_cost_micros,
+    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteDiagnoseTarget,
+    RouteDiagnoseView, RouteStrategy, RouteTarget, Usage, estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -3115,6 +3115,10 @@ fn target_upstream_endpoint<'a>(
     request_endpoint: &'a str,
 ) -> Option<&'a str> {
     let provider_type = ProviderType::from_str(&target.provider_type).ok()?;
+    provider_upstream_endpoint(provider_type, request_endpoint)
+}
+
+fn provider_upstream_endpoint(provider_type: ProviderType, request_endpoint: &str) -> Option<&str> {
     match provider_type {
         ProviderType::Anthropic => {
             if request_endpoint == OPENAI_CHAT_COMPLETIONS || request_endpoint == ANTHROPIC_MESSAGES
@@ -3133,12 +3137,11 @@ fn target_supports_endpoint(target: &RouteTarget, request_endpoint: &str) -> boo
     let Some(upstream_endpoint) = target_upstream_endpoint(target, request_endpoint) else {
         return false;
     };
-    let Some(raw) = target.supported_endpoints.as_deref() else {
-        return true;
-    };
-    let Ok(endpoints) = serde_json::from_str::<Vec<String>>(raw) else {
-        return true;
-    };
+    endpoint_metadata_supports(target.supported_endpoints.as_deref(), upstream_endpoint)
+}
+
+fn endpoint_metadata_supports(raw: Option<&str>, upstream_endpoint: &str) -> bool {
+    let endpoints = supported_endpoint_list(raw);
     if endpoints.is_empty() {
         return true;
     }
@@ -3146,6 +3149,11 @@ fn target_supports_endpoint(target: &RouteTarget, request_endpoint: &str) -> boo
     endpoints
         .iter()
         .any(|endpoint| normalized_endpoint(endpoint) == expected)
+}
+
+fn supported_endpoint_list(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
 }
 
 fn filter_targets_for_endpoint(
@@ -3196,6 +3204,316 @@ async fn resolve_route(state: &AppState, model: &str, endpoint: &str) -> AppResu
         targets,
         barrel: Some(barrel),
     })
+}
+
+pub async fn diagnose_route(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+) -> AppResult<RouteDiagnoseView> {
+    let routes = sqlx::query_as::<_, Route>(
+        r#"
+        SELECT * FROM routes
+        ORDER BY
+            CASE WHEN instr(model_pattern, '*') = 0 AND instr(model_pattern, '?') = 0 THEN 0 ELSE 1 END,
+            length(model_pattern) DESC,
+            id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut disabled_match = None;
+    for route in routes {
+        let Ok(glob) = Glob::new(&route.model_pattern) else {
+            continue;
+        };
+        if !glob.compile_matcher().is_match(model) {
+            continue;
+        }
+        if route.enabled != 0 {
+            return diagnose_explicit_route(state, model, endpoint, route, true).await;
+        }
+        disabled_match.get_or_insert(route);
+    }
+    if let Some(route) = disabled_match {
+        return diagnose_explicit_route(state, model, endpoint, route, false).await;
+    }
+
+    diagnose_direct_route(state, model, endpoint).await
+}
+
+async fn diagnose_explicit_route(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+    route: Route,
+    route_enabled: bool,
+) -> AppResult<RouteDiagnoseView> {
+    let rows = sqlx::query_as::<_, DiagnosticTargetRow>(
+        r#"
+        SELECT p.id AS provider_id, p.name AS provider_name,
+               p.provider_type, rt.upstream_model,
+               rt.enabled AS target_enabled,
+               p.enabled AS provider_enabled,
+               CASE WHEN pm.model_name IS NULL THEN 0 ELSE 1 END AS model_exists,
+               COALESCE(pm.enabled, 1) AS model_enabled,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               p.last_test_ok AS provider_health
+        FROM route_targets rt
+        JOIN providers p ON p.id = rt.provider_id
+        LEFT JOIN provider_models pm
+          ON pm.provider_id = rt.provider_id
+         AND pm.model_name = rt.upstream_model
+        WHERE rt.route_id = ?
+        ORDER BY rt.priority ASC, rt.id
+        "#,
+    )
+    .bind(route.id)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let diagnosed = rows
+        .iter()
+        .map(|row| row.diagnose(endpoint, route_enabled))
+        .collect::<Vec<_>>();
+    let eligible_pairs = rows
+        .iter()
+        .zip(&diagnosed)
+        .filter(|(_, (_, eligible))| *eligible)
+        .map(|(row, _)| (row.provider_id, row.upstream_model.clone()))
+        .collect::<Vec<_>>();
+    let barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
+    let resolved = route_enabled && !eligible_pairs.is_empty();
+    let message = if !route_enabled {
+        format!("route '{}' is disabled", route.name)
+    } else if resolved {
+        format!("{} target(s) can serve {}", eligible_pairs.len(), endpoint)
+    } else {
+        format!(
+            "route '{}' has no eligible target for {endpoint}",
+            route.name
+        )
+    };
+
+    Ok(RouteDiagnoseView {
+        model: model.to_string(),
+        endpoint: endpoint.to_string(),
+        matched: true,
+        resolved,
+        match_type: "explicit_route".to_string(),
+        route_id: Some(route.id),
+        route_name: Some(route.name),
+        strategy: Some(route.strategy),
+        message,
+        barrel: barrel.capabilities,
+        barrel_incomplete: barrel.incomplete,
+        targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
+    })
+}
+
+async fn diagnose_direct_route(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+) -> AppResult<RouteDiagnoseView> {
+    let prefixed = sqlx::query_as::<_, DiagnosticTargetRow>(
+        r#"
+        SELECT p.id AS provider_id, p.name AS provider_name,
+               p.provider_type, pm.model_name AS upstream_model,
+               1 AS target_enabled,
+               p.enabled AS provider_enabled,
+               1 AS model_exists,
+               pm.enabled AS model_enabled,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               p.last_test_ok AS provider_health
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id
+        WHERE p.model_prefix <> ''
+          AND substr(?, 1, length(p.model_prefix)) = p.model_prefix
+          AND substr(?, length(p.model_prefix) + 1) = pm.model_name
+        ORDER BY p.id, pm.model_name
+        "#,
+    )
+    .bind(model)
+    .bind(model)
+    .fetch_all(&state.pool)
+    .await?;
+    let prefixed_diagnosed = prefixed
+        .iter()
+        .map(|row| row.diagnose(endpoint, true))
+        .collect::<Vec<_>>();
+    if prefixed_diagnosed.iter().any(|(_, eligible)| *eligible) {
+        return build_direct_diagnosis(
+            state,
+            model,
+            endpoint,
+            "prefix",
+            prefixed,
+            prefixed_diagnosed,
+        )
+        .await;
+    }
+
+    let unprefixed = sqlx::query_as::<_, DiagnosticTargetRow>(
+        r#"
+        SELECT p.id AS provider_id, p.name AS provider_name,
+               p.provider_type, pm.model_name AS upstream_model,
+               1 AS target_enabled,
+               p.enabled AS provider_enabled,
+               1 AS model_exists,
+               pm.enabled AS model_enabled,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               p.last_test_ok AS provider_health
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id
+        WHERE p.model_prefix = '' AND pm.model_name = ?
+        ORDER BY p.id
+        "#,
+    )
+    .bind(model)
+    .fetch_all(&state.pool)
+    .await?;
+    let unprefixed_diagnosed = unprefixed
+        .iter()
+        .map(|row| row.diagnose(endpoint, true))
+        .collect::<Vec<_>>();
+    if !unprefixed.is_empty() {
+        return build_direct_diagnosis(
+            state,
+            model,
+            endpoint,
+            "direct",
+            unprefixed,
+            unprefixed_diagnosed,
+        )
+        .await;
+    }
+
+    let match_type = if prefixed.is_empty() {
+        "none"
+    } else {
+        "prefix"
+    };
+    build_direct_diagnosis(
+        state,
+        model,
+        endpoint,
+        match_type,
+        prefixed,
+        prefixed_diagnosed,
+    )
+    .await
+}
+
+async fn build_direct_diagnosis(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+    match_type: &str,
+    rows: Vec<DiagnosticTargetRow>,
+    diagnosed: Vec<(RouteDiagnoseTarget, bool)>,
+) -> AppResult<RouteDiagnoseView> {
+    let eligible_pairs = rows
+        .iter()
+        .zip(&diagnosed)
+        .filter(|(_, (_, eligible))| *eligible)
+        .map(|(row, _)| (row.provider_id, row.upstream_model.clone()))
+        .collect::<Vec<_>>();
+    let matched = !rows.is_empty();
+    let conflict = match_type == "direct" && eligible_pairs.len() > 1;
+    let resolved = if match_type == "prefix" {
+        !eligible_pairs.is_empty()
+    } else {
+        eligible_pairs.len() == 1
+    };
+    let effective_match_type = if conflict { "conflict" } else { match_type };
+    let message = if !matched {
+        format!("no enabled or disabled provider model matches '{model}'")
+    } else if conflict {
+        format!("model '{model}' exists on multiple providers; add a prefix or explicit route")
+    } else if resolved {
+        format!("direct model match can serve {endpoint}")
+    } else {
+        format!("model '{model}' exists but no target can serve {endpoint}")
+    };
+    let barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
+
+    Ok(RouteDiagnoseView {
+        model: model.to_string(),
+        endpoint: endpoint.to_string(),
+        matched,
+        resolved,
+        match_type: effective_match_type.to_string(),
+        route_id: None,
+        route_name: None,
+        strategy: None,
+        message,
+        barrel: barrel.capabilities,
+        barrel_incomplete: barrel.incomplete,
+        targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
+    })
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct DiagnosticTargetRow {
+    provider_id: i64,
+    provider_name: String,
+    provider_type: String,
+    upstream_model: String,
+    target_enabled: i64,
+    provider_enabled: i64,
+    model_exists: i64,
+    model_enabled: i64,
+    supported_endpoints: Option<String>,
+    provider_health: Option<i64>,
+}
+
+impl DiagnosticTargetRow {
+    fn diagnose(&self, endpoint: &str, route_enabled: bool) -> (RouteDiagnoseTarget, bool) {
+        let reason = if !route_enabled {
+            Some("route is disabled".to_string())
+        } else if self.target_enabled == 0 {
+            Some("route target is disabled".to_string())
+        } else if self.provider_enabled == 0 {
+            Some("provider is disabled".to_string())
+        } else if self.model_exists != 0 && self.model_enabled == 0 {
+            Some("model is disabled".to_string())
+        } else {
+            match ProviderType::from_str(&self.provider_type)
+                .ok()
+                .and_then(|provider_type| provider_upstream_endpoint(provider_type, endpoint))
+            {
+                None => Some("provider does not support this endpoint".to_string()),
+                Some(upstream_endpoint)
+                    if !endpoint_metadata_supports(
+                        self.supported_endpoints.as_deref(),
+                        upstream_endpoint,
+                    ) =>
+                {
+                    Some("model does not declare support for this endpoint".to_string())
+                }
+                Some(_) => None,
+            }
+        };
+        let eligible = reason.is_none();
+        (
+            RouteDiagnoseTarget {
+                provider_id: self.provider_id,
+                provider_name: self.provider_name.clone(),
+                provider_type: self.provider_type.clone(),
+                upstream_model: self.upstream_model.clone(),
+                eligible,
+                reason: reason.unwrap_or_else(|| "eligible".to_string()),
+                supported_endpoints: supported_endpoint_list(self.supported_endpoints.as_deref()),
+                provider_health: self.provider_health.map(|value| value != 0),
+            },
+            eligible,
+        )
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4573,6 +4891,70 @@ mod tests {
             payload["data"][0]["supported_endpoints"],
             json!(["/responses"])
         );
+    }
+
+    #[tokio::test]
+    async fn route_diagnosis_explains_each_target() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, enabled, last_test_ok
+             ) VALUES
+                (1, 'chat-only', 'openai', 'http://chat-only', 1, 1),
+                (2, 'responses', 'openai', 'http://responses', 1, 1),
+                (3, 'disabled', 'openai', 'http://disabled', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, supported_endpoints
+             ) VALUES
+                (1, 'model', '[\"/chat/completions\"]'),
+                (2, 'model', '[\"/chat/completions\",\"/responses\"]'),
+                (3, 'model', '[\"/responses\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'shared route', 'shared', 'priority', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO route_targets (
+                id, route_id, provider_id, upstream_model, priority, enabled
+             ) VALUES
+                (1, 1, 1, 'model', 0, 1),
+                (2, 1, 2, 'model', 1, 1),
+                (3, 1, 3, 'model', 2, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let diagnosis = diagnose_route(&state, "shared", OPENAI_RESPONSES)
+            .await
+            .unwrap();
+        assert!(diagnosis.matched);
+        assert!(diagnosis.resolved);
+        assert_eq!(diagnosis.match_type, "explicit_route");
+        assert_eq!(diagnosis.targets.len(), 3);
+        assert!(!diagnosis.targets[0].eligible);
+        assert!(diagnosis.targets[0].reason.contains("does not declare"));
+        assert!(diagnosis.targets[1].eligible);
+        assert!(!diagnosis.targets[2].eligible);
+        assert!(diagnosis.targets[2].reason.contains("provider is disabled"));
     }
 
     #[tokio::test]

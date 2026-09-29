@@ -1,10 +1,13 @@
 import { useEffect, useState } from 'react'
-import { DeleteOutlined, EditOutlined, PlusOutlined } from '@ant-design/icons'
+import { DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined } from '@ant-design/icons'
 import {
+  Alert,
   App,
   AutoComplete,
   Button,
   Card,
+  Descriptions,
+  Empty,
   Form,
   Input,
   InputNumber,
@@ -18,7 +21,14 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { api, formatError, type GatewayRoute, type Provider, type RouteTarget } from '../api'
+import {
+  api,
+  formatError,
+  type GatewayRoute,
+  type Provider,
+  type RouteDiagnose,
+  type RouteTarget,
+} from '../api'
 import PageHeader from '../components/PageHeader'
 
 type FormValues = {
@@ -35,6 +45,32 @@ const strategyLabels = {
   round_robin: '轮询',
 }
 
+const matchTypeLabels = {
+  explicit_route: '显式路由',
+  prefix: '模型前缀',
+  direct: '直接模型',
+  conflict: '同名冲突',
+  none: '未匹配',
+}
+
+const diagnosticEndpoints = [
+  '/v1/chat/completions',
+  '/v1/responses',
+  '/v1/completions',
+  '/v1/embeddings',
+  '/v1/messages',
+].map((value) => ({ value, label: value }))
+
+const diagnosisReasonLabels: Record<string, string> = {
+  eligible: '可用',
+  'route is disabled': '路由已停用',
+  'route target is disabled': '目标已停用',
+  'provider is disabled': '提供商已停用',
+  'model is disabled': '模型已停用',
+  'provider does not support this endpoint': '提供商不支持此接口',
+  'model does not declare support for this endpoint': '模型未声明支持此接口',
+}
+
 export default function RoutesPage() {
   const { message } = App.useApp()
   const [items, setItems] = useState<GatewayRoute[]>([])
@@ -43,6 +79,11 @@ export default function RoutesPage() {
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState<GatewayRoute>()
   const [open, setOpen] = useState(false)
+  const [diagnoseOpen, setDiagnoseOpen] = useState(false)
+  const [diagnoseModel, setDiagnoseModel] = useState('')
+  const [diagnoseEndpoint, setDiagnoseEndpoint] = useState('/v1/chat/completions')
+  const [diagnosing, setDiagnosing] = useState(false)
+  const [diagnosis, setDiagnosis] = useState<RouteDiagnose>()
   const [form] = Form.useForm<FormValues>()
   const watchedTargets = Form.useWatch('targets', form)
 
@@ -108,12 +149,48 @@ export default function RoutesPage() {
     }
   }
 
+  const runDiagnosis = async () => {
+    const model = diagnoseModel.trim()
+    if (!model) {
+      message.warning('请输入要诊断的模型')
+      return
+    }
+    setDiagnosing(true)
+    try {
+      setDiagnosis(
+        await api.post<RouteDiagnose>('/api/routes/diagnose', {
+          model,
+          endpoint: diagnoseEndpoint,
+        }),
+      )
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setDiagnosing(false)
+    }
+  }
+
   return (
     <>
       <PageHeader
         title="模型路由"
         description="按模型通配符选择上游，并配置故障切换与负载均衡"
-        extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => openEditor()}>创建路由</Button>}
+        extra={
+          <Space>
+            <Button
+              icon={<ExperimentOutlined />}
+              onClick={() => {
+                setDiagnosis(undefined)
+                setDiagnoseOpen(true)
+              }}
+            >
+              路由诊断
+            </Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => openEditor()}>
+              创建路由
+            </Button>
+          </Space>
+        }
       />
       <Card bordered={false}>
         <Table
@@ -284,6 +361,133 @@ export default function RoutesPage() {
             )}
           </Form.List>
         </Form>
+      </Modal>
+
+      <Modal
+        title="路由诊断"
+        open={diagnoseOpen}
+        onCancel={() => setDiagnoseOpen(false)}
+        footer={null}
+        width={920}
+        destroyOnHidden
+      >
+        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+          <Space.Compact block>
+            <Input
+              autoFocus
+              value={diagnoseModel}
+              onChange={(event) => setDiagnoseModel(event.target.value)}
+              onPressEnter={() => void runDiagnosis()}
+              placeholder="输入客户端实际使用的模型名称"
+            />
+            <Select
+              value={diagnoseEndpoint}
+              options={diagnosticEndpoints}
+              onChange={setDiagnoseEndpoint}
+              style={{ width: 220 }}
+            />
+            <Button type="primary" loading={diagnosing} onClick={() => void runDiagnosis()}>
+              诊断
+            </Button>
+          </Space.Compact>
+
+          {diagnosis && (
+            <>
+              <Alert
+                showIcon
+                type={diagnosis.resolved ? 'success' : 'error'}
+                message={diagnosis.resolved ? '路由可用' : '路由不可用'}
+                description={diagnosis.message}
+              />
+              <Descriptions size="small" bordered column={2}>
+                <Descriptions.Item label="匹配方式">
+                  {matchTypeLabels[diagnosis.match_type]}
+                </Descriptions.Item>
+                <Descriptions.Item label="路由">
+                  {diagnosis.route_name || '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="策略">
+                  {diagnosis.strategy ? strategyLabels[diagnosis.strategy] : '-'}
+                </Descriptions.Item>
+                <Descriptions.Item label="能力桶">
+                  {diagnosis.barrel
+                    ? [
+                        diagnosis.barrel.context_limit
+                          ? `上下文 ${diagnosis.barrel.context_limit}`
+                          : '',
+                        diagnosis.barrel.output_limit
+                          ? `输出 ${diagnosis.barrel.output_limit}`
+                          : '',
+                      ]
+                        .filter(Boolean)
+                        .join(' / ') || '-'
+                    : '-'}
+                  {diagnosis.barrel_incomplete ? '（信息不完整）' : ''}
+                </Descriptions.Item>
+              </Descriptions>
+              {diagnosis.targets.length ? (
+                <Table
+                  rowKey={(record) => `${record.provider_id}-${record.upstream_model}`}
+                  size="small"
+                  pagination={false}
+                  dataSource={diagnosis.targets}
+                  scroll={{ x: 820 }}
+                  columns={[
+                    {
+                      title: '状态',
+                      dataIndex: 'eligible',
+                      width: 80,
+                      render: (eligible: boolean) => (
+                        <Tag color={eligible ? 'success' : 'error'}>
+                          {eligible ? '可用' : '跳过'}
+                        </Tag>
+                      ),
+                    },
+                    {
+                      title: '提供商',
+                      dataIndex: 'provider_name',
+                      width: 150,
+                      render: (value: string, record) => (
+                        <Space size={4}>
+                          <Typography.Text strong>{value}</Typography.Text>
+                          {record.provider_health === false && <Tag color="error">异常</Tag>}
+                        </Space>
+                      ),
+                    },
+                    {
+                      title: '上游模型',
+                      dataIndex: 'upstream_model',
+                      width: 180,
+                      render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+                    },
+                    {
+                      title: '支持接口',
+                      dataIndex: 'supported_endpoints',
+                      width: 220,
+                      render: (endpoints: string[]) =>
+                        endpoints.length
+                          ? endpoints.map((endpoint) => (
+                              <Tag key={endpoint}>{endpoint.replace(/^\/v1/, '')}</Tag>
+                            ))
+                          : <Typography.Text type="secondary">未声明</Typography.Text>,
+                    },
+                    {
+                      title: '原因',
+                      dataIndex: 'reason',
+                      render: (value: string) => (
+                        <Typography.Text type={value === 'eligible' ? 'success' : 'secondary'}>
+                          {diagnosisReasonLabels[value] || value}
+                        </Typography.Text>
+                      ),
+                    },
+                  ]}
+                />
+              ) : (
+                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有匹配到候选目标" />
+              )}
+            </>
+          )}
+        </Space>
       </Modal>
     </>
   )

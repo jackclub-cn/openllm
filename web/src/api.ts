@@ -154,6 +154,32 @@ export type GatewayRoute = {
   updated_at: string
 }
 
+export type RouteDiagnoseTarget = {
+  provider_id: number
+  provider_name: string
+  provider_type: string
+  upstream_model: string
+  eligible: boolean
+  reason: string
+  supported_endpoints: string[]
+  provider_health?: boolean | null
+}
+
+export type RouteDiagnose = {
+  model: string
+  endpoint: string
+  matched: boolean
+  resolved: boolean
+  match_type: 'explicit_route' | 'prefix' | 'direct' | 'conflict' | 'none'
+  route_id?: number
+  route_name?: string
+  strategy?: GatewayRoute['strategy']
+  message: string
+  barrel?: ModelCapabilities
+  barrel_incomplete: boolean
+  targets: RouteDiagnoseTarget[]
+}
+
 export type ApiKey = {
   id: number
   name: string
