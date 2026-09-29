@@ -6,6 +6,7 @@
 
 - 添加 OpenAI 兼容、Anthropic、Ollama 和自定义上游提供商。
 - 可从 OpenAI `/models`、Anthropic `/v1/models` 或 Ollama `/api/tags` 同步提供商模型。
+- 提供商列表保留最近一次连接测试结果，显示健康状态、延迟、检测时间和错误摘要。
 - 可搜索并启用、停用单个模型，也可覆盖上下文、输入和输出上限；设置值在重新同步后仍保留，并同时作用于 `/v1/models` 与路由能力聚合。
 - 可为提供商设置 `vendor/` 形式的模型前缀，直接用 `vendor/model` 调用而不必先建路由。
 - 按模型通配符创建路由，例如 `gpt-*`、`claude-*` 或 `*`。

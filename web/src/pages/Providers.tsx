@@ -178,6 +178,7 @@ export default function Providers() {
       } else {
         message.error({ content: result.message, key, duration: 6 })
       }
+      await load()
     } catch (error) {
       message.error({ content: formatError(error), key })
     }
@@ -269,7 +270,7 @@ export default function Providers() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 860 }}
+          scroll={{ x: 1040 }}
           columns={[
             {
               title: '提供商',
@@ -294,6 +295,37 @@ export default function Providers() {
               dataIndex: 'api_key_set',
               width: 100,
               render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '已配置' : '无需密钥'}</Tag>,
+            },
+            {
+              title: '健康',
+              width: 160,
+              render: (_, record) => {
+                const state =
+                  record.last_test_ok === undefined
+                    ? { color: 'default', label: '未检测' }
+                    : record.last_test_ok
+                      ? { color: 'success', label: '正常' }
+                      : { color: 'error', label: '异常' }
+                const detail = [
+                  record.last_test_message,
+                  record.last_test_latency_ms != null ? `${record.last_test_latency_ms} ms` : '',
+                  record.last_test_checked === 'models' ? '仅验证主机可达' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' · ')
+                return (
+                  <Tooltip title={detail || undefined}>
+                    <Space direction="vertical" size={0}>
+                      <Tag color={state.color}>{state.label}</Tag>
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        {record.last_test_at
+                          ? record.last_test_at.slice(0, 16).replace('T', ' ')
+                          : '尚未检测'}
+                      </Typography.Text>
+                    </Space>
+                  </Tooltip>
+                )
+              },
             },
             {
               title: '模型',

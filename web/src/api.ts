@@ -80,6 +80,11 @@ export type Provider = {
   models: string[]
   models_synced_at?: string
   models_sync_error?: string
+  last_test_at?: string
+  last_test_ok?: boolean
+  last_test_latency_ms?: number
+  last_test_checked?: 'inference' | 'models'
+  last_test_message?: string
   created_at: string
   updated_at: string
 }

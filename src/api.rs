@@ -364,9 +364,9 @@ pub async fn test_provider(
             },
         };
         request = apply_custom_headers(request, &provider.headers)?;
-        return Ok(Json(
-            probe_provider(request, started, "inference", &model).await,
-        ));
+        let result = probe_provider(request, started, "inference", &model).await;
+        persist_provider_test(&state, id, &result).await?;
+        return Ok(Json(result));
     }
 
     // No model synced yet, so fall back to listing. This only proves the host
@@ -388,7 +388,31 @@ pub async fn test_provider(
     }
     request = apply_custom_headers(request, &provider.headers)?;
 
-    Ok(Json(probe_provider(request, started, "models", "").await))
+    let result = probe_provider(request, started, "models", "").await;
+    persist_provider_test(&state, id, &result).await?;
+    Ok(Json(result))
+}
+
+async fn persist_provider_test(
+    state: &AppState,
+    provider_id: i64,
+    result: &ProviderTestResult,
+) -> AppResult<()> {
+    sqlx::query(
+        "UPDATE providers \
+         SET last_test_at = ?, last_test_ok = ?, last_test_latency_ms = ?, \
+             last_test_checked = ?, last_test_message = ? \
+         WHERE id = ?",
+    )
+    .bind(Utc::now().to_rfc3339())
+    .bind(result.ok as i64)
+    .bind(result.latency_ms)
+    .bind(&result.checked)
+    .bind(&result.message)
+    .bind(provider_id)
+    .execute(&state.pool)
+    .await?;
+    Ok(())
 }
 
 /// Sends the probe and turns the outcome into a test result.
@@ -2074,6 +2098,61 @@ mod tests {
         assert_eq!(csv_field("a,b"), "\"a,b\"");
         assert_eq!(csv_field("a\"b"), "\"a\"\"b\"");
         assert_eq!(csv_field("line\nbreak"), "\"line\nbreak\"");
+    }
+
+    #[tokio::test]
+    async fn persists_provider_test_result() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE providers (
+                id INTEGER PRIMARY KEY,
+                last_test_at TEXT,
+                last_test_ok INTEGER,
+                last_test_latency_ms INTEGER,
+                last_test_checked TEXT,
+                last_test_message TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO providers (id) VALUES (1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = AppState::new(pool.clone(), None);
+        persist_provider_test(
+            &state,
+            1,
+            &ProviderTestResult {
+                ok: true,
+                latency_ms: 42,
+                message: "ok".to_string(),
+                checked: "inference".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let row: (Option<i64>, Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT last_test_ok, last_test_latency_ms, last_test_checked, last_test_message \
+             FROM providers WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some(1),
+                Some(42),
+                Some("inference".to_string()),
+                Some("ok".to_string())
+            )
+        );
     }
 
     #[test]
