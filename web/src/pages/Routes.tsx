@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined } from '@ant-design/icons'
 import {
   Alert,
@@ -21,6 +21,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
+import { useSearchParams } from 'react-router-dom'
 import {
   api,
   formatError,
@@ -84,6 +85,8 @@ export default function RoutesPage() {
   const [diagnoseEndpoint, setDiagnoseEndpoint] = useState('/v1/chat/completions')
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnosis, setDiagnosis] = useState<RouteDiagnose>()
+  const [searchParams, setSearchParams] = useSearchParams()
+  const handledDiagnosisQuery = useRef('')
   const [form] = Form.useForm<FormValues>()
   const watchedTargets = Form.useWatch('targets', form)
 
@@ -149,8 +152,11 @@ export default function RoutesPage() {
     }
   }
 
-  const runDiagnosis = async () => {
-    const model = diagnoseModel.trim()
+  const runDiagnosis = async (
+    modelValue = diagnoseModel,
+    endpointValue = diagnoseEndpoint,
+  ) => {
+    const model = modelValue.trim()
     if (!model) {
       message.warning('请输入要诊断的模型')
       return
@@ -160,7 +166,7 @@ export default function RoutesPage() {
       setDiagnosis(
         await api.post<RouteDiagnose>('/api/routes/diagnose', {
           model,
-          endpoint: diagnoseEndpoint,
+          endpoint: endpointValue,
         }),
       )
     } catch (error) {
@@ -169,6 +175,21 @@ export default function RoutesPage() {
       setDiagnosing(false)
     }
   }
+
+  useEffect(() => {
+    const queryKey = searchParams.toString()
+    if (!queryKey || handledDiagnosisQuery.current === queryKey) return
+    const model = searchParams.get('diagnose_model')?.trim()
+    if (!model) return
+    handledDiagnosisQuery.current = queryKey
+    const endpoint = searchParams.get('diagnose_endpoint') || '/v1/chat/completions'
+    setDiagnoseModel(model)
+    setDiagnoseEndpoint(endpoint)
+    setDiagnosis(undefined)
+    setDiagnoseOpen(true)
+    void runDiagnosis(model, endpoint)
+    setSearchParams({}, { replace: true })
+  }, [searchParams, setSearchParams])
 
   return (
     <>

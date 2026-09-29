@@ -4,6 +4,7 @@ import {
   CloseCircleOutlined,
   CopyOutlined,
   DownloadOutlined,
+  ExperimentOutlined,
   LoadingOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
@@ -30,6 +31,7 @@ import {
 } from 'antd'
 import type { Dayjs } from 'dayjs'
 import dayjs from 'dayjs'
+import { useNavigate } from 'react-router-dom'
 import { api, formatError, type ApiKey, type Provider, type UsageLog } from '../api'
 import { formatCompact, formatCostMicros, formatExact } from '../format'
 import PageHeader from '../components/PageHeader'
@@ -45,6 +47,7 @@ type UsagePageResponse = {
 
 export default function Usage() {
   const { message } = App.useApp()
+  const navigate = useNavigate()
   const [items, setItems] = useState<UsageLog[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
@@ -562,6 +565,18 @@ export default function Usage() {
                     : `请求失败 · HTTP ${detail.status_code}`}
               </span>
             </div>
+            <Button
+              icon={<ExperimentOutlined />}
+              onClick={() => {
+                const params = new URLSearchParams({
+                  diagnose_model: detail.requested_model,
+                  diagnose_endpoint: detail.endpoint,
+                })
+                navigate(`/routes?${params}`)
+              }}
+            >
+              诊断此请求路由
+            </Button>
             <Descriptions column={1} size="small" bordered>
               <Descriptions.Item label="请求 ID">
                 <Typography.Text copyable={{ text: detail.request_id }}>{detail.request_id}</Typography.Text>
