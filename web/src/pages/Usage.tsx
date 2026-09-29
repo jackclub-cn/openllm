@@ -56,7 +56,7 @@ export default function Usage() {
   const [requestId, setRequestId] = useState('')
   const [providerId, setProviderId] = useState<number>()
   const [apiKeyId, setApiKeyId] = useState<number>()
-  const [success, setSuccess] = useState<boolean>()
+  const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>('all')
   const [dates, setDates] = useState<[Dayjs, Dayjs]>()
   const [newRequests, setNewRequests] = useState(0)
   const [autoScroll, setAutoScroll] = useState(true)
@@ -67,14 +67,14 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, providerId, apiKeyId, success, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, providerId, apiKeyId, success, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, providerId, apiKeyId, statusFilter, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, providerId, apiKeyId, statusFilter, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
     providerId,
     apiKeyId,
-    success,
+    statusFilter,
     dates?.[0]?.toISOString(),
     dates?.[1]?.toISOString(),
   ])
@@ -99,7 +99,9 @@ export default function Usage() {
     if (requestId) params.set('request_id', requestId)
     if (providerId) params.set('provider_id', String(providerId))
     if (apiKeyId) params.set('api_key_id', String(apiKeyId))
-    if (success !== undefined) params.set('success', String(success))
+    if (statusFilter === 'success') params.set('success', 'true')
+    if (statusFilter === 'failed') params.set('success', 'false')
+    if (statusFilter === 'pending') params.set('in_flight', 'true')
     if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
     if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
     try {
@@ -109,7 +111,7 @@ export default function Usage() {
         requestId,
         providerId,
         apiKeyId,
-        success,
+        statusFilter,
         dates?.[0]?.toISOString(),
         dates?.[1]?.toISOString(),
       ])
@@ -145,7 +147,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, model, page, pageSize, providerId, requestId, success])
+  }, [apiKeyId, autoScroll, dates, model, page, pageSize, providerId, requestId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -215,7 +217,9 @@ export default function Usage() {
       if (requestId) params.set('request_id', requestId)
       if (providerId) params.set('provider_id', String(providerId))
       if (apiKeyId) params.set('api_key_id', String(apiKeyId))
-      if (success !== undefined) params.set('success', String(success))
+      if (statusFilter === 'success') params.set('success', 'true')
+      if (statusFilter === 'failed') params.set('success', 'false')
+      if (statusFilter === 'pending') params.set('in_flight', 'true')
       if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
       if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
       const blob = await api.download(`/api/usage/export?${params}`)
@@ -335,15 +339,16 @@ export default function Usage() {
             style={{ width: 180 }}
           />
           <Select
-            allowClear
             placeholder="调用结果"
-            value={success}
-            onChange={(value) => { setSuccess(value); setTimeout(() => load(1), 0) }}
+            value={statusFilter}
+            onChange={(value) => { setStatusFilter(value); setTimeout(() => load(1), 0) }}
             options={[
-              { value: true, label: '成功' },
-              { value: false, label: '失败' },
+              { value: 'all', label: '全部状态' },
+              { value: 'success', label: '成功' },
+              { value: 'failed', label: '失败' },
+              { value: 'pending', label: '请求中' },
             ]}
-            style={{ width: 130 }}
+            style={{ width: 140 }}
           />
           <DatePicker.RangePicker
             value={dates}

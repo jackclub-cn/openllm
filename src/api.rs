@@ -589,6 +589,17 @@ pub async fn run_due_usage_retention(state: AppState) {
         }
     }
 
+    let stale_cutoff = (Utc::now() - Duration::days(1)).to_rfc3339();
+    if let Err(error) = finish_interrupted_usage_requests(
+        &state,
+        Some(&stale_cutoff),
+        "request was interrupted before completion",
+    )
+    .await
+    {
+        tracing::warn!(%error, "failed to reconcile stale in-flight usage logs");
+    }
+
     let raw = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
         .bind(SETTING_USAGE_RETENTION_DAYS)
         .fetch_optional(&state.pool)
@@ -630,6 +641,53 @@ pub async fn run_due_usage_retention(state: AppState) {
     }
 
     *state.retention_last_run.lock().await = Some(std::time::Instant::now());
+}
+
+pub async fn reconcile_interrupted_usage_requests(state: &AppState) -> AppResult<u64> {
+    let updated = finish_interrupted_usage_requests(
+        state,
+        None,
+        "gateway restarted before request completed",
+    )
+    .await?;
+    if updated > 0 {
+        tracing::warn!(updated, "reconciled interrupted usage logs after restart");
+    }
+    Ok(updated)
+}
+
+async fn finish_interrupted_usage_requests(
+    state: &AppState,
+    cutoff: Option<&str>,
+    message: &str,
+) -> AppResult<u64> {
+    let base = r#"
+        UPDATE usage_logs
+        SET in_flight = 0,
+            status_code = 499,
+            success = 0,
+            error_message = COALESCE(error_message, ?),
+            latency_ms = CASE
+                WHEN latency_ms > 0 THEN latency_ms
+                ELSE CAST(
+                    MAX(0, (julianday('now') - julianday(created_at)) * 86400000)
+                    AS INTEGER
+                )
+            END
+        WHERE in_flight = 1
+    "#;
+    let result = match cutoff {
+        Some(cutoff) => {
+            let query = format!("{base} AND created_at < ?");
+            sqlx::query(&query)
+                .bind(message)
+                .bind(cutoff)
+                .execute(&state.pool)
+                .await?
+        }
+        None => sqlx::query(base).bind(message).execute(&state.pool).await?,
+    };
+    Ok(result.rows_affected())
 }
 
 async fn persist_provider_test(
@@ -2474,6 +2532,11 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
             builder.push(" AND u.in_flight = 0");
         }
     }
+    if let Some(in_flight) = query.in_flight {
+        builder
+            .push(" AND u.in_flight = ")
+            .push_bind(in_flight as i64);
+    }
     if let Some(from) = &query.from {
         builder.push(" AND u.created_at >= ").push_bind(from);
     }
@@ -3120,5 +3183,118 @@ mod tests {
         );
         assert_eq!(view.model_usage[0].requests, 2);
         assert_eq!(view.model_usage[0].tokens, 150);
+    }
+
+    #[tokio::test]
+    async fn usage_filter_can_select_in_flight_requests() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, prompt_tokens, total_tokens,
+                latency_ms, status_code, in_flight, success, created_at
+             ) VALUES
+                ('pending', 'm', '/v1/chat/completions', 10, 10, 0, 0, 1, 0,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                ('finished', 'm', '/v1/chat/completions', 10, 20, 100, 200, 0, 1,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let Json(page) = list_usage(
+            State(state),
+            Query(UsageQuery {
+                page: 1,
+                page_size: 20,
+                provider_id: None,
+                api_key_id: None,
+                route_id: None,
+                model: None,
+                request_id: None,
+                success: None,
+                in_flight: Some(true),
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "pending");
+        assert!(page.items[0].in_flight);
+    }
+
+    #[tokio::test]
+    async fn reconciles_stale_and_interrupted_usage_requests() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let stale = (Utc::now() - Duration::days(2)).to_rfc3339();
+        let recent = Utc::now().to_rfc3339();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code, in_flight,
+                success, created_at
+             ) VALUES
+                ('stale', 'm', '/v1/chat/completions', 0, 1, 0, ?),
+                ('recent', 'm', '/v1/chat/completions', 0, 1, 0, ?),
+                ('done', 'm', '/v1/chat/completions', 200, 0, 1, ?)",
+        )
+        .bind(stale)
+        .bind(recent)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool.clone(), None);
+        let cutoff = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let stale_updated = finish_interrupted_usage_requests(
+            &state,
+            Some(&cutoff),
+            "request was interrupted before completion",
+        )
+        .await
+        .unwrap();
+        assert_eq!(stale_updated, 1);
+        let stale_row: (i64, i64, String) = sqlx::query_as(
+            "SELECT in_flight, status_code, error_message
+             FROM usage_logs WHERE request_id = 'stale'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stale_row.0, 0);
+        assert_eq!(stale_row.1, 499);
+        assert_eq!(stale_row.2, "request was interrupted before completion");
+
+        let startup_updated = reconcile_interrupted_usage_requests(&state).await.unwrap();
+        assert_eq!(startup_updated, 1);
+        let statuses = sqlx::query_as::<_, (String, i64, i64)>(
+            "SELECT request_id, in_flight, status_code
+             FROM usage_logs ORDER BY request_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            statuses,
+            vec![
+                ("done".to_string(), 0, 200),
+                ("recent".to_string(), 0, 499),
+                ("stale".to_string(), 0, 499),
+            ]
+        );
     }
 }

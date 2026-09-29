@@ -781,6 +781,7 @@ pub struct UsageQuery {
     pub model: Option<String>,
     pub request_id: Option<String>,
     pub success: Option<bool>,
+    pub in_flight: Option<bool>,
     pub from: Option<String>,
     pub to: Option<String>,
 }
