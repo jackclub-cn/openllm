@@ -131,6 +131,8 @@ export type ApiKey = {
   tokens: number
   cost_micros?: number | null
   unpriced_requests: number
+  daily_token_limit?: number | null
+  daily_cost_limit_micros?: number | null
 }
 
 export type UsageLog = {

@@ -7,6 +7,7 @@ use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
+use chrono::Utc;
 use futures_util::StreamExt;
 use globset::Glob;
 use rand::distributions::{Distribution, WeightedIndex};
@@ -1076,6 +1077,7 @@ fn anthropic_error_response(error: AppError) -> Response {
         AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
         AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
         AppError::Conflict(_) => (StatusCode::CONFLICT, "invalid_request_error"),
+        AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
         AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "api_error"),
         AppError::Database(_) | AppError::Http(_) | AppError::Internal(_) => {
             (StatusCode::INTERNAL_SERVER_ERROR, "api_error")
@@ -1120,6 +1122,7 @@ async fn proxy_anthropic_inner(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
+    enforce_api_key_quota(state, api_key.as_ref()).await?;
     let resolved = resolve_route(state, &requested_model).await?;
     let route_id = resolved.route_id;
     let requested_output_tokens = request_json.get("max_tokens").and_then(Value::as_i64);
@@ -1499,6 +1502,7 @@ pub async fn proxy_openai(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(&state, &headers).await?;
+    enforce_api_key_quota(&state, api_key.as_ref()).await?;
     let resolved = resolve_route(&state, &requested_model).await?;
     let route_id = resolved.route_id;
     // Barrel mode: clamp the requested output length to the strictest common
@@ -2614,6 +2618,53 @@ async fn authenticate_gateway(
         tracing::warn!(%error, key_id = record.id, "failed to update API key last_used_at");
     }
     Ok(Some(record))
+}
+
+/// Checks a key's soft daily quotas before any upstream work begins.
+///
+/// Usage is committed after the response completes, so concurrent requests can
+/// overshoot by at most the work already in flight. The guard still prevents a
+/// key from continuing to spend after its previous usage has crossed a limit.
+async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>) -> AppResult<()> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    if api_key.daily_token_limit.is_none() && api_key.daily_cost_limit_micros.is_none() {
+        return Ok(());
+    }
+
+    let day_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+        .to_rfc3339();
+    let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
+         FROM usage_logs WHERE api_key_id = ? AND created_at >= ?",
+    )
+    .bind(api_key.id)
+    .bind(day_start)
+    .fetch_one(&state.pool)
+    .await?;
+
+    if let Some(limit) = api_key.daily_token_limit
+        && tokens >= limit
+    {
+        return Err(AppError::TooManyRequests(format!(
+            "daily token limit reached for this API key ({tokens}/{limit})"
+        )));
+    }
+    if let Some(limit) = api_key.daily_cost_limit_micros
+        && cost_micros.unwrap_or(0) >= limit
+    {
+        return Err(AppError::TooManyRequests(format!(
+            "daily cost limit reached for this API key (${:.4}/${:.4})",
+            cost_micros.unwrap_or(0) as f64 / 1_000_000.0,
+            limit as f64 / 1_000_000.0
+        )));
+    }
+    Ok(())
 }
 
 struct ResolvedRoute {
@@ -3918,6 +3969,92 @@ mod tests {
         let routes = crate::registry::route_models(&state.pool).await.unwrap();
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].target_count, 1);
+    }
+
+    #[tokio::test]
+    async fn api_key_daily_token_quota_blocks_after_limit() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage_logs (
+                api_key_id INTEGER,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_micros INTEGER,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (api_key_id, total_tokens, created_at)
+             VALUES (1, 10, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: Some(10),
+            daily_cost_limit_micros: None,
+        };
+        let state = AppState::new(pool, None);
+        assert!(matches!(
+            enforce_api_key_quota(&state, Some(&key)).await,
+            Err(AppError::TooManyRequests(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_key_daily_cost_quota_uses_estimated_cost() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage_logs (
+                api_key_id INTEGER,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_micros INTEGER,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (api_key_id, total_tokens, estimated_cost_micros, created_at)
+             VALUES (1, 1, 2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: Some(2),
+        };
+        let state = AppState::new(pool, None);
+        assert!(matches!(
+            enforce_api_key_quota(&state, Some(&key)).await,
+            Err(AppError::TooManyRequests(_))
+        ));
     }
 
     #[test]

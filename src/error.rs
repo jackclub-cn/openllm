@@ -14,6 +14,8 @@ pub enum AppError {
     #[error("{0}")]
     Conflict(String),
     #[error("{0}")]
+    TooManyRequests(String),
+    #[error("{0}")]
     Upstream(String),
     #[error(transparent)]
     Database(#[from] sqlx::Error),
@@ -30,6 +32,7 @@ impl IntoResponse for AppError {
             Self::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
             Self::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
             Self::Conflict(_) => (StatusCode::CONFLICT, "conflict_error"),
+            Self::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
             Self::Upstream(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             Self::Database(_) | Self::Http(_) | Self::Internal(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")

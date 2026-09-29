@@ -485,6 +485,8 @@ pub struct ApiKeyRecord {
     pub enabled: i64,
     pub last_used_at: Option<String>,
     pub created_at: String,
+    pub daily_token_limit: Option<i64>,
+    pub daily_cost_limit_micros: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -500,6 +502,8 @@ pub struct ApiKeyView {
     pub tokens: i64,
     pub cost_micros: Option<i64>,
     pub unpriced_requests: i64,
+    pub daily_token_limit: Option<i64>,
+    pub daily_cost_limit_micros: Option<i64>,
 }
 
 #[derive(Debug, FromRow)]
@@ -515,16 +519,26 @@ pub struct ApiKeyStatsRow {
     pub tokens: i64,
     pub cost_micros: Option<i64>,
     pub unpriced_requests: i64,
+    pub daily_token_limit: Option<i64>,
+    pub daily_cost_limit_micros: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ApiKeyInput {
     pub name: String,
+    #[serde(default)]
+    pub daily_token_limit: Option<i64>,
+    #[serde(default)]
+    pub daily_cost_limit_micros: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ApiKeyUpdate {
     pub enabled: bool,
+    #[serde(default)]
+    pub daily_token_limit: Option<i64>,
+    #[serde(default)]
+    pub daily_cost_limit_micros: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

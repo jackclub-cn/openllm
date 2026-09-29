@@ -838,6 +838,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         SELECT
             k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
             k.last_used_at, k.created_at,
+            k.daily_token_limit, k.daily_cost_limit_micros,
             COUNT(u.id) AS requests,
             COALESCE(SUM(u.total_tokens), 0) AS tokens,
             SUM(u.estimated_cost_micros) AS cost_micros,
@@ -848,7 +849,8 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         FROM api_keys k
         LEFT JOIN usage_logs u ON u.api_key_id = k.id
         GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
-                 k.last_used_at, k.created_at
+                 k.last_used_at, k.created_at, k.daily_token_limit,
+                 k.daily_cost_limit_micros
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
@@ -865,6 +867,9 @@ pub async fn create_api_key(
     if name.is_empty() {
         return Err(AppError::BadRequest("key name is required".to_string()));
     }
+    let daily_token_limit = normalize_api_key_limit("daily token", input.daily_token_limit)?;
+    let daily_cost_limit_micros =
+        normalize_api_key_limit("daily cost", input.daily_cost_limit_micros)?;
 
     let raw = format!("sk-openllm-{}", uuid::Uuid::new_v4().simple());
     let key_hash = hash_secret(&raw);
@@ -879,12 +884,17 @@ pub async fn create_api_key(
         .collect::<String>();
 
     let result = sqlx::query(
-        "INSERT INTO api_keys (name, key_hash, key_prefix, key_suffix, enabled) VALUES (?, ?, ?, ?, 1)",
+        "INSERT INTO api_keys (
+            name, key_hash, key_prefix, key_suffix, enabled,
+            daily_token_limit, daily_cost_limit_micros
+         ) VALUES (?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(name)
     .bind(key_hash)
     .bind(key_prefix)
     .bind(key_suffix)
+    .bind(daily_token_limit)
+    .bind(daily_cost_limit_micros)
     .execute(&state.pool)
     .await?;
 
@@ -923,11 +933,30 @@ pub async fn update_api_key(
     Path(id): Path<i64>,
     Json(input): Json<ApiKeyUpdate>,
 ) -> AppResult<Json<ApiKeyView>> {
-    let result = sqlx::query("UPDATE api_keys SET enabled = ? WHERE id = ?")
-        .bind(input.enabled as i64)
+    let current = sqlx::query_as::<_, ApiKeyRecord>("SELECT * FROM api_keys WHERE id = ?")
         .bind(id)
-        .execute(&state.pool)
-        .await?;
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("API key not found".to_string()))?;
+    let daily_token_limit = match input.daily_token_limit {
+        Some(value) => normalize_api_key_limit("daily token", Some(value))?,
+        None => current.daily_token_limit,
+    };
+    let daily_cost_limit_micros = match input.daily_cost_limit_micros {
+        Some(value) => normalize_api_key_limit("daily cost", Some(value))?,
+        None => current.daily_cost_limit_micros,
+    };
+    let result = sqlx::query(
+        "UPDATE api_keys \
+         SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ? \
+         WHERE id = ?",
+    )
+    .bind(input.enabled as i64)
+    .bind(daily_token_limit)
+    .bind(daily_cost_limit_micros)
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("API key not found".to_string()));
     }
@@ -936,6 +965,16 @@ pub async fn update_api_key(
         .fetch_one(&state.pool)
         .await?;
     Ok(Json(record.into()))
+}
+
+fn normalize_api_key_limit(name: &str, value: Option<i64>) -> AppResult<Option<i64>> {
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(format!(
+            "{name} limit must be zero or a positive integer"
+        ))),
+        Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
 }
 
 pub async fn list_usage(
@@ -1732,6 +1771,8 @@ impl From<ApiKeyRecord> for ApiKeyView {
             tokens: 0,
             cost_micros: None,
             unpriced_requests: 0,
+            daily_token_limit: value.daily_token_limit,
+            daily_cost_limit_micros: value.daily_cost_limit_micros,
         }
     }
 }
@@ -1750,6 +1791,8 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             tokens: value.tokens,
             cost_micros: value.cost_micros,
             unpriced_requests: value.unpriced_requests,
+            daily_token_limit: value.daily_token_limit,
+            daily_cost_limit_micros: value.daily_cost_limit_micros,
         }
     }
 }
@@ -1884,6 +1927,17 @@ mod tests {
         assert!(validate_limit("context", Some(400_000)).is_ok());
         assert!(validate_limit("context", Some(0)).is_err());
         assert!(validate_limit("input", Some(-1)).is_err());
+    }
+
+    #[test]
+    fn validates_api_key_daily_limits() {
+        assert_eq!(normalize_api_key_limit("token", None).unwrap(), None);
+        assert_eq!(normalize_api_key_limit("token", Some(0)).unwrap(), None);
+        assert_eq!(
+            normalize_api_key_limit("token", Some(10_000)).unwrap(),
+            Some(10_000)
+        );
+        assert!(normalize_api_key_limit("token", Some(-1)).is_err());
     }
 
     #[test]
