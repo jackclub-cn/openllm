@@ -74,6 +74,1094 @@ pub async fn public_models(
     }))
 }
 
+// ===== Inbound Anthropic Messages API compatibility =====
+//
+// Anthropic-protocol clients (Claude Code, the Anthropic SDKs) POST to
+// `/v1/messages`. We accept that shape, route it through the same
+// resolve/barrel machinery as OpenAI traffic, and translate at the boundary:
+// a OpenAI-compatible target gets a converted request and its answer is
+// converted back, while a native Anthropic target is used verbatim.
+
+const ANTHROPIC_MESSAGES: &str = "/v1/messages";
+
+/// Extracts the required `model` field from a request body.
+fn requested_model_of(body: &Value) -> AppResult<String> {
+    body.get("model")
+        .and_then(Value::as_str)
+        .filter(|model| !model.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| AppError::BadRequest("request body must include a model".to_string()))
+}
+
+/// Formats one server-sent event the way Anthropic clients expect it.
+fn sse_line(event: &str, data: Value) -> String {
+    format!(
+        "event: {event}\ndata: {}\n\n",
+        serde_json::to_string(&data).unwrap_or_default()
+    )
+}
+
+/// Collects Anthropic text from either a bare string or an array of blocks.
+fn anthropic_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => Some(
+            items
+                .iter()
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+        ),
+        _ => None,
+    }
+}
+
+/// Converts one Anthropic image block into an OpenAI `image_url` part.
+fn anthropic_image_to_openai(block: &Value) -> Option<Value> {
+    let source = block.get("source")?;
+    let url = match source.get("type").and_then(Value::as_str) {
+        Some("base64") => {
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            let data = source.get("data").and_then(Value::as_str)?;
+            format!("data:{media_type};base64,{data}")
+        }
+        Some("url") => source.get("url").and_then(Value::as_str)?.to_string(),
+        _ => return None,
+    };
+    Some(json!({"type": "image_url", "image_url": {"url": url}}))
+}
+
+/// Converts one non-`tool_result` Anthropic content block into an OpenAI part.
+fn anthropic_block_to_openai_part(block: &Value) -> Option<Value> {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") => block
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "text", "text": text})),
+        Some("image") => anthropic_image_to_openai(block),
+        _ => None,
+    }
+}
+
+fn anthropic_tool_choice_to_openai(choice: &Value) -> Option<Value> {
+    match choice.get("type").and_then(Value::as_str) {
+        Some("auto") => Some(json!("auto")),
+        Some("any") => Some(json!("required")),
+        Some("none") => Some(json!("none")),
+        Some("tool") => Some(json!({
+            "type": "function",
+            "function": {"name": choice.get("name").cloned().unwrap_or(Value::Null)}
+        })),
+        _ => None,
+    }
+}
+
+/// Converts an inbound Anthropic Messages body into the OpenAI chat shape that
+/// the rest of the gateway (routing, barrel clamping, forwarding) understands.
+fn anthropic_request_to_openai(input: &Value, model: &str) -> Value {
+    let mut messages = Vec::new();
+    // Anthropic carries the system prompt outside `messages`.
+    if let Some(system) = input.get("system")
+        && let Some(text) = anthropic_text(system)
+        && !text.is_empty()
+    {
+        messages.push(json!({"role": "system", "content": text}));
+    }
+    if let Some(items) = input.get("messages").and_then(Value::as_array) {
+        for message in items {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let content = message.get("content").cloned().unwrap_or(Value::Null);
+            anthropic_message_to_openai(role, &content, &mut messages);
+        }
+    }
+
+    let mut output = json!({"model": model, "messages": messages});
+    for (source, target) in [
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+    ] {
+        if let Some(value) = input.get(source) {
+            output[target] = value.clone();
+        }
+    }
+    if let Some(stop) = input.get("stop_sequences") {
+        output["stop"] = stop.clone();
+    }
+    if input
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        output["stream"] = json!(true);
+    }
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        let converted = tools
+            .iter()
+            .filter_map(|tool| {
+                let name = tool.get("name")?.as_str()?;
+                Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": tool.get("description").cloned().unwrap_or(Value::Null),
+                        "parameters": tool.get("input_schema").cloned()
+                            .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+                    }
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !converted.is_empty() {
+            output["tools"] = json!(converted);
+        }
+    }
+    if let Some(choice) = input.get("tool_choice")
+        && let Some(mapped) = anthropic_tool_choice_to_openai(choice)
+    {
+        output["tool_choice"] = mapped;
+    }
+    output
+}
+
+/// Appends the OpenAI messages equivalent to one Anthropic message.
+///
+/// A single Anthropic user turn may mix text and `tool_result` blocks. Only the
+/// latter become `role: tool` messages, and they are emitted in place so they
+/// still follow the assistant turn whose `tool_calls` they answer.
+fn anthropic_message_to_openai(role: &str, content: &Value, messages: &mut Vec<Value>) {
+    if let Some(text) = content.as_str() {
+        messages.push(json!({"role": role, "content": text}));
+        return;
+    }
+    let Some(blocks) = content.as_array() else {
+        return;
+    };
+
+    if role == "assistant" {
+        let mut text = String::new();
+        let mut tool_calls = Vec::new();
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("text") => {
+                    if let Some(part) = block.get("text").and_then(Value::as_str) {
+                        text.push_str(part);
+                    }
+                }
+                Some("tool_use") => tool_calls.push(json!({
+                    "id": block.get("id").cloned().unwrap_or(Value::Null),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": serde_json::to_string(
+                            block.get("input").unwrap_or(&json!({}))
+                        ).unwrap_or_else(|_| "{}".to_string())
+                    }
+                })),
+                _ => {}
+            }
+        }
+        let mut message = json!({
+            "role": "assistant",
+            "content": if text.is_empty() { Value::Null } else { json!(text) }
+        });
+        if !tool_calls.is_empty() {
+            message["tool_calls"] = json!(tool_calls);
+        }
+        messages.push(message);
+        return;
+    }
+
+    // User (and any other) turn: split tool results out into their own messages.
+    let mut parts = Vec::new();
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("tool_result") {
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": block.get("tool_use_id").cloned().unwrap_or(Value::Null),
+                "content": anthropic_text(block.get("content").unwrap_or(&Value::Null))
+                    .unwrap_or_default()
+            }));
+        } else if let Some(part) = anthropic_block_to_openai_part(block) {
+            parts.push(part);
+        }
+    }
+    if parts.is_empty() {
+        return;
+    }
+    // Collapse text-only content to a plain string: most providers (and some
+    // strict validators) handle that more reliably than a one-element array.
+    if parts
+        .iter()
+        .all(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+    {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        messages.push(json!({"role": role, "content": text}));
+    } else {
+        messages.push(json!({"role": role, "content": parts}));
+    }
+}
+
+/// Maps an OpenAI finish reason onto the Anthropic `stop_reason` vocabulary.
+fn anthropic_stop_reason(finish: Option<&str>, has_tool_use: bool) -> &'static str {
+    match finish {
+        Some("length") => "max_tokens",
+        Some("tool_calls") | Some("function_call") => "tool_use",
+        _ if has_tool_use => "tool_use",
+        _ => "end_turn",
+    }
+}
+
+/// Converts a non-streamed OpenAI completion into an Anthropic message.
+fn openai_response_to_anthropic(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let message = value.pointer("/choices/0/message");
+    let mut content = Vec::new();
+    if let Some(text) = message
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        content.push(json!({"type": "text", "text": text}));
+    }
+    if let Some(calls) = message
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let function = call.get("function").unwrap_or(call);
+            let input = function
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|arguments| serde_json::from_str::<Value>(arguments).ok())
+                .unwrap_or_else(|| json!({}));
+            content.push(json!({
+                "type": "tool_use",
+                "id": call.get("id").cloned().unwrap_or_else(
+                    || json!(format!("toolu_{}", uuid::Uuid::new_v4().simple()))
+                ),
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "input": input
+            }));
+        }
+    }
+    let has_tool_use = content
+        .iter()
+        .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+    let finish = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str);
+    let usage = usage_from_value(value).unwrap_or_default().normalized();
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("msg_{}", id.trim_start_matches("chatcmpl-")))
+        .unwrap_or_else(|| format!("msg_{}", uuid::Uuid::new_v4().simple()));
+    (
+        json!({
+            "id": id,
+            "type": "message",
+            "role": "assistant",
+            "model": requested_model,
+            "content": content,
+            "stop_reason": anthropic_stop_reason(finish, has_tool_use),
+            "stop_sequence": Value::Null,
+            "usage": {
+                "input_tokens": usage.prompt_tokens,
+                "output_tokens": usage.completion_tokens
+            }
+        }),
+        usage,
+    )
+}
+
+/// Wraps a message in Anthropic's error envelope so Anthropic clients can parse
+/// gateway-side failures the same way they parse upstream errors.
+fn anthropic_error_body(error_type: &str, message: &str) -> Value {
+    json!({"type": "error", "error": {"type": error_type, "message": message}})
+}
+
+/// Accumulates state while rewriting an OpenAI SSE stream into Anthropic events.
+#[derive(Default)]
+struct AnthropicStreamState {
+    started: bool,
+    text_index: Option<usize>,
+    open_tools: Vec<usize>,
+    tool_indices: std::collections::HashMap<i64, usize>,
+    next_index: usize,
+    has_tool_use: bool,
+    finish_reason: Option<String>,
+    input_tokens: i64,
+    output_tokens: i64,
+    text: String,
+}
+
+async fn send_anthropic_event(
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    event: &str,
+    data: Value,
+) {
+    let _ = tx.send(Ok(Bytes::from(sse_line(event, data)))).await;
+}
+
+impl AnthropicStreamState {
+    /// Emits `message_start` once, before any content block.
+    async fn ensure_started(
+        &mut self,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+        ctx: &StreamContext,
+    ) {
+        if self.started {
+            return;
+        }
+        self.started = true;
+        send_anthropic_event(
+            tx,
+            "message_start",
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": ctx.message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "model": ctx.model,
+                    "content": [],
+                    "stop_reason": Value::Null,
+                    "stop_sequence": Value::Null,
+                    "usage": {"input_tokens": ctx.input_tokens, "output_tokens": 0}
+                }
+            }),
+        )
+        .await;
+    }
+
+    /// Closes the open text block so a tool block can start.
+    async fn close_text_block(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        if let Some(index) = self.text_index.take() {
+            send_anthropic_event(
+                tx,
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            )
+            .await;
+        }
+    }
+
+    /// Closes every still-open block at end of stream.
+    async fn close_all_blocks(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        self.close_text_block(tx).await;
+        for index in self.open_tools.drain(..) {
+            send_anthropic_event(
+                tx,
+                "content_block_stop",
+                json!({"type": "content_block_stop", "index": index}),
+            )
+            .await;
+        }
+    }
+}
+
+/// Immutable per-stream values shared with the state machine.
+struct StreamContext {
+    message_id: String,
+    model: String,
+    input_tokens: i64,
+}
+
+/// Handles one OpenAI SSE line, emitting the matching Anthropic events.
+///
+/// Returns `false` once `[DONE]` is seen so the caller can stop reading.
+async fn process_openai_line_for_anthropic(
+    line: &[u8],
+    state: &mut AnthropicStreamState,
+    ctx: &StreamContext,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) -> bool {
+    let line = String::from_utf8_lossy(line);
+    let Some(data) = line.trim().strip_prefix("data:") else {
+        return true;
+    };
+    let data = data.trim();
+    if data == "[DONE]" {
+        return false;
+    }
+    if data.is_empty() {
+        return true;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return true;
+    };
+
+    if let Some(usage) = value.get("usage").filter(|value| !value.is_null()) {
+        if let Some(prompt) = usage.get("prompt_tokens").and_then(Value::as_i64) {
+            state.input_tokens = prompt;
+        }
+        if let Some(completion) = usage.get("completion_tokens").and_then(Value::as_i64) {
+            state.output_tokens = completion;
+        }
+    }
+    if let Some(reason) = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+    {
+        state.finish_reason = Some(reason.to_string());
+    }
+
+    let delta = value.pointer("/choices/0/delta");
+    if let Some(text) = delta
+        .and_then(|delta| delta.get("content"))
+        .and_then(Value::as_str)
+        && !text.is_empty()
+    {
+        state.ensure_started(tx, ctx).await;
+        let index = match state.text_index {
+            Some(index) => index,
+            None => {
+                let index = state.next_index;
+                state.next_index += 1;
+                state.text_index = Some(index);
+                send_anthropic_event(
+                    tx,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {"type": "text", "text": ""}
+                    }),
+                )
+                .await;
+                index
+            }
+        };
+        state.text.push_str(text);
+        send_anthropic_event(
+            tx,
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": index,
+                "delta": {"type": "text_delta", "text": text}
+            }),
+        )
+        .await;
+    }
+
+    if let Some(calls) = delta
+        .and_then(|delta| delta.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let openai_index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+            let function = call.get("function").unwrap_or(call);
+            let index = if let Some(index) = state.tool_indices.get(&openai_index) {
+                *index
+            } else {
+                // A new tool call: text must not stay open alongside it.
+                state.ensure_started(tx, ctx).await;
+                state.close_text_block(tx).await;
+                let index = state.next_index;
+                state.next_index += 1;
+                state.tool_indices.insert(openai_index, index);
+                state.open_tools.push(index);
+                state.has_tool_use = true;
+                send_anthropic_event(
+                    tx,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": call.get("id").cloned().unwrap_or_else(
+                                || json!(format!("toolu_{}", uuid::Uuid::new_v4().simple()))
+                            ),
+                            "name": function.get("name").cloned().unwrap_or(Value::Null),
+                            "input": {}
+                        }
+                    }),
+                )
+                .await;
+                index
+            };
+            if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
+                && !arguments.is_empty()
+            {
+                send_anthropic_event(
+                    tx,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": arguments}
+                    }),
+                )
+                .await;
+            }
+        }
+    }
+    true
+}
+
+/// Finalises an Anthropic stream: close open blocks, then emit the terminal
+/// `message_delta` and `message_stop` events.
+///
+/// Shared by the live handler and tests so the closing sequence is defined once.
+async fn finish_anthropic_stream(
+    state: &mut AnthropicStreamState,
+    ctx: &StreamContext,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    // A stream that produced nothing still owes the client a well-formed
+    // message, so open the message before closing out.
+    if !state.started {
+        state.ensure_started(tx, ctx).await;
+    }
+    state.close_all_blocks(tx).await;
+    let stop_reason = anthropic_stop_reason(state.finish_reason.as_deref(), state.has_tool_use);
+    send_anthropic_event(
+        tx,
+        "message_delta",
+        json!({
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
+            "usage": {"output_tokens": state.output_tokens}
+        }),
+    )
+    .await;
+    send_anthropic_event(tx, "message_stop", json!({"type": "message_stop"})).await;
+}
+
+/// Rewrites an OpenAI SSE stream into the Anthropic event protocol.
+#[allow(clippy::too_many_arguments)]
+fn openai_stream_to_anthropic(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let context = StreamContext {
+            message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            model: requested_model.clone(),
+            input_tokens: request_tokens,
+        };
+        let mut stream_state = AnthropicStreamState::default();
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut stream_error = None;
+        let mut done = false;
+
+        while !done && let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => chunk,
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                // `false` means `[DONE]`: the upstream body is complete.
+                if !process_openai_line_for_anthropic(&line, &mut stream_state, &context, &tx).await
+                {
+                    // `[DONE]` received: stop reading the upstream body.
+                    done = true;
+                    break;
+                }
+            }
+        }
+        if !done && !buffer.is_empty() {
+            process_openai_line_for_anthropic(&buffer, &mut stream_state, &context, &tx).await;
+        }
+
+        finish_anthropic_stream(&mut stream_state, &context, &tx).await;
+        drop(tx);
+
+        let usage = Usage {
+            prompt_tokens: if stream_state.input_tokens > 0 {
+                stream_state.input_tokens
+            } else {
+                request_tokens
+            },
+            completion_tokens: stream_state.output_tokens,
+            total_tokens: stream_state.input_tokens + stream_state.output_tokens,
+        }
+        .normalized();
+        let preview = response_preview(stream_state.text.as_bytes());
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: ANTHROPIC_MESSAGES,
+                usage,
+                latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: None,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Inbound entry point for the Anthropic Messages API (`POST /v1/messages`).
+///
+/// Anthropic-protocol clients (Claude Code, the Anthropic SDKs) can point their
+/// base URL at this gateway. The request is converted into the gateway's
+/// internal OpenAI shape so it reuses routing, barrel clamping and capability
+/// headers, then the answer is converted back into Anthropic's message and
+/// event protocol. Native Anthropic targets skip the conversion entirely.
+pub async fn proxy_anthropic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    match proxy_anthropic_inner(&state, &headers, &uri, &body).await {
+        Ok(response) => response,
+        Err(error) => anthropic_error_response(error),
+    }
+}
+
+/// Renders a gateway error in Anthropic's envelope and status vocabulary so an
+/// Anthropic client can parse it with its usual error handling.
+fn anthropic_error_response(error: AppError) -> Response {
+    let (status, error_type) = match &error {
+        AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
+        AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
+        AppError::Conflict(_) => (StatusCode::CONFLICT, "invalid_request_error"),
+        AppError::Upstream(_) => (StatusCode::BAD_GATEWAY, "api_error"),
+        AppError::Database(_) | AppError::Http(_) | AppError::Internal(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "api_error")
+        }
+    };
+    if status.is_server_error() {
+        tracing::error!(error = %error, "anthropic request failed");
+    }
+    (
+        status,
+        Json(anthropic_error_body(error_type, &error.to_string())),
+    )
+        .into_response()
+}
+
+async fn proxy_anthropic_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+) -> AppResult<Response> {
+    let started = Instant::now();
+    let endpoint = uri.path().to_string();
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let inbound: Value = serde_json::from_slice(body).map_err(|error| {
+        AppError::BadRequest(format!("request body must be valid JSON: {error}"))
+    })?;
+    let requested_model = requested_model_of(&inbound)?;
+    let streamed = inbound
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Convert once up front: routing, barrel clamping and token estimation all
+    // operate on the OpenAI shape.
+    let mut request_json = anthropic_request_to_openai(&inbound, &requested_model);
+    let request_tokens = estimate_request_tokens(&request_json);
+
+    let api_key = authenticate_gateway(state, headers).await?;
+    let resolved = resolve_route(state, &requested_model).await?;
+    let route_id = resolved.route_id;
+    let requested_output_tokens = request_json.get("max_tokens").and_then(Value::as_i64);
+    let clamped_output_tokens = clamp_output_request(&mut request_json, resolved.barrel.as_ref());
+    let receipt = capability_receipt(
+        resolved.barrel.as_ref(),
+        requested_output_tokens,
+        clamped_output_tokens,
+    );
+    let ordering_key = route_id.unwrap_or(-1);
+    let ordered_targets =
+        order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
+
+    let mut last_error = None;
+    for target in ordered_targets {
+        let result = if target.provider_type == "anthropic" {
+            // Native target: forward the caller's Anthropic payload unchanged,
+            // only swapping in the resolved upstream model.
+            let mut native = inbound.clone();
+            native["model"] = json!(target.upstream_model);
+            forward_anthropic_native(
+                state,
+                &request_id,
+                &requested_model,
+                native,
+                target,
+                streamed,
+                request_tokens,
+                api_key.as_ref(),
+                started,
+                receipt.clone(),
+            )
+            .await
+        } else {
+            forward_openai_as_anthropic(
+                state,
+                &request_id,
+                &requested_model,
+                &request_json,
+                target,
+                streamed,
+                request_tokens,
+                api_key.as_ref(),
+                started,
+                receipt.clone(),
+            )
+            .await
+        };
+        match result {
+            Ok(response) => return Ok(response),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    let error = last_error
+        .unwrap_or_else(|| AppError::Upstream("all configured route targets failed".to_string()));
+    log_usage(
+        state,
+        UsageLogEntry {
+            request_id: &request_id,
+            api_key_id: api_key.as_ref().map(|key| key.id),
+            route_id,
+            provider_id: None,
+            requested_model: &requested_model,
+            upstream_model: None,
+            endpoint: &endpoint,
+            usage: Usage {
+                prompt_tokens: request_tokens,
+                completion_tokens: 0,
+                total_tokens: request_tokens,
+            },
+            latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            status_code: 502,
+            success: false,
+            streamed,
+            error_message: Some(&error.to_string()),
+            response_preview: None,
+        },
+    )
+    .await;
+    Err(error)
+}
+
+/// Forwards an Anthropic-shaped request to a native Anthropic provider.
+///
+/// The upstream already speaks the caller's protocol, so the response can be
+/// streamed straight back with no translation.
+#[allow(clippy::too_many_arguments)]
+async fn forward_anthropic_native(
+    state: &AppState,
+    request_id: &str,
+    requested_model: &str,
+    body: Value,
+    target: RouteTarget,
+    streamed: bool,
+    request_tokens: i64,
+    api_key: Option<&ApiKeyRecord>,
+    started: Instant,
+    receipt: Option<Value>,
+) -> AppResult<Response> {
+    let url = join_upstream_url(&target.base_url, ANTHROPIC_MESSAGES);
+    let mut request = state
+        .client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body);
+    if let Some(key) = &target.api_key {
+        request = request
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01");
+    }
+    request = apply_custom_headers(request, &target.provider_headers)?;
+
+    let response = request.send().await.map_err(|error| {
+        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let response_body = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let message = String::from_utf8_lossy(&response_body)
+            .chars()
+            .take(600)
+            .collect::<String>();
+        if retryable_status(status) {
+            return Err(AppError::Upstream(format!(
+                "{} returned {}: {}",
+                target.provider_name, status, message
+            )));
+        }
+        let preview = response_preview(&response_body);
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: ANTHROPIC_MESSAGES,
+                usage: Usage {
+                    prompt_tokens: request_tokens,
+                    completion_tokens: 0,
+                    total_tokens: request_tokens,
+                },
+                latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: None,
+                status_code: status.as_u16() as i64,
+                success: false,
+                streamed,
+                error_message: Some(&message),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+        // Preserve the upstream status and Anthropic-shaped error body.
+        return Ok(Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(response_body))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
+    }
+
+    if streamed {
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("text/event-stream")
+            .to_string();
+        return Ok(passthrough_stream_response(
+            state.clone(),
+            response,
+            content_type,
+            ANTHROPIC_MESSAGES.to_string(),
+            request_id.to_string(),
+            requested_model.to_string(),
+            target,
+            request_tokens,
+            api_key.cloned(),
+            started,
+            receipt,
+        ));
+    }
+
+    let response_bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Upstream(error.to_string()))?;
+    let usage = extract_usage_from_json(&response_bytes)
+        .unwrap_or_else(|| estimated_completion_usage(request_tokens, &response_bytes));
+    let preview = response_preview(&response_bytes);
+    log_usage_detached(
+        state.clone(),
+        OwnedUsageLogEntry {
+            request_id: request_id.to_string(),
+            api_key_id: api_key.map(|key| key.id),
+            route_id: target.route_id,
+            provider_id: Some(target.provider_id),
+            requested_model: requested_model.to_string(),
+            upstream_model: Some(target.upstream_model.clone()),
+            endpoint: ANTHROPIC_MESSAGES.to_string(),
+            usage,
+            latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            status_code: status.as_u16() as i64,
+            success: true,
+            streamed: false,
+            error_message: None,
+            response_preview: preview,
+        },
+    );
+    let mut response = Response::builder()
+        .status(status)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(response_bytes))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    Ok(response)
+}
+
+/// Forwards an OpenAI-shaped request to an OpenAI-compatible provider and
+/// converts the completion back into an Anthropic message.
+#[allow(clippy::too_many_arguments)]
+async fn forward_openai_as_anthropic(
+    state: &AppState,
+    request_id: &str,
+    requested_model: &str,
+    request_json: &Value,
+    target: RouteTarget,
+    streamed: bool,
+    request_tokens: i64,
+    api_key: Option<&ApiKeyRecord>,
+    started: Instant,
+    receipt: Option<Value>,
+) -> AppResult<Response> {
+    let mut body = request_json.clone();
+    body["model"] = json!(target.upstream_model);
+    let url = join_upstream_url(&target.base_url, OPENAI_CHAT_COMPLETIONS);
+    let mut request = state
+        .client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(&body);
+    if let Some(key) = &target.api_key {
+        request = request.bearer_auth(key);
+    }
+    request = apply_custom_headers(request, &target.provider_headers)?;
+
+    let response = request.send().await.map_err(|error| {
+        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        let response_body = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let message = String::from_utf8_lossy(&response_body)
+            .chars()
+            .take(600)
+            .collect::<String>();
+        if retryable_status(status) {
+            return Err(AppError::Upstream(format!(
+                "{} returned {}: {}",
+                target.provider_name, status, message
+            )));
+        }
+        // Non-retryable: surface the upstream failure verbatim so the operator
+        // sees the provider's own message rather than a generic gateway error.
+        let preview = response_preview(&response_body);
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: ANTHROPIC_MESSAGES,
+                usage: Usage {
+                    prompt_tokens: request_tokens,
+                    completion_tokens: 0,
+                    total_tokens: request_tokens,
+                },
+                latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: None,
+                status_code: status.as_u16() as i64,
+                success: false,
+                streamed,
+                error_message: Some(&message),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+        return Ok(Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&anthropic_error_body("api_error", &message))
+                    .unwrap_or_default(),
+            ))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
+    }
+
+    if streamed {
+        return Ok(openai_stream_to_anthropic(
+            state.clone(),
+            response,
+            request_id.to_string(),
+            requested_model.to_string(),
+            target,
+            request_tokens,
+            api_key.cloned(),
+            started,
+        ));
+    }
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| AppError::Upstream(error.to_string()))?;
+    let upstream: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| AppError::Upstream(format!("invalid JSON from upstream: {error}")))?;
+    let (converted, usage) = openai_response_to_anthropic(&upstream, requested_model);
+    let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
+    let preview = response_preview(converted_bytes.as_slice());
+    log_usage(
+        state,
+        UsageLogEntry {
+            request_id,
+            api_key_id: api_key.map(|key| key.id),
+            route_id: target.route_id,
+            provider_id: Some(target.provider_id),
+            requested_model,
+            upstream_model: Some(&target.upstream_model),
+            endpoint: ANTHROPIC_MESSAGES,
+            usage: fill_usage(usage, request_tokens, &converted),
+            latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            status_code: status.as_u16() as i64,
+            success: true,
+            streamed: false,
+            error_message: None,
+            response_preview: preview.as_deref(),
+        },
+    )
+    .await;
+    let mut response = Response::builder()
+        .status(status)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(Body::from(converted_bytes))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    Ok(response)
+}
+
 pub async fn proxy_openai(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -86,12 +1174,7 @@ pub async fn proxy_openai(
     let mut request_json: Value = serde_json::from_slice(&body).map_err(|error| {
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
-    let requested_model = request_json
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|model| !model.trim().is_empty())
-        .ok_or_else(|| AppError::BadRequest("request body must include a model".to_string()))?
-        .to_string();
+    let requested_model = requested_model_of(&request_json)?;
     let streamed = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -1462,7 +2545,26 @@ impl UsageParser {
             return;
         };
         if let Some(usage) = usage_from_value(&value) {
-            self.usage = Some(usage);
+            // Merge instead of replace: Anthropic reports input tokens in
+            // `message_start` and output tokens later in `message_delta`, so
+            // overwriting would drop whichever side arrived first.
+            self.usage = Some(match self.usage.take() {
+                Some(previous) => Usage {
+                    prompt_tokens: if usage.prompt_tokens > 0 {
+                        usage.prompt_tokens
+                    } else {
+                        previous.prompt_tokens
+                    },
+                    completion_tokens: if usage.completion_tokens > 0 {
+                        usage.completion_tokens
+                    } else {
+                        previous.completion_tokens
+                    },
+                    total_tokens: 0,
+                }
+                .normalized(),
+                None => usage,
+            });
         }
         if let Some(content) = value
             .pointer("/choices/0/delta/content")
@@ -1515,7 +2617,11 @@ fn extract_usage_from_json(bytes: &[u8]) -> Option<Usage> {
 fn usage_from_value(value: &Value) -> Option<Usage> {
     let usage = value
         .get("usage")
-        .or_else(|| value.pointer("/response/usage"))?;
+        .or_else(|| value.pointer("/response/usage"))
+        // Native Anthropic streams report usage in two different places:
+        // `message_start` nests it under `message.usage`, while `message_delta`
+        // carries a top-level `usage` (handled by the first branch above).
+        .or_else(|| value.pointer("/message/usage"))?;
     let prompt_tokens = usage
         .get("prompt_tokens")
         .or_else(|| usage.get("input_tokens"))
@@ -2028,6 +3134,250 @@ mod tests {
         // Non-JSON bodies must be left alone rather than replaced.
         assert!(inject_capability_receipt(b"not json", &receipt).is_none());
         assert!(inject_capability_receipt(b"{}", &None).is_none());
+    }
+
+    #[test]
+    fn converts_anthropic_request_into_openai_shape() {
+        let inbound = json!({
+            "model": "claude-x",
+            "system": "be brief",
+            "max_tokens": 256,
+            "temperature": 0.3,
+            "stop_sequences": ["STOP"],
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]}
+            ],
+            "tools": [{
+                "name": "get_weather",
+                "description": "weather",
+                "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }],
+            "tool_choice": {"type": "tool", "name": "get_weather"}
+        });
+        let openai = anthropic_request_to_openai(&inbound, "claude-x");
+
+        assert_eq!(openai["max_tokens"], 256);
+        assert_eq!(openai["temperature"], 0.3);
+        assert_eq!(openai["stop"], json!(["STOP"]));
+        // The system prompt becomes a leading system message.
+        assert_eq!(openai["messages"][0]["role"], "system");
+        assert_eq!(openai["messages"][0]["content"], "be brief");
+        // A text-only user turn collapses to a plain string.
+        assert_eq!(openai["messages"][1]["role"], "user");
+        assert_eq!(openai["messages"][1]["content"], "hi");
+        // Anthropic tool schema maps onto the OpenAI function shape.
+        assert_eq!(openai["tools"][0]["type"], "function");
+        assert_eq!(openai["tools"][0]["function"]["name"], "get_weather");
+        assert_eq!(
+            openai["tools"][0]["function"]["parameters"]["type"],
+            "object"
+        );
+        assert_eq!(openai["tool_choice"]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn converts_anthropic_tool_use_and_results_round_trip() {
+        // Assistant asks for a tool, then the user returns its result.
+        let inbound = json!({
+            "model": "claude-x",
+            "max_tokens": 128,
+            "messages": [
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "checking"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "18C"}
+                ]}
+            ]
+        });
+        let openai = anthropic_request_to_openai(&inbound, "claude-x");
+        let assistant = &openai["messages"][0];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["content"], "checking");
+        assert_eq!(assistant["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
+        assert_eq!(
+            assistant["tool_calls"][0]["function"]["arguments"],
+            "{\"city\":\"Paris\"}"
+        );
+        // The tool result becomes a dedicated role: tool message.
+        let tool = &openai["messages"][1];
+        assert_eq!(tool["role"], "tool");
+        assert_eq!(tool["tool_call_id"], "toolu_1");
+        assert_eq!(tool["content"], "18C");
+    }
+
+    #[test]
+    fn converts_openai_completion_into_anthropic_message() {
+        let upstream = json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "hello"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+        });
+        let (message, usage) = openai_response_to_anthropic(&upstream, "claude-x");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert_eq!(message["model"], "claude-x");
+        assert_eq!(message["content"][0]["type"], "text");
+        assert_eq!(message["content"][0]["text"], "hello");
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(message["usage"]["input_tokens"], 4);
+        assert_eq!(message["usage"]["output_tokens"], 2);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (4, 2));
+    }
+
+    #[test]
+    fn converts_openai_tool_call_into_anthropic_tool_use() {
+        let upstream = json!({
+            "id": "chatcmpl-abc",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 5, "total_tokens": 8}
+        });
+        let (message, _) = openai_response_to_anthropic(&upstream, "claude-x");
+        // No text block: a tool-only answer must not emit an empty text block.
+        assert_eq!(message["content"].as_array().unwrap().len(), 1);
+        assert_eq!(message["content"][0]["type"], "tool_use");
+        assert_eq!(message["content"][0]["id"], "call_1");
+        assert_eq!(message["content"][0]["name"], "get_weather");
+        assert_eq!(message["content"][0]["input"]["city"], "Paris");
+        assert_eq!(message["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn maps_openai_finish_reasons_to_anthropic_stop_reasons() {
+        assert_eq!(anthropic_stop_reason(Some("length"), false), "max_tokens");
+        assert_eq!(anthropic_stop_reason(Some("tool_calls"), false), "tool_use");
+        assert_eq!(anthropic_stop_reason(Some("stop"), false), "end_turn");
+        // A tool_use block is authoritative even without a matching reason.
+        assert_eq!(anthropic_stop_reason(None, true), "tool_use");
+    }
+
+    #[tokio::test]
+    async fn rewrites_openai_stream_into_anthropic_events() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let context = StreamContext {
+            message_id: "msg_test".to_string(),
+            model: "claude-x".to_string(),
+            input_tokens: 7,
+        };
+        let mut state = AnthropicStreamState::default();
+
+        let lines: [&[u8]; 5] = [
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hel\"}}]}\n",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"}}]}\n",
+            b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\n",
+            b"data: [DONE]\n",
+        ];
+        let mut saw_done = false;
+        for line in lines {
+            if !process_openai_line_for_anthropic(line, &mut state, &context, &tx).await {
+                saw_done = true;
+            }
+        }
+        assert!(saw_done, "[DONE] must terminate the stream");
+        // Exercise the same closing sequence the live handler uses.
+        finish_anthropic_stream(&mut state, &context, &tx).await;
+        drop(tx);
+
+        let mut frames = Vec::new();
+        while let Some(item) = rx.recv().await {
+            frames.push(String::from_utf8(item.unwrap().to_vec()).unwrap());
+        }
+        let all = frames.join("");
+
+        assert!(all.contains("event: message_start"), "{all}");
+        assert!(all.contains("event: content_block_start"), "{all}");
+        assert!(all.contains("\"type\":\"text_delta\""), "{all}");
+        // Text deltas must not be re-joined; each chunk passes through.
+        assert!(all.contains("\"text\":\"Hel\""), "{all}");
+        assert!(all.contains("\"text\":\"lo\""), "{all}");
+        assert!(all.contains("event: content_block_stop"), "{all}");
+        assert!(all.contains("event: message_delta"), "{all}");
+        assert!(all.contains("\"stop_reason\":\"end_turn\""), "{all}");
+        assert!(all.contains("event: message_stop"), "{all}");
+        assert_eq!(state.output_tokens, 2);
+        assert_eq!(state.text, "Hello");
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_maps_tool_calls_to_tool_use_blocks() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let context = StreamContext {
+            message_id: "msg_test".to_string(),
+            model: "claude-x".to_string(),
+            input_tokens: 5,
+        };
+        let mut state = AnthropicStreamState::default();
+        // Build the frames with serde so nested JSON escaping stays correct.
+        let frames = [
+            json!({"choices":[{"index":0,"delta":{"content":"thinking"}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"get_weather","arguments":"{\"city\":"}}]}}]}),
+            json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]}}]}),
+        ];
+        for frame in frames {
+            let line = format!("data: {frame}\n");
+            process_openai_line_for_anthropic(line.as_bytes(), &mut state, &context, &tx).await;
+        }
+        process_openai_line_for_anthropic(b"data: [DONE]\n", &mut state, &context, &tx).await;
+        drop(tx);
+
+        let mut all = String::new();
+        while let Some(item) = rx.recv().await {
+            all.push_str(std::str::from_utf8(&item.unwrap()).unwrap());
+        }
+        assert!(all.contains("\"type\":\"tool_use\""), "{all}");
+        assert!(all.contains("\"name\":\"get_weather\""), "{all}");
+        assert!(all.contains("\"type\":\"input_json_delta\""), "{all}");
+        assert!(all.contains("partial_json"), "{all}");
+        assert!(state.has_tool_use);
+        assert_eq!(state.finish_reason, None);
+    }
+
+    #[test]
+    fn anthropic_request_requires_a_model() {
+        let missing = json!({"max_tokens": 10, "messages": []});
+        assert!(requested_model_of(&missing).is_err());
+        let present = json!({"model": "claude-x"});
+        assert_eq!(requested_model_of(&present).unwrap(), "claude-x");
+    }
+
+    #[test]
+    fn stream_usage_merges_anthropic_start_and_delta() {
+        // Anthropic sends input tokens in `message_start`...
+        let mut parser = UsageParser::new(Instant::now());
+        parser.push(
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"output_tokens\":0}}}\n\n",
+        );
+        // ...and output tokens later in `message_delta`.
+        parser.push(
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+        );
+        let usage = parser.finish().expect("usage should be parsed");
+        // Both sides must survive; replacing would leave one of them at zero.
+        assert_eq!(usage.prompt_tokens, 11);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 14);
     }
 
     #[test]

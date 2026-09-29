@@ -25,6 +25,7 @@ import {
 } from 'antd'
 import { api, formatError, type Provider, type ProviderInput } from '../api'
 import PageHeader from '../components/PageHeader'
+import { providerPresets } from '../providerPresets'
 
 const providerLabels = {
   openai: 'OpenAI 兼容',
@@ -45,6 +46,7 @@ export default function Providers() {
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState<Provider>()
   const [open, setOpen] = useState(false)
+  const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
 
   const load = async () => {
@@ -81,7 +83,20 @@ export default function Providers() {
       headersText: '{}',
       modelsText: '',
     } as never)
+    setPresetKey(undefined)
     setOpen(true)
+  }
+
+  /**
+   * Fills the form from a common provider preset. Only connection details are
+   * written, so anything the user already typed (keys, headers, model list)
+   * survives a preset change.
+   */
+  const applyPreset = (key: string) => {
+    setPresetKey(key)
+    const preset = providerPresets.find((item) => item.key === key)
+    if (!preset) return
+    form.setFieldsValue(preset.values as never)
   }
 
   const save = async () => {
@@ -261,6 +276,24 @@ export default function Providers() {
         destroyOnHidden
       >
         <Form form={form} layout="vertical" className="modal-form">
+          {!editing && (
+            <Form.Item label="常用提供商" extra="选择后自动填入协议、地址和模型前缀，仍可手动修改。">
+              <Select
+                showSearch
+                allowClear
+                value={presetKey}
+                onChange={(value) => (value ? applyPreset(value) : setPresetKey(undefined))}
+                placeholder="选择预设快速填充"
+                optionFilterProp="label"
+                options={Array.from(new Set(providerPresets.map((item) => item.group))).map((group) => ({
+                  label: group,
+                  options: providerPresets
+                    .filter((item) => item.group === group)
+                    .map((item) => ({ value: item.key, label: item.label })),
+                }))}
+              />
+            </Form.Item>
+          )}
           <div className="form-grid">
             <Form.Item name="name" label="名称" rules={[{ required: true, message: '请输入名称' }]}>
               <Input placeholder="例如 OpenAI" />
