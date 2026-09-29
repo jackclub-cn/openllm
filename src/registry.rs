@@ -54,7 +54,12 @@ const CAPABILITY_COLUMNS: &str = "COALESCE(pm.context_override, pm.context_limit
      pm.attachment AS attachment, pm.reasoning AS reasoning, \
      pm.tool_call AS tool_call, pm.structured_output AS structured_output, \
      pm.temperature AS temperature, pm.open_weights AS open_weights, \
-     pm.modalities AS modalities, pm.cost AS cost, pm.family AS family, \
+     pm.modalities AS modalities, pm.cost AS cost, \
+     pm.cost_input_override AS cost_input_override, \
+     pm.cost_output_override AS cost_output_override, \
+     pm.cost_cache_read_override AS cost_cache_read_override, \
+     pm.cost_cache_write_override AS cost_cache_write_override, \
+     pm.family AS family, \
      pm.knowledge AS knowledge, pm.release_date AS release_date, \
      pm.last_updated AS last_updated, pm.canonical_model_id AS canonical_model_id";
 
@@ -71,6 +76,10 @@ struct CapabilityRow {
     open_weights: Option<i64>,
     modalities: Option<String>,
     cost: Option<String>,
+    cost_input_override: Option<f64>,
+    cost_output_override: Option<f64>,
+    cost_cache_read_override: Option<f64>,
+    cost_cache_write_override: Option<f64>,
     family: Option<String>,
     knowledge: Option<String>,
     release_date: Option<String>,
@@ -81,6 +90,7 @@ struct CapabilityRow {
 impl CapabilityRow {
     fn into_capabilities(self) -> Option<ModelCapabilities> {
         let boolean = |value: Option<i64>| value.map(|value| value != 0);
+        let cost = parse_json_column(self.cost);
         let capabilities = ModelCapabilities {
             context_limit: self.context_limit,
             output_limit: self.output_limit,
@@ -93,7 +103,13 @@ impl CapabilityRow {
             open_weights: boolean(self.open_weights),
             input_modalities: stored_modality(&self.modalities, "input"),
             output_modalities: stored_modality(&self.modalities, "output"),
-            cost: parse_json_column(self.cost),
+            cost: crate::models::effective_cost_value(
+                cost.as_ref(),
+                self.cost_input_override,
+                self.cost_output_override,
+                self.cost_cache_read_override,
+                self.cost_cache_write_override,
+            ),
             family: self.family,
             knowledge: self.knowledge,
             release_date: self.release_date,
@@ -302,6 +318,10 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
 /// in `route_models`, this keeps the intersection helper borrowing-friendly.
 fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
     let boolean = |value: Option<i64>| value.map(|value| value != 0);
+    let cost = row
+        .cost
+        .as_ref()
+        .and_then(|value| serde_json::from_str::<Value>(value).ok());
     let capabilities = ModelCapabilities {
         context_limit: row.context_limit,
         output_limit: row.output_limit,
@@ -314,10 +334,13 @@ fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
         open_weights: boolean(row.open_weights),
         input_modalities: stored_modality(&row.modalities, "input"),
         output_modalities: stored_modality(&row.modalities, "output"),
-        cost: row
-            .cost
-            .as_ref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        cost: crate::models::effective_cost_value(
+            cost.as_ref(),
+            row.cost_input_override,
+            row.cost_output_override,
+            row.cost_cache_read_override,
+            row.cost_cache_write_override,
+        ),
         family: row.family.clone(),
         knowledge: row.knowledge.clone(),
         release_date: row.release_date.clone(),

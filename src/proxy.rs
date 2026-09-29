@@ -20,7 +20,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteDiagnoseTarget,
-    RouteDiagnoseView, RouteStrategy, RouteTarget, Usage, estimate_cost_micros,
+    RouteDiagnoseView, RouteStrategy, RouteTarget, Usage, effective_cost_value,
+    estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -4488,18 +4489,31 @@ async fn estimate_usage_cost(
     upstream_model: &str,
     usage: Usage,
 ) -> Option<i64> {
-    let raw = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT cost FROM provider_models \
+    let row = sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ),
+    >(
+        "SELECT cost, cost_input_override, cost_output_override, \
+                cost_cache_read_override, cost_cache_write_override \
+         FROM provider_models \
          WHERE provider_id = ? AND model_name = ? AND enabled = 1",
     )
     .bind(provider_id)
     .bind(upstream_model)
     .fetch_optional(&state.pool)
     .await
-    .ok()
-    .flatten()
-    .flatten()?;
-    let cost = serde_json::from_str::<Value>(&raw).ok()?;
+    .ok()??;
+    let synced = row
+        .0
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+    let cost = effective_cost_value(synced.as_ref(), row.1, row.2, row.3, row.4)?;
     estimate_cost_micros(Some(&cost), usage)
 }
 
@@ -4897,6 +4911,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn usage_cost_uses_manual_price_overrides() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'priced', 'openai', 'http://priced')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, enabled,
+                cost_input_override, cost_output_override
+             ) VALUES (1, 'model', 1, 2.0, 4.0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let cost = estimate_usage_cost(&state, 1, "model", Usage::new(1_000_000, 1_000_000))
+            .await
+            .unwrap();
+        assert_eq!(cost, 6_000_000);
+    }
+
+    #[tokio::test]
     async fn route_diagnosis_explains_each_target() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -5095,7 +5141,11 @@ mod tests {
                 last_updated TEXT,
                 canonical_model_id TEXT,
                 supported_endpoints TEXT,
-                supported_endpoints_override TEXT
+                supported_endpoints_override TEXT,
+                cost_input_override REAL,
+                cost_output_override REAL,
+                cost_cache_read_override REAL,
+                cost_cache_write_override REAL
             )",
         )
         .execute(&pool)
@@ -5191,7 +5241,11 @@ mod tests {
                 last_updated TEXT,
                 canonical_model_id TEXT,
                 supported_endpoints TEXT,
-                supported_endpoints_override TEXT
+                supported_endpoints_override TEXT,
+                cost_input_override REAL,
+                cost_output_override REAL,
+                cost_cache_read_override REAL,
+                cost_cache_write_override REAL
             )",
         )
         .execute(&pool)

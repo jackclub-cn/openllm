@@ -181,6 +181,16 @@ pub struct ProviderModelLimitView {
     pub context_override: Option<i64>,
     pub input_override: Option<i64>,
     pub output_override: Option<i64>,
+    /// Effective USD-per-million-token prices after applying overrides.
+    pub cost_input: Option<f64>,
+    pub cost_output: Option<f64>,
+    pub cost_cache_read: Option<f64>,
+    pub cost_cache_write: Option<f64>,
+    /// Manual price values. `None` keeps the synchronized price.
+    pub cost_input_override: Option<f64>,
+    pub cost_output_override: Option<f64>,
+    pub cost_cache_read_override: Option<f64>,
+    pub cost_cache_write_override: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -196,6 +206,14 @@ pub struct ProviderModelLimitInput {
     pub input_limit: Option<i64>,
     #[serde(default)]
     pub output_limit: Option<i64>,
+    #[serde(default)]
+    pub cost_input_override: Option<f64>,
+    #[serde(default)]
+    pub cost_output_override: Option<f64>,
+    #[serde(default)]
+    pub cost_cache_read_override: Option<f64>,
+    #[serde(default)]
+    pub cost_cache_write_override: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1052,6 +1070,54 @@ impl Usage {
     }
 }
 
+/// Merges manual price overrides into a models.dev cost object.
+///
+/// Overrides are applied to both the base object and every tier, so a manual
+/// correction wins regardless of which context tier the request selects.
+pub fn effective_cost_value(
+    cost: Option<&serde_json::Value>,
+    input: Option<f64>,
+    output: Option<f64>,
+    cache_read: Option<f64>,
+    cache_write: Option<f64>,
+) -> Option<serde_json::Value> {
+    if input.is_none() && output.is_none() && cache_read.is_none() && cache_write.is_none() {
+        return cost.cloned().filter(|value| value.is_object());
+    }
+    let mut object = cost
+        .and_then(serde_json::Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in [
+        ("input", input),
+        ("output", output),
+        ("cache_read", cache_read),
+        ("cache_write", cache_write),
+    ] {
+        let Some(value) = value else {
+            continue;
+        };
+        let value = serde_json::json!(value);
+        object.insert(key.to_string(), value.clone());
+        if let Some(tiers) = object
+            .get_mut("tiers")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for tier in tiers {
+                if let Some(tier) = tier.as_object_mut() {
+                    tier.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+    Some(serde_json::Value::Object(object))
+}
+
+/// Reads a base, non-tiered price for display in the management console.
+pub fn cost_base_price(cost: &serde_json::Value, key: &str) -> Option<f64> {
+    cost_price(cost, cost, key)
+}
+
 /// Estimates a request's cost in micro-US dollars from models.dev pricing.
 ///
 /// Prices are expressed per million tokens, so multiplying a token count by
@@ -1361,6 +1427,25 @@ mod capability_tests {
             estimate_cost_micros(Some(&cost), usage),
             Some(500_000 + 40_000 + 125_000 + 2_000_000)
         );
+    }
+
+    #[test]
+    fn cost_overrides_apply_to_base_and_tiered_prices() {
+        let synced = serde_json::json!({
+            "input": 2.0,
+            "output": 10.0,
+            "tiers": [
+                {"input": 4.0, "output": 20.0}
+            ]
+        });
+        let effective =
+            effective_cost_value(Some(&synced), Some(1.5), None, Some(0.25), None).unwrap();
+        assert_eq!(cost_base_price(&effective, "input"), Some(1.5));
+        assert_eq!(cost_base_price(&effective, "cache_read"), Some(0.25));
+        assert_eq!(cost_base_price(&effective, "output"), Some(10.0));
+        assert_eq!(effective["tiers"][0]["input"], serde_json::json!(1.5));
+        assert_eq!(effective["tiers"][0]["cache_read"], serde_json::json!(0.25));
+        assert_eq!(effective["tiers"][0]["output"], serde_json::json!(20.0));
     }
 
     #[test]

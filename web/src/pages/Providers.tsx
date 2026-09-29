@@ -317,6 +317,22 @@ export default function Providers() {
     )
   }
 
+  const updateCostOverride = (
+    modelName: string,
+    field:
+      | 'cost_input_override'
+      | 'cost_output_override'
+      | 'cost_cache_read_override'
+      | 'cost_cache_write_override',
+    value: number | null,
+  ) => {
+    setLimitRows((rows) =>
+      rows.map((row) =>
+        row.model_name === modelName ? { ...row, [field]: value ?? undefined } : row,
+      ),
+    )
+  }
+
   const toggleLimitRow = (modelName: string, enabled: boolean) => {
     setLimitRows((rows) =>
       rows.map((row) => (row.model_name === modelName ? { ...row, enabled } : row)),
@@ -348,6 +364,10 @@ export default function Providers() {
               input_override: undefined,
               output_override: undefined,
               supported_endpoints_override: undefined,
+              cost_input_override: undefined,
+              cost_output_override: undefined,
+              cost_cache_read_override: undefined,
+              cost_cache_write_override: undefined,
             }
           : row,
       ),
@@ -363,6 +383,10 @@ export default function Providers() {
       context_limit: row.context_override ?? null,
       input_limit: row.input_override ?? null,
       output_limit: row.output_override ?? null,
+      cost_input_override: row.cost_input_override ?? null,
+      cost_output_override: row.cost_output_override ?? null,
+      cost_cache_read_override: row.cost_cache_read_override ?? null,
+      cost_cache_write_override: row.cost_cache_write_override ?? null,
     }))
     setLimitsSaving(true)
     try {
@@ -685,7 +709,7 @@ export default function Providers() {
         destroyOnHidden
       >
         <Typography.Paragraph type="secondary">
-          停用后模型不会出现在 /v1/models 或参与路由。上限和接口留空使用同步值，填写后覆盖同步值。
+          停用后模型不会出现在 /v1/models 或参与路由。上限、接口和价格留空使用同步值，填写后覆盖同步值。
         </Typography.Paragraph>
         <Space wrap style={{ marginBottom: 12 }}>
           <Input
@@ -747,7 +771,7 @@ export default function Providers() {
             showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
             onChange: setLimitPage,
           }}
-          scroll={{ x: 1370, y: 520 }}
+          scroll={{ x: 1690, y: 520 }}
           locale={{ emptyText: '暂无模型' }}
           columns={[
             {
@@ -880,6 +904,62 @@ export default function Providers() {
               ),
             },
             {
+              title: '价格覆盖（USD / 1M）',
+              width: 320,
+              render: (_, record) => (
+                <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                  <InputNumber
+                    min={0}
+                    precision={6}
+                    disabled={!record.enabled}
+                    value={record.cost_input_override}
+                    placeholder={record.cost_input?.toString() ?? '输入'}
+                    addonBefore="输入"
+                    onChange={(value) =>
+                      updateCostOverride(record.model_name, 'cost_input_override', value)
+                    }
+                    style={{ width: '100%' }}
+                  />
+                  <InputNumber
+                    min={0}
+                    precision={6}
+                    disabled={!record.enabled}
+                    value={record.cost_output_override}
+                    placeholder={record.cost_output?.toString() ?? '输出'}
+                    addonBefore="输出"
+                    onChange={(value) =>
+                      updateCostOverride(record.model_name, 'cost_output_override', value)
+                    }
+                    style={{ width: '100%' }}
+                  />
+                  <InputNumber
+                    min={0}
+                    precision={6}
+                    disabled={!record.enabled}
+                    value={record.cost_cache_read_override}
+                    placeholder={record.cost_cache_read?.toString() ?? '缓存读'}
+                    addonBefore="缓存读"
+                    onChange={(value) =>
+                      updateCostOverride(record.model_name, 'cost_cache_read_override', value)
+                    }
+                    style={{ width: '100%' }}
+                  />
+                  <InputNumber
+                    min={0}
+                    precision={6}
+                    disabled={!record.enabled}
+                    value={record.cost_cache_write_override}
+                    placeholder={record.cost_cache_write?.toString() ?? '缓存写'}
+                    addonBefore="缓存写"
+                    onChange={(value) =>
+                      updateCostOverride(record.model_name, 'cost_cache_write_override', value)
+                    }
+                    style={{ width: '100%' }}
+                  />
+                </Space>
+              ),
+            },
+            {
               title: '状态',
               width: 80,
               render: (_, record) =>
@@ -888,7 +968,11 @@ export default function Providers() {
                 ) : record.context_override != null ||
                 record.input_override != null ||
                 record.output_override != null ||
-                record.supported_endpoints_override != null ? (
+                record.supported_endpoints_override != null ||
+                record.cost_input_override != null ||
+                record.cost_output_override != null ||
+                record.cost_cache_read_override != null ||
+                record.cost_cache_write_override != null ? (
                   <Tag color="blue">已覆盖</Tag>
                 ) : (
                   <Tag>同步值</Tag>

@@ -849,6 +849,10 @@ pub async fn update_provider_model_limits(
         validate_limit("context", model.context_limit)?;
         validate_limit("input", model.input_limit)?;
         validate_limit("output", model.output_limit)?;
+        validate_cost_override("input cost", model.cost_input_override)?;
+        validate_cost_override("output cost", model.cost_output_override)?;
+        validate_cost_override("cache read cost", model.cost_cache_read_override)?;
+        validate_cost_override("cache write cost", model.cost_cache_write_override)?;
         if let (Some(context), Some(input)) = (model.context_limit, model.input_limit)
             && input > context
         {
@@ -866,7 +870,9 @@ pub async fn update_provider_model_limits(
         let result = sqlx::query(
             "UPDATE provider_models \
              SET enabled = ?, context_override = ?, input_override = ?, output_override = ?, \
-                 supported_endpoints_override = ? \
+                 supported_endpoints_override = ?, cost_input_override = ?, \
+                 cost_output_override = ?, cost_cache_read_override = ?, \
+                 cost_cache_write_override = ? \
              WHERE provider_id = ? AND model_name = ?",
         )
         .bind(model.enabled as i64)
@@ -874,6 +880,10 @@ pub async fn update_provider_model_limits(
         .bind(model.input_limit)
         .bind(model.output_limit)
         .bind(endpoint_override)
+        .bind(model.cost_input_override)
+        .bind(model.cost_output_override)
+        .bind(model.cost_cache_read_override)
+        .bind(model.cost_cache_write_override)
         .bind(id)
         .bind(model.model_name.trim())
         .execute(&mut *tx)
@@ -926,7 +936,12 @@ async fn provider_model_limits(
                output_override,
                COALESCE(supported_endpoints_override, supported_endpoints)
                    AS supported_endpoints,
-               supported_endpoints_override
+               supported_endpoints_override,
+               cost,
+               cost_input_override,
+               cost_output_override,
+               cost_cache_read_override,
+               cost_cache_write_override
         FROM provider_models
         WHERE provider_id = ?
         ORDER BY model_name COLLATE NOCASE
@@ -950,10 +965,26 @@ struct ProviderModelLimitRow {
     output_override: Option<i64>,
     supported_endpoints: Option<String>,
     supported_endpoints_override: Option<String>,
+    cost: Option<String>,
+    cost_input_override: Option<f64>,
+    cost_output_override: Option<f64>,
+    cost_cache_read_override: Option<f64>,
+    cost_cache_write_override: Option<f64>,
 }
 
 impl From<ProviderModelLimitRow> for ProviderModelLimitView {
     fn from(value: ProviderModelLimitRow) -> Self {
+        let cost = value
+            .cost
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok());
+        let effective_cost = crate::models::effective_cost_value(
+            cost.as_ref(),
+            value.cost_input_override,
+            value.cost_output_override,
+            value.cost_cache_read_override,
+            value.cost_cache_write_override,
+        );
         Self {
             model_name: value.model_name,
             enabled: value.enabled,
@@ -972,6 +1003,22 @@ impl From<ProviderModelLimitRow> for ProviderModelLimitView {
             context_override: value.context_override,
             input_override: value.input_override,
             output_override: value.output_override,
+            cost_input: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "input")),
+            cost_output: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "output")),
+            cost_cache_read: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "cache_read")),
+            cost_cache_write: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "cache_write")),
+            cost_input_override: value.cost_input_override,
+            cost_output_override: value.cost_output_override,
+            cost_cache_read_override: value.cost_cache_read_override,
+            cost_cache_write_override: value.cost_cache_write_override,
         }
     }
 }
@@ -980,6 +1027,15 @@ fn validate_limit(name: &str, value: Option<i64>) -> AppResult<()> {
     if value.is_some_and(|value| value <= 0) {
         return Err(AppError::BadRequest(format!(
             "{name} limit must be a positive integer"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_cost_override(name: &str, value: Option<f64>) -> AppResult<()> {
+    if value.is_some_and(|value| !value.is_finite() || value < 0.0) {
+        return Err(AppError::BadRequest(format!(
+            "{name} override must be a non-negative number"
         )));
     }
     Ok(())
@@ -2239,7 +2295,8 @@ async fn replace_provider_models(
 ) -> AppResult<()> {
     let existing_overrides = sqlx::query_as::<_, ProviderModelOverride>(
         "SELECT model_name, enabled, context_override, input_override, output_override, \
-                supported_endpoints_override \
+                supported_endpoints_override, cost_input_override, cost_output_override, \
+                cost_cache_read_override, cost_cache_write_override \
          FROM provider_models WHERE provider_id = ?",
     )
     .bind(provider_id)
@@ -2279,8 +2336,9 @@ async fn replace_provider_models(
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
                 upstream_context_limit, supported_endpoints, display_name,
                 context_override, input_override, output_override,
-                supported_endpoints_override
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                supported_endpoints_override, cost_input_override, cost_output_override,
+                cost_cache_read_override, cost_cache_write_override
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
@@ -2323,6 +2381,10 @@ async fn replace_provider_models(
         .bind(overrides.input_override)
         .bind(overrides.output_override)
         .bind(overrides.supported_endpoints_override)
+        .bind(overrides.cost_input_override)
+        .bind(overrides.cost_output_override)
+        .bind(overrides.cost_cache_read_override)
+        .bind(overrides.cost_cache_write_override)
         .execute(&mut **tx)
         .await?;
     }
@@ -2350,6 +2412,10 @@ struct ProviderModelOverride {
     input_override: Option<i64>,
     output_override: Option<i64>,
     supported_endpoints_override: Option<String>,
+    cost_input_override: Option<f64>,
+    cost_output_override: Option<f64>,
+    cost_cache_read_override: Option<f64>,
+    cost_cache_write_override: Option<f64>,
 }
 
 /// Reads every common context/input spelling and keeps the strictest value.
@@ -2873,6 +2939,11 @@ mod tests {
             Some(r#"["/v1/responses"]"#)
         );
         assert!(serialize_endpoint_override(Some(&["responses".to_string()])).is_err());
+
+        assert!(validate_cost_override("input cost", None).is_ok());
+        assert!(validate_cost_override("input cost", Some(0.0)).is_ok());
+        assert!(validate_cost_override("input cost", Some(1.25)).is_ok());
+        assert!(validate_cost_override("input cost", Some(-0.1)).is_err());
     }
 
     #[test]
@@ -3163,12 +3234,13 @@ mod tests {
             "INSERT INTO provider_models (
                 provider_id, model_name, enabled, context_limit, input_limit,
                 output_limit, context_override, input_override, output_override,
-                supported_endpoints_override
+                supported_endpoints_override, cost, cost_input_override,
+                cost_output_override
              ) VALUES
                 (1, 'gpt-6-astra', 0, 1050000, 922000, 128000, 400000, NULL, 64000,
-                 '[\"/responses\"]'),
+                 '[\"/responses\"]', '{\"input\":2,\"output\":10,\"cache_read\":0.2}', 1.5, 12.0),
                 (1, 'gpt-6-luna', 1, 1050000, 922000, 128000, 400000, 400000, 64000,
-                 NULL)",
+                 NULL, NULL, NULL, NULL)",
         )
         .execute(&pool)
         .await
@@ -3223,6 +3295,10 @@ mod tests {
             astra.supported_endpoints_override,
             Some(vec!["/responses".to_string()])
         );
+        assert_eq!(astra.cost_input, Some(1.5));
+        assert_eq!(astra.cost_output, Some(12.0));
+        assert_eq!(astra.cost_input_override, Some(1.5));
+        assert_eq!(astra.cost_output_override, Some(12.0));
 
         let luna = limits
             .iter()
@@ -3251,6 +3327,58 @@ mod tests {
                 "/responses".to_string()
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn updates_model_cost_overrides() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'Priced', 'openai', 'https://priced.example/v1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name)
+             VALUES (1, 'model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+
+        let Json(rows) = update_provider_model_limits(
+            State(state),
+            Path(1),
+            Json(ProviderModelLimitsUpdate {
+                models: vec![ProviderModelLimitInput {
+                    model_name: "model".to_string(),
+                    enabled: true,
+                    supported_endpoints_override: None,
+                    context_limit: None,
+                    input_limit: None,
+                    output_limit: None,
+                    cost_input_override: Some(1.25),
+                    cost_output_override: Some(5.0),
+                    cost_cache_read_override: Some(0.1),
+                    cost_cache_write_override: Some(2.0),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rows[0].cost_input, Some(1.25));
+        assert_eq!(rows[0].cost_output, Some(5.0));
+        assert_eq!(rows[0].cost_cache_read, Some(0.1));
+        assert_eq!(rows[0].cost_cache_write, Some(2.0));
+        assert_eq!(rows[0].cost_input_override, Some(1.25));
     }
 
     #[tokio::test]
