@@ -129,6 +129,8 @@ export type UsageLog = {
   cache_write_tokens: number
   latency_ms: number
   first_token_ms?: number
+  /** Output tokens per second. For streams this excludes the first-token wait. */
+  output_tps?: number
   status_code: number
   success: boolean
   streamed: boolean

@@ -494,6 +494,14 @@ pub struct UsageLogView {
     pub cache_write_tokens: i64,
     pub latency_ms: i64,
     pub first_token_ms: Option<i64>,
+    /// Generation throughput in tokens per second.
+    ///
+    /// For streamed requests this measures the generation phase only, i.e. it
+    /// excludes the wait for the first token, which is what "tokens per second"
+    /// means in practice. Non-streamed requests have no first-token timestamp,
+    /// so the whole latency is used and the figure includes queue time.
+    /// `None` when it cannot be derived (no output, or no elapsed time).
+    pub output_tps: Option<f64>,
     pub status_code: i64,
     pub success: bool,
     pub streamed: bool,
@@ -504,6 +512,11 @@ pub struct UsageLogView {
 
 impl From<UsageLog> for UsageLogView {
     fn from(value: UsageLog) -> Self {
+        let output_tps = output_tps_of(
+            value.completion_tokens,
+            value.latency_ms,
+            value.first_token_ms,
+        );
         Self {
             id: value.id,
             request_id: value.request_id,
@@ -523,6 +536,7 @@ impl From<UsageLog> for UsageLogView {
             cache_write_tokens: value.cache_write_tokens,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
+            output_tps,
             status_code: value.status_code,
             success: value.success != 0,
             streamed: value.streamed != 0,
@@ -563,6 +577,11 @@ pub struct UsageLogDetailRow {
 
 impl From<UsageLogDetailRow> for UsageLogView {
     fn from(value: UsageLogDetailRow) -> Self {
+        let output_tps = output_tps_of(
+            value.completion_tokens,
+            value.latency_ms,
+            value.first_token_ms,
+        );
         Self {
             id: value.id,
             request_id: value.request_id,
@@ -582,6 +601,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
             cache_write_tokens: value.cache_write_tokens,
             latency_ms: value.latency_ms,
             first_token_ms: value.first_token_ms,
+            output_tps,
             status_code: value.status_code,
             success: value.success != 0,
             streamed: value.streamed != 0,
@@ -749,6 +769,35 @@ impl Usage {
     }
 }
 
+/// Derives output throughput from a completed request.
+///
+/// Streamed requests measure the generation phase alone (total latency minus
+/// the first-token wait), since including queue time would understate a fast
+/// model behind a slow first token. Requests without a first-token timestamp
+/// fall back to the full latency. Returns `None` rather than infinity or zero
+/// when there is nothing meaningful to report, so the UI can show a dash.
+fn output_tps_of(
+    completion_tokens: i64,
+    latency_ms: i64,
+    first_token_ms: Option<i64>,
+) -> Option<f64> {
+    if completion_tokens <= 0 {
+        return None;
+    }
+    let elapsed_ms = match first_token_ms {
+        // Guard against a first-token stamp that exceeds the total (possible
+        // with clock granularity): fall back to the full latency.
+        Some(first) if latency_ms > first => latency_ms - first,
+        Some(_) => return None,
+        None => latency_ms,
+    };
+    if elapsed_ms <= 0 {
+        return None;
+    }
+    let tps = completion_tokens as f64 / (elapsed_ms as f64 / 1000.0);
+    tps.is_finite().then_some(tps)
+}
+
 impl From<Provider> for ProviderView {
     fn from(value: Provider) -> Self {
         let headers =
@@ -860,5 +909,32 @@ mod capability_tests {
         assert!(ModelCapabilities::intersect(std::iter::empty()).is_none());
         let empty = ModelCapabilities::default();
         assert!(ModelCapabilities::intersect([&empty]).is_none());
+    }
+
+    #[test]
+    fn tps_measures_generation_phase_for_streams() {
+        // 100 tokens emitted over 2s after a 3s first-token wait:
+        // generation phase is 2s, so 50 tok/s (not 20, which the total would give).
+        let tps = output_tps_of(100, 5000, Some(3000)).unwrap();
+        assert!((tps - 50.0).abs() < 0.001, "got {tps}");
+    }
+
+    #[test]
+    fn tps_falls_back_to_full_latency_without_first_token() {
+        // Non-streamed: no first-token stamp, so the whole 2s counts.
+        let tps = output_tps_of(100, 2000, None).unwrap();
+        assert!((tps - 50.0).abs() < 0.001, "got {tps}");
+    }
+
+    #[test]
+    fn tps_is_absent_when_undefined() {
+        // No output tokens means no throughput to report.
+        assert_eq!(output_tps_of(0, 1000, Some(100)), None);
+        // Zero elapsed time would divide by zero.
+        assert_eq!(output_tps_of(10, 0, None), None);
+        assert_eq!(output_tps_of(10, 500, Some(500)), None);
+        // A first-token stamp beyond the total must not underflow into a
+        // nonsensical negative duration.
+        assert_eq!(output_tps_of(10, 100, Some(5000)), None);
     }
 }

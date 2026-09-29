@@ -298,7 +298,7 @@ export default function Usage() {
           rowKey="id"
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1560 }}
+          scroll={{ x: 1680 }}
           onRow={(record) => ({
             onClick: () => void openDetail(record),
             style: { cursor: 'pointer' },
@@ -384,6 +384,22 @@ export default function Usage() {
                 ),
             },
             {
+              title: 'TPS',
+              dataIndex: 'output_tps',
+              width: 100,
+              render: (value: number | undefined, record) => (
+                <Tooltip
+                  title={
+                    record.streamed
+                      ? '生成阶段速度（已排除首 token 等待）'
+                      : '含等待时间的整体速度'
+                  }
+                >
+                  <span>{value != null ? `${value.toFixed(1)} tok/s` : '-'}</span>
+                </Tooltip>
+              ),
+            },
+            {
               title: '类型',
               dataIndex: 'streamed',
               width: 90,
@@ -467,6 +483,9 @@ export default function Usage() {
               </Descriptions.Item>
               <Descriptions.Item label="首 token 延迟">
                 {detail.first_token_ms != null ? `${detail.first_token_ms} ms` : '-'}
+              </Descriptions.Item>
+              <Descriptions.Item label="生成速度 (TPS)">
+                {detail.output_tps != null ? `${detail.output_tps.toFixed(1)} tok/s` : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="输入 tokens">
                 {detail.prompt_tokens}
