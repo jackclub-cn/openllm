@@ -1184,10 +1184,14 @@ async fn replace_provider_models(
         }
         let found = catalog.and_then(|catalog| catalog.lookup(provider_hint, model));
         let has_capabilities = found.is_some();
-        let capabilities = found.unwrap_or_default();
+        let capabilities = found.unwrap_or_default().with_effective_input_limit();
         // The provider's own context window is more trustworthy than a
         // models.dev guess, and is the only source for models models.dev lacks.
-        let context_limit = upstream.context_limit.or(capabilities.context_limit);
+        // A provider may publish both a total window and a smaller accepted
+        // input ceiling; keep the strictest value so clients never see an
+        // optimistic limit.
+        let context_limit = min_known(upstream.context_limit, capabilities.context_limit);
+        let input_limit = min_known(context_limit, capabilities.input_limit);
         sqlx::query(
             r#"
             INSERT INTO provider_models (
@@ -1203,7 +1207,7 @@ async fn replace_provider_models(
         .bind(model)
         .bind(context_limit)
         .bind(capabilities.output_limit)
-        .bind(capabilities.input_limit)
+        .bind(input_limit)
         .bind(capabilities.attachment.map(i64::from))
         .bind(capabilities.reasoning.map(i64::from))
         .bind(capabilities.tool_call.map(i64::from))
@@ -1253,6 +1257,35 @@ struct UpstreamModelInfo {
     display_name: Option<String>,
 }
 
+/// Reads every common context/input spelling and keeps the strictest value.
+///
+/// OpenAI-compatible providers are inconsistent here: some expose
+/// `context_length`, others `context_window`, and several publish both a total
+/// window and a smaller `max_input_tokens`. Taking the minimum keeps the
+/// gateway conservative when those fields disagree.
+fn upstream_context_limit(model: &Value) -> Option<i64> {
+    [
+        "context_length",
+        "context_window",
+        "context_size",
+        "max_input_tokens",
+        "max_context_window",
+        "max_context_tokens",
+    ]
+    .iter()
+    .filter_map(|key| model.get(*key).and_then(Value::as_i64))
+    .filter(|value| *value > 0)
+    .min()
+}
+
+fn min_known(left: Option<i64>, right: Option<i64>) -> Option<i64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(value), None) | (None, Some(value)) => Some(value),
+        (None, None) => None,
+    }
+}
+
 /// Parses an OpenAI-style model list, preserving each entry's name and any
 /// upstream-reported limits.
 fn parse_openai_model_entries(value: &Value) -> Vec<(String, UpstreamModelInfo)> {
@@ -1270,10 +1303,7 @@ fn parse_openai_model_entries(value: &Value) -> Vec<(String, UpstreamModelInfo)>
             if name.is_empty() {
                 return None;
             }
-            // Providers disagree on the field name; accept the common spellings.
-            let context_limit = ["context_length", "context_window", "context_size"]
-                .iter()
-                .find_map(|key| model.get(key).and_then(Value::as_i64));
+            let context_limit = upstream_context_limit(model);
             let supported_endpoints = model
                 .get("supported_endpoints")
                 .and_then(Value::as_array)
@@ -1631,6 +1661,31 @@ mod tests {
             entries[0].1.supported_endpoints,
             vec!["/chat/completions", "/responses"]
         );
+    }
+
+    #[test]
+    fn prefers_stricter_upstream_input_limit() {
+        // The live CallAI catalog advertises 400K input, while models.dev
+        // reports a 1.05M window. Keeping the smaller value prevents Codex from
+        // compacting too late and hitting an upstream 400.
+        let value = json!({ "data": [
+            {
+                "id": "gpt-6-astra",
+                "context_length": 1050000,
+                "max_input_tokens": 400000
+            }
+        ]});
+        let entries = parse_openai_model_entries(&value);
+        assert_eq!(entries[0].1.context_limit, Some(400_000));
+    }
+
+    #[test]
+    fn accepts_max_input_tokens_without_context_length() {
+        let value = json!({ "data": [
+            { "id": "codex-auto-review", "max_input_tokens": 400000 }
+        ]});
+        let entries = parse_openai_model_entries(&value);
+        assert_eq!(entries[0].1.context_limit, Some(400_000));
     }
 
     #[test]
