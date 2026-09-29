@@ -30,7 +30,9 @@ use crate::api::{
 };
 use crate::assets::static_handler;
 use crate::db::Database;
-use crate::proxy::{count_tokens_anthropic, proxy_anthropic, proxy_openai, public_models};
+use crate::proxy::{
+    count_tokens_anthropic, proxy_anthropic, proxy_openai, public_model, public_models,
+};
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -120,6 +122,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/events", get(event_stream))
         .nest("/api", admin)
         .route("/v1/models", get(public_models))
+        .route("/v1/models/{*model}", get(public_model))
         .route("/v1/chat/completions", post(proxy_openai))
         .route("/v1/completions", post(proxy_openai))
         .route("/v1/embeddings", post(proxy_openai))

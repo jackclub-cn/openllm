@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chrono::{Timelike, Utc};
@@ -54,13 +54,25 @@ async fn public_models_inner(
     if wants_anthropic_models(headers) {
         return anthropic_models(state, uri, model_patterns.as_deref()).await;
     }
+    let data = openai_public_models(state, model_patterns.as_deref()).await?;
+    Ok(Json(ModelList {
+        object: "list",
+        data,
+    })
+    .into_response())
+}
+
+async fn openai_public_models(
+    state: &AppState,
+    model_patterns: Option<&[String]>,
+) -> AppResult<Vec<PublicModel>> {
     let routes = filter_allowed_models(
-        model_patterns.as_deref(),
+        model_patterns,
         crate::registry::route_models(&state.pool).await?,
         |model| model.id.as_str(),
     );
     let synced = filter_allowed_models(
-        model_patterns.as_deref(),
+        model_patterns,
         crate::registry::synced_models(&state.pool).await?,
         |model| model.id.as_str(),
     );
@@ -119,12 +131,44 @@ async fn public_models_inner(
             .with_flat_limits(),
         );
     }
-    let data = by_id.into_values().collect();
-    Ok(Json(ModelList {
-        object: "list",
-        data,
-    })
-    .into_response())
+    Ok(by_id.into_values().collect())
+}
+
+/// Retrieves one public model using the caller's protocol.
+pub async fn public_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(model_id): Path<String>,
+) -> Response {
+    match public_model_inner(&state, &headers, &model_id).await {
+        Ok(response) => response,
+        Err(error) if wants_anthropic_models(&headers) => anthropic_error_response(error),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn public_model_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    model_id: &str,
+) -> AppResult<Response> {
+    let api_key = authenticate_gateway(state, headers).await?;
+    let model_patterns = api_key_model_patterns(api_key.as_ref())?;
+    if wants_anthropic_models(headers) {
+        let model = anthropic_model_values(state, model_patterns.as_deref())
+            .await?
+            .into_iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some(model_id))
+            .ok_or_else(|| AppError::NotFound(format!("model '{model_id}' not found")))?;
+        return Ok(Json(model).into_response());
+    }
+
+    let model = openai_public_models(state, model_patterns.as_deref())
+        .await?
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| AppError::NotFound(format!("model '{model_id}' not found")))?;
+    Ok(Json(model).into_response())
 }
 
 /// True when the caller speaks the Anthropic protocol.
@@ -160,6 +204,24 @@ async fn anthropic_models(
     uri: &Uri,
     model_patterns: Option<&[String]>,
 ) -> AppResult<Response> {
+    let models = anthropic_model_values(state, model_patterns).await?;
+    let page = ModelPageQuery::parse(uri);
+    let (models, has_more) = paginate_models(models, &page);
+    let first = models.first().and_then(|m| m.get("id")).cloned();
+    let last = models.last().and_then(|m| m.get("id")).cloned();
+    Ok(Json(json!({
+        "data": models,
+        "has_more": has_more,
+        "first_id": first,
+        "last_id": last,
+    }))
+    .into_response())
+}
+
+async fn anthropic_model_values(
+    state: &AppState,
+    model_patterns: Option<&[String]>,
+) -> AppResult<Vec<Value>> {
     let routes = filter_allowed_models(
         model_patterns,
         crate::registry::route_models(&state.pool).await?,
@@ -196,17 +258,7 @@ async fn anthropic_models(
             "created_at": model.created_at,
         }));
     }
-    let page = ModelPageQuery::parse(uri);
-    let (models, has_more) = paginate_models(models, &page);
-    let first = models.first().and_then(|m| m.get("id")).cloned();
-    let last = models.last().and_then(|m| m.get("id")).cloned();
-    Ok(Json(json!({
-        "data": models,
-        "has_more": has_more,
-        "first_id": first,
-        "last_id": last,
-    }))
-    .into_response())
+    Ok(models)
 }
 
 /// Applies Anthropic's cursor pagination to an ordered model list.
@@ -6206,6 +6258,20 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["vendor/gpt-5"]);
 
+        let response = public_model_inner(&state, &openai_headers, "vendor/gpt-5")
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["id"], "vendor/gpt-5");
+        assert_eq!(value["object"], "model");
+        assert!(matches!(
+            public_model_inner(&state, &openai_headers, "vendor/claude-4").await,
+            Err(AppError::NotFound(_))
+        ));
+
         let mut anthropic_headers = openai_headers.clone();
         anthropic_headers.insert(
             HeaderName::from_static("anthropic-version"),
@@ -6225,6 +6291,60 @@ mod tests {
             .filter_map(|model| model["id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["vendor/gpt-5"]);
+
+        let response = public_model_inner(&state, &anthropic_headers, "vendor/gpt-5")
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["id"], "vendor/gpt-5");
+        assert_eq!(value["type"], "model");
+    }
+
+    #[tokio::test]
+    async fn model_retrieve_route_accepts_slashed_model_ids() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Vendor', 'openai', 'https://example.com/v1', 'vendor/', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'gpt-5', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let response = crate::build_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/models/vendor/gpt-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["id"], "vendor/gpt-5");
     }
 
     #[test]
