@@ -1198,6 +1198,17 @@ async fn proxy_anthropic_inner(
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
         order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    enforce_api_key_rate_limit_or_log(
+        state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        request_tokens,
+        streamed,
+        started,
+    )
+    .await?;
     log_usage_started(
         state,
         &request_id,
@@ -1642,6 +1653,17 @@ pub async fn proxy_openai(
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
         order_targets(&state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    enforce_api_key_rate_limit_or_log(
+        &state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        request_tokens,
+        streamed,
+        started,
+    )
+    .await?;
     log_usage_started(
         &state,
         &request_id,
@@ -2914,69 +2936,136 @@ async fn authenticate_gateway(
     Ok(Some(record))
 }
 
-/// Checks a key's soft quotas before any upstream work begins.
+/// Checks a key's soft daily quotas before any upstream work begins.
 ///
 /// Usage is committed after the response completes, so concurrent requests can
 /// overshoot by at most the work already in flight. The guard still prevents a
 /// key from continuing to spend after its previous usage has crossed a limit.
-async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>) -> AppResult<()> {
+async fn enforce_api_key_daily_quota(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+) -> AppResult<()> {
     let Some(api_key) = api_key else {
         return Ok(());
     };
-    if api_key.daily_token_limit.is_none()
-        && api_key.daily_cost_limit_micros.is_none()
-        && api_key.requests_per_minute.is_none()
-        && api_key.max_concurrency.is_none()
-    {
+    if api_key.daily_token_limit.is_none() && api_key.daily_cost_limit_micros.is_none() {
         return Ok(());
     }
 
-    if api_key.daily_token_limit.is_some() || api_key.daily_cost_limit_micros.is_some() {
-        let day_start = Utc::now()
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .expect("midnight is valid")
-            .and_utc()
-            .to_rfc3339();
-        let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
-            "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
-             FROM usage_logs WHERE api_key_id = ? AND created_at >= ? AND in_flight = 0",
-        )
-        .bind(api_key.id)
-        .bind(day_start)
-        .fetch_one(&state.pool)
-        .await?;
+    let day_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is valid")
+        .and_utc()
+        .to_rfc3339();
+    let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
+         FROM usage_logs WHERE api_key_id = ? AND created_at >= ? AND in_flight = 0",
+    )
+    .bind(api_key.id)
+    .bind(day_start)
+    .fetch_one(&state.pool)
+    .await?;
 
-        if let Some(limit) = api_key.daily_token_limit
-            && tokens >= limit
-        {
-            return Err(AppError::TooManyRequests(format!(
-                "daily token limit reached for this API key ({tokens}/{limit})"
-            )));
-        }
-        if let Some(limit) = api_key.daily_cost_limit_micros
-            && cost_micros.unwrap_or(0) >= limit
-        {
-            return Err(AppError::TooManyRequests(format!(
-                "daily cost limit reached for this API key (${:.4}/${:.4})",
-                cost_micros.unwrap_or(0) as f64 / 1_000_000.0,
-                limit as f64 / 1_000_000.0
-            )));
-        }
+    if let Some(limit) = api_key.daily_token_limit
+        && tokens >= limit
+    {
+        return Err(AppError::TooManyRequests(format!(
+            "daily token limit reached for this API key ({tokens}/{limit})"
+        )));
+    }
+    if let Some(limit) = api_key.daily_cost_limit_micros
+        && cost_micros.unwrap_or(0) >= limit
+    {
+        return Err(AppError::TooManyRequests(format!(
+            "daily cost limit reached for this API key (${:.4}/${:.4})",
+            cost_micros.unwrap_or(0) as f64 / 1_000_000.0,
+            limit as f64 / 1_000_000.0
+        )));
+    }
+    Ok(())
+}
+
+/// Atomically checks and reserves a rate-limit slot.
+///
+/// Counting and inserting in one SQLite statement closes the race where a
+/// burst of requests could all pass a read-only limit check. The inserted row
+/// is the same in-flight row later completed by usage logging.
+#[allow(clippy::too_many_arguments)]
+async fn reserve_api_key_rate_limit(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+    request_id: &str,
+    requested_model: &str,
+    endpoint: &str,
+    request_tokens: i64,
+    streamed: bool,
+) -> AppResult<()> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    if api_key.requests_per_minute.is_none() && api_key.max_concurrency.is_none() {
+        return Ok(());
+    }
+
+    let minute_start = Utc::now()
+        .with_second(0)
+        .and_then(|value| value.with_nanosecond(0))
+        .expect("current minute start is valid")
+        .to_rfc3339();
+    let result = sqlx::query(
+        r#"
+        INSERT INTO usage_logs (
+            request_id, api_key_id, route_id, provider_id, requested_model,
+            upstream_model, endpoint, prompt_tokens, completion_tokens,
+            total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
+            estimated_cost_micros, first_token_ms, status_code, in_flight,
+            success, streamed, error_message, response_preview
+        )
+        SELECT ?, ?, NULL, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0,
+               NULL, NULL, 0, 1, 0, ?, NULL, NULL
+        WHERE (
+            ? IS NULL OR (
+                SELECT COUNT(*) FROM usage_logs
+                WHERE api_key_id = ? AND created_at >= ?
+            ) < ?
+        )
+        AND (
+            ? IS NULL OR (
+                SELECT COUNT(*) FROM usage_logs
+                WHERE api_key_id = ? AND in_flight = 1
+            ) < ?
+        )
+        ON CONFLICT(request_id) DO NOTHING
+        "#,
+    )
+    .bind(request_id)
+    .bind(api_key.id)
+    .bind(requested_model)
+    .bind(endpoint)
+    .bind(request_tokens)
+    .bind(request_tokens)
+    .bind(streamed as i64)
+    .bind(api_key.requests_per_minute)
+    .bind(api_key.id)
+    .bind(&minute_start)
+    .bind(api_key.requests_per_minute)
+    .bind(api_key.max_concurrency)
+    .bind(api_key.id)
+    .bind(api_key.max_concurrency)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        return Ok(());
     }
 
     if let Some(limit) = api_key.requests_per_minute {
-        let minute_start = Utc::now()
-            .with_second(0)
-            .and_then(|value| value.with_nanosecond(0))
-            .expect("current minute start is valid")
-            .to_rfc3339();
         let requests = sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM usage_logs \
              WHERE api_key_id = ? AND created_at >= ?",
         )
         .bind(api_key.id)
-        .bind(minute_start)
+        .bind(&minute_start)
         .fetch_one(&state.pool)
         .await?;
         if requests >= limit {
@@ -2999,7 +3088,10 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
             )));
         }
     }
-    Ok(())
+
+    Err(AppError::TooManyRequests(
+        "API key rate limit reached".to_string(),
+    ))
 }
 
 fn api_key_model_patterns(api_key: Option<&ApiKeyRecord>) -> AppResult<Option<Vec<String>>> {
@@ -3055,7 +3147,7 @@ async fn enforce_policy_or_log(
     started: Instant,
 ) -> AppResult<()> {
     let rejection = match enforce_api_key_model_access(api_key, requested_model) {
-        Ok(()) => enforce_api_key_quota(state, api_key).await.err(),
+        Ok(()) => enforce_api_key_daily_quota(state, api_key).await.err(),
         Err(error) => Some(error),
     };
     match rejection {
@@ -3064,6 +3156,52 @@ async fn enforce_policy_or_log(
             let message = error.to_string();
             let status_code = match error {
                 AppError::Forbidden(_) => 403,
+                AppError::TooManyRequests(_) => 429,
+                _ => 500,
+            };
+            log_request_rejection(
+                state,
+                api_key,
+                request_id,
+                requested_model,
+                endpoint,
+                streamed,
+                started,
+                status_code,
+                &message,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enforce_api_key_rate_limit_or_log(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+    request_id: &str,
+    requested_model: &str,
+    endpoint: &str,
+    request_tokens: i64,
+    streamed: bool,
+    started: Instant,
+) -> AppResult<()> {
+    match reserve_api_key_rate_limit(
+        state,
+        api_key,
+        request_id,
+        requested_model,
+        endpoint,
+        request_tokens,
+        streamed,
+    )
+    .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let message = error.to_string();
+            let status_code = match error {
                 AppError::TooManyRequests(_) => 429,
                 _ => 500,
             };
@@ -4370,13 +4508,22 @@ async fn log_usage_started(
 ) {
     let result = sqlx::query(
         r#"
-        INSERT OR IGNORE INTO usage_logs (
+        INSERT INTO usage_logs (
             request_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
             success, streamed, error_message, response_preview
         ) VALUES (?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?, NULL, NULL)
+        ON CONFLICT(request_id) DO UPDATE SET
+            route_id = excluded.route_id,
+            requested_model = excluded.requested_model,
+            endpoint = excluded.endpoint,
+            prompt_tokens = excluded.prompt_tokens,
+            total_tokens = excluded.total_tokens,
+            streamed = excluded.streamed,
+            in_flight = 1
+        WHERE usage_logs.in_flight = 1
         "#,
     )
     .bind(request_id)
@@ -4393,12 +4540,23 @@ async fn log_usage_started(
     match result {
         Ok(result) => {
             if result.rows_affected() > 0 {
-                let _ = state.events.send(crate::state::UsageEvent {
-                    id: result.last_insert_rowid(),
-                    request_id: request_id.to_string(),
-                    success: false,
-                    streamed,
-                });
+                match sqlx::query_scalar::<_, i64>("SELECT id FROM usage_logs WHERE request_id = ?")
+                    .bind(request_id)
+                    .fetch_one(&state.pool)
+                    .await
+                {
+                    Ok(id) => {
+                        let _ = state.events.send(crate::state::UsageEvent {
+                            id,
+                            request_id: request_id.to_string(),
+                            success: false,
+                            streamed,
+                        });
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, request_id, "failed to find in-flight usage row");
+                    }
+                }
             }
         }
         Err(error) => {
@@ -5410,7 +5568,7 @@ mod tests {
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
-            enforce_api_key_quota(&state, Some(&key)).await,
+            enforce_api_key_daily_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
         ));
     }
@@ -5550,7 +5708,7 @@ mod tests {
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
-            enforce_api_key_quota(&state, Some(&key)).await,
+            enforce_api_key_daily_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
         ));
     }
@@ -5562,21 +5720,12 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         sqlx::query(
-            "CREATE TABLE usage_logs (
-                api_key_id INTEGER,
-                in_flight INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO usage_logs (api_key_id, created_at) VALUES
-                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-2 minutes'))",
+            "INSERT INTO api_keys (
+                id, name, key_hash, key_prefix, key_suffix,
+                enabled, requests_per_minute, max_concurrency
+             ) VALUES (1, 'rate-limited', 'rate-hash', 'sk-openllm', 'test', 1, 2, NULL)",
         )
         .execute(&pool)
         .await
@@ -5596,11 +5745,39 @@ mod tests {
             allowed_models: None,
             expires_at: None,
         };
-        let state = AppState::new(pool, None);
+        let state = AppState::new(pool.clone(), None);
+        for request_id in ["first", "second"] {
+            reserve_api_key_rate_limit(
+                &state,
+                Some(&key),
+                request_id,
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+            )
+            .await
+            .unwrap();
+        }
         assert!(matches!(
-            enforce_api_key_quota(&state, Some(&key)).await,
+            reserve_api_key_rate_limit(
+                &state,
+                Some(&key),
+                "third",
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+            )
+            .await,
             Err(AppError::TooManyRequests(_))
         ));
+        let in_flight: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(in_flight, 2);
     }
 
     #[tokio::test]
@@ -5610,19 +5787,12 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         sqlx::query(
-            "CREATE TABLE usage_logs (
-                api_key_id INTEGER,
-                in_flight INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
-            )",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO usage_logs (api_key_id, in_flight, created_at)
-             VALUES (1, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+            "INSERT INTO api_keys (
+                id, name, key_hash, key_prefix, key_suffix,
+                enabled, requests_per_minute, max_concurrency
+             ) VALUES (1, 'concurrency-limited', 'concurrency-hash', 'sk-openllm', 'test', 1, NULL, 1)",
         )
         .execute(&pool)
         .await
@@ -5643,16 +5813,48 @@ mod tests {
             expires_at: None,
         };
         let state = AppState::new(pool.clone(), None);
+        reserve_api_key_rate_limit(
+            &state,
+            Some(&key),
+            "active",
+            "model",
+            "/v1/chat/completions",
+            10,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
-            enforce_api_key_quota(&state, Some(&key)).await,
+            reserve_api_key_rate_limit(
+                &state,
+                Some(&key),
+                "blocked",
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+            )
+            .await,
             Err(AppError::TooManyRequests(_))
         ));
 
-        sqlx::query("UPDATE usage_logs SET in_flight = 0")
+        sqlx::query("UPDATE usage_logs SET in_flight = 0 WHERE request_id = 'active'")
             .execute(&pool)
             .await
             .unwrap();
-        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
+        assert!(
+            reserve_api_key_rate_limit(
+                &state,
+                Some(&key),
+                "next",
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+            )
+            .await
+            .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -5678,7 +5880,92 @@ mod tests {
             expires_at: None,
         };
         let state = AppState::new(pool, None);
-        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
+        assert!(
+            reserve_api_key_rate_limit(
+                &state,
+                Some(&key),
+                "unlimited",
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_rate_limit_rejection_is_logged_without_extra_in_flight() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (
+                id, name, key_hash, key_prefix, key_suffix,
+                enabled, requests_per_minute, max_concurrency
+             ) VALUES (1, 'concurrency-limited', 'reject-hash', 'sk-openllm', 'test', 1, NULL, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "concurrency-limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: Some(1),
+            allowed_models: None,
+            expires_at: None,
+        };
+        let state = AppState::new(pool.clone(), None);
+        reserve_api_key_rate_limit(
+            &state,
+            Some(&key),
+            "active",
+            "model",
+            "/v1/chat/completions",
+            10,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            enforce_api_key_rate_limit_or_log(
+                &state,
+                Some(&key),
+                "blocked",
+                "model",
+                "/v1/chat/completions",
+                10,
+                false,
+                Instant::now(),
+            )
+            .await,
+            Err(AppError::TooManyRequests(_))
+        ));
+        let blocked: (i64, i64) = sqlx::query_as(
+            "SELECT status_code, in_flight FROM usage_logs WHERE request_id = 'blocked'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(blocked, (429, 0));
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 1);
     }
 
     #[tokio::test]
@@ -5725,14 +6012,18 @@ mod tests {
         };
         let state = AppState::new(pool.clone(), None);
 
-        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
+        assert!(
+            enforce_api_key_daily_quota(&state, Some(&key))
+                .await
+                .is_ok()
+        );
 
         sqlx::query("UPDATE usage_logs SET in_flight = 0")
             .execute(&pool)
             .await
             .unwrap();
         assert!(matches!(
-            enforce_api_key_quota(&state, Some(&key)).await,
+            enforce_api_key_daily_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
         ));
     }
