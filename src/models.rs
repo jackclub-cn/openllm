@@ -863,6 +863,24 @@ pub struct ProviderTestResult {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ProviderTestSummary {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub ok: bool,
+    pub latency_ms: i64,
+    pub message: String,
+    pub checked: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderTestAllResult {
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub results: Vec<ProviderTestSummary>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ModelSyncResult {
     pub ok: bool,
     pub provider_id: i64,

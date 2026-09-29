@@ -55,6 +55,7 @@ export default function Providers() {
   const [items, setItems] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [testingAll, setTestingAll] = useState(false)
   const [editing, setEditing] = useState<Provider>()
   const [open, setOpen] = useState(false)
   const [limitsOpen, setLimitsOpen] = useState(false)
@@ -184,6 +185,27 @@ export default function Providers() {
     }
   }
 
+  const testAll = async () => {
+    setTestingAll(true)
+    try {
+      const result = await api.post<{
+        total: number
+        ok: number
+        failed: number
+      }>('/api/providers/test-all')
+      if (result.failed > 0) {
+        message.warning(`检测完成：${result.ok} 正常，${result.failed} 异常`)
+      } else {
+        message.success(`检测完成：${result.ok} 个提供商全部正常`)
+      }
+      await load()
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setTestingAll(false)
+    }
+  }
+
   const sync = async (id: number) => {
     const key = `provider-sync-${id}`
     message.loading({ content: '正在从上游同步模型...', key })
@@ -262,7 +284,21 @@ export default function Providers() {
       <PageHeader
         title="提供商"
         description="管理 OpenAI、Anthropic、Ollama 及任意兼容 API"
-        extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => openEditor()}>添加提供商</Button>}
+        extra={
+          <Space>
+            <Button
+              icon={<ThunderboltOutlined />}
+              loading={testingAll}
+              disabled={!items.length}
+              onClick={() => void testAll()}
+            >
+              测试全部
+            </Button>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => openEditor()}>
+              添加提供商
+            </Button>
+          </Space>
+        }
       />
       <Card bordered={false}>
         <Table

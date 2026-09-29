@@ -8,6 +8,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use chrono::{Duration, Utc};
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite};
@@ -302,6 +303,10 @@ pub async fn test_provider(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> AppResult<Json<ProviderTestResult>> {
+    Ok(Json(test_provider_inner(&state, id).await?))
+}
+
+async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTestResult> {
     let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.pool)
@@ -365,8 +370,8 @@ pub async fn test_provider(
         };
         request = apply_custom_headers(request, &provider.headers)?;
         let result = probe_provider(request, started, "inference", &model).await;
-        persist_provider_test(&state, id, &result).await?;
-        return Ok(Json(result));
+        persist_provider_test(state, id, &result).await?;
+        return Ok(result);
     }
 
     // No model synced yet, so fall back to listing. This only proves the host
@@ -389,8 +394,50 @@ pub async fn test_provider(
     request = apply_custom_headers(request, &provider.headers)?;
 
     let result = probe_provider(request, started, "models", "").await;
-    persist_provider_test(&state, id, &result).await?;
-    Ok(Json(result))
+    persist_provider_test(state, id, &result).await?;
+    Ok(result)
+}
+
+pub async fn test_all_providers(
+    State(state): State<AppState>,
+) -> AppResult<Json<ProviderTestAllResult>> {
+    let providers = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, name FROM providers WHERE enabled = 1 ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let results = futures_util::stream::iter(providers.into_iter().map(|(id, name)| {
+        let state = state.clone();
+        async move {
+            let result = test_provider_inner(&state, id).await;
+            ProviderTestSummary {
+                provider_id: id,
+                provider_name: name,
+                ok: result.as_ref().map(|result| result.ok).unwrap_or(false),
+                latency_ms: result.as_ref().map(|result| result.latency_ms).unwrap_or(0),
+                message: result
+                    .as_ref()
+                    .map(|result| result.message.clone())
+                    .unwrap_or_else(|error| error.to_string()),
+                checked: result
+                    .as_ref()
+                    .map(|result| result.checked.clone())
+                    .unwrap_or_else(|_| "none".to_string()),
+            }
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+
+    let ok = results.iter().filter(|result| result.ok).count();
+    Ok(Json(ProviderTestAllResult {
+        total: results.len(),
+        ok,
+        failed: results.len() - ok,
+        results,
+    }))
 }
 
 async fn persist_provider_test(
