@@ -144,11 +144,27 @@ export default function RoutesPage() {
               dataIndex: 'targets',
               render: (targets: GatewayRoute['targets']) => (
                 <Space wrap>
-                  {targets.map((target, index) => (
-                    <Tag key={`${target.id ?? index}-${target.provider_id}`} color={target.enabled ? 'cyan' : 'default'}>
-                      {target.provider_name} / {target.model_prefix || ''}{target.upstream_model}
-                    </Tag>
-                  ))}
+                  {targets.map((target, index) => {
+                    const endpoints = target.supported_endpoints?.map((endpoint) =>
+                      endpoint.replace(/^\/v1/, ''),
+                    )
+                    return (
+                      <Tooltip
+                        key={`${target.id ?? index}-${target.provider_id}`}
+                        title={
+                          endpoints?.length
+                            ? `支持接口：${endpoints.join('、')}`
+                            : '未声明接口限制，所有兼容接口均可尝试'
+                        }
+                      >
+                        <Tag color={target.enabled ? 'cyan' : 'default'}>
+                          {target.provider_name} / {target.model_prefix || ''}
+                          {target.upstream_model}
+                          {endpoints?.length ? ` · ${endpoints.join(', ')}` : ''}
+                        </Tag>
+                      </Tooltip>
+                    )
+                  })}
                 </Space>
               ),
             },

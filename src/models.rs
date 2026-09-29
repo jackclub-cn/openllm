@@ -255,6 +255,9 @@ pub struct RouteTargetView {
     pub provider_name: String,
     pub provider_type: String,
     pub upstream_model: String,
+    /// Effective endpoint paths used when deciding whether this target can
+    /// serve a request. Empty means the target did not declare a restriction.
+    pub supported_endpoints: Vec<String>,
     pub model_prefix: String,
     pub weight: i64,
     pub priority: i64,

@@ -136,6 +136,7 @@ export type RouteTarget = {
   provider_name?: string
   provider_type?: string
   upstream_model: string
+  supported_endpoints?: string[]
   model_prefix?: string
   weight: number
   priority: number

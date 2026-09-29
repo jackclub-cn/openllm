@@ -2170,6 +2170,11 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
                 provider_name: target.provider_name,
                 provider_type: target.provider_type,
                 upstream_model: target.upstream_model,
+                supported_endpoints: target
+                    .supported_endpoints
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                    .unwrap_or_default(),
                 model_prefix: target.model_prefix,
                 weight: target.weight,
                 priority: target.priority,
