@@ -1134,6 +1134,22 @@ async fn proxy_anthropic_inner(
     )
     .await?;
     let resolved = resolve_route(state, &requested_model).await?;
+    if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
+        let message = error.to_string();
+        log_request_rejection(
+            state,
+            api_key.as_ref(),
+            &request_id,
+            &requested_model,
+            &endpoint,
+            streamed,
+            started,
+            400,
+            &message,
+        )
+        .await;
+        return Err(error);
+    }
     let route_id = resolved.route_id;
     let requested_output_tokens = request_json.get("max_tokens").and_then(Value::as_i64);
     let clamped_output_tokens = clamp_output_request(&mut request_json, resolved.barrel.as_ref());
@@ -1523,6 +1539,22 @@ pub async fn proxy_openai(
     )
     .await?;
     let resolved = resolve_route(&state, &requested_model).await?;
+    if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
+        let message = error.to_string();
+        log_request_rejection(
+            &state,
+            api_key.as_ref(),
+            &request_id,
+            &requested_model,
+            &endpoint,
+            streamed,
+            started,
+            400,
+            &message,
+        )
+        .await;
+        return Err(error);
+    }
     let route_id = resolved.route_id;
     // Barrel mode: clamp the requested output length to the strictest common
     // ceiling across every target, so no target is picked that would reject the
@@ -2734,30 +2766,70 @@ async fn enforce_policy_or_log(
                 AppError::TooManyRequests(_) => 429,
                 _ => 500,
             };
-            log_usage(
+            log_request_rejection(
                 state,
-                UsageLogEntry {
-                    request_id,
-                    api_key_id: api_key.map(|key| key.id),
-                    route_id: None,
-                    provider_id: None,
-                    requested_model,
-                    upstream_model: None,
-                    endpoint,
-                    usage: Usage::default(),
-                    latency_ms: started.elapsed().as_millis() as i64,
-                    first_token_ms: None,
-                    status_code,
-                    success: false,
-                    streamed,
-                    error_message: Some(&message),
-                    response_preview: None,
-                },
+                api_key,
+                request_id,
+                requested_model,
+                endpoint,
+                streamed,
+                started,
+                status_code,
+                &message,
             )
             .await;
             Err(error)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn log_request_rejection(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+    request_id: &str,
+    requested_model: &str,
+    endpoint: &str,
+    streamed: bool,
+    started: Instant,
+    status_code: i64,
+    message: &str,
+) {
+    log_usage(
+        state,
+        UsageLogEntry {
+            request_id,
+            api_key_id: api_key.map(|key| key.id),
+            route_id: None,
+            provider_id: None,
+            requested_model,
+            upstream_model: None,
+            endpoint,
+            usage: Usage::default(),
+            latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            status_code,
+            success: false,
+            streamed,
+            error_message: Some(message),
+            response_preview: None,
+        },
+    )
+    .await;
+}
+
+fn enforce_context_capacity(request_tokens: i64, barrel: Option<&BarrelEnvelope>) -> AppResult<()> {
+    let limit = barrel
+        .and_then(|barrel| barrel.capabilities.as_ref())
+        .and_then(|capabilities| capabilities.context_limit);
+    if let Some(limit) = limit
+        && request_tokens > limit
+    {
+        return Err(AppError::BadRequest(format!(
+            "estimated input tokens ({request_tokens}) exceed the route context limit ({limit})"
+        )));
+    }
+    Ok(())
 }
 
 struct ResolvedRoute {
@@ -3545,7 +3617,7 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
     let estimated_cost_micros =
-        if matches!(entry.status_code, 403 | 429) && entry.provider_id.is_none() {
+        if matches!(entry.status_code, 400 | 403 | 429) && entry.provider_id.is_none() {
             Some(0)
         } else {
             match (entry.provider_id, entry.upstream_model) {
@@ -4311,6 +4383,24 @@ mod tests {
         assert_eq!(provider_health_rank(None), 1);
         assert_eq!(provider_health_rank(Some(0)), 2);
         assert_eq!(provider_health_rank(Some(7)), 0);
+    }
+
+    #[test]
+    fn rejects_estimated_input_above_route_context_limit() {
+        let barrel = BarrelEnvelope {
+            capabilities: Some(crate::models::ModelCapabilities {
+                context_limit: Some(100),
+                ..Default::default()
+            }),
+            incomplete: false,
+            target_count: 1,
+        };
+        assert!(enforce_context_capacity(100, Some(&barrel)).is_ok());
+        assert!(matches!(
+            enforce_context_capacity(101, Some(&barrel)),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(enforce_context_capacity(101, None).is_ok());
     }
 
     fn barrel_with_output_limit(output_limit: Option<i64>) -> BarrelEnvelope {
