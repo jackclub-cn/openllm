@@ -760,6 +760,43 @@ fn openai_stream_to_anthropic(
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
+/// Anthropic token-counting endpoint (`POST /v1/messages/count_tokens`).
+///
+/// Claude Code calls this before sending a request to decide how much context
+/// remains, so its absence breaks the client outright. Most OpenAI-compatible
+/// upstreams have no equivalent (verified: CommandCode returns 404), so this
+/// answers locally with an estimate rather than proxying.
+///
+/// The estimate is deliberately deterministic: the same body always yields the
+/// same count, which clients rely on to detect real context growth.
+pub async fn count_tokens_anthropic(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match count_tokens_inner(&state, &headers, &body).await {
+        Ok(response) => response,
+        Err(error) => anthropic_error_response(error),
+    }
+}
+
+async fn count_tokens_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+) -> AppResult<Response> {
+    let inbound: Value = serde_json::from_slice(body).map_err(|error| {
+        AppError::BadRequest(format!("request body must be valid JSON: {error}"))
+    })?;
+    // `model` is required by the real endpoint; reject early rather than
+    // silently counting a body the client meant for a different model.
+    requested_model_of(&inbound)?;
+    authenticate_gateway(state, headers).await?;
+
+    let input_tokens = estimate_request_tokens(&inbound);
+    Ok(Json(json!({"input_tokens": input_tokens})).into_response())
+}
+
 /// Inbound entry point for the Anthropic Messages API (`POST /v1/messages`).
 ///
 /// Anthropic-protocol clients (Claude Code, the Anthropic SDKs) can point their
@@ -2754,13 +2791,63 @@ fn estimated_completion_usage(request_tokens: i64, bytes: &[u8]) -> Usage {
 }
 
 fn estimate_request_tokens(value: &Value) -> i64 {
-    let text = value
+    // Walk the structured content and sum only text-bearing fields. The
+    // previous implementation stringified the whole payload, so JSON keys,
+    // braces and quotes inflated the estimate on every request.
+    let chars = count_text_chars(value, None);
+    // Rough per-item framing overhead: providers wrap each message and tool in
+    // a handful of structural tokens beyond its visible text.
+    let items = value
         .get("messages")
         .or_else(|| value.get("input"))
-        .or_else(|| value.get("prompt"))
-        .map(Value::to_string)
-        .unwrap_or_default();
-    (text.chars().count() / 4).max(1) as i64
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        .unwrap_or(0);
+    let tools = value
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| tools.len())
+        .unwrap_or(0);
+    let framing = (items as i64) * 4 + (tools as i64) * 8;
+    (chars as i64 / 4 + framing).max(1)
+}
+
+/// Field names whose string values represent prompt content worth counting.
+/// Anything else (ids, roles, media URLs, base64 blobs) is ignored so the
+/// estimate tracks text, not wire format.
+const TEXT_BEARING_KEYS: [&str; 9] = [
+    "text",
+    "content",
+    "input",
+    "prompt",
+    "system",
+    "description",
+    "arguments",
+    "partial_json",
+    "name",
+];
+
+/// Sums the characters of text-bearing strings nested anywhere in `value`.
+///
+/// A string is counted only when its key is text-bearing, or when it is the
+/// root value (as in a bare `input: "..."` payload). This deliberately skips
+/// `image_url` / base64 data, which providers meter separately from text.
+fn count_text_chars(value: &Value, key: Option<&str>) -> usize {
+    match value {
+        Value::String(text) => {
+            if key.is_none_or(|key| TEXT_BEARING_KEYS.contains(&key)) {
+                text.chars().count()
+            } else {
+                0
+            }
+        }
+        Value::Array(items) => items.iter().map(|item| count_text_chars(item, key)).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, value)| count_text_chars(value, Some(key)))
+            .sum(),
+        _ => 0,
+    }
 }
 
 fn fill_usage(usage: Usage, request_tokens: i64, response: &Value) -> Usage {
@@ -3076,6 +3163,64 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_estimate_ignores_json_scaffolding() {
+        // A short message must not be inflated by keys, braces and quotes.
+        let body = json!({
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let estimate = estimate_request_tokens(&body);
+        // 5 chars of content -> 1 token, plus one message of framing (4).
+        assert_eq!(estimate, 5);
+        // Sanity: far below the old "stringify the whole payload" behaviour.
+        let stringified = body.to_string().chars().count() / 4;
+        assert!(estimate < stringified as i64, "{estimate} vs {stringified}");
+    }
+
+    #[test]
+    fn text_estimate_counts_nested_content_blocks() {
+        let body = json!({
+            "model": "claude-x",
+            "system": "be brief",
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "abcdefgh"},
+                    {"type": "text", "text": "ijkl"}
+                ]}
+            ]
+        });
+        // 8 ("be brief") + 12 (content) = 20 chars -> 5 tokens + 4 framing.
+        assert_eq!(estimate_request_tokens(&body), 9);
+    }
+
+    #[test]
+    fn text_estimate_skips_image_payloads() {
+        // A base64 image must not be metered as prompt text.
+        let body = json!({
+            "model": "claude-x",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAAAAAABBBBBBBBCCCCCCCC"}}
+            ]}]
+        });
+        let estimate = estimate_request_tokens(&body);
+        // Only "describe" (8 chars -> 2) plus one message of framing (4).
+        assert_eq!(estimate, 6);
+    }
+
+    #[test]
+    fn text_estimate_is_deterministic_and_grows_with_content() {
+        let small = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let large =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hi".repeat(200)}]});
+        assert_eq!(
+            estimate_request_tokens(&small),
+            estimate_request_tokens(&small)
+        );
+        assert!(estimate_request_tokens(&large) > estimate_request_tokens(&small));
+    }
 
     #[test]
     fn joins_base_and_path_without_double_v1() {

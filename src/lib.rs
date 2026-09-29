@@ -27,7 +27,7 @@ use crate::api::{
 };
 use crate::assets::static_handler;
 use crate::db::Database;
-use crate::proxy::{proxy_anthropic, proxy_openai, public_models};
+use crate::proxy::{count_tokens_anthropic, proxy_anthropic, proxy_openai, public_models};
 use crate::state::AppState;
 
 #[derive(Debug, Clone)]
@@ -93,6 +93,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/embeddings", post(proxy_openai))
         .route("/v1/responses", post(proxy_openai))
         .route("/v1/messages", post(proxy_anthropic))
+        .route("/v1/messages/count_tokens", post(count_tokens_anthropic))
         .fallback(static_handler)
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(
