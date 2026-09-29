@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   ApiOutlined,
   DashboardOutlined,
@@ -9,19 +9,20 @@ import {
   NodeIndexOutlined,
   SettingOutlined,
 } from '@ant-design/icons'
-import { Button, Layout, Menu, Space, Tag, Tooltip, Typography } from 'antd'
+import { Button, Layout, Menu, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
 import { api, setAdminToken, type Settings } from './api'
-import Dashboard from './pages/Dashboard'
-import Providers from './pages/Providers'
-import RoutesPage from './pages/Routes'
-import ApiKeys from './pages/ApiKeys'
-import Usage from './pages/Usage'
-import SettingsPage from './pages/Settings'
-import Playground from './pages/Playground'
 import { RealtimeProvider, useRealtime } from './realtime'
 
 const { Header, Sider, Content } = Layout
+
+const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Providers = lazy(() => import('./pages/Providers'))
+const RoutesPage = lazy(() => import('./pages/Routes'))
+const ApiKeys = lazy(() => import('./pages/ApiKeys'))
+const Usage = lazy(() => import('./pages/Usage'))
+const SettingsPage = lazy(() => import('./pages/Settings'))
+const Playground = lazy(() => import('./pages/Playground'))
 
 const navigation = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
@@ -137,16 +138,18 @@ function AppLayout({
           </Space>
         </Header>
         <Content className="app-content">
-          <Routes>
-            <Route path="/" element={<Dashboard />} />
-            <Route path="/providers" element={<Providers />} />
-            <Route path="/routes" element={<RoutesPage />} />
-            <Route path="/playground" element={<Playground />} />
-            <Route path="/keys" element={<ApiKeys />} />
-            <Route path="/usage" element={<Usage />} />
-            <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
+          <Suspense fallback={<Skeleton active paragraph={{ rows: 8 }} />}>
+            <Routes>
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/providers" element={<Providers />} />
+              <Route path="/routes" element={<RoutesPage />} />
+              <Route path="/playground" element={<Playground />} />
+              <Route path="/keys" element={<ApiKeys />} />
+              <Route path="/usage" element={<Usage />} />
+              <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </Suspense>
         </Content>
       </Layout>
     </Layout>
