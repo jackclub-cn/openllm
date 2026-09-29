@@ -1157,7 +1157,16 @@ async fn proxy_anthropic_inner(
         started,
     )
     .await?;
-    let resolved = resolve_route(state, &requested_model, &endpoint).await?;
+    let resolved = resolve_route_or_log(
+        state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+    )
+    .await?;
     if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
         let message = error.to_string();
         log_request_rejection(
@@ -1586,7 +1595,16 @@ pub async fn proxy_openai(
         started,
     )
     .await?;
-    let resolved = resolve_route(&state, &requested_model, &endpoint).await?;
+    let resolved = resolve_route_or_log(
+        &state,
+        api_key.as_ref(),
+        &request_id,
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+    )
+    .await?;
     if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
         let message = error.to_string();
         log_request_rejection(
@@ -3178,6 +3196,47 @@ async fn resolve_route(state: &AppState, model: &str, endpoint: &str) -> AppResu
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn resolve_route_or_log(
+    state: &AppState,
+    api_key: Option<&ApiKeyRecord>,
+    request_id: &str,
+    model: &str,
+    endpoint: &str,
+    streamed: bool,
+    started: Instant,
+) -> AppResult<ResolvedRoute> {
+    match resolve_route(state, model, endpoint).await {
+        Ok(route) => Ok(route),
+        Err(error) => {
+            let status_code = match &error {
+                AppError::BadRequest(_) => 400,
+                AppError::Unauthorized(_) => 401,
+                AppError::Forbidden(_) => 403,
+                AppError::NotFound(_) => 404,
+                AppError::Conflict(_) => 409,
+                AppError::TooManyRequests(_) => 429,
+                AppError::Upstream(_) => 502,
+                AppError::Database(_) | AppError::Http(_) | AppError::Internal(_) => 500,
+            };
+            let message = error.to_string();
+            log_request_rejection(
+                state,
+                api_key,
+                request_id,
+                model,
+                endpoint,
+                streamed,
+                started,
+                status_code,
+                &message,
+            )
+            .await;
+            Err(error)
+        }
+    }
+}
+
 async fn find_explicit_route(state: &AppState, model: &str) -> AppResult<Option<Route>> {
     let routes = sqlx::query_as::<_, Route>(
         r#"
@@ -4450,6 +4509,43 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn route_resolution_failures_are_logged() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool.clone(), None);
+
+        let error = resolve_route_or_log(
+            &state,
+            None,
+            "route-rejection",
+            "missing-model",
+            OPENAI_RESPONSES,
+            false,
+            Instant::now(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(error, AppError::NotFound(_)));
+
+        let row: (String, i64, i64, String) = sqlx::query_as(
+            "SELECT request_id, status_code, success, error_message
+             FROM usage_logs WHERE request_id = 'route-rejection'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "route-rejection");
+        assert_eq!(row.1, 404);
+        assert_eq!(row.2, 0);
+        assert!(row.3.contains("missing-model"));
     }
 
     #[tokio::test]
