@@ -112,6 +112,7 @@ export type ProviderModelLimit = {
   model_name: string
   enabled: boolean
   supported_endpoints: string[]
+  supported_endpoints_override?: string[] | null
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
@@ -123,6 +124,7 @@ export type ProviderModelLimit = {
 export type ProviderModelLimitInput = {
   model_name: string
   enabled: boolean
+  supported_endpoints_override?: string[] | null
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
@@ -295,6 +297,7 @@ export type ModelInfo = {
   max_input_tokens?: number
   max_output_tokens?: number
   max_completion_tokens?: number
+  supported_endpoints?: string[]
 }
 
 export function formatError(error: unknown) {

@@ -835,6 +835,7 @@ pub async fn update_provider_model_limits(
 ) -> AppResult<Json<Vec<ProviderModelLimitView>>> {
     ensure_provider_exists(&state, id).await?;
     let mut seen = HashSet::new();
+    let mut endpoint_overrides = Vec::with_capacity(input.models.len());
     for model in &input.models {
         let name = model.model_name.trim();
         if name.is_empty() {
@@ -855,19 +856,24 @@ pub async fn update_provider_model_limits(
                 "model '{name}' input limit cannot exceed its context limit"
             )));
         }
+        endpoint_overrides.push(serialize_endpoint_override(
+            model.supported_endpoints_override.as_deref(),
+        )?);
     }
 
     let mut tx = state.pool.begin().await?;
-    for model in &input.models {
+    for (model, endpoint_override) in input.models.iter().zip(&endpoint_overrides) {
         let result = sqlx::query(
             "UPDATE provider_models \
-             SET enabled = ?, context_override = ?, input_override = ?, output_override = ? \
+             SET enabled = ?, context_override = ?, input_override = ?, output_override = ?, \
+                 supported_endpoints_override = ? \
              WHERE provider_id = ? AND model_name = ?",
         )
         .bind(model.enabled as i64)
         .bind(model.context_limit)
         .bind(model.input_limit)
         .bind(model.output_limit)
+        .bind(endpoint_override)
         .bind(id)
         .bind(model.model_name.trim())
         .execute(&mut *tx)
@@ -918,7 +924,9 @@ async fn provider_model_limits(
                context_override,
                input_override,
                output_override,
-               supported_endpoints
+               COALESCE(supported_endpoints_override, supported_endpoints)
+                   AS supported_endpoints,
+               supported_endpoints_override
         FROM provider_models
         WHERE provider_id = ?
         ORDER BY model_name COLLATE NOCASE
@@ -941,6 +949,7 @@ struct ProviderModelLimitRow {
     input_override: Option<i64>,
     output_override: Option<i64>,
     supported_endpoints: Option<String>,
+    supported_endpoints_override: Option<String>,
 }
 
 impl From<ProviderModelLimitRow> for ProviderModelLimitView {
@@ -953,6 +962,10 @@ impl From<ProviderModelLimitRow> for ProviderModelLimitView {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
                 .unwrap_or_default(),
+            supported_endpoints_override: value
+                .supported_endpoints_override
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok()),
             context_limit: value.context_limit,
             input_limit: value.input_limit,
             output_limit: value.output_limit,
@@ -970,6 +983,38 @@ fn validate_limit(name: &str, value: Option<i64>) -> AppResult<()> {
         )));
     }
     Ok(())
+}
+
+fn serialize_endpoint_override(value: Option<&[String]>) -> AppResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mut endpoints = Vec::new();
+    for raw in value {
+        let endpoint = raw.trim().trim_end_matches('/');
+        if endpoint.is_empty() {
+            continue;
+        }
+        if !endpoint.starts_with('/') {
+            return Err(AppError::BadRequest(format!(
+                "endpoint '{raw}' must start with '/'"
+            )));
+        }
+        if endpoint.len() > 200 {
+            return Err(AppError::BadRequest(format!(
+                "endpoint '{raw}' is too long"
+            )));
+        }
+        if !endpoints.iter().any(|existing| existing == endpoint) {
+            endpoints.push(endpoint.to_string());
+        }
+    }
+    if endpoints.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&endpoints)
+        .map(Some)
+        .map_err(|error| AppError::Internal(error.into()))
 }
 
 async fn fetch_provider_entries(
@@ -1241,7 +1286,8 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
-                display_name: None,
+                display_name: model.display_name,
+                supported_endpoints: model.supported_endpoints,
             }
             .with_flat_limits(),
         );
@@ -1263,6 +1309,7 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
                 max_output_tokens: None,
                 max_completion_tokens: None,
                 display_name: model.display_name,
+                supported_endpoints: model.supported_endpoints,
             }
             .with_flat_limits(),
         );
@@ -2091,7 +2138,8 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
-               pm.supported_endpoints,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
@@ -2166,7 +2214,8 @@ async fn replace_provider_models(
     provider_hint: Option<&str>,
 ) -> AppResult<()> {
     let existing_overrides = sqlx::query_as::<_, ProviderModelOverride>(
-        "SELECT model_name, enabled, context_override, input_override, output_override \
+        "SELECT model_name, enabled, context_override, input_override, output_override, \
+                supported_endpoints_override \
          FROM provider_models WHERE provider_id = ?",
     )
     .bind(provider_id)
@@ -2205,8 +2254,9 @@ async fn replace_provider_models(
                 temperature, open_weights, modalities, cost, family, knowledge,
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
                 upstream_context_limit, supported_endpoints, display_name,
-                context_override, input_override, output_override
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                context_override, input_override, output_override,
+                supported_endpoints_override
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
@@ -2248,6 +2298,7 @@ async fn replace_provider_models(
         .bind(overrides.context_override)
         .bind(overrides.input_override)
         .bind(overrides.output_override)
+        .bind(overrides.supported_endpoints_override)
         .execute(&mut **tx)
         .await?;
     }
@@ -2274,6 +2325,7 @@ struct ProviderModelOverride {
     context_override: Option<i64>,
     input_override: Option<i64>,
     output_override: Option<i64>,
+    supported_endpoints_override: Option<String>,
 }
 
 /// Reads every common context/input spelling and keeps the strictest value.
@@ -2785,6 +2837,18 @@ mod tests {
         assert!(validate_limit("context", Some(400_000)).is_ok());
         assert!(validate_limit("context", Some(0)).is_err());
         assert!(validate_limit("input", Some(-1)).is_err());
+
+        assert_eq!(serialize_endpoint_override(None).unwrap(), None);
+        assert_eq!(
+            serialize_endpoint_override(Some(&[
+                "/v1/responses/".to_string(),
+                "/v1/responses".to_string()
+            ]))
+            .unwrap()
+            .as_deref(),
+            Some(r#"["/v1/responses"]"#)
+        );
+        assert!(serialize_endpoint_override(Some(&["responses".to_string()])).is_err());
     }
 
     #[test]
@@ -3074,10 +3138,13 @@ mod tests {
         sqlx::query(
             "INSERT INTO provider_models (
                 provider_id, model_name, enabled, context_limit, input_limit,
-                output_limit, context_override, input_override, output_override
+                output_limit, context_override, input_override, output_override,
+                supported_endpoints_override
              ) VALUES
-                (1, 'gpt-6-astra', 0, 1050000, 922000, 128000, 400000, NULL, 64000),
-                (1, 'gpt-6-luna', 1, 1050000, 922000, 128000, 400000, 400000, 64000)",
+                (1, 'gpt-6-astra', 0, 1050000, 922000, 128000, 400000, NULL, 64000,
+                 '[\"/responses\"]'),
+                (1, 'gpt-6-luna', 1, 1050000, 922000, 128000, 400000, 400000, 64000,
+                 NULL)",
         )
         .execute(&pool)
         .await
@@ -3127,7 +3194,11 @@ mod tests {
         assert_eq!(astra.input_limit, Some(400_000));
         assert_eq!(astra.output_limit, Some(64_000));
         assert_eq!(astra.context_override, Some(400_000));
-        assert_eq!(astra.supported_endpoints, vec!["/chat/completions"]);
+        assert_eq!(astra.supported_endpoints, vec!["/responses"]);
+        assert_eq!(
+            astra.supported_endpoints_override,
+            Some(vec!["/responses".to_string()])
+        );
 
         let luna = limits
             .iter()
@@ -3137,6 +3208,7 @@ mod tests {
             luna.supported_endpoints,
             vec!["/chat/completions", "/responses"]
         );
+        assert_eq!(luna.supported_endpoints_override, None);
 
         let models = crate::registry::synced_models(&state.pool).await.unwrap();
         let model = models
@@ -3148,6 +3220,13 @@ mod tests {
         assert_eq!(capabilities.context_limit, Some(400_000));
         assert_eq!(capabilities.input_limit, Some(400_000));
         assert_eq!(capabilities.output_limit, Some(64_000));
+        assert_eq!(
+            model.supported_endpoints,
+            Some(vec![
+                "/chat/completions".to_string(),
+                "/responses".to_string()
+            ])
+        );
     }
 
     #[tokio::test]

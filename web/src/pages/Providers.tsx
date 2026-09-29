@@ -50,6 +50,14 @@ const providerLabels = {
   custom: '自定义',
 }
 
+const endpointOptions = [
+  '/v1/chat/completions',
+  '/v1/responses',
+  '/v1/completions',
+  '/v1/embeddings',
+  '/v1/messages',
+].map((value) => ({ value, label: value }))
+
 type ProviderForm = ProviderInput & {
   headersText: string
   modelsText: string
@@ -299,6 +307,16 @@ export default function Providers() {
     )
   }
 
+  const updateEndpointOverride = (modelName: string, value?: string[]) => {
+    setLimitRows((rows) =>
+      rows.map((row) =>
+        row.model_name === modelName
+          ? { ...row, supported_endpoints_override: value?.length ? value : undefined }
+          : row,
+      ),
+    )
+  }
+
   const toggleLimitRow = (modelName: string, enabled: boolean) => {
     setLimitRows((rows) =>
       rows.map((row) => (row.model_name === modelName ? { ...row, enabled } : row)),
@@ -329,6 +347,7 @@ export default function Providers() {
               context_override: undefined,
               input_override: undefined,
               output_override: undefined,
+              supported_endpoints_override: undefined,
             }
           : row,
       ),
@@ -340,6 +359,7 @@ export default function Providers() {
     const models: ProviderModelLimitInput[] = limitRows.map((row) => ({
       model_name: row.model_name,
       enabled: row.enabled,
+      supported_endpoints_override: row.supported_endpoints_override ?? null,
       context_limit: row.context_override ?? null,
       input_limit: row.input_override ?? null,
       output_limit: row.output_override ?? null,
@@ -665,7 +685,7 @@ export default function Providers() {
         destroyOnHidden
       >
         <Typography.Paragraph type="secondary">
-          停用后模型不会出现在 /v1/models 或参与路由。上限留空使用同步值，填写后覆盖同步值。
+          停用后模型不会出现在 /v1/models 或参与路由。上限和接口留空使用同步值，填写后覆盖同步值。
         </Typography.Paragraph>
         <Space wrap style={{ marginBottom: 12 }}>
           <Input
@@ -727,7 +747,7 @@ export default function Providers() {
             showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
             onChange: setLimitPage,
           }}
-          scroll={{ x: 1130, y: 520 }}
+          scroll={{ x: 1370, y: 520 }}
           locale={{ emptyText: '暂无模型' }}
           columns={[
             {
@@ -752,6 +772,23 @@ export default function Providers() {
                 ) : (
                   <Typography.Text type="secondary">未声明</Typography.Text>
                 ),
+            },
+            {
+              title: '接口覆盖',
+              width: 240,
+              render: (_, record) => (
+                <Select
+                  mode="multiple"
+                  allowClear
+                  maxTagCount="responsive"
+                  disabled={!record.enabled}
+                  value={record.supported_endpoints_override ?? undefined}
+                  placeholder="使用同步值"
+                  options={endpointOptions}
+                  onChange={(value) => updateEndpointOverride(record.model_name, value)}
+                  style={{ width: '100%' }}
+                />
+              ),
             },
             {
               title: '启用',
@@ -850,7 +887,8 @@ export default function Providers() {
                   <Tag color="default">已停用</Tag>
                 ) : record.context_override != null ||
                 record.input_override != null ||
-                record.output_override != null ? (
+                record.output_override != null ||
+                record.supported_endpoints_override != null ? (
                   <Tag color="blue">已覆盖</Tag>
                 ) : (
                   <Tag>同步值</Tag>

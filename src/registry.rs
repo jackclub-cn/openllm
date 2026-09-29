@@ -22,6 +22,8 @@ pub struct SyncedModel {
     /// real `created_at` instead of null.
     pub created_at: Option<String>,
     pub capabilities: Option<ModelCapabilities>,
+    /// Effective endpoint paths after applying any manual override.
+    pub supported_endpoints: Option<Vec<String>>,
 }
 
 /// A route, whose advertised capabilities are the barrel (strictest common)
@@ -36,6 +38,9 @@ pub struct RouteModel {
     pub created_at: Option<String>,
     pub target_count: usize,
     pub capabilities: Option<ModelCapabilities>,
+    /// Endpoint paths supported by every target. `None` means at least one
+    /// target did not declare endpoint metadata.
+    pub supported_endpoints: Option<Vec<String>>,
     /// True when at least one target is missing metadata, meaning the
     /// intersection is a lower bound rather than a verified envelope.
     pub incomplete: bool,
@@ -130,6 +135,7 @@ struct SyncedRow {
     provider_name: String,
     display_name: Option<String>,
     created_at: Option<String>,
+    supported_endpoints: Option<String>,
     #[sqlx(flatten)]
     capabilities: CapabilityRow,
 }
@@ -137,6 +143,7 @@ struct SyncedRow {
 /// One enabled target of a route, joined to its synced capability metadata.
 #[derive(Debug, sqlx::FromRow)]
 struct RouteTargetRow {
+    supported_endpoints: Option<String>,
     #[sqlx(flatten)]
     capabilities: CapabilityRow,
 }
@@ -149,6 +156,8 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
                p.name AS provider_name,
                pm.display_name AS display_name,
                pm.created_at AS created_at,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
                {CAPABILITY_COLUMNS}
         FROM providers p
         JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
@@ -168,6 +177,7 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
             display_name: row.display_name,
             created_at: row.created_at,
             capabilities: row.capabilities.into_capabilities(),
+            supported_endpoints: parse_endpoints(row.supported_endpoints.as_deref()),
         })
         .collect())
 }
@@ -236,7 +246,9 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
     for (route_id, pattern, route_name, route_created_at) in routes {
         let query = format!(
             r#"
-            SELECT {CAPABILITY_COLUMNS}
+            SELECT COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                       AS supported_endpoints,
+                   {CAPABILITY_COLUMNS}
             FROM route_targets rt
             JOIN providers p ON p.id = rt.provider_id AND p.enabled = 1
             LEFT JOIN provider_models pm
@@ -264,6 +276,11 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
             .iter()
             .map(|row| capability_from_row(&row.capabilities))
             .collect::<Vec<_>>();
+        let supported_endpoints = intersect_endpoints(
+            targets
+                .iter()
+                .map(|row| parse_endpoints(row.supported_endpoints.as_deref())),
+        );
         // A target without metadata widens the true envelope, so the
         // intersection is only a lower bound in that case.
         let incomplete = capabilities.iter().any(Option::is_none);
@@ -274,6 +291,7 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
             created_at: Some(route_created_at),
             target_count,
             capabilities: ModelCapabilities::intersect(known),
+            supported_endpoints,
             incomplete,
         });
     }
@@ -309,4 +327,34 @@ fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
     };
     let capabilities = capabilities.with_effective_input_limit();
     (!capabilities.is_empty()).then_some(capabilities)
+}
+
+fn parse_endpoints(raw: Option<&str>) -> Option<Vec<String>> {
+    let endpoints = raw
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())?
+        .into_iter()
+        .map(|endpoint| endpoint.trim().trim_end_matches('/').to_string())
+        .filter(|endpoint| !endpoint.is_empty())
+        .collect::<Vec<_>>();
+    (!endpoints.is_empty()).then_some(endpoints)
+}
+
+fn intersect_endpoints(
+    endpoints: impl IntoIterator<Item = Option<Vec<String>>>,
+) -> Option<Vec<String>> {
+    let mut declared = Vec::new();
+    for endpoints in endpoints {
+        let endpoints = endpoints?;
+        declared.push(
+            endpoints
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+        );
+    }
+    let mut declared = declared.into_iter();
+    let mut result = declared.next()?;
+    for endpoints in declared {
+        result = result.intersection(&endpoints).cloned().collect();
+    }
+    (!result.is_empty()).then(|| result.into_iter().collect())
 }

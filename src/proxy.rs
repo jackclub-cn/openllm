@@ -90,6 +90,7 @@ async fn public_models_inner(
                 // The route's own name is the friendly label, matching the
                 // Anthropic shape so both agree.
                 display_name: model.display_name,
+                supported_endpoints: model.supported_endpoints,
             }
             .with_flat_limits(),
         );
@@ -111,6 +112,7 @@ async fn public_models_inner(
                 max_output_tokens: None,
                 max_completion_tokens: None,
                 display_name: model.display_name,
+                supported_endpoints: model.supported_endpoints,
             }
             .with_flat_limits(),
         );
@@ -3274,7 +3276,8 @@ async fn find_prefixed_targets(
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
-               pm.supported_endpoints,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
@@ -3303,7 +3306,8 @@ async fn find_prefixed_targets(
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
-               pm.supported_endpoints,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
@@ -3340,7 +3344,8 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
-               pm.supported_endpoints,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
@@ -4512,6 +4517,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn endpoint_override_controls_routing_and_public_metadata() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, model_prefix
+             ) VALUES (1, 'override', 'openai', 'http://override', 'vendor/')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, supported_endpoints,
+                supported_endpoints_override
+             ) VALUES (
+                1, 'model', '[\"/chat/completions\"]', '[\"/responses\"]'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        assert!(
+            resolve_route(&state, "vendor/model", OPENAI_CHAT_COMPLETIONS)
+                .await
+                .is_err()
+        );
+        let resolved = resolve_route(&state, "vendor/model", OPENAI_RESPONSES)
+            .await
+            .unwrap();
+        assert_eq!(resolved.targets.len(), 1);
+
+        let models = crate::registry::synced_models(&state.pool).await.unwrap();
+        assert_eq!(
+            models[0].supported_endpoints,
+            Some(vec!["/responses".to_string()])
+        );
+
+        let uri: Uri = "/v1/models".parse().unwrap();
+        let response = public_models_inner(&state, &HeaderMap::new(), &uri)
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            payload["data"][0]["supported_endpoints"],
+            json!(["/responses"])
+        );
+    }
+
+    #[tokio::test]
     async fn route_resolution_failures_are_logged() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -4604,7 +4668,8 @@ mod tests {
                 release_date TEXT,
                 last_updated TEXT,
                 canonical_model_id TEXT,
-                supported_endpoints TEXT
+                supported_endpoints TEXT,
+                supported_endpoints_override TEXT
             )",
         )
         .execute(&pool)
@@ -4699,7 +4764,8 @@ mod tests {
                 release_date TEXT,
                 last_updated TEXT,
                 canonical_model_id TEXT,
-                supported_endpoints TEXT
+                supported_endpoints TEXT,
+                supported_endpoints_override TEXT
             )",
         )
         .execute(&pool)

@@ -169,8 +169,10 @@ pub struct ProviderUpdate {
 pub struct ProviderModelLimitView {
     pub model_name: String,
     pub enabled: bool,
-    /// Endpoint paths reported by the provider during model sync.
+    /// Effective endpoint paths after applying any manual override.
     pub supported_endpoints: Vec<String>,
+    /// Manual endpoint list. `None` means the synchronized value is used.
+    pub supported_endpoints_override: Option<Vec<String>>,
     /// Effective values after applying any manual overrides.
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
@@ -186,6 +188,8 @@ pub struct ProviderModelLimitInput {
     pub model_name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub supported_endpoints_override: Option<Vec<String>>,
     #[serde(default)]
     pub context_limit: Option<i64>,
     #[serde(default)]
@@ -331,6 +335,12 @@ pub struct PublicModel {
     /// Friendly label for clients that show one (Anthropic's `display_name`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+    /// Endpoint paths this model is known to support.
+    ///
+    /// Omitted means the provider did not declare endpoint capabilities and
+    /// the gateway treats the model as eligible for any compatible endpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_endpoints: Option<Vec<String>>,
 }
 
 impl PublicModel {
