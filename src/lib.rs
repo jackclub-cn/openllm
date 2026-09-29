@@ -48,6 +48,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             crate::api::run_due_provider_health_checks(health_state.clone()).await;
+            crate::api::run_due_provider_model_syncs(health_state.clone()).await;
         }
     });
 

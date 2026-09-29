@@ -144,6 +144,8 @@ pub async fn create_provider(
     let base_url = normalize_base_url(&input.base_url);
     let health_check_interval_minutes =
         normalize_health_interval(input.health_check_interval_minutes)?;
+    let models_sync_interval_minutes =
+        normalize_health_interval(input.models_sync_interval_minutes)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
     // hit the network, and holding a SQLite write transaction across it would
     // block every other writer.
@@ -156,8 +158,9 @@ pub async fn create_provider(
     let result = sqlx::query(
         "INSERT INTO providers (
             name, provider_type, base_url, model_prefix, models_dev_id,
-            api_key, headers, enabled, health_check_interval_minutes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            api_key, headers, enabled, health_check_interval_minutes,
+            models_sync_interval_minutes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -168,6 +171,7 @@ pub async fn create_provider(
     .bind(headers)
     .bind(input.enabled as i64)
     .bind(health_check_interval_minutes)
+    .bind(models_sync_interval_minutes)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
@@ -224,6 +228,10 @@ pub async fn update_provider(
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.health_check_interval_minutes,
     };
+    let models_sync_interval_minutes = match input.models_sync_interval_minutes {
+        Some(value) => normalize_health_interval(Some(value))?,
+        None => current.models_sync_interval_minutes,
+    };
     let api_key = match input.api_key {
         Some(key) if key.trim().is_empty() => current.api_key,
         Some(key) => Some(key.trim().to_string()),
@@ -248,7 +256,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -259,6 +267,7 @@ pub async fn update_provider(
     .bind(headers)
     .bind(enabled as i64)
     .bind(health_check_interval_minutes)
+    .bind(models_sync_interval_minutes)
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -486,6 +495,45 @@ pub async fn run_due_provider_health_checks(state: AppState) {
         }
     }))
     .buffer_unordered(4)
+    .for_each(|_| async {})
+    .await;
+}
+
+pub async fn run_due_provider_model_syncs(state: AppState) {
+    let due = match sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id FROM providers
+        WHERE enabled = 1
+          AND models_sync_interval_minutes > 0
+          AND (
+              models_sync_attempted_at IS NULL
+              OR datetime(models_sync_attempted_at) <= datetime(
+                  'now',
+                  '-' || models_sync_interval_minutes || ' minutes'
+              )
+          )
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "failed to query providers due for model sync");
+            return;
+        }
+    };
+
+    futures_util::stream::iter(due.into_iter().map(|id| {
+        let state = state.clone();
+        async move {
+            if let Err(error) = sync_provider(state, id).await {
+                tracing::warn!(provider_id = id, %error, "scheduled provider model sync failed");
+            }
+        }
+    }))
+    .buffer_unordered(2)
     .for_each(|_| async {})
     .await;
 }
@@ -803,14 +851,25 @@ async fn fetch_provider_entries(
 
 async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
     let result = sync_provider_inner(&state, id).await;
+    let attempted_at = Utc::now().to_rfc3339();
     if let Err(error) = &result {
         let _ = sqlx::query(
-            "UPDATE providers SET models_sync_error = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+            "UPDATE providers \
+             SET models_sync_error = ?, models_sync_attempted_at = ?, \
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
         )
         .bind(error.to_string())
+        .bind(&attempted_at)
         .bind(id)
         .execute(&state.pool)
         .await;
+    } else {
+        let _ = sqlx::query("UPDATE providers SET models_sync_attempted_at = ? WHERE id = ?")
+            .bind(&attempted_at)
+            .bind(id)
+            .execute(&state.pool)
+            .await;
     }
     result
 }

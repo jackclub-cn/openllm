@@ -111,6 +111,7 @@ export default function Providers() {
       enabled: true,
       auto_sync_models: true,
       health_check_interval_minutes: 0,
+      models_sync_interval_minutes: 0,
       headersText: '{}',
       modelsText: '',
     } as never)
@@ -150,6 +151,7 @@ export default function Providers() {
       auto_sync_models: values.auto_sync_models,
       models: values.modelsText.split('\n').map((item) => item.trim()).filter(Boolean),
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
+      models_sync_interval_minutes: values.models_sync_interval_minutes ?? 0,
     }
     setSaving(true)
     try {
@@ -535,6 +537,13 @@ export default function Providers() {
             name="health_check_interval_minutes"
             label="自动健康检查间隔（分钟）"
             extra="0 或留空表示关闭；启用后后台会按间隔检测并更新健康状态。"
+          >
+            <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="models_sync_interval_minutes"
+            label="自动模型同步间隔（分钟）"
+            extra="0 或留空表示关闭；失败也会记录尝试时间，避免每分钟重复请求。"
           >
             <InputNumber min={0} precision={0} style={{ width: '100%' }} />
           </Form.Item>

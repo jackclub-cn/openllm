@@ -85,6 +85,8 @@ pub struct Provider {
     pub last_test_checked: Option<String>,
     pub last_test_message: Option<String>,
     pub health_check_interval_minutes: Option<i64>,
+    pub models_sync_interval_minutes: Option<i64>,
+    pub models_sync_attempted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -109,6 +111,8 @@ pub struct ProviderView {
     pub last_test_checked: Option<String>,
     pub last_test_message: Option<String>,
     pub health_check_interval_minutes: Option<i64>,
+    pub models_sync_interval_minutes: Option<i64>,
+    pub models_sync_attempted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -132,6 +136,8 @@ pub struct ProviderInput {
     pub models: Vec<String>,
     #[serde(default)]
     pub health_check_interval_minutes: Option<i64>,
+    #[serde(default)]
+    pub models_sync_interval_minutes: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -148,6 +154,8 @@ pub struct ProviderUpdate {
     pub models: Option<Vec<String>>,
     #[serde(default)]
     pub health_check_interval_minutes: Option<i64>,
+    #[serde(default)]
+    pub models_sync_interval_minutes: Option<i64>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -1065,6 +1073,8 @@ impl From<Provider> for ProviderView {
             last_test_checked: value.last_test_checked,
             last_test_message: value.last_test_message,
             health_check_interval_minutes: value.health_check_interval_minutes,
+            models_sync_interval_minutes: value.models_sync_interval_minutes,
+            models_sync_attempted_at: value.models_sync_attempted_at,
             created_at: value.created_at,
             updated_at: value.updated_at,
         }
