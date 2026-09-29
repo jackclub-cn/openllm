@@ -160,6 +160,7 @@ export type ApiKey = {
   today_requests: number
   today_tokens: number
   today_cost_micros?: number | null
+  allowed_models: string[]
 }
 
 export type UsageLog = {

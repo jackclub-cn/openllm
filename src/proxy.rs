@@ -1075,6 +1075,7 @@ fn anthropic_error_response(error: AppError) -> Response {
     let (status, error_type) = match &error {
         AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "invalid_request_error"),
         AppError::Unauthorized(_) => (StatusCode::UNAUTHORIZED, "authentication_error"),
+        AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "permission_error"),
         AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found_error"),
         AppError::Conflict(_) => (StatusCode::CONFLICT, "invalid_request_error"),
         AppError::TooManyRequests(_) => (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
@@ -1122,7 +1123,7 @@ async fn proxy_anthropic_inner(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
-    enforce_quota_or_log(
+    enforce_policy_or_log(
         state,
         api_key.as_ref(),
         &request_id,
@@ -1511,7 +1512,7 @@ pub async fn proxy_openai(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(&state, &headers).await?;
-    enforce_quota_or_log(
+    enforce_policy_or_log(
         &state,
         api_key.as_ref(),
         &request_id,
@@ -2685,7 +2686,33 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
     Ok(())
 }
 
-async fn enforce_quota_or_log(
+fn enforce_api_key_model_access(
+    api_key: Option<&ApiKeyRecord>,
+    requested_model: &str,
+) -> AppResult<()> {
+    let Some(api_key) = api_key else {
+        return Ok(());
+    };
+    let patterns = api_key
+        .allowed_models
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default();
+    if patterns.is_empty()
+        || patterns.iter().any(|pattern| {
+            Glob::new(pattern)
+                .map(|glob| glob.compile_matcher().is_match(requested_model))
+                .unwrap_or(false)
+        })
+    {
+        return Ok(());
+    }
+    Err(AppError::Forbidden(format!(
+        "API key is not allowed to call model '{requested_model}'"
+    )))
+}
+
+async fn enforce_policy_or_log(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
@@ -2694,10 +2721,19 @@ async fn enforce_quota_or_log(
     streamed: bool,
     started: Instant,
 ) -> AppResult<()> {
-    match enforce_api_key_quota(state, api_key).await {
-        Ok(()) => Ok(()),
-        Err(error) => {
+    let rejection = match enforce_api_key_model_access(api_key, requested_model) {
+        Ok(()) => enforce_api_key_quota(state, api_key).await.err(),
+        Err(error) => Some(error),
+    };
+    match rejection {
+        None => Ok(()),
+        Some(error) => {
             let message = error.to_string();
+            let status_code = match error {
+                AppError::Forbidden(_) => 403,
+                AppError::TooManyRequests(_) => 429,
+                _ => 500,
+            };
             log_usage(
                 state,
                 UsageLogEntry {
@@ -2711,7 +2747,7 @@ async fn enforce_quota_or_log(
                     usage: Usage::default(),
                     latency_ms: started.elapsed().as_millis() as i64,
                     first_token_ms: None,
-                    status_code: 429,
+                    status_code,
                     success: false,
                     streamed,
                     error_message: Some(&message),
@@ -3493,16 +3529,17 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
 
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
-    let estimated_cost_micros = if entry.status_code == 429 && entry.provider_id.is_none() {
-        Some(0)
-    } else {
-        match (entry.provider_id, entry.upstream_model) {
-            (Some(provider_id), Some(upstream_model)) if usage.has_tokens() => {
-                estimate_usage_cost(state, provider_id, upstream_model, usage).await
+    let estimated_cost_micros =
+        if matches!(entry.status_code, 403 | 429) && entry.provider_id.is_none() {
+            Some(0)
+        } else {
+            match (entry.provider_id, entry.upstream_model) {
+                (Some(provider_id), Some(upstream_model)) if usage.has_tokens() => {
+                    estimate_usage_cost(state, provider_id, upstream_model, usage).await
+                }
+                _ => None,
             }
-            _ => None,
-        }
-    };
+        };
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logs (
@@ -4067,6 +4104,7 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: Some(10),
             daily_cost_limit_micros: None,
+            allowed_models: None,
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
@@ -4110,6 +4148,7 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: None,
             daily_cost_limit_micros: Some(2),
+            allowed_models: None,
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
@@ -4177,10 +4216,11 @@ mod tests {
             created_at: String::new(),
             daily_token_limit: Some(1),
             daily_cost_limit_micros: None,
+            allowed_models: None,
         };
         let state = AppState::new(pool.clone(), None);
         assert!(
-            enforce_quota_or_log(
+            enforce_policy_or_log(
                 &state,
                 Some(&key),
                 "rejected",
@@ -4200,6 +4240,28 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(row, (0, 429, Some(0), 0));
+    }
+
+    #[test]
+    fn api_key_model_permissions_support_globs() {
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "scoped".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            allowed_models: Some(r#"["gpt-*","claude-sonnet-*"]"#.to_string()),
+        };
+        assert!(enforce_api_key_model_access(Some(&key), "gpt-5.4").is_ok());
+        assert!(enforce_api_key_model_access(Some(&key), "claude-sonnet-5").is_ok());
+        assert!(matches!(
+            enforce_api_key_model_access(Some(&key), "claude-opus-5"),
+            Err(AppError::Forbidden(_))
+        ));
     }
 
     #[test]

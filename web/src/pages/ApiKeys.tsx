@@ -26,6 +26,7 @@ type ApiKeyForm = {
   name: string
   daily_token_limit?: number | null
   daily_cost_limit_usd?: number | null
+  allowed_models_text?: string
 }
 
 export default function ApiKeys() {
@@ -65,6 +66,10 @@ export default function ApiKeys() {
           values.daily_cost_limit_usd != null
             ? Math.round(values.daily_cost_limit_usd * 1_000_000)
             : 0,
+        allowed_models: (values.allowed_models_text || '')
+          .split('\n')
+          .map((value) => value.trim())
+          .filter(Boolean),
       })
       setCreatedKey(result.key)
       form.resetFields()
@@ -110,6 +115,7 @@ export default function ApiKeys() {
         record.daily_cost_limit_micros != null
           ? record.daily_cost_limit_micros / 1_000_000
           : null,
+      allowed_models_text: record.allowed_models.join('\n'),
     })
     setLimitsOpen(true)
   }
@@ -126,8 +132,12 @@ export default function ApiKeys() {
           values.daily_cost_limit_usd != null
             ? Math.round(values.daily_cost_limit_usd * 1_000_000)
             : 0,
+        allowed_models: (values.allowed_models_text || '')
+          .split('\n')
+          .map((value) => value.trim())
+          .filter(Boolean),
       })
-      message.success('限额已保存')
+      message.success('访问策略已保存')
       setLimitsOpen(false)
       await load()
     } catch (error) {
@@ -156,7 +166,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 880 }}
+          scroll={{ x: 990 }}
           columns={[
             {
               title: '名称',
@@ -233,6 +243,18 @@ export default function ApiKeys() {
                   <Typography.Text type="secondary">今日无消耗</Typography.Text>
                 )
               },
+            },
+            {
+              title: '模型权限',
+              width: 110,
+              render: (_, record) =>
+                record.allowed_models.length ? (
+                  <Tooltip title={record.allowed_models.join('\n')}>
+                    <Tag color="blue">{record.allowed_models.length} 条规则</Tag>
+                  </Tooltip>
+                ) : (
+                  <Tag>全部模型</Tag>
+                ),
             },
             {
               title: '创建时间',
@@ -318,12 +340,19 @@ export default function ApiKeys() {
                 <InputNumber min={0} precision={4} style={{ width: '100%' }} />
               </Form.Item>
             </div>
+            <Form.Item
+              name="allowed_models_text"
+              label="允许调用的模型"
+              extra="每行一个模型名或通配符，例如 gpt-*。留空表示允许全部模型。"
+            >
+              <Input.TextArea rows={3} placeholder={'gpt-*\nclaude-sonnet-*'} />
+            </Form.Item>
           </Form>
         )}
       </Modal>
 
       <Modal
-        title={editing ? `每日限额 · ${editing.name}` : '每日限额'}
+        title={editing ? `访问策略 · ${editing.name}` : '访问策略'}
         open={limitsOpen}
         onCancel={() => setLimitsOpen(false)}
         onOk={() => void saveLimits()}
@@ -332,6 +361,13 @@ export default function ApiKeys() {
         destroyOnHidden
       >
         <Form form={limitsForm} layout="vertical">
+          <Form.Item
+            name="allowed_models_text"
+            label="允许调用的模型"
+            extra="每行一个模型名或通配符，例如 gpt-*。留空表示允许全部模型。"
+          >
+            <Input.TextArea rows={3} placeholder={'gpt-*\nclaude-sonnet-*'} />
+          </Form.Item>
           <Form.Item
             name="daily_token_limit"
             label="每日 token 上限"

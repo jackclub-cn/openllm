@@ -497,6 +497,7 @@ pub struct ApiKeyRecord {
     pub created_at: String,
     pub daily_token_limit: Option<i64>,
     pub daily_cost_limit_micros: Option<i64>,
+    pub allowed_models: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -517,6 +518,7 @@ pub struct ApiKeyView {
     pub today_requests: i64,
     pub today_tokens: i64,
     pub today_cost_micros: Option<i64>,
+    pub allowed_models: Vec<String>,
 }
 
 #[derive(Debug, FromRow)]
@@ -537,6 +539,7 @@ pub struct ApiKeyStatsRow {
     pub today_requests: i64,
     pub today_tokens: i64,
     pub today_cost_micros: Option<i64>,
+    pub allowed_models: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,6 +549,8 @@ pub struct ApiKeyInput {
     pub daily_token_limit: Option<i64>,
     #[serde(default)]
     pub daily_cost_limit_micros: Option<i64>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -555,6 +560,8 @@ pub struct ApiKeyUpdate {
     pub daily_token_limit: Option<i64>,
     #[serde(default)]
     pub daily_cost_limit_micros: Option<i64>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]

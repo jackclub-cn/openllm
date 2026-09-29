@@ -868,7 +868,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         SELECT
             k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
             k.last_used_at, k.created_at,
-            k.daily_token_limit, k.daily_cost_limit_micros,
+            k.daily_token_limit, k.daily_cost_limit_micros, k.allowed_models,
             COUNT(CASE WHEN u.id IS NOT NULL AND u.created_at >= ? THEN 1 END) AS today_requests,
             COALESCE(SUM(
                 CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
@@ -889,7 +889,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         LEFT JOIN usage_logs u ON u.api_key_id = k.id
         GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
                  k.last_used_at, k.created_at, k.daily_token_limit,
-                 k.daily_cost_limit_micros
+                 k.daily_cost_limit_micros, k.allowed_models
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
@@ -912,6 +912,7 @@ pub async fn create_api_key(
     let daily_token_limit = normalize_api_key_limit("daily token", input.daily_token_limit)?;
     let daily_cost_limit_micros =
         normalize_api_key_limit("daily cost", input.daily_cost_limit_micros)?;
+    let allowed_models = normalize_allowed_models(input.allowed_models)?;
 
     let raw = format!("sk-openllm-{}", uuid::Uuid::new_v4().simple());
     let key_hash = hash_secret(&raw);
@@ -928,8 +929,8 @@ pub async fn create_api_key(
     let result = sqlx::query(
         "INSERT INTO api_keys (
             name, key_hash, key_prefix, key_suffix, enabled,
-            daily_token_limit, daily_cost_limit_micros
-         ) VALUES (?, ?, ?, ?, 1, ?, ?)",
+            daily_token_limit, daily_cost_limit_micros, allowed_models
+         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(name)
     .bind(key_hash)
@@ -937,6 +938,7 @@ pub async fn create_api_key(
     .bind(key_suffix)
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
+    .bind(allowed_models)
     .execute(&state.pool)
     .await?;
 
@@ -988,14 +990,20 @@ pub async fn update_api_key(
         Some(value) => normalize_api_key_limit("daily cost", Some(value))?,
         None => current.daily_cost_limit_micros,
     };
+    let allowed_models = match input.allowed_models {
+        Some(value) => normalize_allowed_models(Some(value))?,
+        None => current.allowed_models,
+    };
     let result = sqlx::query(
         "UPDATE api_keys \
-         SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ? \
+         SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ?, \
+             allowed_models = ? \
          WHERE id = ?",
     )
     .bind(input.enabled as i64)
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
+    .bind(allowed_models)
     .bind(id)
     .execute(&state.pool)
     .await?;
@@ -1017,6 +1025,45 @@ fn normalize_api_key_limit(name: &str, value: Option<i64>) -> AppResult<Option<i
         Some(0) | None => Ok(None),
         Some(value) => Ok(Some(value)),
     }
+}
+
+fn parse_allowed_models(raw: Option<&str>) -> Vec<String> {
+    raw.and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|model| !model.trim().is_empty())
+        .collect()
+}
+
+fn normalize_allowed_models(value: Option<Vec<String>>) -> AppResult<Option<String>> {
+    let Some(values) = value else {
+        return Ok(None);
+    };
+    let mut seen = HashSet::new();
+    let mut models = Vec::new();
+    for value in values {
+        let model = value.trim();
+        if model.is_empty() {
+            continue;
+        }
+        if model.chars().count() > 500 {
+            return Err(AppError::BadRequest(
+                "model permission entries must be at most 500 characters".to_string(),
+            ));
+        }
+        if seen.insert(model.to_string()) {
+            models.push(model.to_string());
+        }
+    }
+    if models.len() > 200 {
+        return Err(AppError::BadRequest(
+            "an API key can allow at most 200 model patterns".to_string(),
+        ));
+    }
+    if models.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&models).unwrap_or_default()))
 }
 
 pub async fn list_usage(
@@ -1922,6 +1969,7 @@ impl From<ApiKeyRecord> for ApiKeyView {
             today_requests: 0,
             today_tokens: 0,
             today_cost_micros: None,
+            allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
         }
     }
 }
@@ -1945,6 +1993,7 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             today_requests: value.today_requests,
             today_tokens: value.today_tokens,
             today_cost_micros: value.today_cost_micros,
+            allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
         }
     }
 }
@@ -2090,6 +2139,23 @@ mod tests {
             Some(10_000)
         );
         assert!(normalize_api_key_limit("token", Some(-1)).is_err());
+    }
+
+    #[test]
+    fn normalizes_api_key_model_permissions() {
+        assert_eq!(normalize_allowed_models(None).unwrap(), None);
+        assert_eq!(
+            normalize_allowed_models(Some(vec!["  ".to_string()])).unwrap(),
+            None
+        );
+        let stored = normalize_allowed_models(Some(vec![
+            " gpt-* ".to_string(),
+            "gpt-*".to_string(),
+            "claude-*".to_string(),
+        ]))
+        .unwrap()
+        .unwrap();
+        assert_eq!(stored, r#"["gpt-*","claude-*"]"#);
     }
 
     #[test]
