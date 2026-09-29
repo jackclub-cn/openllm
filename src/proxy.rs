@@ -2639,7 +2639,9 @@ async fn authenticate_gateway(
         })?;
     let hash = hash_secret(supplied);
     let record = sqlx::query_as::<_, ApiKeyRecord>(
-        "SELECT * FROM api_keys WHERE key_hash = ? AND enabled = 1",
+        "SELECT * FROM api_keys \
+         WHERE key_hash = ? AND enabled = 1 \
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
     )
     .bind(hash)
     .fetch_optional(&state.pool)
@@ -4194,6 +4196,7 @@ mod tests {
             daily_token_limit: Some(10),
             daily_cost_limit_micros: None,
             allowed_models: None,
+            expires_at: None,
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
@@ -4238,6 +4241,7 @@ mod tests {
             daily_token_limit: None,
             daily_cost_limit_micros: Some(2),
             allowed_models: None,
+            expires_at: None,
         };
         let state = AppState::new(pool, None);
         assert!(matches!(
@@ -4306,6 +4310,7 @@ mod tests {
             daily_token_limit: Some(1),
             daily_cost_limit_micros: None,
             allowed_models: None,
+            expires_at: None,
         };
         let state = AppState::new(pool.clone(), None);
         assert!(
@@ -4344,6 +4349,7 @@ mod tests {
             daily_token_limit: None,
             daily_cost_limit_micros: None,
             allowed_models: Some(r#"["gpt-*","claude-sonnet-*"]"#.to_string()),
+            expires_at: None,
         };
         assert!(enforce_api_key_model_access(Some(&key), "gpt-5.4").is_ok());
         assert!(enforce_api_key_model_access(Some(&key), "claude-sonnet-5").is_ok());

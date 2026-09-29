@@ -1090,7 +1090,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         SELECT
             k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
             k.last_used_at, k.created_at,
-            k.daily_token_limit, k.daily_cost_limit_micros, k.allowed_models,
+            k.daily_token_limit, k.daily_cost_limit_micros, k.allowed_models, k.expires_at,
             COUNT(CASE WHEN u.id IS NOT NULL AND u.created_at >= ? THEN 1 END) AS today_requests,
             COALESCE(SUM(
                 CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
@@ -1111,7 +1111,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         LEFT JOIN usage_logs u ON u.api_key_id = k.id
         GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
                  k.last_used_at, k.created_at, k.daily_token_limit,
-                 k.daily_cost_limit_micros, k.allowed_models
+                 k.daily_cost_limit_micros, k.allowed_models, k.expires_at
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
@@ -1150,14 +1150,15 @@ pub async fn create_api_key(
     let daily_cost_limit_micros =
         normalize_api_key_limit("daily cost", input.daily_cost_limit_micros)?;
     let allowed_models = normalize_allowed_models(input.allowed_models)?;
+    let expires_at = normalize_expiration(input.expires_at)?;
 
     let (raw, key_hash, key_prefix, key_suffix) = generate_api_key_material();
 
     let result = sqlx::query(
         "INSERT INTO api_keys (
             name, key_hash, key_prefix, key_suffix, enabled,
-            daily_token_limit, daily_cost_limit_micros, allowed_models
-         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
+            daily_token_limit, daily_cost_limit_micros, allowed_models, expires_at
+         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(key_hash)
@@ -1166,6 +1167,7 @@ pub async fn create_api_key(
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
     .bind(allowed_models)
+    .bind(expires_at)
     .execute(&state.pool)
     .await?;
 
@@ -1250,16 +1252,21 @@ pub async fn update_api_key(
         Some(value) => normalize_allowed_models(Some(value))?,
         None => current.allowed_models,
     };
+    let expires_at = match input.expires_at {
+        Some(value) => normalize_expiration(Some(value))?,
+        None => current.expires_at,
+    };
     let result = sqlx::query(
         "UPDATE api_keys \
-         SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ?, \
-             allowed_models = ? \
+             SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ?, \
+             allowed_models = ?, expires_at = ? \
          WHERE id = ?",
     )
     .bind(input.enabled as i64)
     .bind(daily_token_limit)
     .bind(daily_cost_limit_micros)
     .bind(allowed_models)
+    .bind(expires_at)
     .bind(id)
     .execute(&state.pool)
     .await?;
@@ -1325,6 +1332,25 @@ fn normalize_allowed_models(value: Option<Vec<String>>) -> AppResult<Option<Stri
         return Ok(None);
     }
     Ok(Some(serde_json::to_string(&models).unwrap_or_default()))
+}
+
+fn normalize_expiration(value: Option<String>) -> AppResult<Option<String>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    let parsed = chrono::DateTime::parse_from_rfc3339(value).map_err(|error| {
+        AppError::BadRequest(format!("expiration must be an RFC3339 timestamp: {error}"))
+    })?;
+    if parsed <= Utc::now() {
+        return Err(AppError::BadRequest(
+            "expiration must be in the future".to_string(),
+        ));
+    }
+    Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
 pub async fn list_usage(
@@ -2279,6 +2305,7 @@ impl From<ApiKeyRecord> for ApiKeyView {
             today_tokens: 0,
             today_cost_micros: None,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
+            expires_at: value.expires_at,
         }
     }
 }
@@ -2303,6 +2330,7 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             today_tokens: value.today_tokens,
             today_cost_micros: value.today_cost_micros,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
+            expires_at: value.expires_at,
         }
     }
 }
@@ -2465,6 +2493,18 @@ mod tests {
         assert_eq!(hash.len(), 64);
         assert_eq!(prefix, raw[..12]);
         assert_eq!(suffix, raw[raw.len() - 4..]);
+    }
+
+    #[test]
+    fn validates_api_key_expiration() {
+        assert_eq!(normalize_expiration(None).unwrap(), None);
+        assert_eq!(normalize_expiration(Some("  ".to_string())).unwrap(), None);
+        let future = (Utc::now() + Duration::hours(1)).to_rfc3339();
+        assert!(normalize_expiration(Some(future)).unwrap().is_some());
+        assert!(normalize_expiration(Some("not-a-date".to_string())).is_err());
+        assert!(
+            normalize_expiration(Some((Utc::now() - Duration::hours(1)).to_rfc3339())).is_err()
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ import {
   App,
   Button,
   Card,
+  DatePicker,
   Form,
   Input,
   InputNumber,
@@ -24,7 +25,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import dayjs from 'dayjs'
+import dayjs, { type Dayjs } from 'dayjs'
 import { api, formatError, type ApiKey } from '../api'
 import PageHeader from '../components/PageHeader'
 import { formatCompact, formatCostMicros, formatExact } from '../format'
@@ -34,6 +35,7 @@ type ApiKeyForm = {
   daily_token_limit?: number | null
   daily_cost_limit_usd?: number | null
   allowed_models_text?: string
+  expires_at?: Dayjs | null
 }
 
 export default function ApiKeys() {
@@ -77,6 +79,7 @@ export default function ApiKeys() {
           .split('\n')
           .map((value) => value.trim())
           .filter(Boolean),
+        expires_at: values.expires_at ? values.expires_at.toISOString() : '',
       })
       setCreatedKey(result.key)
       form.resetFields()
@@ -134,6 +137,7 @@ export default function ApiKeys() {
           ? record.daily_cost_limit_micros / 1_000_000
           : null,
       allowed_models_text: record.allowed_models.join('\n'),
+      expires_at: record.expires_at ? dayjs(record.expires_at) : null,
     })
     setLimitsOpen(true)
   }
@@ -154,6 +158,7 @@ export default function ApiKeys() {
           .split('\n')
           .map((value) => value.trim())
           .filter(Boolean),
+        expires_at: values.expires_at ? values.expires_at.toISOString() : '',
       })
       message.success('访问策略已保存')
       setLimitsOpen(false)
@@ -184,7 +189,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 990 }}
+          scroll={{ x: 1140 }}
           columns={[
             {
               title: '名称',
@@ -275,6 +280,13 @@ export default function ApiKeys() {
                 ),
             },
             {
+              title: '到期时间',
+              dataIndex: 'expires_at',
+              width: 150,
+              render: (value?: string | null) =>
+                value ? dayjs(value).format('YYYY-MM-DD HH:mm') : '永不过期',
+            },
+            {
               title: '创建时间',
               dataIndex: 'created_at',
               width: 150,
@@ -284,12 +296,23 @@ export default function ApiKeys() {
               title: '状态',
               dataIndex: 'enabled',
               width: 130,
-              render: (value: boolean, record) => (
-                <Space size={8}>
-                  <Switch size="small" checked={value} onChange={(checked) => void toggle(record.id, checked)} />
-                  <Tag color={value ? 'success' : 'default'}>{value ? '启用' : '停用'}</Tag>
-                </Space>
-              ),
+              render: (value: boolean, record) => {
+                const expired = record.expires_at
+                  ? dayjs(record.expires_at).isBefore(dayjs())
+                  : false
+                return (
+                  <Space size={8}>
+                    <Switch
+                      size="small"
+                      checked={value}
+                      onChange={(checked) => void toggle(record.id, checked)}
+                    />
+                    <Tag color={expired ? 'error' : value ? 'success' : 'default'}>
+                      {expired ? '已过期' : value ? '启用' : '停用'}
+                    </Tag>
+                  </Space>
+                )
+              },
             },
             {
               title: '操作',
@@ -373,6 +396,13 @@ export default function ApiKeys() {
             >
               <Input.TextArea rows={3} placeholder={'gpt-*\nclaude-sonnet-*'} />
             </Form.Item>
+            <Form.Item
+              name="expires_at"
+              label="到期时间"
+              extra="留空表示永不过期。"
+            >
+              <DatePicker showTime style={{ width: '100%' }} />
+            </Form.Item>
           </Form>
         )}
       </Modal>
@@ -393,6 +423,9 @@ export default function ApiKeys() {
             extra="每行一个模型名或通配符，例如 gpt-*。留空表示允许全部模型。"
           >
             <Input.TextArea rows={3} placeholder={'gpt-*\nclaude-sonnet-*'} />
+          </Form.Item>
+          <Form.Item name="expires_at" label="到期时间" extra="留空表示永不过期。">
+            <DatePicker showTime style={{ width: '100%' }} />
           </Form.Item>
           <Form.Item
             name="daily_token_limit"

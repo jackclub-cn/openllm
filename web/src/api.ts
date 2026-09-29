@@ -166,6 +166,7 @@ export type ApiKey = {
   today_tokens: number
   today_cost_micros?: number | null
   allowed_models: string[]
+  expires_at?: string | null
 }
 
 export type UsageLog = {
