@@ -1198,6 +1198,13 @@ async fn proxy_anthropic_inner(
 
     let mut last_error = None;
     for target in ordered_targets {
+        log_usage_target(
+            state,
+            &request_id,
+            target.provider_id,
+            &target.upstream_model,
+        )
+        .await;
         let result = if target.provider_type == "anthropic" {
             // Native target: forward the caller's Anthropic payload unchanged,
             // only swapping in the resolved upstream model.
@@ -1628,6 +1635,13 @@ pub async fn proxy_openai(
             continue;
         }
 
+        log_usage_target(
+            &state,
+            &request_id,
+            target.provider_id,
+            &target.upstream_model,
+        )
+        .await;
         match forward_to_target(
             &state,
             &request_id,
@@ -3728,6 +3742,26 @@ async fn log_usage_started(
     }
 }
 
+async fn log_usage_target(
+    state: &AppState,
+    request_id: &str,
+    provider_id: i64,
+    upstream_model: &str,
+) {
+    if let Err(error) = sqlx::query(
+        "UPDATE usage_logs SET provider_id = ?, upstream_model = ? \
+         WHERE request_id = ? AND in_flight = 1",
+    )
+    .bind(provider_id)
+    .bind(upstream_model)
+    .bind(request_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(%error, request_id, "failed to update in-flight usage target");
+    }
+}
+
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
     let estimated_cost_micros =
@@ -4383,6 +4417,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(pending, (1, 0, 10, 10));
+
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (7, 'test-provider', 'openai', 'https://example.com/v1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        log_usage_target(&state, "request-in-flight", 7, "upstream-test-model").await;
+        let target: (i64, String) = sqlx::query_as(
+            "SELECT provider_id, upstream_model
+             FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(target, (7, "upstream-test-model".to_string()));
 
         log_usage(
             &state,
