@@ -1098,6 +1098,11 @@ fn normalize_allowed_models(value: Option<Vec<String>>) -> AppResult<Option<Stri
                 "model permission entries must be at most 500 characters".to_string(),
             ));
         }
+        if let Err(error) = globset::Glob::new(model) {
+            return Err(AppError::BadRequest(format!(
+                "invalid model permission pattern '{model}': {error}"
+            )));
+        }
         if seen.insert(model.to_string()) {
             models.push(model.to_string());
         }
@@ -2203,6 +2208,7 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(stored, r#"["gpt-*","claude-*"]"#);
+        assert!(normalize_allowed_models(Some(vec!["unclosed[".to_string()])).is_err());
     }
 
     #[test]

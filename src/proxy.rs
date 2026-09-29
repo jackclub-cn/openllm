@@ -2693,23 +2693,23 @@ fn enforce_api_key_model_access(
     let Some(api_key) = api_key else {
         return Ok(());
     };
-    let patterns = api_key
-        .allowed_models
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-        .unwrap_or_default();
-    if patterns.is_empty()
-        || patterns.iter().any(|pattern| {
-            Glob::new(pattern)
-                .map(|glob| glob.compile_matcher().is_match(requested_model))
-                .unwrap_or(false)
-        })
-    {
-        return Ok(());
+    if let Some(raw) = api_key.allowed_models.as_deref() {
+        let patterns = serde_json::from_str::<Vec<String>>(raw).map_err(|_| {
+            AppError::Forbidden("API key model permissions are invalid".to_string())
+        })?;
+        if !patterns.is_empty()
+            && !patterns.iter().any(|pattern| {
+                Glob::new(pattern)
+                    .map(|glob| glob.compile_matcher().is_match(requested_model))
+                    .unwrap_or(false)
+            })
+        {
+            return Err(AppError::Forbidden(format!(
+                "API key is not allowed to call model '{requested_model}'"
+            )));
+        }
     }
-    Err(AppError::Forbidden(format!(
-        "API key is not allowed to call model '{requested_model}'"
-    )))
+    Ok(())
 }
 
 async fn enforce_policy_or_log(
@@ -4260,6 +4260,14 @@ mod tests {
         assert!(enforce_api_key_model_access(Some(&key), "claude-sonnet-5").is_ok());
         assert!(matches!(
             enforce_api_key_model_access(Some(&key), "claude-opus-5"),
+            Err(AppError::Forbidden(_))
+        ));
+        let malformed = ApiKeyRecord {
+            allowed_models: Some("{".to_string()),
+            ..key
+        };
+        assert!(matches!(
+            enforce_api_key_model_access(Some(&malformed), "gpt-5.4"),
             Err(AppError::Forbidden(_))
         ));
     }
