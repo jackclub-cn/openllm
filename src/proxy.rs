@@ -1064,8 +1064,10 @@ async fn count_tokens_inner(
     })?;
     // `model` is required by the real endpoint; reject early rather than
     // silently counting a body the client meant for a different model.
-    requested_model_of(&inbound)?;
-    authenticate_gateway(state, headers).await?;
+    let requested_model = requested_model_of(&inbound)?;
+    let api_key = authenticate_gateway(state, headers).await?;
+    enforce_api_key_model_access(api_key.as_ref(), &requested_model)?;
+    resolve_route(state, &requested_model).await?;
 
     let input_tokens = estimate_request_tokens(&inbound);
     Ok(Json(json!({"input_tokens": input_tokens})).into_response())
@@ -4811,6 +4813,63 @@ mod tests {
         assert!(requested_model_of(&missing).is_err());
         let present = json!({"model": "claude-x"});
         assert_eq!(requested_model_of(&present).unwrap(), "claude-x");
+    }
+
+    #[tokio::test]
+    async fn count_tokens_enforces_model_access_and_route_availability() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (name, provider_type, base_url, enabled)
+             VALUES ('Scoped', 'anthropic', 'https://example.com', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'gpt-5', 1), (1, 'claude-4', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let raw_key = "sk-openllm-count-tokens";
+        sqlx::query(
+            "INSERT INTO api_keys (
+                name, key_hash, key_prefix, key_suffix, enabled, allowed_models
+             ) VALUES ('scoped', ?, 'sk-openllm-c', 'kens', 1, '[\"gpt-*\"]')",
+        )
+        .bind(hash_secret(raw_key))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HeaderName::from_static("authorization"),
+            HeaderValue::from_str(&format!("Bearer {raw_key}")).unwrap(),
+        );
+
+        let allowed = Bytes::from_static(
+            br#"{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}"#,
+        );
+        assert!(count_tokens_inner(&state, &headers, &allowed).await.is_ok());
+
+        let forbidden = Bytes::from_static(br#"{"model":"claude-4","messages":[]}"#);
+        assert!(matches!(
+            count_tokens_inner(&state, &headers, &forbidden).await,
+            Err(AppError::Forbidden(_))
+        ));
+
+        let missing = Bytes::from_static(br#"{"model":"gpt-missing","messages":[]}"#);
+        assert!(matches!(
+            count_tokens_inner(&state, &headers, &missing).await,
+            Err(AppError::NotFound(_))
+        ));
     }
 
     #[test]
