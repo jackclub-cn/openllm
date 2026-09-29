@@ -1312,6 +1312,41 @@ pub async fn cleanup_usage(
     }))
 }
 
+pub async fn backup_database(State(state): State<AppState>) -> AppResult<Response> {
+    let filename = format!("openllm-backup-{}.db", Utc::now().format("%Y%m%d-%H%M%S"));
+    let path = std::env::temp_dir().join(format!(
+        "openllm-backup-{}.db",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let path_string = path.to_string_lossy().to_string();
+    if let Err(error) = sqlx::query("VACUUM INTO ?")
+        .bind(&path_string)
+        .execute(&state.pool)
+        .await
+    {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(AppError::Database(error));
+    }
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&path).await;
+            return Err(AppError::Internal(error.into()));
+        }
+    };
+    let _ = tokio::fs::remove_file(&path).await;
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.sqlite3")
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{filename}\""),
+        )
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
 /// Share of prompt tokens served from cache, as a percentage.
 ///
 /// `prompt_tokens` must be the total input count (fresh + cached), so the ratio

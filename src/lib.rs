@@ -20,11 +20,11 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api::{
-    admin_auth, cleanup_usage, create_api_key, create_provider, create_route, delete_api_key,
-    delete_provider, delete_route, event_stream, export_usage, get_settings, get_usage_detail,
-    health, list_api_keys, list_models, list_provider_model_limits, list_providers, list_routes,
-    list_usage, overview, sync_provider_models, test_all_providers, test_provider, update_api_key,
-    update_provider, update_provider_model_limits, update_route,
+    admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
+    delete_api_key, delete_provider, delete_route, event_stream, export_usage, get_settings,
+    get_usage_detail, health, list_api_keys, list_models, list_provider_model_limits,
+    list_providers, list_routes, list_usage, overview, sync_provider_models, test_all_providers,
+    test_provider, update_api_key, update_provider, update_provider_model_limits, update_route,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -63,6 +63,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 pub fn build_router(state: AppState) -> Router {
     let admin = Router::new()
         .route("/overview", get(overview))
+        .route("/database/backup", get(backup_database))
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/test-all", post(test_all_providers))
         .route(

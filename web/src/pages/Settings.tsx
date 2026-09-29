@@ -1,17 +1,42 @@
 import { useEffect, useState } from 'react'
-import { CheckCircleOutlined, DatabaseOutlined, SafetyCertificateOutlined } from '@ant-design/icons'
-import { Alert, Button, Card, Descriptions, Form, Input, Space, Tag, Typography } from 'antd'
-import { api, getAdminToken, type Settings } from '../api'
+import {
+  CheckCircleOutlined,
+  DatabaseOutlined,
+  DownloadOutlined,
+  SafetyCertificateOutlined,
+} from '@ant-design/icons'
+import { Alert, App, Button, Card, Descriptions, Form, Input, Space, Tag, Typography } from 'antd'
+import { api, formatError, getAdminToken, type Settings } from '../api'
 import PageHeader from '../components/PageHeader'
 
 export default function SettingsPage({ onSave }: { onSave: (value: string) => void }) {
+  const { message } = App.useApp()
   const [settings, setSettings] = useState<Settings>()
   const [saved, setSaved] = useState(false)
   const [token, setToken] = useState(getAdminToken())
+  const [backingUp, setBackingUp] = useState(false)
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
   }, [])
+
+  const backup = async () => {
+    setBackingUp(true)
+    try {
+      const blob = await api.download('/api/database/backup')
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `openllm-backup-${new Date().toISOString().slice(0, 19).replaceAll(':', '-')}.db`
+      link.click()
+      URL.revokeObjectURL(url)
+      message.success('数据库备份已下载')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setBackingUp(false)
+    }
+  }
 
   return (
     <>
@@ -63,10 +88,18 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="版本">
               {settings?.version || '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="数据库备份">
+              <Button
+                icon={<DownloadOutlined />}
+                loading={backingUp}
+                onClick={() => void backup()}
+              >
+                下载备份
+              </Button>
+            </Descriptions.Item>
           </Descriptions>
         </Card>
       </div>
     </>
   )
 }
-
