@@ -1,11 +1,14 @@
 import { useEffect, useState } from 'react'
 import {
   ApiOutlined,
+  CheckCircleOutlined,
+  ClearOutlined,
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
   SearchOutlined,
   SettingOutlined,
+  StopOutlined,
   SyncOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
@@ -18,6 +21,7 @@ import {
   InputNumber,
   Modal,
   Popconfirm,
+  Segmented,
   Select,
   Space,
   Switch,
@@ -76,6 +80,8 @@ export default function Providers() {
   const [limitProvider, setLimitProvider] = useState<Provider>()
   const [limitRows, setLimitRows] = useState<ProviderModelLimit[]>([])
   const [limitSearch, setLimitSearch] = useState('')
+  const [limitStatus, setLimitStatus] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [limitPage, setLimitPage] = useState(1)
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
 
@@ -257,6 +263,8 @@ export default function Providers() {
   const openLimits = async (provider: Provider) => {
     setLimitProvider(provider)
     setLimitSearch('')
+    setLimitStatus('all')
+    setLimitPage(1)
     setLimitsOpen(true)
     setLimitsLoading(true)
     try {
@@ -286,6 +294,36 @@ export default function Providers() {
   const toggleLimitRow = (modelName: string, enabled: boolean) => {
     setLimitRows((rows) =>
       rows.map((row) => (row.model_name === modelName ? { ...row, enabled } : row)),
+    )
+  }
+
+  const filteredLimitRows = limitRows.filter((row) => {
+    if (!row.model_name.toLowerCase().includes(limitSearch.trim().toLowerCase())) return false
+    if (limitStatus === 'enabled') return row.enabled
+    if (limitStatus === 'disabled') return !row.enabled
+    return true
+  })
+
+  const setFilteredLimitRowsEnabled = (enabled: boolean) => {
+    const names = new Set(filteredLimitRows.map((row) => row.model_name))
+    setLimitRows((rows) =>
+      rows.map((row) => (names.has(row.model_name) ? { ...row, enabled } : row)),
+    )
+  }
+
+  const clearFilteredLimitOverrides = () => {
+    const names = new Set(filteredLimitRows.map((row) => row.model_name))
+    setLimitRows((rows) =>
+      rows.map((row) =>
+        names.has(row.model_name)
+          ? {
+              ...row,
+              context_override: undefined,
+              input_override: undefined,
+              output_override: undefined,
+            }
+          : row,
+      ),
     )
   }
 
@@ -576,22 +614,66 @@ export default function Providers() {
         <Typography.Paragraph type="secondary">
           停用后模型不会出现在 /v1/models 或参与路由。上限留空使用同步值，填写后覆盖同步值。
         </Typography.Paragraph>
-        <Input
-          allowClear
-          prefix={<SearchOutlined />}
-          value={limitSearch}
-          onChange={(event) => setLimitSearch(event.target.value)}
-          placeholder="搜索模型"
-          style={{ width: 280, marginBottom: 12 }}
-        />
+        <Space wrap style={{ marginBottom: 12 }}>
+          <Input
+            allowClear
+            prefix={<SearchOutlined />}
+            value={limitSearch}
+            onChange={(event) => {
+              setLimitSearch(event.target.value)
+              setLimitPage(1)
+            }}
+            placeholder="搜索模型"
+            style={{ width: 280 }}
+          />
+          <Segmented
+            value={limitStatus}
+            onChange={(value) => {
+              setLimitStatus(value as 'all' | 'enabled' | 'disabled')
+              setLimitPage(1)
+            }}
+            options={[
+              { label: '全部', value: 'all' },
+              { label: '已启用', value: 'enabled' },
+              { label: '已停用', value: 'disabled' },
+            ]}
+          />
+          <Tag>{filteredLimitRows.length} 个结果</Tag>
+          <Button
+            icon={<CheckCircleOutlined />}
+            disabled={!filteredLimitRows.length}
+            onClick={() => setFilteredLimitRowsEnabled(true)}
+          >
+            批量启用
+          </Button>
+          <Button
+            icon={<StopOutlined />}
+            disabled={!filteredLimitRows.length}
+            onClick={() => setFilteredLimitRowsEnabled(false)}
+          >
+            批量停用
+          </Button>
+          <Button
+            icon={<ClearOutlined />}
+            disabled={!filteredLimitRows.length}
+            onClick={clearFilteredLimitOverrides}
+          >
+            清除覆盖
+          </Button>
+        </Space>
         <Table
           rowKey="model_name"
           size="small"
           loading={limitsLoading}
-          dataSource={limitRows.filter((row) =>
-            row.model_name.toLowerCase().includes(limitSearch.trim().toLowerCase()),
-          )}
-          pagination={false}
+          dataSource={filteredLimitRows}
+          pagination={{
+            current: limitPage,
+            defaultPageSize: 50,
+            pageSizeOptions: [20, 50, 100],
+            showSizeChanger: true,
+            showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
+            onChange: setLimitPage,
+          }}
           scroll={{ x: 900, y: 520 }}
           locale={{ emptyText: '暂无模型' }}
           columns={[
