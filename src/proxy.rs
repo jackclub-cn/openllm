@@ -172,6 +172,28 @@ fn requested_model_of(body: &Value) -> AppResult<String> {
         .ok_or_else(|| AppError::BadRequest("request body must include a model".to_string()))
 }
 
+/// Validates Anthropic's required `max_tokens` field.
+///
+/// Mirrors the upstream contract: it must be present and a positive integer.
+/// A zero or negative value would be rejected later anyway, but catching it
+/// here yields the precise `invalid_request_error` the client expects.
+fn validate_anthropic_max_tokens(body: &Value) -> AppResult<()> {
+    match body.get("max_tokens") {
+        Some(value) => match value.as_i64() {
+            Some(tokens) if tokens > 0 => Ok(()),
+            Some(_) => Err(AppError::BadRequest(
+                "max_tokens must be a positive integer".to_string(),
+            )),
+            None => Err(AppError::BadRequest(
+                "max_tokens must be an integer".to_string(),
+            )),
+        },
+        None => Err(AppError::BadRequest(
+            "max_tokens is required for the Anthropic Messages API".to_string(),
+        )),
+    }
+}
+
 /// Formats one server-sent event the way Anthropic clients expect it.
 fn sse_line(event: &str, data: Value) -> String {
     format!(
@@ -917,6 +939,11 @@ async fn proxy_anthropic_inner(
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
     let requested_model = requested_model_of(&inbound)?;
+    // Anthropic requires `max_tokens`; the real API answers 400 with an
+    // `invalid_request_error` when it is missing (verified against the live
+    // provider). Defaulting silently would hide a client bug and let the
+    // request fail later with a less obvious error.
+    validate_anthropic_max_tokens(&inbound)?;
     let streamed = inbound
         .get("stream")
         .and_then(Value::as_bool)
@@ -3299,6 +3326,21 @@ mod tests {
         openai.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
         assert!(!wants_anthropic_models(&openai));
         assert!(!wants_anthropic_models(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn requires_max_tokens_like_the_anthropic_api() {
+        // Missing entirely: the live API answers 400, so the gateway must too
+        // rather than silently defaulting and hiding a client bug.
+        assert!(validate_anthropic_max_tokens(&json!({"messages": []})).is_err());
+        // Present and positive is the only accepted form.
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": 1})).is_ok());
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": 4096})).is_ok());
+        // Zero, negative and non-numeric values are rejected.
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": 0})).is_err());
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": -5})).is_err());
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": "1024"})).is_err());
+        assert!(validate_anthropic_max_tokens(&json!({"max_tokens": null})).is_err());
     }
 
     #[test]
