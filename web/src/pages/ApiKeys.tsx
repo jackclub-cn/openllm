@@ -13,11 +13,13 @@ import {
   Switch,
   Table,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import dayjs from 'dayjs'
 import { api, formatError, type ApiKey } from '../api'
 import PageHeader from '../components/PageHeader'
+import { formatCompact, formatCostMicros, formatExact } from '../format'
 
 export default function ApiKeys() {
   const { message } = App.useApp()
@@ -101,6 +103,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
+          scroll={{ x: 880 }}
           columns={[
             {
               title: '名称',
@@ -114,11 +117,41 @@ export default function ApiKeys() {
             {
               title: '最后使用',
               dataIndex: 'last_used_at',
+              width: 170,
               render: (value?: string) => value ? dayjs(value).format('YYYY-MM-DD HH:mm:ss') : '从未使用',
+            },
+            {
+              title: '请求',
+              dataIndex: 'requests',
+              width: 80,
+            },
+            {
+              title: '令牌',
+              dataIndex: 'tokens',
+              width: 110,
+              render: (value: number) => (
+                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+              ),
+            },
+            {
+              title: '费用',
+              dataIndex: 'cost_micros',
+              width: 120,
+              render: (value: number | null, record) => (
+                <div>
+                  <div>{formatCostMicros(value)}</div>
+                  {record.unpriced_requests > 0 && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {record.unpriced_requests} 条未定价
+                    </Typography.Text>
+                  )}
+                </div>
+              ),
             },
             {
               title: '创建时间',
               dataIndex: 'created_at',
+              width: 150,
               render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm'),
             },
             {

@@ -833,8 +833,24 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
 }
 
 pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<ApiKeyView>>> {
-    let keys = sqlx::query_as::<_, ApiKeyRecord>(
-        "SELECT * FROM api_keys ORDER BY enabled DESC, created_at DESC",
+    let keys = sqlx::query_as::<_, ApiKeyStatsRow>(
+        r#"
+        SELECT
+            k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
+            k.last_used_at, k.created_at,
+            COUNT(u.id) AS requests,
+            COALESCE(SUM(u.total_tokens), 0) AS tokens,
+            SUM(u.estimated_cost_micros) AS cost_micros,
+            COALESCE(SUM(
+                CASE WHEN u.id IS NOT NULL AND u.estimated_cost_micros IS NULL
+                     THEN 1 ELSE 0 END
+            ), 0) AS unpriced_requests
+        FROM api_keys k
+        LEFT JOIN usage_logs u ON u.api_key_id = k.id
+        GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
+                 k.last_used_at, k.created_at
+        ORDER BY k.enabled DESC, k.created_at DESC
+        "#,
     )
     .fetch_all(&state.pool)
     .await?;
@@ -1712,6 +1728,28 @@ impl From<ApiKeyRecord> for ApiKeyView {
             enabled: value.enabled != 0,
             last_used_at: value.last_used_at,
             created_at: value.created_at,
+            requests: 0,
+            tokens: 0,
+            cost_micros: None,
+            unpriced_requests: 0,
+        }
+    }
+}
+
+impl From<ApiKeyStatsRow> for ApiKeyView {
+    fn from(value: ApiKeyStatsRow) -> Self {
+        Self {
+            id: value.id,
+            name: value.name,
+            key_prefix: value.key_prefix,
+            key_suffix: value.key_suffix,
+            enabled: value.enabled != 0,
+            last_used_at: value.last_used_at,
+            created_at: value.created_at,
+            requests: value.requests,
+            tokens: value.tokens,
+            cost_micros: value.cost_micros,
+            unpriced_requests: value.unpriced_requests,
         }
     }
 }

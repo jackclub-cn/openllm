@@ -496,6 +496,25 @@ pub struct ApiKeyView {
     pub enabled: bool,
     pub last_used_at: Option<String>,
     pub created_at: String,
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost_micros: Option<i64>,
+    pub unpriced_requests: i64,
+}
+
+#[derive(Debug, FromRow)]
+pub struct ApiKeyStatsRow {
+    pub id: i64,
+    pub name: String,
+    pub key_prefix: String,
+    pub key_suffix: String,
+    pub enabled: i64,
+    pub last_used_at: Option<String>,
+    pub created_at: String,
+    pub requests: i64,
+    pub tokens: i64,
+    pub cost_micros: Option<i64>,
+    pub unpriced_requests: i64,
 }
 
 #[derive(Debug, Deserialize)]

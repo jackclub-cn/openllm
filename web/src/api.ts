@@ -127,6 +127,10 @@ export type ApiKey = {
   enabled: boolean
   last_used_at?: string
   created_at: string
+  requests: number
+  tokens: number
+  cost_micros?: number | null
+  unpriced_requests: number
 }
 
 export type UsageLog = {
