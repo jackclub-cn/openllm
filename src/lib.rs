@@ -22,8 +22,9 @@ use tower_http::trace::TraceLayer;
 use crate::api::{
     admin_auth, cleanup_usage, create_api_key, create_provider, create_route, delete_api_key,
     delete_provider, delete_route, event_stream, get_settings, get_usage_detail, health,
-    list_api_keys, list_models, list_providers, list_routes, list_usage, overview,
-    sync_provider_models, test_provider, update_api_key, update_provider, update_route,
+    list_api_keys, list_models, list_provider_model_limits, list_providers, list_routes,
+    list_usage, overview, sync_provider_models, test_provider, update_api_key, update_provider,
+    update_provider_model_limits, update_route,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -69,6 +70,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/providers/{id}/test", post(test_provider))
         .route("/providers/{id}/models/sync", post(sync_provider_models))
+        .route(
+            "/providers/{id}/model-limits",
+            get(list_provider_model_limits).put(update_provider_model_limits),
+        )
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/{id}", put(update_route).delete(delete_route))
         .route("/models", get(list_models))

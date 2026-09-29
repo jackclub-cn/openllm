@@ -134,6 +134,35 @@ pub struct ProviderUpdate {
     pub models: Option<Vec<String>>,
 }
 
+#[derive(Debug, Serialize, FromRow)]
+pub struct ProviderModelLimitView {
+    pub model_name: String,
+    /// Effective values after applying any manual overrides.
+    pub context_limit: Option<i64>,
+    pub input_limit: Option<i64>,
+    pub output_limit: Option<i64>,
+    /// Manual values. `None` means the synced value is used.
+    pub context_override: Option<i64>,
+    pub input_override: Option<i64>,
+    pub output_override: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderModelLimitInput {
+    pub model_name: String,
+    #[serde(default)]
+    pub context_limit: Option<i64>,
+    #[serde(default)]
+    pub input_limit: Option<i64>,
+    #[serde(default)]
+    pub output_limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderModelLimitsUpdate {
+    pub models: Vec<ProviderModelLimitInput>,
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Route {
     pub id: i64,

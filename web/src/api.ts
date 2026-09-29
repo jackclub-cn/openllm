@@ -77,6 +77,23 @@ export type ProviderInput = {
   models: string[]
 }
 
+export type ProviderModelLimit = {
+  model_name: string
+  context_limit?: number | null
+  input_limit?: number | null
+  output_limit?: number | null
+  context_override?: number | null
+  input_override?: number | null
+  output_override?: number | null
+}
+
+export type ProviderModelLimitInput = {
+  model_name: string
+  context_limit?: number | null
+  input_limit?: number | null
+  output_limit?: number | null
+}
+
 export type RouteTarget = {
   id?: number
   provider_id: number

@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 
 use axum::Json;
@@ -434,6 +434,122 @@ pub async fn sync_provider_models(
     Path(id): Path<i64>,
 ) -> AppResult<Json<ModelSyncResult>> {
     Ok(Json(sync_provider(state, id).await?))
+}
+
+pub async fn list_provider_model_limits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<Vec<ProviderModelLimitView>>> {
+    ensure_provider_exists(&state, id).await?;
+    Ok(Json(provider_model_limits(&state, id).await?))
+}
+
+pub async fn update_provider_model_limits(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(input): Json<ProviderModelLimitsUpdate>,
+) -> AppResult<Json<Vec<ProviderModelLimitView>>> {
+    ensure_provider_exists(&state, id).await?;
+    let mut seen = HashSet::new();
+    for model in &input.models {
+        let name = model.model_name.trim();
+        if name.is_empty() {
+            return Err(AppError::BadRequest("model name is required".to_string()));
+        }
+        if !seen.insert(name.to_string()) {
+            return Err(AppError::BadRequest(format!(
+                "model '{name}' appears more than once"
+            )));
+        }
+        validate_limit("context", model.context_limit)?;
+        validate_limit("input", model.input_limit)?;
+        validate_limit("output", model.output_limit)?;
+        if let (Some(context), Some(input)) = (model.context_limit, model.input_limit)
+            && input > context
+        {
+            return Err(AppError::BadRequest(format!(
+                "model '{name}' input limit cannot exceed its context limit"
+            )));
+        }
+    }
+
+    let mut tx = state.pool.begin().await?;
+    for model in &input.models {
+        let result = sqlx::query(
+            "UPDATE provider_models \
+             SET context_override = ?, input_override = ?, output_override = ? \
+             WHERE provider_id = ? AND model_name = ? AND enabled = 1",
+        )
+        .bind(model.context_limit)
+        .bind(model.input_limit)
+        .bind(model.output_limit)
+        .bind(id)
+        .bind(model.model_name.trim())
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(format!(
+                "model '{}' was not found for this provider",
+                model.model_name.trim()
+            )));
+        }
+    }
+    tx.commit().await?;
+
+    Ok(Json(provider_model_limits(&state, id).await?))
+}
+
+async fn ensure_provider_exists(state: &AppState, id: i64) -> AppResult<()> {
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM providers WHERE id = ?)")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    if exists {
+        Ok(())
+    } else {
+        Err(AppError::NotFound("provider not found".to_string()))
+    }
+}
+
+async fn provider_model_limits(
+    state: &AppState,
+    provider_id: i64,
+) -> AppResult<Vec<ProviderModelLimitView>> {
+    Ok(sqlx::query_as::<_, ProviderModelLimitView>(
+        r#"
+        SELECT model_name,
+               COALESCE(context_override, context_limit) AS context_limit,
+               CASE
+                   WHEN COALESCE(input_override, input_limit) IS NULL
+                       THEN COALESCE(context_override, context_limit)
+                   WHEN COALESCE(context_override, context_limit) IS NULL
+                       THEN COALESCE(input_override, input_limit)
+                   ELSE MIN(
+                       COALESCE(input_override, input_limit),
+                       COALESCE(context_override, context_limit)
+                   )
+               END AS input_limit,
+               COALESCE(output_override, output_limit) AS output_limit,
+               context_override,
+               input_override,
+               output_override
+        FROM provider_models
+        WHERE provider_id = ? AND enabled = 1
+        ORDER BY model_name COLLATE NOCASE
+        "#,
+    )
+    .bind(provider_id)
+    .fetch_all(&state.pool)
+    .await?)
+}
+
+fn validate_limit(name: &str, value: Option<i64>) -> AppResult<()> {
+    if value.is_some_and(|value| value <= 0) {
+        return Err(AppError::BadRequest(format!(
+            "{name} limit must be a positive integer"
+        )));
+    }
+    Ok(())
 }
 
 async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
@@ -1171,6 +1287,16 @@ async fn replace_provider_models(
     catalog: Option<&models_dev::Catalog>,
     provider_hint: Option<&str>,
 ) -> AppResult<()> {
+    let existing_overrides = sqlx::query_as::<_, ProviderModelOverride>(
+        "SELECT model_name, context_override, input_override, output_override \
+         FROM provider_models WHERE provider_id = ?",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|row| (row.model_name.clone(), row))
+    .collect::<HashMap<_, _>>();
     sqlx::query("DELETE FROM provider_models WHERE provider_id = ?")
         .bind(provider_id)
         .execute(&mut **tx)
@@ -1192,6 +1318,7 @@ async fn replace_provider_models(
         // optimistic limit.
         let context_limit = min_known(upstream.context_limit, capabilities.context_limit);
         let input_limit = min_known(context_limit, capabilities.input_limit);
+        let overrides = existing_overrides.get(model).cloned().unwrap_or_default();
         sqlx::query(
             r#"
             INSERT INTO provider_models (
@@ -1199,8 +1326,9 @@ async fn replace_provider_models(
                 input_limit, attachment, reasoning, tool_call, structured_output,
                 temperature, open_weights, modalities, cost, family, knowledge,
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
-                upstream_context_limit, supported_endpoints, display_name
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                upstream_context_limit, supported_endpoints, display_name,
+                context_override, input_override, output_override
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
@@ -1238,6 +1366,9 @@ async fn replace_provider_models(
                 .unwrap_or_default(),
         )
         .bind(upstream.display_name.clone())
+        .bind(overrides.context_override)
+        .bind(overrides.input_override)
+        .bind(overrides.output_override)
         .execute(&mut **tx)
         .await?;
     }
@@ -1255,6 +1386,14 @@ struct UpstreamModelInfo {
     supported_endpoints: Vec<String>,
     /// Provider-supplied label, e.g. "DeepSeek V4.1 Flash".
     display_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
+struct ProviderModelOverride {
+    model_name: String,
+    context_override: Option<i64>,
+    input_override: Option<i64>,
+    output_override: Option<i64>,
 }
 
 /// Reads every common context/input spelling and keeps the strictest value.
@@ -1689,6 +1828,14 @@ mod tests {
     }
 
     #[test]
+    fn validates_manual_model_limits() {
+        assert!(validate_limit("context", None).is_ok());
+        assert!(validate_limit("context", Some(400_000)).is_ok());
+        assert!(validate_limit("context", Some(0)).is_err());
+        assert!(validate_limit("input", Some(-1)).is_err());
+    }
+
+    #[test]
     fn parses_ollama_style_model_lists() {
         let value = json!({ "models": [
             { "name": "llama3:8b", "model": "llama3:8b" },
@@ -1741,5 +1888,67 @@ mod tests {
             enabled: true,
         }];
         assert!(validate_targets(&enabled).is_ok());
+    }
+
+    #[tokio::test]
+    async fn model_limit_overrides_survive_resync() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url) \
+             VALUES (1, 'CallAI', 'openai', 'https://sub.callai.one/v1')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, enabled, context_limit, input_limit,
+                output_limit, context_override, input_override, output_override
+             ) VALUES (1, 'gpt-6-astra', 1, 1050000, 922000, 128000, 400000, NULL, 64000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        replace_provider_models(
+            &mut tx,
+            1,
+            &[(
+                "gpt-6-astra".to_string(),
+                UpstreamModelInfo {
+                    context_limit: Some(1_050_000),
+                    ..Default::default()
+                },
+            )],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        let state = AppState::new(pool, None);
+        let limits = provider_model_limits(&state, 1).await.unwrap();
+        assert_eq!(limits.len(), 1);
+        assert_eq!(limits[0].context_limit, Some(400_000));
+        assert_eq!(limits[0].input_limit, Some(400_000));
+        assert_eq!(limits[0].output_limit, Some(64_000));
+        assert_eq!(limits[0].context_override, Some(400_000));
+
+        let models = crate::registry::synced_models(&state.pool).await.unwrap();
+        let model = models
+            .iter()
+            .find(|model| model.upstream_model == "gpt-6-astra")
+            .unwrap();
+        let capabilities = model.capabilities.as_ref().unwrap();
+        assert_eq!(capabilities.context_limit, Some(400_000));
+        assert_eq!(capabilities.input_limit, Some(400_000));
+        assert_eq!(capabilities.output_limit, Some(64_000));
     }
 }

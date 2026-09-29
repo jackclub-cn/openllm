@@ -3703,7 +3703,26 @@ mod tests {
             "CREATE TABLE provider_models (
                 provider_id INTEGER NOT NULL,
                 model_name TEXT NOT NULL,
-                enabled INTEGER NOT NULL DEFAULT 1
+                enabled INTEGER NOT NULL DEFAULT 1,
+                context_limit INTEGER,
+                input_limit INTEGER,
+                output_limit INTEGER,
+                context_override INTEGER,
+                input_override INTEGER,
+                output_override INTEGER,
+                attachment INTEGER,
+                reasoning INTEGER,
+                tool_call INTEGER,
+                structured_output INTEGER,
+                temperature INTEGER,
+                open_weights INTEGER,
+                modalities TEXT,
+                cost TEXT,
+                family TEXT,
+                knowledge TEXT,
+                release_date TEXT,
+                last_updated TEXT,
+                canonical_model_id TEXT
             )",
         )
         .execute(&pool)

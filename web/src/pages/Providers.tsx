@@ -4,6 +4,7 @@ import {
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
+  SettingOutlined,
   SyncOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
@@ -13,6 +14,7 @@ import {
   Card,
   Form,
   Input,
+  InputNumber,
   Modal,
   Popconfirm,
   Select,
@@ -23,8 +25,16 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { api, formatError, type Provider, type ProviderInput } from '../api'
+import {
+  api,
+  formatError,
+  type Provider,
+  type ProviderInput,
+  type ProviderModelLimit,
+  type ProviderModelLimitInput,
+} from '../api'
 import PageHeader from '../components/PageHeader'
+import { formatCompact, formatExact } from '../format'
 import { providerPresets } from '../providerPresets'
 
 const providerLabels = {
@@ -46,6 +56,11 @@ export default function Providers() {
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState<Provider>()
   const [open, setOpen] = useState(false)
+  const [limitsOpen, setLimitsOpen] = useState(false)
+  const [limitsLoading, setLimitsLoading] = useState(false)
+  const [limitsSaving, setLimitsSaving] = useState(false)
+  const [limitProvider, setLimitProvider] = useState<Provider>()
+  const [limitRows, setLimitRows] = useState<ProviderModelLimit[]>([])
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
 
@@ -178,6 +193,59 @@ export default function Providers() {
     }
   }
 
+  const openLimits = async (provider: Provider) => {
+    setLimitProvider(provider)
+    setLimitsOpen(true)
+    setLimitsLoading(true)
+    try {
+      setLimitRows(
+        await api.get<ProviderModelLimit[]>(`/api/providers/${provider.id}/model-limits`),
+      )
+    } catch (error) {
+      message.error(formatError(error))
+      setLimitsOpen(false)
+    } finally {
+      setLimitsLoading(false)
+    }
+  }
+
+  const updateLimitRow = (
+    modelName: string,
+    field: 'context_override' | 'input_override' | 'output_override',
+    value: number | null,
+  ) => {
+    setLimitRows((rows) =>
+      rows.map((row) =>
+        row.model_name === modelName ? { ...row, [field]: value ?? undefined } : row,
+      ),
+    )
+  }
+
+  const saveLimits = async () => {
+    if (!limitProvider) return
+    const models: ProviderModelLimitInput[] = limitRows.map((row) => ({
+      model_name: row.model_name,
+      context_limit: row.context_override ?? null,
+      input_limit: row.input_override ?? null,
+      output_limit: row.output_override ?? null,
+    }))
+    setLimitsSaving(true)
+    try {
+      setLimitRows(
+        await api.put<ProviderModelLimit[]>(
+          `/api/providers/${limitProvider.id}/model-limits`,
+          { models },
+        ),
+      )
+      message.success('模型上限已保存')
+      setLimitsOpen(false)
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setLimitsSaving(false)
+    }
+  }
+
   return (
     <>
       <PageHeader
@@ -254,7 +322,7 @@ export default function Providers() {
             },
             {
               title: '操作',
-              width: 200,
+              width: 240,
               fixed: 'right',
               render: (_, record) => (
                 <Space>
@@ -263,6 +331,13 @@ export default function Providers() {
                   </Tooltip>
                   <Tooltip title="测试连接">
                     <Button type="text" icon={<ThunderboltOutlined />} onClick={() => test(record.id)} />
+                  </Tooltip>
+                  <Tooltip title="模型上限">
+                    <Button
+                      type="text"
+                      icon={<SettingOutlined />}
+                      onClick={() => void openLimits(record)}
+                    />
                   </Tooltip>
                   <Tooltip title="编辑">
                     <Button type="text" icon={<EditOutlined />} onClick={() => openEditor(record)} />
@@ -351,6 +426,124 @@ export default function Providers() {
             <Switch />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title={limitProvider ? `模型上限 · ${limitProvider.name}` : '模型上限'}
+        open={limitsOpen}
+        onCancel={() => setLimitsOpen(false)}
+        onOk={() => void saveLimits()}
+        confirmLoading={limitsSaving}
+        okButtonProps={{ disabled: limitsLoading }}
+        width={900}
+        destroyOnHidden
+      >
+        <Typography.Paragraph type="secondary">
+          留空使用同步值，填写后覆盖同步值。
+        </Typography.Paragraph>
+        <Table
+          rowKey="model_name"
+          size="small"
+          loading={limitsLoading}
+          dataSource={limitRows}
+          pagination={false}
+          scroll={{ x: 820, y: 520 }}
+          locale={{ emptyText: '暂无模型' }}
+          columns={[
+            {
+              title: '模型',
+              dataIndex: 'model_name',
+              width: 260,
+              render: (value: string) => <Typography.Text strong>{value}</Typography.Text>,
+            },
+            {
+              title: '当前生效',
+              key: 'effective',
+              width: 210,
+              render: (_, record) => (
+                <Space size={4} wrap>
+                  {record.context_limit != null && (
+                    <Tooltip title={`上下文 ${formatExact(record.context_limit)}`}>
+                      <Tag>上下文 {formatCompact(record.context_limit)}</Tag>
+                    </Tooltip>
+                  )}
+                  {record.input_limit != null && (
+                    <Tooltip title={`输入 ${formatExact(record.input_limit)}`}>
+                      <Tag>输入 {formatCompact(record.input_limit)}</Tag>
+                    </Tooltip>
+                  )}
+                  {record.output_limit != null && (
+                    <Tooltip title={`输出 ${formatExact(record.output_limit)}`}>
+                      <Tag>输出 {formatCompact(record.output_limit)}</Tag>
+                    </Tooltip>
+                  )}
+                  {record.context_limit == null &&
+                    record.input_limit == null &&
+                    record.output_limit == null && (
+                      <Typography.Text type="secondary">无</Typography.Text>
+                    )}
+                </Space>
+              ),
+            },
+            {
+              title: '上下文覆盖',
+              width: 150,
+              render: (_, record) => (
+                <InputNumber
+                  min={1}
+                  value={record.context_override}
+                  placeholder={record.context_limit?.toString()}
+                  onChange={(value) =>
+                    updateLimitRow(record.model_name, 'context_override', value)
+                  }
+                  style={{ width: '100%' }}
+                />
+              ),
+            },
+            {
+              title: '输入覆盖',
+              width: 150,
+              render: (_, record) => (
+                <InputNumber
+                  min={1}
+                  value={record.input_override}
+                  placeholder={record.input_limit?.toString()}
+                  onChange={(value) =>
+                    updateLimitRow(record.model_name, 'input_override', value)
+                  }
+                  style={{ width: '100%' }}
+                />
+              ),
+            },
+            {
+              title: '输出覆盖',
+              width: 150,
+              render: (_, record) => (
+                <InputNumber
+                  min={1}
+                  value={record.output_override}
+                  placeholder={record.output_limit?.toString()}
+                  onChange={(value) =>
+                    updateLimitRow(record.model_name, 'output_override', value)
+                  }
+                  style={{ width: '100%' }}
+                />
+              ),
+            },
+            {
+              title: '状态',
+              width: 80,
+              render: (_, record) =>
+                record.context_override != null ||
+                record.input_override != null ||
+                record.output_override != null ? (
+                  <Tag color="blue">已覆盖</Tag>
+                ) : (
+                  <Tag>同步值</Tag>
+                ),
+            },
+          ]}
+        />
       </Modal>
     </>
   )

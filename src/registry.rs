@@ -43,8 +43,9 @@ pub struct RouteModel {
 
 /// Capability columns, in the order [`CapabilityRow`] declares them. Kept in
 /// one place so the struct and its query cannot drift.
-const CAPABILITY_COLUMNS: &str = "pm.context_limit AS context_limit, \
-     pm.output_limit AS output_limit, pm.input_limit AS input_limit, \
+const CAPABILITY_COLUMNS: &str = "COALESCE(pm.context_override, pm.context_limit) AS context_limit, \
+     COALESCE(pm.output_override, pm.output_limit) AS output_limit, \
+     COALESCE(pm.input_override, pm.input_limit) AS input_limit, \
      pm.attachment AS attachment, pm.reasoning AS reasoning, \
      pm.tool_call AS tool_call, pm.structured_output AS structured_output, \
      pm.temperature AS temperature, pm.open_weights AS open_weights, \
