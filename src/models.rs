@@ -73,6 +73,7 @@ pub struct Provider {
     pub provider_type: String,
     pub base_url: String,
     pub model_prefix: String,
+    pub models_dev_id: Option<String>,
     pub api_key: Option<String>,
     pub headers: String,
     pub enabled: i64,
@@ -89,6 +90,7 @@ pub struct ProviderView {
     pub provider_type: String,
     pub base_url: String,
     pub model_prefix: String,
+    pub models_dev_id: Option<String>,
     pub headers: serde_json::Value,
     pub enabled: bool,
     pub api_key_set: bool,
@@ -224,6 +226,156 @@ pub struct PublicModel {
     pub object: &'static str,
     pub created: i64,
     pub owned_by: &'static str,
+    /// Upstream provider the model resolves to. Absent on route entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The upstream model name this entry forwards to.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upstream_model: Option<String>,
+    /// Effective capability envelope. For routes this is the barrel (strictest
+    /// common) intersection across every enabled target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ModelCapabilities>,
+    /// Number of enabled targets behind a route entry. Absent for a model that
+    /// resolves directly to a single provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<usize>,
+    /// Present on route entries. `false` means at least one target lacks
+    /// metadata, so `capabilities` is a lower bound rather than a verified
+    /// guarantee that every target accepts the advertised limits.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits_verified: Option<bool>,
+}
+
+/// Capability metadata mirrored from models.dev. Every field is optional so an
+/// unknown value stays distinguishable from a known `false` or `0`, which
+/// matters when intersecting several targets.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelCapabilities {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_weights: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modalities: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub knowledge: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub release_date: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_updated: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub canonical_model_id: Option<String>,
+}
+
+impl ModelCapabilities {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Barrel/intersection: the strictest common envelope across `targets`.
+    ///
+    /// Numeric limits take the minimum of the known values, booleans are only
+    /// true when every target that reports the flag says true, and modalities
+    /// keep only what all targets accept. Descriptive fields (family, cost,
+    /// release dates) are intentionally dropped because a route can span
+    /// unrelated models where they have no common meaning.
+    pub fn intersect<'a>(targets: impl IntoIterator<Item = &'a ModelCapabilities>) -> Option<Self> {
+        let targets = targets.into_iter().collect::<Vec<_>>();
+        if targets.is_empty() {
+            return None;
+        }
+        let min = |f: fn(&ModelCapabilities) -> Option<i64>| -> Option<i64> {
+            targets.iter().filter_map(|c| f(c)).min()
+        };
+        let all_true = |f: fn(&ModelCapabilities) -> Option<bool>| -> Option<bool> {
+            let known = targets.iter().filter_map(|c| f(c)).collect::<Vec<_>>();
+            if known.is_empty() {
+                None
+            } else {
+                Some(known.iter().all(|v| *v))
+            }
+        };
+        let capabilities = Self {
+            context_limit: min(|c| c.context_limit),
+            output_limit: min(|c| c.output_limit),
+            input_limit: min(|c| c.input_limit),
+            attachment: all_true(|c| c.attachment),
+            reasoning: all_true(|c| c.reasoning),
+            tool_call: all_true(|c| c.tool_call),
+            structured_output: all_true(|c| c.structured_output),
+            temperature: all_true(|c| c.temperature),
+            open_weights: all_true(|c| c.open_weights),
+            modalities: intersect_modalities(&targets),
+            cost: None,
+            family: None,
+            knowledge: None,
+            release_date: None,
+            last_updated: None,
+            canonical_model_id: None,
+        };
+        (!capabilities.is_empty()).then_some(capabilities)
+    }
+}
+
+/// Keeps only the modalities supported by every target. `None` entries are
+/// ignored; if no target declares modalities the result is `None`.
+fn intersect_modalities(targets: &[&ModelCapabilities]) -> Option<serde_json::Value> {
+    let declared = targets
+        .iter()
+        .filter_map(|c| c.modalities.as_ref())
+        .collect::<Vec<_>>();
+    if declared.is_empty() {
+        return None;
+    }
+    let sets = |key: &str| -> Vec<std::collections::BTreeSet<String>> {
+        declared
+            .iter()
+            .map(|value| {
+                value
+                    .get(key)
+                    .and_then(serde_json::Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .map(ToOwned::to_owned)
+                            .collect::<std::collections::BTreeSet<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
+    };
+    let intersect = |groups: Vec<std::collections::BTreeSet<String>>| {
+        let mut iter = groups.into_iter();
+        let mut result = iter.next().unwrap_or_default();
+        for group in iter {
+            result = result.intersection(&group).cloned().collect();
+        }
+        result
+    };
+    Some(serde_json::json!({
+        "input": intersect(sets("input")),
+        "output": intersect(sets("output")),
+    }))
 }
 
 #[derive(Debug, Serialize)]
@@ -284,6 +436,9 @@ pub struct UsageLog {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub latency_ms: i64,
+    /// Time to first streamed content token, in milliseconds. `None` for
+    /// non-streamed requests or when the upstream sent no content at all.
+    pub first_token_ms: Option<i64>,
     pub status_code: i64,
     pub success: i64,
     pub streamed: i64,
@@ -309,6 +464,7 @@ pub struct UsageLogView {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub latency_ms: i64,
+    pub first_token_ms: Option<i64>,
     pub status_code: i64,
     pub success: bool,
     pub streamed: bool,
@@ -335,6 +491,7 @@ impl From<UsageLog> for UsageLogView {
             completion_tokens: value.completion_tokens,
             total_tokens: value.total_tokens,
             latency_ms: value.latency_ms,
+            first_token_ms: value.first_token_ms,
             status_code: value.status_code,
             success: value.success != 0,
             streamed: value.streamed != 0,
@@ -362,6 +519,7 @@ pub struct UsageLogDetailRow {
     pub completion_tokens: i64,
     pub total_tokens: i64,
     pub latency_ms: i64,
+    pub first_token_ms: Option<i64>,
     pub status_code: i64,
     pub success: i64,
     pub streamed: i64,
@@ -388,6 +546,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
             completion_tokens: value.completion_tokens,
             total_tokens: value.total_tokens,
             latency_ms: value.latency_ms,
+            first_token_ms: value.first_token_ms,
             status_code: value.status_code,
             success: value.success != 0,
             streamed: value.streamed != 0,
@@ -540,6 +699,7 @@ impl From<Provider> for ProviderView {
             provider_type: value.provider_type,
             base_url: value.base_url,
             model_prefix: value.model_prefix,
+            models_dev_id: value.models_dev_id,
             headers,
             enabled: value.enabled != 0,
             api_key_set: value.api_key.as_deref().is_some_and(|key| !key.is_empty()),
@@ -566,4 +726,80 @@ fn default_page() -> i64 {
 
 fn default_page_size() -> i64 {
     20
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+
+    fn capabilities(
+        output: Option<i64>,
+        tools: Option<bool>,
+        context: Option<i64>,
+    ) -> ModelCapabilities {
+        ModelCapabilities {
+            output_limit: output,
+            tool_call: tools,
+            context_limit: context,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn intersection_takes_strictest_common_envelope() {
+        let wide = capabilities(Some(128000), Some(true), Some(400000));
+        let narrow = capabilities(Some(8000), Some(true), Some(32000));
+        let result = ModelCapabilities::intersect([&wide, &narrow]).unwrap();
+        assert_eq!(result.output_limit, Some(8000));
+        assert_eq!(result.context_limit, Some(32000));
+        assert_eq!(result.tool_call, Some(true));
+    }
+
+    #[test]
+    fn intersection_reports_false_when_any_target_lacks_a_capability() {
+        let with_tools = capabilities(Some(8000), Some(true), None);
+        let without_tools = capabilities(Some(8000), Some(false), None);
+        let result = ModelCapabilities::intersect([&with_tools, &without_tools]).unwrap();
+        assert_eq!(result.tool_call, Some(false));
+    }
+
+    #[test]
+    fn intersection_ignores_unknown_values_instead_of_zeroing_them() {
+        let known = capabilities(Some(8000), None, Some(32000));
+        let unknown = ModelCapabilities::default();
+        let result = ModelCapabilities::intersect([&known, &unknown]).unwrap();
+        // An unknown limit must not collapse the known one to zero.
+        assert_eq!(result.output_limit, Some(8000));
+        assert_eq!(result.context_limit, Some(32000));
+        assert_eq!(result.tool_call, None);
+    }
+
+    #[test]
+    fn intersection_keeps_only_shared_modalities() {
+        let multi = ModelCapabilities {
+            modalities: Some(serde_json::json!({
+                "input": ["text", "image", "pdf"],
+                "output": ["text"]
+            })),
+            ..Default::default()
+        };
+        let text_only = ModelCapabilities {
+            modalities: Some(serde_json::json!({
+                "input": ["text"],
+                "output": ["text"]
+            })),
+            ..Default::default()
+        };
+        let result = ModelCapabilities::intersect([&multi, &text_only]).unwrap();
+        let modalities = result.modalities.unwrap();
+        assert_eq!(modalities["input"], serde_json::json!(["text"]));
+        assert_eq!(modalities["output"], serde_json::json!(["text"]));
+    }
+
+    #[test]
+    fn empty_intersection_returns_none() {
+        assert!(ModelCapabilities::intersect(std::iter::empty()).is_none());
+        let empty = ModelCapabilities::default();
+        assert!(ModelCapabilities::intersect([&empty]).is_none());
+    }
 }

@@ -54,6 +54,7 @@ export type Provider = {
   provider_type: 'openai' | 'anthropic' | 'ollama' | 'custom'
   base_url: string
   model_prefix: string
+  models_dev_id?: string
   headers: Record<string, string>
   enabled: boolean
   api_key_set: boolean
@@ -125,6 +126,7 @@ export type UsageLog = {
   completion_tokens: number
   total_tokens: number
   latency_ms: number
+  first_token_ms?: number
   status_code: number
   success: boolean
   streamed: boolean
@@ -159,6 +161,37 @@ export type Settings = {
   admin_auth_enabled: boolean
   database: string
   version: string
+}
+
+export type ModelCapabilities = {
+  context_limit?: number
+  output_limit?: number
+  input_limit?: number
+  attachment?: boolean
+  reasoning?: boolean
+  tool_call?: boolean
+  structured_output?: boolean
+  temperature?: boolean
+  open_weights?: boolean
+  modalities?: { input?: string[]; output?: string[] }
+  cost?: Record<string, unknown>
+  family?: string
+  knowledge?: string
+  release_date?: string
+  last_updated?: string
+  canonical_model_id?: string
+}
+
+export type ModelInfo = {
+  id: string
+  object: string
+  created: number
+  owned_by: string
+  provider?: string
+  upstream_model?: string
+  capabilities?: ModelCapabilities
+  target_count?: number
+  limits_verified?: boolean
 }
 
 export function formatError(error: unknown) {

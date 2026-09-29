@@ -24,7 +24,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { api, formatError } from '../api'
+import { api, formatError, type ModelInfo } from '../api'
 import PageHeader from '../components/PageHeader'
 
 const GATEWAY_KEY = 'openllm-gateway-key'
@@ -53,9 +53,7 @@ function readSettings(): PersistedSettings {
   return { temperature: 0.7, maxTokens: 4096 }
 }
 
-type ModelOption = {
-  id: string
-}
+type ModelOption = ModelInfo
 
 type ChatMessage = {
   id: string
@@ -94,6 +92,11 @@ export default function Playground() {
   const [loadError, setLoadError] = useState('')
   const abortRef = useRef<AbortController | undefined>(undefined)
   const scrollRef = useRef<HTMLDivElement>(null)
+  const selected = models.find((item) => item.id === model)
+  const capabilities = selected?.capabilities
+  // Never let the form submit above what the model (or route barrel) accepts;
+  // the gateway clamps too, but surfacing the real ceiling avoids a surprise.
+  const outputLimit = capabilities?.output_limit
 
   const loadModels = useCallback(async () => {
     try {
@@ -444,11 +447,37 @@ export default function Playground() {
               <InputNumber
                 className="settings-control"
                 min={1}
-                max={131072}
-                value={maxTokens}
+                max={outputLimit ?? 131072}
+                value={maxTokens && outputLimit ? Math.min(maxTokens, outputLimit) : maxTokens}
                 onChange={setMaxTokens}
               />
             </div>
+            {capabilities && (
+              <div>
+                <Typography.Text strong>模型能力</Typography.Text>
+                <div className="capability-tags">
+                  {capabilities.context_limit != null && (
+                    <Tag>上下文 {capabilities.context_limit.toLocaleString()}</Tag>
+                  )}
+                  {capabilities.output_limit != null && (
+                    <Tag>输出上限 {capabilities.output_limit.toLocaleString()}</Tag>
+                  )}
+                  {capabilities.reasoning && <Tag color="geekblue">推理</Tag>}
+                  {capabilities.tool_call && <Tag color="green">工具调用</Tag>}
+                  {capabilities.attachment && <Tag color="orange">附件</Tag>}
+                  {capabilities.structured_output && <Tag>结构化输出</Tag>}
+                  {capabilities.modalities?.input && (
+                    <Tag>输入 {capabilities.modalities.input.join('/')}</Tag>
+                  )}
+                </div>
+                {selected?.target_count != null && (
+                  <Typography.Text type="secondary">
+                    路由 {selected.target_count} 个目标，能力为共同下限
+                    {selected.limits_verified === false ? '（部分目标缺少元数据）' : ''}
+                  </Typography.Text>
+                )}
+              </div>
+            )}
           </Space>
         </Card>
       </div>

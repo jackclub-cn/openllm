@@ -14,6 +14,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::error::{AppError, AppResult};
 use crate::models::*;
+use crate::models_dev;
 use crate::proxy::apply_custom_headers;
 use crate::state::AppState;
 
@@ -139,15 +140,24 @@ pub async fn create_provider(
     let headers = serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
     let model_prefix = normalize_model_prefix(&input.model_prefix)?;
     let api_key = normalize_optional(input.api_key);
+    let base_url = normalize_base_url(&input.base_url);
+    // Resolve metadata before opening the transaction: the catalog fetch may
+    // hit the network, and holding a SQLite write transaction across it would
+    // block every other writer.
+    let catalog = models_dev::try_load(&state).await;
+    let models_dev_id = catalog
+        .as_ref()
+        .and_then(|catalog| catalog.match_provider(input.name.trim(), &base_url));
 
     let mut tx = state.pool.begin().await?;
     let result = sqlx::query(
-        "INSERT INTO providers (name, provider_type, base_url, model_prefix, api_key, headers, enabled) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO providers (name, provider_type, base_url, model_prefix, models_dev_id, api_key, headers, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
-    .bind(normalize_base_url(&input.base_url))
+    .bind(base_url)
     .bind(model_prefix)
+    .bind(models_dev_id.as_deref())
     .bind(api_key)
     .bind(headers)
     .bind(input.enabled as i64)
@@ -156,7 +166,14 @@ pub async fn create_provider(
     .map_err(map_sqlite_conflict)?;
 
     let id = result.last_insert_rowid();
-    replace_provider_models(&mut tx, id, &input.models).await?;
+    replace_provider_models(
+        &mut tx,
+        id,
+        &input.models,
+        catalog.as_deref(),
+        models_dev_id.as_deref(),
+    )
+    .await?;
     tx.commit().await?;
 
     if input.auto_sync_models
@@ -211,14 +228,21 @@ pub async fn update_provider(
         ));
     }
 
+    // Name or base URL may have changed, which can change the models.dev match.
+    let catalog = models_dev::try_load(&state).await;
+    let models_dev_id = catalog
+        .as_ref()
+        .and_then(|catalog| catalog.match_provider(&name, &base_url));
+
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, api_key = ?, headers = ?, enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
     .bind(base_url)
     .bind(model_prefix)
+    .bind(models_dev_id.as_deref())
     .bind(api_key)
     .bind(headers)
     .bind(enabled as i64)
@@ -228,7 +252,14 @@ pub async fn update_provider(
     .map_err(map_sqlite_conflict)?;
 
     if let Some(models) = input.models {
-        replace_provider_models(&mut tx, id, &models).await?;
+        replace_provider_models(
+            &mut tx,
+            id,
+            &models,
+            catalog.as_deref(),
+            models_dev_id.as_deref(),
+        )
+        .await?;
     }
     tx.commit().await?;
 
@@ -410,12 +441,27 @@ async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncRe
         ));
     }
 
+    let catalog = models_dev::try_load(state).await;
+    // Re-resolve the provider match on every sync: the stored id may be stale
+    // (for example a provider renamed after a catalog update).
+    let models_dev_id = catalog
+        .as_ref()
+        .and_then(|catalog| catalog.match_provider(&provider.name, &provider.base_url));
+
     let mut tx = state.pool.begin().await?;
-    replace_provider_models(&mut tx, id, &models).await?;
+    replace_provider_models(
+        &mut tx,
+        id,
+        &models,
+        catalog.as_deref(),
+        models_dev_id.as_deref(),
+    )
+    .await?;
     let synced_at = Utc::now().to_rfc3339();
     sqlx::query(
-        "UPDATE providers SET models_synced_at = ?, models_sync_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET models_dev_id = ?, models_synced_at = ?, models_sync_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
+    .bind(models_dev_id.as_deref())
     .bind(&synced_at)
     .bind(id)
     .execute(&mut *tx)
@@ -535,47 +581,40 @@ pub async fn delete_route(
 }
 
 pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<PublicModel>>> {
-    let routes =
-        sqlx::query_as::<_, Route>("SELECT * FROM routes WHERE enabled = 1 ORDER BY model_pattern")
-            .fetch_all(&state.pool)
-            .await?;
-    let synced_models = sqlx::query_as::<_, (String, String)>(
-        r#"
-        SELECT p.model_prefix, pm.model_name
-        FROM providers p
-        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
-        WHERE p.enabled = 1
-        ORDER BY p.model_prefix, pm.model_name
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let routes = crate::registry::route_models(&state.pool).await?;
+    let synced = crate::registry::synced_models(&state.pool).await?;
     let from = std::time::UNIX_EPOCH
         .elapsed()
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    let mut unique = BTreeMap::new();
-    for route in routes {
-        let pattern = route.model_pattern;
-        unique
-            .entry(pattern.clone())
-            .or_insert_with(|| PublicModel {
-                id: pattern,
-                object: "model",
-                created: from,
-                owned_by: "openllm",
-            });
-    }
-    for (prefix, model) in synced_models {
-        let id = format!("{prefix}{model}");
-        unique.entry(id.clone()).or_insert_with(|| PublicModel {
-            id,
+    let mut by_id = BTreeMap::new();
+    for model in routes {
+        by_id.entry(model.id.clone()).or_insert(PublicModel {
+            id: model.id,
             object: "model",
             created: from,
             owned_by: "openllm",
+            provider: None,
+            upstream_model: None,
+            capabilities: model.capabilities,
+            target_count: Some(model.target_count),
+            limits_verified: Some(!model.incomplete),
         });
     }
-    Ok(Json(unique.into_values().collect()))
+    for model in synced {
+        by_id.entry(model.id.clone()).or_insert(PublicModel {
+            id: model.id,
+            object: "model",
+            created: from,
+            owned_by: "openllm",
+            provider: Some(model.provider_name),
+            upstream_model: Some(model.upstream_model),
+            capabilities: model.capabilities,
+            target_count: None,
+            limits_verified: None,
+        });
+    }
+    Ok(Json(by_id.into_values().collect()))
 }
 
 pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<ApiKeyView>>> {
@@ -685,7 +724,7 @@ pub async fn list_usage(
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.latency_ms, u.status_code,
-               u.success, u.streamed, u.error_message, u.created_at,
+               u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
         FROM usage_logs u
@@ -813,7 +852,7 @@ pub async fn overview(
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.latency_ms, u.status_code,
-               u.success, u.streamed, u.error_message, u.created_at,
+               u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
         FROM usage_logs u
@@ -981,22 +1020,66 @@ async fn replace_provider_models(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     provider_id: i64,
     models: &[String],
+    catalog: Option<&models_dev::Catalog>,
+    provider_hint: Option<&str>,
 ) -> AppResult<()> {
     sqlx::query("DELETE FROM provider_models WHERE provider_id = ?")
         .bind(provider_id)
         .execute(&mut **tx)
         .await?;
     let mut seen = HashSet::new();
+    let synced_at = Utc::now().to_rfc3339();
     for model in models {
         let model = model.trim();
         if model.is_empty() || !seen.insert(model.to_string()) {
             continue;
         }
+        let found = catalog.and_then(|catalog| catalog.lookup(provider_hint, model));
+        let has_capabilities = found.is_some();
+        let capabilities = found.unwrap_or_default();
         sqlx::query(
-            "INSERT INTO provider_models (provider_id, model_name, enabled) VALUES (?, ?, 1)",
+            r#"
+            INSERT INTO provider_models (
+                provider_id, model_name, enabled, context_limit, output_limit,
+                input_limit, attachment, reasoning, tool_call, structured_output,
+                temperature, open_weights, modalities, cost, family, knowledge,
+                release_date, last_updated, canonical_model_id, capabilities_synced_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            "#,
         )
         .bind(provider_id)
         .bind(model)
+        .bind(capabilities.context_limit)
+        .bind(capabilities.output_limit)
+        .bind(capabilities.input_limit)
+        .bind(capabilities.attachment.map(i64::from))
+        .bind(capabilities.reasoning.map(i64::from))
+        .bind(capabilities.tool_call.map(i64::from))
+        .bind(capabilities.structured_output.map(i64::from))
+        .bind(capabilities.temperature.map(i64::from))
+        .bind(capabilities.open_weights.map(i64::from))
+        .bind(
+            capabilities
+                .modalities
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .unwrap_or_default(),
+        )
+        .bind(
+            capabilities
+                .cost
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .unwrap_or_default(),
+        )
+        .bind(capabilities.family)
+        .bind(capabilities.knowledge)
+        .bind(capabilities.release_date)
+        .bind(capabilities.last_updated)
+        .bind(capabilities.canonical_model_id)
+        .bind(has_capabilities.then_some(synced_at.clone()))
         .execute(&mut **tx)
         .await?;
     }

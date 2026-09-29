@@ -415,6 +415,17 @@ body {
   margin-top: 8px;
 }
 
+.capability-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.capability-tags .ant-tag {
+  margin-inline-end: 0;
+}
+
 @media (max-width: 992px) {
   .app-content {
     padding: 18px;

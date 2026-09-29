@@ -20,6 +20,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteStrategy, RouteTarget, Usage,
 };
+use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
@@ -29,42 +30,44 @@ pub async fn public_models(
     headers: HeaderMap,
 ) -> AppResult<Json<ModelList>> {
     authenticate_gateway(&state, &headers).await?;
-    let patterns = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT model_pattern FROM routes WHERE enabled = 1 ORDER BY model_pattern COLLATE NOCASE",
-    )
-    .fetch_all(&state.pool)
-    .await?;
-    let synced_models = sqlx::query_scalar::<_, String>(
-        r#"
-        SELECT p.model_prefix || pm.model_name
-        FROM providers p
-        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
-        WHERE p.enabled = 1
-        ORDER BY p.model_prefix || pm.model_name
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await?;
+    let routes = crate::registry::route_models(&state.pool).await?;
+    let synced = crate::registry::synced_models(&state.pool).await?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or_default();
-    // A route pattern can coincide with a synced model name (for example an
-    // exact-match route for a prefixed model), so de-duplicate before exposing
-    // the list. Clients treat duplicate ids as distinct entries.
-    let mut ids = patterns;
-    ids.extend(synced_models);
-    ids.sort();
-    ids.dedup();
-    let data = ids
-        .into_iter()
-        .map(|id| PublicModel {
-            id,
+    // A route pattern can coincide with a synced model id (for example an
+    // exact-match route for a prefixed model). Explicit routes win because they
+    // carry the barrel intersection across their targets, while deduping keeps
+    // clients from seeing the same id twice.
+    let mut by_id = std::collections::BTreeMap::new();
+    for model in routes {
+        by_id.entry(model.id.clone()).or_insert(PublicModel {
+            id: model.id,
             object: "model",
             created,
             owned_by: "openllm",
-        })
-        .collect();
+            provider: None,
+            upstream_model: None,
+            capabilities: model.capabilities,
+            target_count: Some(model.target_count),
+            limits_verified: Some(!model.incomplete),
+        });
+    }
+    for model in synced {
+        by_id.entry(model.id.clone()).or_insert(PublicModel {
+            id: model.id,
+            object: "model",
+            created,
+            owned_by: "openllm",
+            provider: Some(model.provider_name),
+            upstream_model: Some(model.upstream_model),
+            capabilities: model.capabilities,
+            target_count: None,
+            limits_verified: None,
+        });
+    }
+    let data = by_id.into_values().collect();
     Ok(Json(ModelList {
         object: "list",
         data,
@@ -80,7 +83,7 @@ pub async fn proxy_openai(
     let started = Instant::now();
     let endpoint = uri.path().to_string();
     let request_id = uuid::Uuid::new_v4().to_string();
-    let request_json: Value = serde_json::from_slice(&body).map_err(|error| {
+    let mut request_json: Value = serde_json::from_slice(&body).map_err(|error| {
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
     let requested_model = request_json
@@ -98,6 +101,19 @@ pub async fn proxy_openai(
     let api_key = authenticate_gateway(&state, &headers).await?;
     let resolved = resolve_route(&state, &requested_model).await?;
     let route_id = resolved.route_id;
+    // Barrel mode: clamp the requested output length to the strictest common
+    // ceiling across every target, so no target is picked that would reject the
+    // request as too large.
+    let requested_output_tokens = request_json
+        .get("max_tokens")
+        .or_else(|| request_json.get("max_completion_tokens"))
+        .and_then(Value::as_i64);
+    let clamped_output_tokens = clamp_output_request(&mut request_json, resolved.barrel.as_ref());
+    let receipt = capability_receipt(
+        resolved.barrel.as_ref(),
+        requested_output_tokens,
+        clamped_output_tokens,
+    );
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
         order_targets(&state, ordering_key, &resolved.strategy, resolved.targets).await?;
@@ -124,6 +140,7 @@ pub async fn proxy_openai(
             request_tokens,
             api_key.as_ref(),
             started,
+            receipt.clone(),
         )
         .await
         {
@@ -157,6 +174,7 @@ pub async fn proxy_openai(
                 total_tokens: request_tokens,
             },
             latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
             status_code: 502,
             success: false,
             streamed,
@@ -181,6 +199,7 @@ async fn forward_to_target(
     request_tokens: i64,
     api_key: Option<&ApiKeyRecord>,
     started: Instant,
+    receipt: Option<Value>,
 ) -> AppResult<Response> {
     let provider_type =
         ProviderType::from_str(&target.provider_type).map_err(AppError::BadRequest)?;
@@ -267,6 +286,7 @@ async fn forward_to_target(
                     total_tokens: request_tokens,
                 },
                 latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: None,
                 status_code: status.as_u16() as i64,
                 success: false,
                 streamed,
@@ -306,6 +326,7 @@ async fn forward_to_target(
                 request_tokens,
                 api_key.cloned(),
                 started,
+                receipt,
             ));
         }
 
@@ -317,6 +338,8 @@ async fn forward_to_target(
             .map_err(|error| AppError::Upstream(format!("invalid JSON from Anthropic: {error}")))?;
         let (converted, usage) = convert_anthropic_response(&upstream_json);
         let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
+        let converted_bytes =
+            inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
         let preview = response_preview(&converted_bytes);
         log_usage(
             state,
@@ -330,6 +353,7 @@ async fn forward_to_target(
                 endpoint,
                 usage: fill_usage(usage, request_tokens, &converted),
                 latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: None,
                 status_code: status.as_u16() as i64,
                 success: true,
                 streamed: false,
@@ -338,11 +362,13 @@ async fn forward_to_target(
             },
         )
         .await;
-        return Ok(Response::builder()
+        let mut response = Response::builder()
             .status(status)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(Body::from(converted_bytes))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        apply_capability_headers(&mut response, &receipt);
+        return Ok(response);
     }
 
     if streamed {
@@ -357,6 +383,7 @@ async fn forward_to_target(
             request_tokens,
             api_key.cloned(),
             started,
+            receipt,
         ));
     }
 
@@ -385,6 +412,7 @@ async fn forward_to_target(
             endpoint: endpoint.to_string(),
             usage,
             latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
             status_code: status.as_u16() as i64,
             success: true,
             streamed: false,
@@ -393,14 +421,21 @@ async fn forward_to_target(
         },
     );
 
-    Ok(Response::builder()
+    // Inject the receipt only when the body is a JSON object, and only after
+    // usage logging has read the original bytes.
+    let body_bytes = inject_capability_receipt(&response_bytes, &receipt)
+        .map(Bytes::from)
+        .unwrap_or(response_bytes);
+    let mut response = Response::builder()
         .status(status)
         .header(reqwest::header::CONTENT_TYPE, response_content_type)
-        .body(Body::from(response_bytes))
+        .body(Body::from(body_bytes))
         .unwrap_or_else(|_| {
             AppError::Upstream(format!("could not forward response: {response_text}"))
                 .into_response()
-        }))
+        });
+    apply_capability_headers(&mut response, &receipt);
+    Ok(response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -415,11 +450,12 @@ fn passthrough_stream_response(
     request_tokens: i64,
     api_key: Option<ApiKeyRecord>,
     started: Instant,
+    receipt: Option<Value>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let mut upstream = response.bytes_stream();
-        let mut parser = UsageParser::default();
+        let mut parser = UsageParser::new(started);
         let mut stream_error = None;
         while let Some(chunk) = upstream.next().await {
             match chunk {
@@ -462,6 +498,7 @@ fn passthrough_stream_response(
                 endpoint: &endpoint,
                 usage,
                 latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms: parser.first_token_ms,
                 status_code: if stream_error.is_some() { 502 } else { 200 },
                 success: stream_error.is_none(),
                 streamed: true,
@@ -472,14 +509,16 @@ fn passthrough_stream_response(
         .await;
     });
 
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(reqwest::header::CONTENT_TYPE, content_type)
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .header(reqwest::header::CONNECTION, "keep-alive")
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(rx)))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -492,6 +531,7 @@ fn anthropic_stream_response(
     request_tokens: i64,
     api_key: Option<ApiKeyRecord>,
     started: Instant,
+    receipt: Option<Value>,
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
@@ -510,6 +550,7 @@ fn anthropic_stream_response(
         let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
         let mut stream_error = None;
         let mut text = String::new();
+        let mut first_token_ms = None;
 
         while let Some(chunk) = upstream.next().await {
             let chunk = match chunk {
@@ -532,6 +573,8 @@ fn anthropic_stream_response(
                     &mut saw_tool_use,
                     &mut next_tool_index,
                     &mut tool_indices,
+                    &mut first_token_ms,
+                    started,
                     &message_id,
                     &requested_model,
                     &tx,
@@ -551,6 +594,8 @@ fn anthropic_stream_response(
                 &mut saw_tool_use,
                 &mut next_tool_index,
                 &mut tool_indices,
+                &mut first_token_ms,
+                started,
                 &message_id,
                 &requested_model,
                 &tx,
@@ -616,6 +661,7 @@ fn anthropic_stream_response(
                 endpoint: OPENAI_CHAT_COMPLETIONS,
                 usage: usage.normalized(),
                 latency_ms: started.elapsed().as_millis() as i64,
+                first_token_ms,
                 status_code: 200,
                 success: stream_error.is_none(),
                 streamed: true,
@@ -626,14 +672,16 @@ fn anthropic_stream_response(
         .await;
     });
 
-    Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
         .header(reqwest::header::CACHE_CONTROL, "no-cache")
         .header(reqwest::header::CONNECTION, "keep-alive")
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(rx)))
-        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -647,6 +695,8 @@ async fn process_anthropic_line(
     saw_tool_use: &mut bool,
     next_tool_index: &mut usize,
     tool_indices: &mut std::collections::HashMap<i64, usize>,
+    first_token_ms: &mut Option<i64>,
+    started: Instant,
     message_id: &str,
     model: &str,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
@@ -695,6 +745,9 @@ async fn process_anthropic_line(
         }
         "content_block_delta" => {
             if let Some(delta_text) = value.pointer("/delta/text").and_then(Value::as_str) {
+                if first_token_ms.is_none() && !delta_text.is_empty() {
+                    *first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
                 *output_chars += delta_text.chars().count();
                 push_preview_text(text_acc, delta_text);
                 let chunk = openai_stream_chunk(
@@ -716,6 +769,9 @@ async fn process_anthropic_line(
             if value.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta")
                 && let Some(partial) = value.pointer("/delta/partial_json").and_then(Value::as_str)
             {
+                if first_token_ms.is_none() {
+                    *first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
                 let block_index = value.get("index").and_then(Value::as_i64).unwrap_or(0);
                 let index = *tool_indices.get(&block_index).unwrap_or(&0);
                 let chunk = openai_stream_chunk(
@@ -1147,6 +1203,10 @@ struct ResolvedRoute {
     route_id: Option<i64>,
     strategy: String,
     targets: Vec<RouteTarget>,
+    /// Strictest common capability envelope across the route's targets. Only
+    /// meaningful for explicit routes; a directly matched model reports its own
+    /// capabilities.
+    barrel: Option<BarrelEnvelope>,
 }
 
 async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute> {
@@ -1157,18 +1217,30 @@ async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute
                 "the matched route has no enabled provider targets".to_string(),
             ));
         }
+        let pairs = targets
+            .iter()
+            .map(|target| (target.provider_id, target.upstream_model.clone()))
+            .collect::<Vec<_>>();
+        let barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
         return Ok(ResolvedRoute {
             route_id: Some(route.id),
             strategy: route.strategy,
             targets,
+            barrel: Some(barrel),
         });
     }
 
     let targets = find_prefixed_targets(state, model).await?;
+    let pairs = targets
+        .iter()
+        .map(|target| (target.provider_id, target.upstream_model.clone()))
+        .collect::<Vec<_>>();
+    let barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
     Ok(ResolvedRoute {
         route_id: None,
         strategy: "priority".to_string(),
         targets,
+        barrel: Some(barrel),
     })
 }
 
@@ -1312,15 +1384,34 @@ async fn order_targets(
     Ok(targets)
 }
 
-#[derive(Default)]
 struct UsageParser {
     buffer: Vec<u8>,
     usage: Option<Usage>,
     output_chars: usize,
     text: String,
+    started_at: Instant,
+    first_token_ms: Option<i64>,
 }
 
 impl UsageParser {
+    fn new(started_at: Instant) -> Self {
+        Self {
+            buffer: Vec::new(),
+            usage: None,
+            output_chars: 0,
+            text: String::new(),
+            started_at,
+            first_token_ms: None,
+        }
+    }
+
+    /// Records time-to-first-token the first time any real content arrives.
+    fn mark_first_token(&mut self) {
+        if self.first_token_ms.is_none() {
+            self.first_token_ms = Some(self.started_at.elapsed().as_millis() as i64);
+        }
+    }
+
     fn push(&mut self, chunk: &[u8]) {
         self.buffer.extend_from_slice(chunk);
         while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
@@ -1377,16 +1468,25 @@ impl UsageParser {
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
         {
+            if !content.is_empty() {
+                self.mark_first_token();
+            }
             self.output_chars += content.chars().count();
             push_preview_text(&mut self.text, content);
         }
         // Legacy `/v1/completions` streams put the text in `choices[0].text`
         // instead of a delta object.
         if let Some(text) = value.pointer("/choices/0/text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                self.mark_first_token();
+            }
             self.output_chars += text.chars().count();
             push_preview_text(&mut self.text, text);
         }
         if let Some(text) = value.get("output_text").and_then(Value::as_str) {
+            if !text.is_empty() {
+                self.mark_first_token();
+            }
             self.output_chars += text.chars().count();
             push_preview_text(&mut self.text, text);
         }
@@ -1398,6 +1498,9 @@ impl UsageParser {
             .is_some_and(|kind| kind == "response.output_text.delta")
             && let Some(delta) = value.get("delta").and_then(Value::as_str)
         {
+            if !delta.is_empty() {
+                self.mark_first_token();
+            }
             self.output_chars += delta.chars().count();
             push_preview_text(&mut self.text, delta);
         }
@@ -1536,6 +1639,92 @@ fn retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
 }
 
+/// Downward compatibility for multi-target routes.
+///
+/// A route may fan out to models with different ceilings. Clamping the
+/// requested output length to the strictest common `output_limit` keeps the
+/// request valid for *every* target, so whichever one the strategy picks can
+/// serve it instead of failing with a "max_tokens too large" error.
+///
+/// Returns the clamped value when a reduction happened, so the caller can
+/// surface it in the response receipt.
+fn clamp_output_request(body: &mut Value, barrel: Option<&BarrelEnvelope>) -> Option<i64> {
+    let limit = barrel
+        .and_then(|barrel| barrel.capabilities.as_ref())
+        .and_then(|capabilities| capabilities.output_limit)?;
+    let mut clamped = None;
+    for key in ["max_tokens", "max_completion_tokens"] {
+        if let Some(requested) = body.get(key).and_then(Value::as_i64)
+            && requested > limit
+        {
+            body[key] = json!(limit);
+            clamped = Some(limit);
+        }
+    }
+    clamped
+}
+
+/// Builds the capability receipt returned alongside a completion.
+///
+/// `requested_output_tokens` and `clamped_output_tokens` make the barrel
+/// behaviour visible: a client that asked for more than the route supports can
+/// see that the gateway reduced the request rather than silently ignoring it.
+fn capability_receipt(
+    barrel: Option<&BarrelEnvelope>,
+    requested_output_tokens: Option<i64>,
+    clamped_output_tokens: Option<i64>,
+) -> Option<Value> {
+    let capabilities = barrel.and_then(|barrel| barrel.capabilities.as_ref())?;
+    let mut receipt = serde_json::to_value(capabilities).ok()?;
+    let object = receipt.as_object_mut()?;
+    let incomplete = barrel.is_some_and(|barrel| barrel.incomplete);
+    object.insert("limits_verified".to_string(), json!(!incomplete));
+    if let Some(barrel) = barrel {
+        object.insert("target_count".to_string(), json!(barrel.target_count));
+    }
+    if let Some(requested) = requested_output_tokens {
+        object.insert("requested_output_tokens".to_string(), json!(requested));
+    }
+    if let Some(clamped) = clamped_output_tokens {
+        object.insert("clamped_output_tokens".to_string(), json!(clamped));
+    }
+    Some(receipt)
+}
+
+/// Injects the receipt into a JSON response body. Bodies that are not JSON
+/// objects are returned unchanged so upstream payloads are never corrupted.
+fn inject_capability_receipt(bytes: &[u8], receipt: &Option<Value>) -> Option<Vec<u8>> {
+    let receipt = receipt.as_ref()?;
+    let mut value: Value = serde_json::from_slice(bytes).ok()?;
+    value
+        .as_object_mut()?
+        .insert("capabilities".to_string(), receipt.clone());
+    serde_json::to_vec(&value).ok()
+}
+
+/// Limits mirrored onto response headers so streaming clients, which never
+/// receive a single JSON body, can still read the effective ceiling.
+fn apply_capability_headers(response: &mut Response, receipt: &Option<Value>) {
+    let Some(receipt) = receipt.as_ref() else {
+        return;
+    };
+    let Some(output) = receipt.get("output_limit").and_then(Value::as_i64) else {
+        return;
+    };
+    if let Ok(value) = HeaderValue::from_str(&output.to_string()) {
+        response
+            .headers_mut()
+            .insert("x-openllm-max-output-tokens", value);
+    }
+    if let Some(context) = receipt.get("context_limit").and_then(Value::as_i64)
+        && let Ok(value) = HeaderValue::from_str(&context.to_string())
+    {
+        response
+            .headers_mut()
+            .insert("x-openllm-max-context-tokens", value);
+    }
+}
+
 /// Keep a short, human-readable slice of the response for later debugging
 /// without storing unbounded payloads.
 fn response_preview(bytes: &[u8]) -> Option<String> {
@@ -1572,6 +1761,7 @@ struct UsageLogEntry<'a> {
     endpoint: &'a str,
     usage: Usage,
     latency_ms: i64,
+    first_token_ms: Option<i64>,
     status_code: i64,
     success: bool,
     streamed: bool,
@@ -1591,6 +1781,7 @@ struct OwnedUsageLogEntry {
     endpoint: String,
     usage: Usage,
     latency_ms: i64,
+    first_token_ms: Option<i64>,
     status_code: i64,
     success: bool,
     streamed: bool,
@@ -1610,6 +1801,7 @@ impl OwnedUsageLogEntry {
             endpoint: &self.endpoint,
             usage: self.usage,
             latency_ms: self.latency_ms,
+            first_token_ms: self.first_token_ms,
             status_code: self.status_code,
             success: self.success,
             streamed: self.streamed,
@@ -1634,9 +1826,9 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
         INSERT INTO usage_logs (
             request_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
-            total_tokens, latency_ms, status_code, success, streamed, error_message,
-            response_preview
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            total_tokens, latency_ms, first_token_ms, status_code, success, streamed,
+            error_message, response_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         "#,
     )
     .bind(entry.request_id)
@@ -1650,6 +1842,7 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     .bind(usage.completion_tokens)
     .bind(usage.total_tokens)
     .bind(entry.latency_ms)
+    .bind(entry.first_token_ms)
     .bind(entry.status_code)
     .bind(entry.success as i64)
     .bind(entry.streamed as i64)
@@ -1774,6 +1967,69 @@ mod tests {
         }
     }
 
+    fn barrel_with_output_limit(output_limit: Option<i64>) -> BarrelEnvelope {
+        BarrelEnvelope {
+            capabilities: Some(crate::models::ModelCapabilities {
+                output_limit,
+                ..Default::default()
+            }),
+            incomplete: false,
+            target_count: 2,
+        }
+    }
+
+    #[test]
+    fn clamps_requested_output_to_barrel_limit() {
+        let barrel = barrel_with_output_limit(Some(8000));
+        let mut body = json!({"model": "m", "max_tokens": 32000});
+        assert_eq!(clamp_output_request(&mut body, Some(&barrel)), Some(8000));
+        assert_eq!(body["max_tokens"], 8000);
+    }
+
+    #[test]
+    fn leaves_requests_within_the_barrel_untouched() {
+        let barrel = barrel_with_output_limit(Some(8000));
+        let mut body = json!({"model": "m", "max_tokens": 4096});
+        assert_eq!(clamp_output_request(&mut body, Some(&barrel)), None);
+        assert_eq!(body["max_tokens"], 4096);
+
+        // No known limit means there is nothing to clamp against.
+        let unknown = barrel_with_output_limit(None);
+        let mut body = json!({"model": "m", "max_tokens": 999999});
+        assert_eq!(clamp_output_request(&mut body, Some(&unknown)), None);
+        assert_eq!(body["max_tokens"], 999999);
+    }
+
+    #[test]
+    fn clamps_max_completion_tokens_too() {
+        let barrel = barrel_with_output_limit(Some(1000));
+        let mut body = json!({"model": "m", "max_completion_tokens": 5000});
+        assert_eq!(clamp_output_request(&mut body, Some(&barrel)), Some(1000));
+        assert_eq!(body["max_completion_tokens"], 1000);
+    }
+
+    #[test]
+    fn receipt_reports_clamping_and_target_count() {
+        let barrel = barrel_with_output_limit(Some(8000));
+        let receipt = capability_receipt(Some(&barrel), Some(32000), Some(8000)).unwrap();
+        assert_eq!(receipt["output_limit"], 8000);
+        assert_eq!(receipt["requested_output_tokens"], 32000);
+        assert_eq!(receipt["clamped_output_tokens"], 8000);
+        assert_eq!(receipt["target_count"], 2);
+        assert_eq!(receipt["limits_verified"], true);
+    }
+
+    #[test]
+    fn receipt_injected_only_into_json_objects() {
+        let receipt = Some(json!({"output_limit": 8000}));
+        let injected = inject_capability_receipt(br#"{"id":"x"}"#, &receipt).unwrap();
+        let value: Value = serde_json::from_slice(&injected).unwrap();
+        assert_eq!(value["capabilities"]["output_limit"], 8000);
+        // Non-JSON bodies must be left alone rather than replaced.
+        assert!(inject_capability_receipt(b"not json", &receipt).is_none());
+        assert!(inject_capability_receipt(b"{}", &None).is_none());
+    }
+
     #[test]
     fn extracts_openai_usage() {
         let usage = usage_from_value(&json!({
@@ -1818,7 +2074,7 @@ mod tests {
 
     #[test]
     fn stream_parser_counts_chat_completion_text() {
-        let mut parser = UsageParser::default();
+        let mut parser = UsageParser::new(Instant::now());
         parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n");
         parser.push(
             b"data: {\"choices\":[{\"delta\":{\"content\":\"world\"}}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":2,\"total_tokens\":4}}\n\n",
@@ -1828,8 +2084,28 @@ mod tests {
     }
 
     #[test]
+    fn stream_parser_records_first_token_once_on_real_content() {
+        let mut parser = UsageParser::new(Instant::now());
+        // A role-only opening frame and an empty delta must not start the
+        // clock; otherwise TTFT would be reported as roughly zero even though
+        // the model has not produced anything yet.
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n");
+        assert_eq!(parser.first_token_ms, None);
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n");
+        let first = parser.first_token_ms.expect("first token should be timed");
+        parser.push(b"data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n");
+        assert_eq!(
+            parser.first_token_ms,
+            Some(first),
+            "the timestamp must be captured once and not overwritten"
+        );
+        parser.finish();
+    }
+
+    #[test]
     fn stream_parser_counts_responses_api_deltas() {
-        let mut parser = UsageParser::default();
+        let mut parser = UsageParser::new(Instant::now());
         parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n");
         parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n");
         let usage = parser
@@ -1843,7 +2119,7 @@ mod tests {
 
     #[test]
     fn stream_parser_counts_legacy_completions_text() {
-        let mut parser = UsageParser::default();
+        let mut parser = UsageParser::new(Instant::now());
         parser.push(b"data: {\"choices\":[{\"text\":\"hello \"}]}\n\n");
         parser.push(b"data: {\"choices\":[{\"text\":\"world\"}]}\n\n");
         let usage = parser
@@ -1858,7 +2134,7 @@ mod tests {
 
     #[test]
     fn stream_preview_is_bounded() {
-        let mut parser = UsageParser::default();
+        let mut parser = UsageParser::new(Instant::now());
         // Feed far more text than the preview budget across many frames.
         for _ in 0..200 {
             let frame = format!(
@@ -1939,6 +2215,7 @@ mod tests {
         let mut saw_tool_use = false;
         let mut next_tool_index = 0usize;
         let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+        let mut first_token_ms: Option<i64> = None;
 
         // Anthropic emits a tool_use block start followed by JSON argument deltas.
         for line in [
@@ -1955,6 +2232,8 @@ mod tests {
                 &mut saw_tool_use,
                 &mut next_tool_index,
                 &mut tool_indices,
+                &mut first_token_ms,
+                Instant::now(),
                 "chatcmpl_test",
                 "claude-x",
                 &tx,
@@ -1975,6 +2254,8 @@ mod tests {
                 &mut saw_tool_use,
                 &mut next_tool_index,
                 &mut tool_indices,
+                &mut first_token_ms,
+                Instant::now(),
                 "chatcmpl_test",
                 "claude-x",
                 &tx,
@@ -2019,6 +2300,7 @@ mod tests {
         let mut saw_tool_use = false;
         let mut next_tool_index = 0usize;
         let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+        let mut first_token_ms: Option<i64> = None;
 
         let lines: [&[u8]; 8] = [
             b"event: content_block_start\n",
@@ -2041,6 +2323,8 @@ mod tests {
                 &mut saw_tool_use,
                 &mut next_tool_index,
                 &mut tool_indices,
+                &mut first_token_ms,
+                Instant::now(),
                 "chatcmpl_test",
                 "claude-x",
                 &tx,
@@ -2077,6 +2361,7 @@ mod tests {
         let mut saw_tool_use = false;
         let mut next_tool_index = 0usize;
         let mut tool_indices = std::collections::HashMap::<i64, usize>::new();
+        let mut first_token_ms: Option<i64> = None;
 
         // Anthropic block 0 is text; the tool calls are blocks 1 and 2.
         // OpenAI must renumber the tool calls to 0 and 1.
@@ -2103,6 +2388,8 @@ mod tests {
                 &mut saw_tool_use,
                 &mut next_tool_index,
                 &mut tool_indices,
+                &mut first_token_ms,
+                Instant::now(),
                 "chatcmpl_test",
                 "claude-x",
                 &tx,

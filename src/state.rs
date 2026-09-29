@@ -19,7 +19,14 @@ pub struct AppState {
     /// Throttles `last_used_at` writes so the hot request path does not take a
     /// SQLite write lock on every single call.
     pub key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Cached models.dev capability catalog plus the instant it was fetched.
+    /// Held behind a read-mostly lock because provider sync refreshes it only
+    /// once per TTL.
+    pub models_dev: Arc<RwLock<Option<CatalogCache>>>,
 }
+
+/// A fetched models.dev catalog and the instant it was retrieved.
+pub type CatalogCache = (Instant, Arc<crate::models_dev::Catalog>);
 
 #[derive(Debug, Clone)]
 pub struct UsageEvent {
@@ -52,6 +59,7 @@ impl AppState {
             events,
             auth_required: Arc::new(RwLock::new(None)),
             key_touched: Arc::new(Mutex::new(HashMap::new())),
+            models_dev: Arc::new(RwLock::new(None)),
         }
     }
 }

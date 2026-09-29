@@ -298,7 +298,7 @@ export default function Usage() {
           rowKey="id"
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1420 }}
+          scroll={{ x: 1560 }}
           onRow={(record) => ({
             onClick: () => void openDetail(record),
             style: { cursor: 'pointer' },
@@ -358,6 +358,17 @@ export default function Usage() {
               ),
             },
             { title: '延迟', dataIndex: 'latency_ms', width: 100, render: (value: number) => `${value} ms` },
+            {
+              title: '首 token',
+              dataIndex: 'first_token_ms',
+              width: 110,
+              render: (value: number | undefined, record) =>
+                value != null ? (
+                  `${value} ms`
+                ) : (
+                  <Typography.Text type="secondary">{record.streamed ? '-' : '—'}</Typography.Text>
+                ),
+            },
             {
               title: '类型',
               dataIndex: 'streamed',
@@ -439,6 +450,9 @@ export default function Usage() {
               </Descriptions.Item>
               <Descriptions.Item label="延迟">
                 {detail.latency_ms} ms
+              </Descriptions.Item>
+              <Descriptions.Item label="首 token 延迟">
+                {detail.first_token_ms != null ? `${detail.first_token_ms} ms` : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="输入 tokens">
                 {detail.prompt_tokens}

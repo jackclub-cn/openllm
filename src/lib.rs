@@ -3,7 +3,9 @@ mod assets;
 mod db;
 mod error;
 mod models;
+mod models_dev;
 mod proxy;
+mod registry;
 mod state;
 
 use std::net::SocketAddr;
