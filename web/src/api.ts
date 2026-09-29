@@ -79,6 +79,7 @@ export type ProviderInput = {
 
 export type ProviderModelLimit = {
   model_name: string
+  enabled: boolean
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
@@ -89,6 +90,7 @@ export type ProviderModelLimit = {
 
 export type ProviderModelLimitInput = {
   model_name: string
+  enabled: boolean
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null

@@ -244,6 +244,12 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
                   AND pm.model_name = rt.upstream_model
                   AND pm.enabled = 1
             WHERE rt.route_id = ? AND rt.enabled = 1
+              AND NOT EXISTS (
+                  SELECT 1 FROM provider_models disabled
+                  WHERE disabled.provider_id = rt.provider_id
+                    AND disabled.model_name = rt.upstream_model
+                    AND disabled.enabled = 0
+              )
             "#
         );
         let targets = sqlx::query_as::<_, RouteTargetRow>(&query)
@@ -251,6 +257,9 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
             .fetch_all(pool)
             .await?;
         let target_count = targets.len();
+        if target_count == 0 {
+            continue;
+        }
         let capabilities = targets
             .iter()
             .map(|row| capability_from_row(&row.capabilities))

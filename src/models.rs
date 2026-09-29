@@ -137,6 +137,7 @@ pub struct ProviderUpdate {
 #[derive(Debug, Serialize, FromRow)]
 pub struct ProviderModelLimitView {
     pub model_name: String,
+    pub enabled: bool,
     /// Effective values after applying any manual overrides.
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
@@ -150,6 +151,8 @@ pub struct ProviderModelLimitView {
 #[derive(Debug, Deserialize)]
 pub struct ProviderModelLimitInput {
     pub model_name: String,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub context_limit: Option<i64>,
     #[serde(default)]

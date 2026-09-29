@@ -477,9 +477,10 @@ pub async fn update_provider_model_limits(
     for model in &input.models {
         let result = sqlx::query(
             "UPDATE provider_models \
-             SET context_override = ?, input_override = ?, output_override = ? \
-             WHERE provider_id = ? AND model_name = ? AND enabled = 1",
+             SET enabled = ?, context_override = ?, input_override = ?, output_override = ? \
+             WHERE provider_id = ? AND model_name = ?",
         )
+        .bind(model.enabled as i64)
         .bind(model.context_limit)
         .bind(model.input_limit)
         .bind(model.output_limit)
@@ -517,7 +518,7 @@ async fn provider_model_limits(
 ) -> AppResult<Vec<ProviderModelLimitView>> {
     Ok(sqlx::query_as::<_, ProviderModelLimitView>(
         r#"
-        SELECT model_name,
+        SELECT model_name, enabled,
                COALESCE(context_override, context_limit) AS context_limit,
                CASE
                    WHEN COALESCE(input_override, input_limit) IS NULL
@@ -534,7 +535,7 @@ async fn provider_model_limits(
                input_override,
                output_override
         FROM provider_models
-        WHERE provider_id = ? AND enabled = 1
+        WHERE provider_id = ?
         ORDER BY model_name COLLATE NOCASE
         "#,
     )
@@ -1288,7 +1289,7 @@ async fn replace_provider_models(
     provider_hint: Option<&str>,
 ) -> AppResult<()> {
     let existing_overrides = sqlx::query_as::<_, ProviderModelOverride>(
-        "SELECT model_name, context_override, input_override, output_override \
+        "SELECT model_name, enabled, context_override, input_override, output_override \
          FROM provider_models WHERE provider_id = ?",
     )
     .bind(provider_id)
@@ -1328,11 +1329,12 @@ async fn replace_provider_models(
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
                 upstream_context_limit, supported_endpoints, display_name,
                 context_override, input_override, output_override
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
         .bind(model)
+        .bind(overrides.enabled.unwrap_or(1))
         .bind(context_limit)
         .bind(capabilities.output_limit)
         .bind(input_limit)
@@ -1391,6 +1393,7 @@ struct UpstreamModelInfo {
 #[derive(Debug, Clone, Default, sqlx::FromRow)]
 struct ProviderModelOverride {
     model_name: String,
+    enabled: Option<i64>,
     context_override: Option<i64>,
     input_override: Option<i64>,
     output_override: Option<i64>,
@@ -1909,7 +1912,9 @@ mod tests {
             "INSERT INTO provider_models (
                 provider_id, model_name, enabled, context_limit, input_limit,
                 output_limit, context_override, input_override, output_override
-             ) VALUES (1, 'gpt-6-astra', 1, 1050000, 922000, 128000, 400000, NULL, 64000)",
+             ) VALUES
+                (1, 'gpt-6-astra', 0, 1050000, 922000, 128000, 400000, NULL, 64000),
+                (1, 'gpt-6-luna', 1, 1050000, 922000, 128000, 400000, 400000, 64000)",
         )
         .execute(&pool)
         .await
@@ -1919,13 +1924,22 @@ mod tests {
         replace_provider_models(
             &mut tx,
             1,
-            &[(
-                "gpt-6-astra".to_string(),
-                UpstreamModelInfo {
-                    context_limit: Some(1_050_000),
-                    ..Default::default()
-                },
-            )],
+            &[
+                (
+                    "gpt-6-astra".to_string(),
+                    UpstreamModelInfo {
+                        context_limit: Some(1_050_000),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "gpt-6-luna".to_string(),
+                    UpstreamModelInfo {
+                        context_limit: Some(1_050_000),
+                        ..Default::default()
+                    },
+                ),
+            ],
             None,
             None,
         )
@@ -1935,17 +1949,23 @@ mod tests {
 
         let state = AppState::new(pool, None);
         let limits = provider_model_limits(&state, 1).await.unwrap();
-        assert_eq!(limits.len(), 1);
-        assert_eq!(limits[0].context_limit, Some(400_000));
-        assert_eq!(limits[0].input_limit, Some(400_000));
-        assert_eq!(limits[0].output_limit, Some(64_000));
-        assert_eq!(limits[0].context_override, Some(400_000));
+        assert_eq!(limits.len(), 2);
+        let astra = limits
+            .iter()
+            .find(|model| model.model_name == "gpt-6-astra")
+            .unwrap();
+        assert!(!astra.enabled);
+        assert_eq!(astra.context_limit, Some(400_000));
+        assert_eq!(astra.input_limit, Some(400_000));
+        assert_eq!(astra.output_limit, Some(64_000));
+        assert_eq!(astra.context_override, Some(400_000));
 
         let models = crate::registry::synced_models(&state.pool).await.unwrap();
         let model = models
             .iter()
-            .find(|model| model.upstream_model == "gpt-6-astra")
+            .find(|model| model.upstream_model == "gpt-6-luna")
             .unwrap();
+        assert_eq!(models.len(), 1);
         let capabilities = model.capabilities.as_ref().unwrap();
         assert_eq!(capabilities.context_limit, Some(400_000));
         assert_eq!(capabilities.input_limit, Some(400_000));

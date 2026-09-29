@@ -4,6 +4,7 @@ import {
   DeleteOutlined,
   EditOutlined,
   PlusOutlined,
+  SearchOutlined,
   SettingOutlined,
   SyncOutlined,
   ThunderboltOutlined,
@@ -61,6 +62,7 @@ export default function Providers() {
   const [limitsSaving, setLimitsSaving] = useState(false)
   const [limitProvider, setLimitProvider] = useState<Provider>()
   const [limitRows, setLimitRows] = useState<ProviderModelLimit[]>([])
+  const [limitSearch, setLimitSearch] = useState('')
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
 
@@ -195,6 +197,7 @@ export default function Providers() {
 
   const openLimits = async (provider: Provider) => {
     setLimitProvider(provider)
+    setLimitSearch('')
     setLimitsOpen(true)
     setLimitsLoading(true)
     try {
@@ -221,10 +224,17 @@ export default function Providers() {
     )
   }
 
+  const toggleLimitRow = (modelName: string, enabled: boolean) => {
+    setLimitRows((rows) =>
+      rows.map((row) => (row.model_name === modelName ? { ...row, enabled } : row)),
+    )
+  }
+
   const saveLimits = async () => {
     if (!limitProvider) return
     const models: ProviderModelLimitInput[] = limitRows.map((row) => ({
       model_name: row.model_name,
+      enabled: row.enabled,
       context_limit: row.context_override ?? null,
       input_limit: row.input_override ?? null,
       output_limit: row.output_override ?? null,
@@ -237,7 +247,7 @@ export default function Providers() {
           { models },
         ),
       )
-      message.success('模型上限已保存')
+      message.success('模型设置已保存')
       setLimitsOpen(false)
     } catch (error) {
       message.error(formatError(error))
@@ -332,7 +342,7 @@ export default function Providers() {
                   <Tooltip title="测试连接">
                     <Button type="text" icon={<ThunderboltOutlined />} onClick={() => test(record.id)} />
                   </Tooltip>
-                  <Tooltip title="模型上限">
+                  <Tooltip title="模型管理">
                     <Button
                       type="text"
                       icon={<SettingOutlined />}
@@ -429,32 +439,54 @@ export default function Providers() {
       </Modal>
 
       <Modal
-        title={limitProvider ? `模型上限 · ${limitProvider.name}` : '模型上限'}
+        title={limitProvider ? `模型管理 · ${limitProvider.name}` : '模型管理'}
         open={limitsOpen}
         onCancel={() => setLimitsOpen(false)}
         onOk={() => void saveLimits()}
         confirmLoading={limitsSaving}
         okButtonProps={{ disabled: limitsLoading }}
-        width={900}
+        width={960}
         destroyOnHidden
       >
         <Typography.Paragraph type="secondary">
-          留空使用同步值，填写后覆盖同步值。
+          停用后模型不会出现在 /v1/models 或参与路由。上限留空使用同步值，填写后覆盖同步值。
         </Typography.Paragraph>
+        <Input
+          allowClear
+          prefix={<SearchOutlined />}
+          value={limitSearch}
+          onChange={(event) => setLimitSearch(event.target.value)}
+          placeholder="搜索模型"
+          style={{ width: 280, marginBottom: 12 }}
+        />
         <Table
           rowKey="model_name"
           size="small"
           loading={limitsLoading}
-          dataSource={limitRows}
+          dataSource={limitRows.filter((row) =>
+            row.model_name.toLowerCase().includes(limitSearch.trim().toLowerCase()),
+          )}
           pagination={false}
-          scroll={{ x: 820, y: 520 }}
+          scroll={{ x: 900, y: 520 }}
           locale={{ emptyText: '暂无模型' }}
           columns={[
             {
               title: '模型',
               dataIndex: 'model_name',
-              width: 260,
+              width: 250,
               render: (value: string) => <Typography.Text strong>{value}</Typography.Text>,
+            },
+            {
+              title: '启用',
+              dataIndex: 'enabled',
+              width: 70,
+              render: (value: boolean, record) => (
+                <Switch
+                  size="small"
+                  checked={value}
+                  onChange={(checked) => toggleLimitRow(record.model_name, checked)}
+                />
+              ),
             },
             {
               title: '当前生效',
@@ -491,6 +523,7 @@ export default function Providers() {
               render: (_, record) => (
                 <InputNumber
                   min={1}
+                  disabled={!record.enabled}
                   value={record.context_override}
                   placeholder={record.context_limit?.toString()}
                   onChange={(value) =>
@@ -506,6 +539,7 @@ export default function Providers() {
               render: (_, record) => (
                 <InputNumber
                   min={1}
+                  disabled={!record.enabled}
                   value={record.input_override}
                   placeholder={record.input_limit?.toString()}
                   onChange={(value) =>
@@ -521,6 +555,7 @@ export default function Providers() {
               render: (_, record) => (
                 <InputNumber
                   min={1}
+                  disabled={!record.enabled}
                   value={record.output_override}
                   placeholder={record.output_limit?.toString()}
                   onChange={(value) =>
@@ -534,7 +569,9 @@ export default function Providers() {
               title: '状态',
               width: 80,
               render: (_, record) =>
-                record.context_override != null ||
+                !record.enabled ? (
+                  <Tag color="default">已停用</Tag>
+                ) : record.context_override != null ||
                 record.input_override != null ||
                 record.output_override != null ? (
                   <Tag color="blue">已覆盖</Tag>

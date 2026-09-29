@@ -2630,7 +2630,8 @@ async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute
         let targets = load_targets(state, route.id).await?;
         if targets.is_empty() {
             return Err(AppError::Upstream(
-                "the matched route has no enabled provider targets".to_string(),
+                "the matched route has no enabled provider targets; a target or its provider model may be disabled"
+                    .to_string(),
             ));
         }
         let pairs = targets
@@ -2755,6 +2756,12 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
         WHERE rt.route_id = ? AND rt.enabled = 1 AND p.enabled = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM provider_models pm
+              WHERE pm.provider_id = rt.provider_id
+                AND pm.model_name = rt.upstream_model
+                AND pm.enabled = 0
+          )
         ORDER BY rt.priority ASC, rt.id
         "#,
     )
@@ -3751,6 +3758,137 @@ mod tests {
         // Prefix comparison must stay case-sensitive so `A_B/x` cannot reach a
         // provider registered as `a_b`.
         assert!(find_prefixed_targets(&state, "A_B/x").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn disabled_provider_model_is_skipped_by_explicit_routes() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TABLE providers (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL,
+                base_url TEXT NOT NULL,
+                model_prefix TEXT NOT NULL DEFAULT '',
+                api_key TEXT,
+                headers TEXT NOT NULL DEFAULT '{}',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                models_synced_at TEXT,
+                models_sync_error TEXT,
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE provider_models (
+                provider_id INTEGER NOT NULL,
+                model_name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                context_limit INTEGER,
+                input_limit INTEGER,
+                output_limit INTEGER,
+                context_override INTEGER,
+                input_override INTEGER,
+                output_override INTEGER,
+                attachment INTEGER,
+                reasoning INTEGER,
+                tool_call INTEGER,
+                structured_output INTEGER,
+                temperature INTEGER,
+                open_weights INTEGER,
+                modalities TEXT,
+                cost TEXT,
+                family TEXT,
+                knowledge TEXT,
+                release_date TEXT,
+                last_updated TEXT,
+                canonical_model_id TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE route_targets (
+                id INTEGER PRIMARY KEY,
+                route_id INTEGER,
+                provider_id INTEGER NOT NULL,
+                upstream_model TEXT NOT NULL,
+                weight INTEGER NOT NULL DEFAULT 100,
+                priority INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "CREATE TABLE routes (
+                id INTEGER PRIMARY KEY,
+                model_pattern TEXT NOT NULL,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'upstream', 'openai', 'http://upstream')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'disabled-model', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO route_targets (id, route_id, provider_id, upstream_model)
+             VALUES (1, 1, 1, 'disabled-model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (id, model_pattern, name)
+             VALUES (1, 'route-model', 'route-model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool.clone(), None);
+        assert!(load_targets(&state, 1).await.unwrap().is_empty());
+        assert!(
+            crate::registry::route_models(&state.pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        sqlx::query("UPDATE provider_models SET enabled = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(load_targets(&state, 1).await.unwrap().len(), 1);
+        let routes = crate::registry::route_models(&state.pool).await.unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].target_count, 1);
     }
 
     #[test]
