@@ -111,6 +111,20 @@ fn wants_anthropic_models(headers: &HeaderMap) -> bool {
     headers.contains_key("anthropic-version")
 }
 
+/// Reads the caller's `anthropic-beta` feature flags, if any.
+///
+/// Anthropic gates capabilities such as prompt caching behind this header, so
+/// it must reach a native upstream verbatim; the gateway never invents its own
+/// value.
+fn anthropic_beta_of(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("anthropic-beta")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 /// Renders the model registry in Anthropic's `/v1/models` shape.
 ///
 /// Anthropic returns `data` entries of `{type, id, display_name, created_at}`
@@ -986,6 +1000,7 @@ async fn proxy_anthropic_inner(
                 api_key.as_ref(),
                 started,
                 receipt.clone(),
+                anthropic_beta_of(headers),
             )
             .await
         } else {
@@ -1051,17 +1066,25 @@ async fn forward_anthropic_native(
     api_key: Option<&ApiKeyRecord>,
     started: Instant,
     receipt: Option<Value>,
+    anthropic_beta: Option<String>,
 ) -> AppResult<Response> {
     let url = join_upstream_url(&target.base_url, ANTHROPIC_MESSAGES);
     let mut request = state
         .client
         .post(url)
         .header(reqwest::header::CONTENT_TYPE, "application/json")
+        // Required by the Anthropic protocol regardless of authentication:
+        // a keyless self-hosted Anthropic-compatible endpoint still rejects a
+        // request that omits it.
+        .header("anthropic-version", "2023-06-01")
         .json(&body);
+    // Feature flags such as prompt caching are opt-in per request via
+    // `anthropic-beta`; dropping it silently disables them upstream.
+    if let Some(beta) = &anthropic_beta {
+        request = request.header("anthropic-beta", beta);
+    }
     if let Some(key) = &target.api_key {
-        request = request
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01");
+        request = request.header("x-api-key", key);
     }
     request = apply_custom_headers(request, &target.provider_headers)?;
 
@@ -3341,6 +3364,26 @@ mod tests {
         assert!(validate_anthropic_max_tokens(&json!({"max_tokens": -5})).is_err());
         assert!(validate_anthropic_max_tokens(&json!({"max_tokens": "1024"})).is_err());
         assert!(validate_anthropic_max_tokens(&json!({"max_tokens": null})).is_err());
+    }
+
+    #[test]
+    fn forwards_anthropic_beta_flags_verbatim() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "anthropic-beta",
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        assert_eq!(
+            anthropic_beta_of(&headers).as_deref(),
+            Some("prompt-caching-2024-07-31")
+        );
+
+        // Absent or blank values must not produce a header, so the gateway
+        // never invents feature flags the caller did not ask for.
+        assert_eq!(anthropic_beta_of(&HeaderMap::new()), None);
+        let mut blank = HeaderMap::new();
+        blank.insert("anthropic-beta", HeaderValue::from_static("   "));
+        assert_eq!(anthropic_beta_of(&blank), None);
     }
 
     #[test]
