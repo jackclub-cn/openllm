@@ -43,6 +43,13 @@ pub struct Config {
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let database = Database::connect(&config).await?;
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
+    let health_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            crate::api::run_due_provider_health_checks(health_state.clone()).await;
+        }
+    });
 
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind)

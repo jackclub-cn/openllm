@@ -142,6 +142,8 @@ pub async fn create_provider(
     let model_prefix = normalize_model_prefix(&input.model_prefix)?;
     let api_key = normalize_optional(input.api_key);
     let base_url = normalize_base_url(&input.base_url);
+    let health_check_interval_minutes =
+        normalize_health_interval(input.health_check_interval_minutes)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
     // hit the network, and holding a SQLite write transaction across it would
     // block every other writer.
@@ -152,7 +154,10 @@ pub async fn create_provider(
 
     let mut tx = state.pool.begin().await?;
     let result = sqlx::query(
-        "INSERT INTO providers (name, provider_type, base_url, model_prefix, models_dev_id, api_key, headers, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO providers (
+            name, provider_type, base_url, model_prefix, models_dev_id,
+            api_key, headers, enabled, health_check_interval_minutes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -162,6 +167,7 @@ pub async fn create_provider(
     .bind(api_key)
     .bind(headers)
     .bind(input.enabled as i64)
+    .bind(health_check_interval_minutes)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
@@ -214,6 +220,10 @@ pub async fn update_provider(
             .unwrap_or(current.model_prefix.as_str()),
     )?;
     let enabled = input.enabled.unwrap_or(current.enabled != 0);
+    let health_check_interval_minutes = match input.health_check_interval_minutes {
+        Some(value) => normalize_health_interval(Some(value))?,
+        None => current.health_check_interval_minutes,
+    };
     let api_key = match input.api_key {
         Some(key) if key.trim().is_empty() => current.api_key,
         Some(key) => Some(key.trim().to_string()),
@@ -238,7 +248,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -248,6 +258,7 @@ pub async fn update_provider(
     .bind(api_key)
     .bind(headers)
     .bind(enabled as i64)
+    .bind(health_check_interval_minutes)
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -438,6 +449,45 @@ pub async fn test_all_providers(
         failed: results.len() - ok,
         results,
     }))
+}
+
+pub async fn run_due_provider_health_checks(state: AppState) {
+    let due = match sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT id FROM providers
+        WHERE enabled = 1
+          AND health_check_interval_minutes > 0
+          AND (
+              last_test_at IS NULL
+              OR datetime(last_test_at) <= datetime(
+                  'now',
+                  '-' || health_check_interval_minutes || ' minutes'
+              )
+          )
+        ORDER BY id
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(ids) => ids,
+        Err(error) => {
+            tracing::warn!(%error, "failed to query providers due for health checks");
+            return;
+        }
+    };
+
+    futures_util::stream::iter(due.into_iter().map(|id| {
+        let state = state.clone();
+        async move {
+            if let Err(error) = test_provider_inner(&state, id).await {
+                tracing::warn!(provider_id = id, %error, "scheduled provider health check failed");
+            }
+        }
+    }))
+    .buffer_unordered(4)
+    .for_each(|_| async {})
+    .await;
 }
 
 async fn persist_provider_test(
@@ -2028,6 +2078,16 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_health_interval(value: Option<i64>) -> AppResult<Option<i64>> {
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "health check interval must be zero or a positive integer".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
 fn map_sqlite_conflict(error: sqlx::Error) -> AppError {
     if let sqlx::Error::Database(database_error) = &error {
         if database_error.is_unique_violation() {
@@ -2292,6 +2352,14 @@ mod tests {
             Some(10_000)
         );
         assert!(normalize_api_key_limit("token", Some(-1)).is_err());
+    }
+
+    #[test]
+    fn validates_provider_health_interval() {
+        assert_eq!(normalize_health_interval(None).unwrap(), None);
+        assert_eq!(normalize_health_interval(Some(0)).unwrap(), None);
+        assert_eq!(normalize_health_interval(Some(30)).unwrap(), Some(30));
+        assert!(normalize_health_interval(Some(-1)).is_err());
     }
 
     #[test]
