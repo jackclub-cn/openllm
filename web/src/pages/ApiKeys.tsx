@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react'
-import { CopyOutlined, DeleteOutlined, EditOutlined, KeyOutlined, PlusOutlined } from '@ant-design/icons'
+import {
+  CopyOutlined,
+  DeleteOutlined,
+  EditOutlined,
+  KeyOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+} from '@ant-design/icons'
 import {
   Alert,
   App,
@@ -91,6 +98,17 @@ export default function ApiKeys() {
     try {
       await api.delete(`/api/api-keys/${id}`)
       message.success('密钥已删除')
+      await load()
+    } catch (error) {
+      message.error(formatError(error))
+    }
+  }
+
+  const rotate = async (id: number) => {
+    try {
+      const result = await api.post<{ key: string; item: ApiKey }>(`/api/api-keys/${id}/rotate`)
+      setCreatedKey(result.key)
+      setOpen(true)
       await load()
     } catch (error) {
       message.error(formatError(error))
@@ -275,12 +293,20 @@ export default function ApiKeys() {
             },
             {
               title: '操作',
-              width: 120,
+              width: 160,
               render: (_, record) => (
                 <Space>
                   <Tooltip title="编辑限额">
                     <Button type="text" icon={<EditOutlined />} onClick={() => openLimits(record)} />
                   </Tooltip>
+                  <Popconfirm
+                    title="轮换此密钥？旧密钥会立即失效。"
+                    onConfirm={() => void rotate(record.id)}
+                  >
+                    <Tooltip title="轮换密钥">
+                      <Button type="text" icon={<ReloadOutlined />} />
+                    </Tooltip>
+                  </Popconfirm>
                   <Popconfirm title="删除此密钥？" onConfirm={() => remove(record.id)}>
                     <Button type="text" danger icon={<DeleteOutlined />} />
                   </Popconfirm>
@@ -292,7 +318,7 @@ export default function ApiKeys() {
       </Card>
 
       <Modal
-        title={createdKey ? '密钥已创建' : '创建访问密钥'}
+        title={createdKey ? '密钥已生成' : '创建访问密钥'}
         open={open}
         onCancel={closeModal}
         footer={createdKey ? <Button type="primary" onClick={closeModal}>完成</Button> : undefined}

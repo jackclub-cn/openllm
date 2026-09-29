@@ -23,7 +23,7 @@ use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
     delete_api_key, delete_provider, delete_route, event_stream, export_usage, get_settings,
     get_usage_detail, health, list_api_keys, list_models, list_provider_model_limits,
-    list_providers, list_routes, list_usage, overview, preview_provider_model_sync,
+    list_providers, list_routes, list_usage, overview, preview_provider_model_sync, rotate_api_key,
     sync_provider_models, test_all_providers, test_provider, update_api_key, update_provider,
     update_provider_model_limits, update_route,
 };
@@ -93,6 +93,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/routes/{id}", put(update_route).delete(delete_route))
         .route("/models", get(list_models))
         .route("/api-keys", get(list_api_keys).post(create_api_key))
+        .route("/api-keys/{id}/rotate", post(rotate_api_key))
         .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))
         .route("/usage", get(list_usage))
         .route("/usage/export", get(export_usage))

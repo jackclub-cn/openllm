@@ -1123,6 +1123,21 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
     Ok(Json(keys.into_iter().map(Into::into).collect()))
 }
 
+fn generate_api_key_material() -> (String, String, String, String) {
+    let raw = format!("sk-openllm-{}", uuid::Uuid::new_v4().simple());
+    let key_hash = hash_secret(&raw);
+    let key_prefix = raw.chars().take(12).collect::<String>();
+    let key_suffix = raw
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect::<String>();
+    (raw, key_hash, key_prefix, key_suffix)
+}
+
 pub async fn create_api_key(
     State(state): State<AppState>,
     Json(input): Json<ApiKeyInput>,
@@ -1136,17 +1151,7 @@ pub async fn create_api_key(
         normalize_api_key_limit("daily cost", input.daily_cost_limit_micros)?;
     let allowed_models = normalize_allowed_models(input.allowed_models)?;
 
-    let raw = format!("sk-openllm-{}", uuid::Uuid::new_v4().simple());
-    let key_hash = hash_secret(&raw);
-    let key_prefix = raw.chars().take(12).collect::<String>();
-    let key_suffix = raw
-        .chars()
-        .rev()
-        .take(4)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
+    let (raw, key_hash, key_prefix, key_suffix) = generate_api_key_material();
 
     let result = sqlx::query(
         "INSERT INTO api_keys (
@@ -1177,6 +1182,35 @@ pub async fn create_api_key(
             item: record.into(),
         }),
     ))
+}
+
+pub async fn rotate_api_key(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<ApiKeyCreated>> {
+    let (raw, key_hash, key_prefix, key_suffix) = generate_api_key_material();
+    let result = sqlx::query(
+        "UPDATE api_keys \
+         SET key_hash = ?, key_prefix = ?, key_suffix = ?, last_used_at = NULL \
+         WHERE id = ?",
+    )
+    .bind(key_hash)
+    .bind(key_prefix)
+    .bind(key_suffix)
+    .bind(id)
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound("API key not found".to_string()));
+    }
+    let record = sqlx::query_as::<_, ApiKeyRecord>("SELECT * FROM api_keys WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    Ok(Json(ApiKeyCreated {
+        key: raw,
+        item: record.into(),
+    }))
 }
 
 pub async fn delete_api_key(
@@ -2422,6 +2456,15 @@ mod tests {
         assert_eq!(normalize_health_interval(Some(0)).unwrap(), None);
         assert_eq!(normalize_health_interval(Some(30)).unwrap(), Some(30));
         assert!(normalize_health_interval(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn generates_api_key_material() {
+        let (raw, hash, prefix, suffix) = generate_api_key_material();
+        assert!(raw.starts_with("sk-openllm-"));
+        assert_eq!(hash.len(), 64);
+        assert_eq!(prefix, raw[..12]);
+        assert_eq!(suffix, raw[raw.len() - 4..]);
     }
 
     #[test]
