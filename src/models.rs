@@ -148,6 +148,8 @@ pub struct ProviderUpdate {
     pub model_prefix: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub clear_api_key: Option<bool>,
     pub headers: Option<serde_json::Value>,
     pub enabled: Option<bool>,
     pub auto_sync_models: Option<bool>,

@@ -275,11 +275,11 @@ pub async fn update_provider(
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.models_sync_interval_minutes,
     };
-    let api_key = match input.api_key {
-        Some(key) if key.trim().is_empty() => current.api_key,
-        Some(key) => Some(key.trim().to_string()),
-        None => current.api_key,
-    };
+    let api_key = merge_provider_api_key(
+        current.api_key,
+        input.api_key,
+        input.clear_api_key.unwrap_or(false),
+    );
     let headers = match input.headers {
         Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
         None => current.headers,
@@ -2365,6 +2365,21 @@ fn validate_provider_input(input: &ProviderInput) -> AppResult<()> {
     Ok(())
 }
 
+fn merge_provider_api_key(
+    current: Option<String>,
+    requested: Option<String>,
+    clear: bool,
+) -> Option<String> {
+    if clear {
+        return None;
+    }
+    match requested {
+        Some(key) if key.trim().is_empty() => current,
+        Some(key) => Some(key.trim().to_string()),
+        None => current,
+    }
+}
+
 fn validate_route_input(input: &RouteInput) -> AppResult<()> {
     if input.name.trim().is_empty() || input.model_pattern.trim().is_empty() {
         return Err(AppError::BadRequest(
@@ -2744,6 +2759,25 @@ mod tests {
         assert_eq!(normalize_health_interval(Some(0)).unwrap(), None);
         assert_eq!(normalize_health_interval(Some(30)).unwrap(), Some(30));
         assert!(normalize_health_interval(Some(-1)).is_err());
+    }
+
+    #[test]
+    fn provider_api_key_update_supports_clear_retain_and_replace() {
+        let current = || Some("sk-existing".to_string());
+
+        assert_eq!(
+            merge_provider_api_key(current(), Some("sk-new".to_string()), false),
+            Some("sk-new".to_string())
+        );
+        assert_eq!(
+            merge_provider_api_key(current(), Some("   ".to_string()), false),
+            current()
+        );
+        assert_eq!(merge_provider_api_key(current(), None, false), current());
+        assert_eq!(
+            merge_provider_api_key(current(), Some("sk-ignored".to_string()), true),
+            None
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ import {
   App,
   Button,
   Card,
+  Checkbox,
   Form,
   Input,
   InputNumber,
@@ -52,6 +53,7 @@ const providerLabels = {
 type ProviderForm = ProviderInput & {
   headersText: string
   modelsText: string
+  clear_api_key?: boolean
 }
 
 type ModelSyncPreview = {
@@ -84,6 +86,7 @@ export default function Providers() {
   const [limitPage, setLimitPage] = useState(1)
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
+  const clearApiKey = Form.useWatch('clear_api_key', form)
 
   const load = async () => {
     setLoading(true)
@@ -103,6 +106,7 @@ export default function Providers() {
     form.setFieldsValue(item ? {
       ...item,
       api_key: '',
+      clear_api_key: false,
       // Never re-sync implicitly while editing: doing so would overwrite a
       // manually curated model list. The user must opt in explicitly.
       auto_sync_models: false,
@@ -114,6 +118,7 @@ export default function Providers() {
       base_url: 'https://api.openai.com/v1',
       model_prefix: '',
       api_key: '',
+      clear_api_key: false,
       enabled: true,
       auto_sync_models: true,
       health_check_interval_minutes: 0,
@@ -146,12 +151,13 @@ export default function Providers() {
       message.error('请求头必须是有效的 JSON 对象')
       return
     }
-    const payload: ProviderInput = {
+    const payload: ProviderInput & { clear_api_key?: boolean } = {
       name: values.name,
       provider_type: values.provider_type,
       base_url: values.base_url,
       model_prefix: values.model_prefix,
       api_key: values.api_key,
+      clear_api_key: editing?.api_key_set ? Boolean(values.clear_api_key) : undefined,
       headers,
       enabled: values.enabled,
       auto_sync_models: values.auto_sync_models,
@@ -562,8 +568,27 @@ export default function Providers() {
             label="API Key"
             extra={editing?.api_key_set ? '留空将保留当前密钥；输入新值会覆盖。' : '本地模型可以留空。'}
           >
-            <Input.Password placeholder="sk-..." autoComplete="new-password" />
+            <Input.Password
+              placeholder={editing?.api_key_set ? '留空保留，输入新值覆盖' : 'sk-...'}
+              autoComplete="new-password"
+              disabled={Boolean(editing?.api_key_set && clearApiKey)}
+            />
           </Form.Item>
+          {editing?.api_key_set && (
+            <Form.Item
+              name="clear_api_key"
+              valuePropName="checked"
+              extra="保存后立即移除已存密钥。需要鉴权的提供商将无法继续调用，直到重新填写密钥。"
+            >
+              <Checkbox
+                onChange={(event) => {
+                  if (event.target.checked) form.setFieldValue('api_key', '')
+                }}
+              >
+                清除已保存的 API Key
+              </Checkbox>
+            </Form.Item>
+          )}
           <Form.Item
             name="auto_sync_models"
             label="保存后自动从上游同步模型"
