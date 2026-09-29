@@ -1143,10 +1143,12 @@ pub async fn proxy_anthropic(
     uri: Uri,
     body: Bytes,
 ) -> Response {
-    match proxy_anthropic_inner(&state, &headers, &uri, &body).await {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let response = match proxy_anthropic_inner(&state, &headers, &uri, &body, &request_id).await {
         Ok(response) => response,
         Err(error) => anthropic_error_response(error),
-    }
+    };
+    with_gateway_request_id(response, &request_id)
 }
 
 /// Renders a gateway error in Anthropic's envelope and status vocabulary so an
@@ -1174,15 +1176,27 @@ fn anthropic_error_response(error: AppError) -> Response {
         .into_response()
 }
 
+/// Exposes the gateway request ID so clients can correlate a response with the
+/// request-log row even when the upstream response is streamed or failed.
+fn with_gateway_request_id(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response
+            .headers_mut()
+            .insert("x-openllm-request-id", value.clone());
+        response.headers_mut().insert("x-request-id", value);
+    }
+    response
+}
+
 async fn proxy_anthropic_inner(
     state: &AppState,
     headers: &HeaderMap,
     uri: &Uri,
     body: &Bytes,
+    request_id: &str,
 ) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
-    let request_id = uuid::Uuid::new_v4().to_string();
     let inbound: Value = serde_json::from_slice(body).map_err(|error| {
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
@@ -1206,7 +1220,7 @@ async fn proxy_anthropic_inner(
     enforce_policy_or_log(
         state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         streamed,
@@ -1216,7 +1230,7 @@ async fn proxy_anthropic_inner(
     let resolved = resolve_route_or_log(
         state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         streamed,
@@ -1228,7 +1242,7 @@ async fn proxy_anthropic_inner(
         log_request_rejection(
             state,
             api_key.as_ref(),
-            &request_id,
+            request_id,
             &requested_model,
             &endpoint,
             streamed,
@@ -1253,7 +1267,7 @@ async fn proxy_anthropic_inner(
     enforce_api_key_rate_limit_or_log(
         state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         request_tokens,
@@ -1263,7 +1277,7 @@ async fn proxy_anthropic_inner(
     .await?;
     log_usage_started(
         state,
-        &request_id,
+        request_id,
         api_key.as_ref().map(|key| key.id),
         route_id,
         &requested_model,
@@ -1280,7 +1294,7 @@ async fn proxy_anthropic_inner(
         let target_upstream_model = target.upstream_model.clone();
         log_usage_target(
             state,
-            &request_id,
+            request_id,
             target_provider_id,
             &target_upstream_model,
         )
@@ -1293,7 +1307,7 @@ async fn proxy_anthropic_inner(
             native["model"] = json!(target.upstream_model);
             forward_anthropic_native(
                 state,
-                &request_id,
+                request_id,
                 &requested_model,
                 native,
                 target,
@@ -1308,7 +1322,7 @@ async fn proxy_anthropic_inner(
         } else {
             forward_openai_as_anthropic(
                 state,
-                &request_id,
+                request_id,
                 &requested_model,
                 &request_json,
                 target,
@@ -1331,7 +1345,7 @@ async fn proxy_anthropic_inner(
     log_usage(
         state,
         UsageLogEntry {
-            request_id: &request_id,
+            request_id,
             api_key_id: api_key.as_ref().map(|key| key.id),
             route_id,
             provider_id: last_target.as_ref().map(|(provider_id, _)| *provider_id),
@@ -1637,11 +1651,26 @@ pub async fn proxy_openai(
     headers: HeaderMap,
     uri: Uri,
     body: Bytes,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = proxy_openai_inner(&state, &headers, &uri, &body, &request_id).await;
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    with_gateway_request_id(response, &request_id)
+}
+
+async fn proxy_openai_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    request_id: &str,
 ) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let mut request_json: Value = serde_json::from_slice(&body).map_err(|error| {
+    let mut request_json: Value = serde_json::from_slice(body).map_err(|error| {
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
     let requested_model = requested_model_of(&request_json)?;
@@ -1651,11 +1680,11 @@ pub async fn proxy_openai(
         .unwrap_or(false);
     let request_tokens = estimate_request_tokens(&request_json);
 
-    let api_key = authenticate_gateway(&state, &headers).await?;
+    let api_key = authenticate_gateway(state, headers).await?;
     enforce_policy_or_log(
-        &state,
+        state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         streamed,
@@ -1663,9 +1692,9 @@ pub async fn proxy_openai(
     )
     .await?;
     let resolved = resolve_route_or_log(
-        &state,
+        state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         streamed,
@@ -1675,9 +1704,9 @@ pub async fn proxy_openai(
     if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
         let message = error.to_string();
         log_request_rejection(
-            &state,
+            state,
             api_key.as_ref(),
-            &request_id,
+            request_id,
             &requested_model,
             &endpoint,
             streamed,
@@ -1704,11 +1733,11 @@ pub async fn proxy_openai(
     );
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
-        order_targets(&state, ordering_key, &resolved.strategy, resolved.targets).await?;
+        order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
     enforce_api_key_rate_limit_or_log(
-        &state,
+        state,
         api_key.as_ref(),
-        &request_id,
+        request_id,
         &requested_model,
         &endpoint,
         request_tokens,
@@ -1717,8 +1746,8 @@ pub async fn proxy_openai(
     )
     .await?;
     log_usage_started(
-        &state,
-        &request_id,
+        state,
+        request_id,
         api_key.as_ref().map(|key| key.id),
         route_id,
         &requested_model,
@@ -1743,19 +1772,19 @@ pub async fn proxy_openai(
         }
 
         log_usage_target(
-            &state,
-            &request_id,
+            state,
+            request_id,
             target_provider_id,
             &target_upstream_model,
         )
         .await;
         match forward_to_target(
-            &state,
-            &request_id,
+            state,
+            request_id,
             &endpoint,
             &requested_model,
             &request_json,
-            &body,
+            body,
             target,
             streamed,
             request_tokens,
@@ -1780,9 +1809,9 @@ pub async fn proxy_openai(
 
     let message = last_error.unwrap_or_else(|| "all configured route targets failed".to_string());
     log_usage(
-        &state,
+        state,
         UsageLogEntry {
-            request_id: &request_id,
+            request_id,
             api_key_id: api_key.as_ref().map(|key| key.id),
             route_id,
             provider_id: last_target.as_ref().map(|(provider_id, _)| *provider_id),
@@ -4843,6 +4872,48 @@ mod tests {
         openai.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
         assert!(!wants_anthropic_models(&openai));
         assert!(!wants_anthropic_models(&HeaderMap::new()));
+    }
+
+    #[tokio::test]
+    async fn gateway_errors_expose_the_request_id_header() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = AppState::new(pool, None);
+
+        let response = proxy_openai(
+            State(state.clone()),
+            HeaderMap::new(),
+            "/v1/chat/completions".parse().unwrap(),
+            Bytes::from_static(b"{"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id = response
+            .headers()
+            .get("x-openllm-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(response.headers().get("x-request-id").unwrap(), request_id);
+
+        let response = proxy_anthropic(
+            State(state),
+            HeaderMap::new(),
+            "/v1/messages".parse().unwrap(),
+            Bytes::from_static(b"{"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id = response
+            .headers()
+            .get("x-openllm-request-id")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert_eq!(response.headers().get("x-request-id").unwrap(), request_id);
     }
 
     #[test]
