@@ -31,8 +31,15 @@ import {
 } from 'antd'
 import type { Dayjs } from 'dayjs'
 import dayjs from 'dayjs'
-import { useNavigate } from 'react-router-dom'
-import { api, formatError, type ApiKey, type Provider, type UsageLog } from '../api'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  api,
+  formatError,
+  type ApiKey,
+  type GatewayRoute,
+  type Provider,
+  type UsageLog,
+} from '../api'
 import { formatCompact, formatCostMicros, formatExact } from '../format'
 import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
@@ -45,21 +52,35 @@ type UsagePageResponse = {
   page_size: number
 }
 
+function positiveIntegerParam(value: string | null) {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+}
+
 export default function Usage() {
   const { message } = App.useApp()
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
   const [items, setItems] = useState<UsageLog[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
+  const [routes, setRoutes] = useState<GatewayRoute[]>([])
   const [loading, setLoading] = useState(true)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [total, setTotal] = useState(0)
-  const [model, setModel] = useState('')
+  const [model, setModel] = useState(() => searchParams.get('model') || '')
   const [requestId, setRequestId] = useState('')
-  const [endpoint, setEndpoint] = useState('')
-  const [providerId, setProviderId] = useState<number>()
-  const [apiKeyId, setApiKeyId] = useState<number>()
+  const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') || '')
+  const [providerId, setProviderId] = useState<number | undefined>(
+    () => positiveIntegerParam(searchParams.get('provider_id')),
+  )
+  const [apiKeyId, setApiKeyId] = useState<number | undefined>(
+    () => positiveIntegerParam(searchParams.get('api_key_id')),
+  )
+  const [routeId, setRouteId] = useState<number | undefined>(
+    () => positiveIntegerParam(searchParams.get('route_id')),
+  )
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>('all')
   const [dates, setDates] = useState<[Dayjs, Dayjs]>()
   const [newRequests, setNewRequests] = useState(0)
@@ -71,14 +92,15 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, apiKeyId, statusFilter, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, apiKeyId, statusFilter, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, apiKeyId, routeId, statusFilter, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, apiKeyId, routeId, statusFilter, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
     endpoint,
     providerId,
     apiKeyId,
+    routeId,
     statusFilter,
     dates?.[0]?.toISOString(),
     dates?.[1]?.toISOString(),
@@ -105,6 +127,7 @@ export default function Usage() {
     if (endpoint) params.set('endpoint', endpoint)
     if (providerId) params.set('provider_id', String(providerId))
     if (apiKeyId) params.set('api_key_id', String(apiKeyId))
+    if (routeId) params.set('route_id', String(routeId))
     if (statusFilter === 'success') params.set('success', 'true')
     if (statusFilter === 'failed') params.set('success', 'false')
     if (statusFilter === 'pending') params.set('in_flight', 'true')
@@ -118,6 +141,7 @@ export default function Usage() {
         endpoint,
         providerId,
         apiKeyId,
+        routeId,
         statusFilter,
         dates?.[0]?.toISOString(),
         dates?.[1]?.toISOString(),
@@ -154,7 +178,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerId, requestId, statusFilter])
+  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerId, requestId, routeId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -165,6 +189,7 @@ export default function Usage() {
     void Promise.all([
       api.get<Provider[]>('/api/providers').then(setProviders),
       api.get<ApiKey[]>('/api/api-keys').then(setApiKeys),
+      api.get<GatewayRoute[]>('/api/routes').then(setRoutes),
       load(1, 20),
     ]).catch((error) => message.error(formatError(error)))
   }, [])
@@ -225,6 +250,7 @@ export default function Usage() {
       if (endpoint) params.set('endpoint', endpoint)
       if (providerId) params.set('provider_id', String(providerId))
       if (apiKeyId) params.set('api_key_id', String(apiKeyId))
+      if (routeId) params.set('route_id', String(routeId))
       if (statusFilter === 'success') params.set('success', 'true')
       if (statusFilter === 'failed') params.set('success', 'false')
       if (statusFilter === 'pending') params.set('in_flight', 'true')
@@ -352,6 +378,16 @@ export default function Usage() {
             value={apiKeyId}
             onChange={(value) => { setApiKeyId(value); setTimeout(() => load(1), 0) }}
             options={apiKeys.map((item) => ({ value: item.id, label: item.name }))}
+            style={{ width: 180 }}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="路由"
+            value={routeId}
+            onChange={(value) => { setRouteId(value); setTimeout(() => load(1), 0) }}
+            options={routes.map((item) => ({ value: item.id, label: item.name }))}
             style={{ width: 180 }}
           />
           <Select

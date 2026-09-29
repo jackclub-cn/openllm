@@ -1,5 +1,11 @@
 import { useEffect, useRef, useState } from 'react'
-import { DeleteOutlined, EditOutlined, ExperimentOutlined, PlusOutlined } from '@ant-design/icons'
+import {
+  DeleteOutlined,
+  EditOutlined,
+  ExperimentOutlined,
+  HistoryOutlined,
+  PlusOutlined,
+} from '@ant-design/icons'
 import {
   Alert,
   App,
@@ -21,7 +27,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   api,
   formatError,
@@ -74,6 +80,7 @@ const diagnosisReasonLabels: Record<string, string> = {
 
 export default function RoutesPage() {
   const { message } = App.useApp()
+  const navigate = useNavigate()
   const [items, setItems] = useState<GatewayRoute[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
@@ -274,10 +281,17 @@ export default function RoutesPage() {
             },
             {
               title: '操作',
-              width: 110,
+              width: 150,
               fixed: 'right',
               render: (_, record) => (
                 <Space>
+                  <Tooltip title="查看请求日志">
+                    <Button
+                      type="text"
+                      icon={<HistoryOutlined />}
+                      onClick={() => navigate(`/usage?route_id=${record.id}`)}
+                    />
+                  </Tooltip>
                   <Tooltip title="编辑">
                     <Button type="text" icon={<EditOutlined />} onClick={() => openEditor(record)} />
                   </Tooltip>

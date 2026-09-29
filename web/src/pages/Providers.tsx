@@ -5,6 +5,7 @@ import {
   ClearOutlined,
   DeleteOutlined,
   EditOutlined,
+  HistoryOutlined,
   PlusOutlined,
   SearchOutlined,
   SettingOutlined,
@@ -31,6 +32,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
+import { useNavigate } from 'react-router-dom'
 import {
   api,
   formatError,
@@ -84,6 +86,7 @@ type ModelSyncPreview = {
 
 export default function Providers() {
   const { message } = App.useApp()
+  const navigate = useNavigate()
   const [items, setItems] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
@@ -557,10 +560,17 @@ export default function Providers() {
             },
             {
               title: '操作',
-              width: 240,
+              width: 280,
               fixed: 'right',
               render: (_, record) => (
                 <Space>
+                  <Tooltip title="查看请求日志">
+                    <Button
+                      type="text"
+                      icon={<HistoryOutlined />}
+                      onClick={() => navigate(`/usage?provider_id=${record.id}`)}
+                    />
+                  </Tooltip>
                   <Tooltip title="预览模型同步">
                     <Button
                       type="text"

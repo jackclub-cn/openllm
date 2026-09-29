@@ -3,6 +3,7 @@ import {
   CopyOutlined,
   DeleteOutlined,
   EditOutlined,
+  HistoryOutlined,
   KeyOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -26,6 +27,7 @@ import {
   Typography,
 } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
+import { useNavigate } from 'react-router-dom'
 import { api, formatError, type ApiKey } from '../api'
 import PageHeader from '../components/PageHeader'
 import { formatCompact, formatCostMicros, formatExact } from '../format'
@@ -42,6 +44,7 @@ type ApiKeyForm = {
 
 export default function ApiKeys() {
   const { message } = App.useApp()
+  const navigate = useNavigate()
   const [items, setItems] = useState<ApiKey[]>([])
   const [loading, setLoading] = useState(true)
   const [open, setOpen] = useState(false)
@@ -359,9 +362,16 @@ export default function ApiKeys() {
             },
             {
               title: '操作',
-              width: 160,
+              width: 190,
               render: (_, record) => (
                 <Space>
+                  <Tooltip title="查看请求日志">
+                    <Button
+                      type="text"
+                      icon={<HistoryOutlined />}
+                      onClick={() => navigate(`/usage?api_key_id=${record.id}`)}
+                    />
+                  </Tooltip>
                   <Tooltip title="编辑限额">
                     <Button type="text" icon={<EditOutlined />} onClick={() => openLimits(record)} />
                   </Tooltip>
