@@ -75,7 +75,8 @@ impl CapabilityRow {
             structured_output: boolean(self.structured_output),
             temperature: boolean(self.temperature),
             open_weights: boolean(self.open_weights),
-            modalities: parse_json_column(self.modalities),
+            input_modalities: stored_modality(&self.modalities, "input"),
+            output_modalities: stored_modality(&self.modalities, "output"),
             cost: parse_json_column(self.cost),
             family: self.family,
             knowledge: self.knowledge,
@@ -85,6 +86,19 @@ impl CapabilityRow {
         };
         (!capabilities.is_empty()).then_some(capabilities)
     }
+}
+
+/// Extracts one modality list from the JSON blob persisted in `provider_models`,
+/// whose shape mirrors models.dev (`{"input": [...], "output": [...]}`).
+fn stored_modality(raw: &Option<String>, key: &str) -> Option<Vec<String>> {
+    let value: Value = serde_json::from_str(raw.as_ref()?).ok()?;
+    let items = value.get(key)?.as_array()?;
+    let values = items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
 }
 
 fn parse_json_column(value: Option<String>) -> Option<Value> {
@@ -246,10 +260,8 @@ fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
         structured_output: boolean(row.structured_output),
         temperature: boolean(row.temperature),
         open_weights: boolean(row.open_weights),
-        modalities: row
-            .modalities
-            .as_ref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok()),
+        input_modalities: stored_modality(&row.modalities, "input"),
+        output_modalities: stored_modality(&row.modalities, "output"),
         cost: row
             .cost
             .as_ref()

@@ -166,10 +166,11 @@ pub async fn create_provider(
     .map_err(map_sqlite_conflict)?;
 
     let id = result.last_insert_rowid();
+    let entries = names_to_entries(&input.models);
     replace_provider_models(
         &mut tx,
         id,
-        &input.models,
+        &entries,
         catalog.as_deref(),
         models_dev_id.as_deref(),
     )
@@ -252,10 +253,11 @@ pub async fn update_provider(
     .map_err(map_sqlite_conflict)?;
 
     if let Some(models) = input.models {
+        let entries = names_to_entries(&models);
         replace_provider_models(
             &mut tx,
             id,
-            &models,
+            &entries,
             catalog.as_deref(),
             models_dev_id.as_deref(),
         )
@@ -430,16 +432,20 @@ async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncRe
 
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::Upstream(format!("invalid model list response: {error}")))?;
-    let models = if ollama_style {
-        parse_ollama_models(&value)
+    let entries = if ollama_style {
+        names_to_entries(&parse_ollama_models(&value))
     } else {
-        parse_openai_models(&value)
+        parse_openai_model_entries(&value)
     };
-    if models.is_empty() {
+    if entries.is_empty() {
         return Err(AppError::Upstream(
             "upstream model list did not contain any recognizable models".to_string(),
         ));
     }
+    let models = entries
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect::<Vec<_>>();
 
     let catalog = models_dev::try_load(state).await;
     // Re-resolve the provider match on every sync: the stored id may be stale
@@ -452,7 +458,7 @@ async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncRe
     replace_provider_models(
         &mut tx,
         id,
-        &models,
+        &entries,
         catalog.as_deref(),
         models_dev_id.as_deref(),
     )
@@ -589,30 +595,44 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
         .unwrap_or_default();
     let mut by_id = BTreeMap::new();
     for model in routes {
-        by_id.entry(model.id.clone()).or_insert(PublicModel {
-            id: model.id,
-            object: "model",
-            created: from,
-            owned_by: "openllm",
-            provider: None,
-            upstream_model: None,
-            capabilities: model.capabilities,
-            target_count: Some(model.target_count),
-            limits_verified: Some(!model.incomplete),
-        });
+        by_id.entry(model.id.clone()).or_insert(
+            PublicModel {
+                id: model.id,
+                object: "model",
+                created: from,
+                owned_by: "openllm",
+                provider: None,
+                upstream_model: None,
+                capabilities: model.capabilities,
+                target_count: Some(model.target_count),
+                limits_verified: Some(!model.incomplete),
+                context_length: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_completion_tokens: None,
+            }
+            .with_flat_limits(),
+        );
     }
     for model in synced {
-        by_id.entry(model.id.clone()).or_insert(PublicModel {
-            id: model.id,
-            object: "model",
-            created: from,
-            owned_by: "openllm",
-            provider: Some(model.provider_name),
-            upstream_model: Some(model.upstream_model),
-            capabilities: model.capabilities,
-            target_count: None,
-            limits_verified: None,
-        });
+        by_id.entry(model.id.clone()).or_insert(
+            PublicModel {
+                id: model.id,
+                object: "model",
+                created: from,
+                owned_by: "openllm",
+                provider: Some(model.provider_name),
+                upstream_model: Some(model.upstream_model),
+                capabilities: model.capabilities,
+                target_count: None,
+                limits_verified: None,
+                context_length: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_completion_tokens: None,
+            }
+            .with_flat_limits(),
+        );
     }
     Ok(Json(by_id.into_values().collect()))
 }
@@ -1016,10 +1036,35 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
     })
 }
 
+/// Wraps plain model names (manually curated lists, Ollama) with empty upstream
+/// metadata so they share one insert path with synced entries.
+fn names_to_entries(models: &[String]) -> Vec<(String, UpstreamModelInfo)> {
+    models
+        .iter()
+        .map(|name| (name.clone(), UpstreamModelInfo::default()))
+        .collect()
+}
+
+/// Serialises the split modality fields back into the nested shape used for
+/// storage, keeping one canonical on-disk representation.
+fn modalities_to_storage(capabilities: &ModelCapabilities) -> Option<String> {
+    if capabilities.input_modalities.is_none() && capabilities.output_modalities.is_none() {
+        return None;
+    }
+    let mut value = serde_json::Map::new();
+    if let Some(input) = &capabilities.input_modalities {
+        value.insert("input".to_string(), json!(input));
+    }
+    if let Some(output) = &capabilities.output_modalities {
+        value.insert("output".to_string(), json!(output));
+    }
+    serde_json::to_string(&Value::Object(value)).ok()
+}
+
 async fn replace_provider_models(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     provider_id: i64,
-    models: &[String],
+    models: &[(String, UpstreamModelInfo)],
     catalog: Option<&models_dev::Catalog>,
     provider_hint: Option<&str>,
 ) -> AppResult<()> {
@@ -1029,7 +1074,7 @@ async fn replace_provider_models(
         .await?;
     let mut seen = HashSet::new();
     let synced_at = Utc::now().to_rfc3339();
-    for model in models {
+    for (model, upstream) in models {
         let model = model.trim();
         if model.is_empty() || !seen.insert(model.to_string()) {
             continue;
@@ -1037,19 +1082,23 @@ async fn replace_provider_models(
         let found = catalog.and_then(|catalog| catalog.lookup(provider_hint, model));
         let has_capabilities = found.is_some();
         let capabilities = found.unwrap_or_default();
+        // The provider's own context window is more trustworthy than a
+        // models.dev guess, and is the only source for models models.dev lacks.
+        let context_limit = upstream.context_limit.or(capabilities.context_limit);
         sqlx::query(
             r#"
             INSERT INTO provider_models (
                 provider_id, model_name, enabled, context_limit, output_limit,
                 input_limit, attachment, reasoning, tool_call, structured_output,
                 temperature, open_weights, modalities, cost, family, knowledge,
-                release_date, last_updated, canonical_model_id, capabilities_synced_at
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                release_date, last_updated, canonical_model_id, capabilities_synced_at,
+                upstream_context_limit, supported_endpoints
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
         .bind(model)
-        .bind(capabilities.context_limit)
+        .bind(context_limit)
         .bind(capabilities.output_limit)
         .bind(capabilities.input_limit)
         .bind(capabilities.attachment.map(i64::from))
@@ -1058,14 +1107,8 @@ async fn replace_provider_models(
         .bind(capabilities.structured_output.map(i64::from))
         .bind(capabilities.temperature.map(i64::from))
         .bind(capabilities.open_weights.map(i64::from))
-        .bind(
-            capabilities
-                .modalities
-                .as_ref()
-                .map(serde_json::to_string)
-                .transpose()
-                .unwrap_or_default(),
-        )
+        // Persisted in models.dev's nested shape; the read path flattens it.
+        .bind(modalities_to_storage(&capabilities))
         .bind(
             capabilities
                 .cost
@@ -1079,28 +1122,71 @@ async fn replace_provider_models(
         .bind(capabilities.release_date)
         .bind(capabilities.last_updated)
         .bind(capabilities.canonical_model_id)
-        .bind(has_capabilities.then_some(synced_at.clone()))
+        .bind((has_capabilities || upstream.context_limit.is_some()).then_some(synced_at.clone()))
+        .bind(upstream.context_limit)
+        .bind(
+            (!upstream.supported_endpoints.is_empty())
+                .then(|| serde_json::to_string(&upstream.supported_endpoints))
+                .transpose()
+                .unwrap_or_default(),
+        )
         .execute(&mut **tx)
         .await?;
     }
     Ok(())
 }
 
-fn parse_openai_models(value: &Value) -> Vec<String> {
+/// Extra facts a provider reports about a model in its own `/models` response.
+///
+/// These are kept separate from models.dev metadata so the upstream's own
+/// numbers can win: a provider knows its real context window even when
+/// models.dev has never heard of the model.
+#[derive(Debug, Clone, Default)]
+struct UpstreamModelInfo {
+    context_limit: Option<i64>,
+    supported_endpoints: Vec<String>,
+}
+
+/// Parses an OpenAI-style model list, preserving each entry's name and any
+/// upstream-reported limits.
+fn parse_openai_model_entries(value: &Value) -> Vec<(String, UpstreamModelInfo)> {
     value
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(|model| {
-            model
+            let name = model
                 .get("id")
                 .or_else(|| model.get("name"))
-                .and_then(Value::as_str)
+                .and_then(Value::as_str)?
+                .trim();
+            if name.is_empty() {
+                return None;
+            }
+            // Providers disagree on the field name; accept the common spellings.
+            let context_limit = ["context_length", "context_window", "context_size"]
+                .iter()
+                .find_map(|key| model.get(key).and_then(Value::as_i64));
+            let supported_endpoints = model
+                .get("supported_endpoints")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some((
+                name.to_string(),
+                UpstreamModelInfo {
+                    context_limit,
+                    supported_endpoints,
+                },
+            ))
         })
-        .map(str::trim)
-        .filter(|model| !model.is_empty())
-        .map(ToOwned::to_owned)
         .collect()
 }
 
@@ -1386,9 +1472,27 @@ mod tests {
             { "id": "gpt-4.1-mini" },
             { "name": "fallback-name" }
         ]});
+        let names = parse_openai_model_entries(&value)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["gpt-4.1", "gpt-4.1-mini", "fallback-name"]);
+    }
+
+    #[test]
+    fn captures_upstream_context_length_and_endpoints() {
+        // CommandCode reports a flat `context_length` for every model, even ones
+        // models.dev has never heard of.
+        let value = json!({ "data": [
+            { "id": "deepseek/deepseek-v4.1-flash", "context_length": 1000000,
+              "supported_endpoints": ["/chat/completions", "/responses"] }
+        ]});
+        let entries = parse_openai_model_entries(&value);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.context_limit, Some(1000000));
         assert_eq!(
-            parse_openai_models(&value),
-            vec!["gpt-4.1", "gpt-4.1-mini", "fallback-name"]
+            entries[0].1.supported_endpoints,
+            vec!["/chat/completions", "/responses"]
         );
     }
 
@@ -1404,7 +1508,11 @@ mod tests {
     #[test]
     fn ignores_empty_model_entries() {
         let value = json!({ "data": [{ "id": "  " }, { "id": "real-model" }] });
-        assert_eq!(parse_openai_models(&value), vec!["real-model"]);
+        let names = parse_openai_model_entries(&value)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["real-model"]);
     }
 
     #[test]

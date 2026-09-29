@@ -245,6 +245,36 @@ pub struct PublicModel {
     /// guarantee that every target accepts the advertised limits.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits_verified: Option<bool>,
+    /// Flat, de-facto-standard limit names.
+    ///
+    /// OpenAI-compatible clients (Hermes, LiteLLM, assorted routers) read
+    /// these specific keys, and several only walk top-level fields. They mirror
+    /// the nested `capabilities` values so both styles of client work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_length: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<i64>,
+}
+
+impl PublicModel {
+    /// Fills the flat limit fields from a capability envelope.
+    ///
+    /// `context_limit` is the total window, so it doubles as the input ceiling
+    /// when no separate input limit is published; that matches how clients
+    /// interpret `max_input_tokens`.
+    pub fn with_flat_limits(mut self) -> Self {
+        if let Some(capabilities) = self.capabilities.as_ref() {
+            self.context_length = capabilities.context_limit;
+            self.max_input_tokens = capabilities.input_limit.or(capabilities.context_limit);
+            self.max_output_tokens = capabilities.output_limit;
+            self.max_completion_tokens = capabilities.output_limit;
+        }
+        self
+    }
 }
 
 /// Capability metadata mirrored from models.dev. Every field is optional so an
@@ -270,8 +300,17 @@ pub struct ModelCapabilities {
     pub temperature: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_weights: Option<bool>,
+    /// Accepted input modalities, e.g. `["text", "image"]`.
+    ///
+    /// Deliberately a top-level list rather than nested under an
+    /// `input`/`output` key: OpenAI-compatible clients walk nested dicts
+    /// looking for `input`/`output` *price* fields, and a list value there
+    /// raises `TypeError: unhashable type: 'list'`, which silently discards the
+    /// whole endpoint's metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub modalities: Option<serde_json::Value>,
+    pub input_modalities: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_modalities: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -294,9 +333,9 @@ impl ModelCapabilities {
     /// Barrel/intersection: the strictest common envelope across `targets`.
     ///
     /// Numeric limits take the minimum of the known values, booleans are only
-    /// true when every target that reports the flag says true, and modalities
-    /// keep only what all targets accept. Descriptive fields (family, cost,
-    /// release dates) are intentionally dropped because a route can span
+    /// true when every target that reports the flag says true, and modality
+    /// lists keep only what all targets accept. Descriptive fields (family,
+    /// cost, release dates) are intentionally dropped because a route can span
     /// unrelated models where they have no common meaning.
     pub fn intersect<'a>(targets: impl IntoIterator<Item = &'a ModelCapabilities>) -> Option<Self> {
         let targets = targets.into_iter().collect::<Vec<_>>();
@@ -324,7 +363,8 @@ impl ModelCapabilities {
             structured_output: all_true(|c| c.structured_output),
             temperature: all_true(|c| c.temperature),
             open_weights: all_true(|c| c.open_weights),
-            modalities: intersect_modalities(&targets),
+            input_modalities: intersect_modalities(&targets, |c| c.input_modalities.as_ref()),
+            output_modalities: intersect_modalities(&targets, |c| c.output_modalities.as_ref()),
             cost: None,
             family: None,
             knowledge: None,
@@ -336,46 +376,28 @@ impl ModelCapabilities {
     }
 }
 
-/// Keeps only the modalities supported by every target. `None` entries are
-/// ignored; if no target declares modalities the result is `None`.
-fn intersect_modalities(targets: &[&ModelCapabilities]) -> Option<serde_json::Value> {
-    let declared = targets
-        .iter()
-        .filter_map(|c| c.modalities.as_ref())
-        .collect::<Vec<_>>();
+/// Keeps only the modalities supported by every target that declares them.
+/// Targets with no modality data are ignored rather than treated as "nothing",
+/// and if none declare anything the result is `None`.
+fn intersect_modalities(
+    targets: &[&ModelCapabilities],
+    get: fn(&ModelCapabilities) -> Option<&Vec<String>>,
+) -> Option<Vec<String>> {
+    let declared = targets.iter().filter_map(|c| get(c)).collect::<Vec<_>>();
     if declared.is_empty() {
         return None;
     }
-    let sets = |key: &str| -> Vec<std::collections::BTreeSet<String>> {
-        declared
+    let mut sets = declared.iter().map(|items| {
+        items
             .iter()
-            .map(|value| {
-                value
-                    .get(key)
-                    .and_then(serde_json::Value::as_array)
-                    .map(|items| {
-                        items
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .map(ToOwned::to_owned)
-                            .collect::<std::collections::BTreeSet<_>>()
-                    })
-                    .unwrap_or_default()
-            })
-            .collect()
-    };
-    let intersect = |groups: Vec<std::collections::BTreeSet<String>>| {
-        let mut iter = groups.into_iter();
-        let mut result = iter.next().unwrap_or_default();
-        for group in iter {
-            result = result.intersection(&group).cloned().collect();
-        }
-        result
-    };
-    Some(serde_json::json!({
-        "input": intersect(sets("input")),
-        "output": intersect(sets("output")),
-    }))
+            .map(|item| item.to_ascii_lowercase())
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+    let mut result = sets.next().unwrap_or_default();
+    for group in sets {
+        result = result.intersection(&group).cloned().collect();
+    }
+    Some(result.into_iter().collect())
 }
 
 #[derive(Debug, Serialize)]
@@ -777,23 +799,22 @@ mod capability_tests {
     #[test]
     fn intersection_keeps_only_shared_modalities() {
         let multi = ModelCapabilities {
-            modalities: Some(serde_json::json!({
-                "input": ["text", "image", "pdf"],
-                "output": ["text"]
-            })),
+            input_modalities: Some(vec![
+                "text".to_string(),
+                "image".to_string(),
+                "pdf".to_string(),
+            ]),
+            output_modalities: Some(vec!["text".to_string()]),
             ..Default::default()
         };
         let text_only = ModelCapabilities {
-            modalities: Some(serde_json::json!({
-                "input": ["text"],
-                "output": ["text"]
-            })),
+            input_modalities: Some(vec!["text".to_string()]),
+            output_modalities: Some(vec!["text".to_string()]),
             ..Default::default()
         };
         let result = ModelCapabilities::intersect([&multi, &text_only]).unwrap();
-        let modalities = result.modalities.unwrap();
-        assert_eq!(modalities["input"], serde_json::json!(["text"]));
-        assert_eq!(modalities["output"], serde_json::json!(["text"]));
+        assert_eq!(result.input_modalities, Some(vec!["text".to_string()]));
+        assert_eq!(result.output_modalities, Some(vec!["text".to_string()]));
     }
 
     #[test]

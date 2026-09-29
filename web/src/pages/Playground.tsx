@@ -466,8 +466,8 @@ export default function Playground() {
                   {capabilities.tool_call && <Tag color="green">工具调用</Tag>}
                   {capabilities.attachment && <Tag color="orange">附件</Tag>}
                   {capabilities.structured_output && <Tag>结构化输出</Tag>}
-                  {capabilities.modalities?.input && (
-                    <Tag>输入 {capabilities.modalities.input.join('/')}</Tag>
+                  {capabilities.input_modalities && (
+                    <Tag>输入 {capabilities.input_modalities.join('/')}</Tag>
                   )}
                 </div>
                 {selected?.target_count != null && (

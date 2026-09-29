@@ -173,7 +173,8 @@ fn parse_capabilities(model: &Value) -> ModelCapabilities {
         structured_output: model.get("structured_output").and_then(Value::as_bool),
         temperature: model.get("temperature").and_then(Value::as_bool),
         open_weights: model.get("open_weights").and_then(Value::as_bool),
-        modalities: model.get("modalities").filter(|v| v.is_object()).cloned(),
+        input_modalities: modality_list(model, "input"),
+        output_modalities: modality_list(model, "output"),
         cost: model.get("cost").filter(|v| v.is_object()).cloned(),
         family: string_field(model, "family"),
         knowledge: string_field(model, "knowledge"),
@@ -181,6 +182,19 @@ fn parse_capabilities(model: &Value) -> ModelCapabilities {
         last_updated: string_field(model, "last_updated"),
         canonical_model_id: string_field(model, "canonical_model_id"),
     }
+}
+
+/// Reads `modalities.input` / `modalities.output` and flattens each to a list of
+/// strings, so the public payload never nests a list under an `input`/`output`
+/// key (which crashes some OpenAI-compatible clients).
+fn modality_list(model: &Value, key: &str) -> Option<Vec<String>> {
+    let items = model.get("modalities")?.get(key)?.as_array()?;
+    let values = items
+        .iter()
+        .filter_map(Value::as_str)
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    (!values.is_empty()).then_some(values)
 }
 
 fn string_field(model: &Value, key: &str) -> Option<String> {

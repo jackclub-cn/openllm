@@ -173,7 +173,8 @@ export type ModelCapabilities = {
   structured_output?: boolean
   temperature?: boolean
   open_weights?: boolean
-  modalities?: { input?: string[]; output?: string[] }
+  input_modalities?: string[]
+  output_modalities?: string[]
   cost?: Record<string, unknown>
   family?: string
   knowledge?: string
@@ -192,6 +193,10 @@ export type ModelInfo = {
   capabilities?: ModelCapabilities
   target_count?: number
   limits_verified?: boolean
+  context_length?: number
+  max_input_tokens?: number
+  max_output_tokens?: number
+  max_completion_tokens?: number
 }
 
 export function formatError(error: unknown) {
