@@ -1068,7 +1068,7 @@ async fn count_tokens_inner(
     let requested_model = requested_model_of(&inbound)?;
     let api_key = authenticate_gateway(state, headers).await?;
     enforce_api_key_model_access(api_key.as_ref(), &requested_model)?;
-    resolve_route(state, &requested_model).await?;
+    resolve_route(state, &requested_model, ANTHROPIC_MESSAGES).await?;
 
     let input_tokens = estimate_request_tokens(&inbound);
     Ok(Json(json!({"input_tokens": input_tokens})).into_response())
@@ -1157,7 +1157,7 @@ async fn proxy_anthropic_inner(
         started,
     )
     .await?;
-    let resolved = resolve_route(state, &requested_model).await?;
+    let resolved = resolve_route(state, &requested_model, &endpoint).await?;
     if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
         let message = error.to_string();
         log_request_rejection(
@@ -1586,7 +1586,7 @@ pub async fn proxy_openai(
         started,
     )
     .await?;
-    let resolved = resolve_route(&state, &requested_model).await?;
+    let resolved = resolve_route(&state, &requested_model, &endpoint).await?;
     if let Err(error) = enforce_context_capacity(request_tokens, resolved.barrel.as_ref()) {
         let message = error.to_string();
         log_request_rejection(
@@ -3080,14 +3080,71 @@ struct ResolvedRoute {
     barrel: Option<BarrelEnvelope>,
 }
 
-async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute> {
+fn normalized_endpoint(value: &str) -> &str {
+    let value = value
+        .split('?')
+        .next()
+        .unwrap_or(value)
+        .trim_end_matches('/');
+    let value = value.strip_prefix("/v1").unwrap_or(value);
+    value.strip_prefix('/').unwrap_or(value)
+}
+
+fn target_upstream_endpoint<'a>(
+    target: &RouteTarget,
+    request_endpoint: &'a str,
+) -> Option<&'a str> {
+    let provider_type = ProviderType::from_str(&target.provider_type).ok()?;
+    match provider_type {
+        ProviderType::Anthropic => {
+            if request_endpoint == OPENAI_CHAT_COMPLETIONS || request_endpoint == ANTHROPIC_MESSAGES
+            {
+                Some(ANTHROPIC_MESSAGES)
+            } else {
+                None
+            }
+        }
+        _ if request_endpoint == ANTHROPIC_MESSAGES => Some(OPENAI_CHAT_COMPLETIONS),
+        _ => Some(request_endpoint),
+    }
+}
+
+fn target_supports_endpoint(target: &RouteTarget, request_endpoint: &str) -> bool {
+    let Some(upstream_endpoint) = target_upstream_endpoint(target, request_endpoint) else {
+        return false;
+    };
+    let Some(raw) = target.supported_endpoints.as_deref() else {
+        return true;
+    };
+    let Ok(endpoints) = serde_json::from_str::<Vec<String>>(raw) else {
+        return true;
+    };
+    if endpoints.is_empty() {
+        return true;
+    }
+    let expected = normalized_endpoint(upstream_endpoint);
+    endpoints
+        .iter()
+        .any(|endpoint| normalized_endpoint(endpoint) == expected)
+}
+
+fn filter_targets_for_endpoint(
+    targets: Vec<RouteTarget>,
+    request_endpoint: &str,
+) -> Vec<RouteTarget> {
+    targets
+        .into_iter()
+        .filter(|target| target_supports_endpoint(target, request_endpoint))
+        .collect()
+}
+
+async fn resolve_route(state: &AppState, model: &str, endpoint: &str) -> AppResult<ResolvedRoute> {
     if let Some(route) = find_explicit_route(state, model).await? {
-        let targets = load_targets(state, route.id).await?;
+        let targets = filter_targets_for_endpoint(load_targets(state, route.id).await?, endpoint);
         if targets.is_empty() {
-            return Err(AppError::Upstream(
-                "the matched route has no enabled provider targets; a target or its provider model may be disabled"
-                    .to_string(),
-            ));
+            return Err(AppError::BadRequest(format!(
+                "model '{model}' has no enabled route target that supports endpoint '{endpoint}'"
+            )));
         }
         let pairs = targets
             .iter()
@@ -3102,7 +3159,12 @@ async fn resolve_route(state: &AppState, model: &str) -> AppResult<ResolvedRoute
         });
     }
 
-    let targets = find_prefixed_targets(state, model).await?;
+    let targets = find_prefixed_targets(state, model, endpoint).await?;
+    if targets.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "model '{model}' is not available for endpoint '{endpoint}'"
+        )));
+    }
     let pairs = targets
         .iter()
         .map(|target| (target.provider_id, target.upstream_model.clone()))
@@ -3143,12 +3205,17 @@ async fn find_explicit_route(state: &AppState, model: &str) -> AppResult<Option<
     Ok(None)
 }
 
-async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<RouteTarget>> {
+async fn find_prefixed_targets(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+) -> AppResult<Vec<RouteTarget>> {
     let prefixed = sqlx::query_as::<_, RouteTarget>(
         r#"
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
@@ -3167,6 +3234,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
     .fetch_all(&state.pool)
     .await?;
 
+    let prefixed = filter_targets_for_endpoint(prefixed, endpoint);
     if !prefixed.is_empty() {
         return Ok(prefixed);
     }
@@ -3176,6 +3244,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
         SELECT NULL AS id, NULL AS route_id, p.id AS provider_id,
                p.name AS provider_name, p.provider_type, p.base_url,
                p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
@@ -3193,6 +3262,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
     .fetch_all(&state.pool)
     .await?;
 
+    let unprefixed = filter_targets_for_endpoint(unprefixed, endpoint);
     if unprefixed.len() > 1 {
         return Err(AppError::Conflict(format!(
             "model '{model}' exists on multiple providers; configure a model prefix or an explicit route"
@@ -3200,7 +3270,7 @@ async fn find_prefixed_targets(state: &AppState, model: &str) -> AppResult<Vec<R
     }
     if unprefixed.is_empty() {
         return Err(AppError::NotFound(format!(
-            "no enabled route or provider model matches '{model}'"
+            "no enabled provider model matches '{model}' for endpoint '{endpoint}'"
         )));
     }
     Ok(unprefixed)
@@ -3211,11 +3281,15 @@ async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTar
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
+        LEFT JOIN provider_models pm
+          ON pm.provider_id = rt.provider_id
+         AND pm.model_name = rt.upstream_model
         WHERE rt.route_id = ? AND rt.enabled = 1 AND p.enabled = 1
           AND NOT EXISTS (
               SELECT 1 FROM provider_models pm
@@ -4288,6 +4362,96 @@ mod tests {
         );
     }
 
+    fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) -> RouteTarget {
+        RouteTarget {
+            id: 1,
+            route_id: None,
+            provider_id: 1,
+            provider_name: "test".to_string(),
+            provider_type: provider_type.to_string(),
+            base_url: "http://upstream".to_string(),
+            model_prefix: String::new(),
+            api_key: None,
+            provider_headers: "{}".to_string(),
+            supported_endpoints: supported_endpoints.map(ToOwned::to_owned),
+            tool_search_supported: 1,
+            provider_health: None,
+            upstream_model: "model".to_string(),
+            weight: 100,
+            priority: 0,
+            enabled: 1,
+        }
+    }
+
+    #[test]
+    fn filters_targets_by_upstream_supported_endpoints() {
+        let openai = endpoint_test_target("openai", Some(r#"["/chat/completions", "/responses"]"#));
+        assert!(target_supports_endpoint(&openai, OPENAI_CHAT_COMPLETIONS));
+        assert!(target_supports_endpoint(&openai, OPENAI_RESPONSES));
+        assert!(!target_supports_endpoint(&openai, "/v1/embeddings"));
+
+        let no_leading_slash = endpoint_test_target("openai", Some(r#"["chat/completions"]"#));
+        assert!(target_supports_endpoint(
+            &no_leading_slash,
+            OPENAI_CHAT_COMPLETIONS
+        ));
+
+        let anthropic = endpoint_test_target("anthropic", Some(r#"["/messages"]"#));
+        assert!(target_supports_endpoint(
+            &anthropic,
+            OPENAI_CHAT_COMPLETIONS
+        ));
+        assert!(target_supports_endpoint(&anthropic, ANTHROPIC_MESSAGES));
+        assert!(!target_supports_endpoint(&anthropic, OPENAI_RESPONSES));
+
+        let unknown = endpoint_test_target("custom", None);
+        assert!(target_supports_endpoint(&unknown, "/v1/embeddings"));
+
+        let filtered =
+            filter_targets_for_endpoint(vec![openai.clone(), anthropic.clone()], OPENAI_RESPONSES);
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].provider_type, "openai");
+    }
+
+    #[tokio::test]
+    async fn auto_route_ignores_models_that_do_not_support_the_requested_endpoint() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+                (1, 'chat-only', 'openai', 'http://chat-only'),
+                (2, 'responses', 'openai', 'http://responses')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+                (1, 'shared', '[\"/chat/completions\"]'),
+                (2, 'shared', '[\"/chat/completions\",\"/responses\"]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let resolved = resolve_route(&state, "shared", OPENAI_RESPONSES)
+            .await
+            .unwrap();
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].provider_id, 2);
+
+        assert!(
+            resolve_route(&state, "shared", OPENAI_CHAT_COMPLETIONS)
+                .await
+                .is_err()
+        );
+    }
+
     #[tokio::test]
     async fn prefix_matching_is_literal_and_case_sensitive() {
         // A pooled `sqlite::memory:` database gives each connection its own
@@ -4343,7 +4507,8 @@ mod tests {
                 knowledge TEXT,
                 release_date TEXT,
                 last_updated TEXT,
-                canonical_model_id TEXT
+                canonical_model_id TEXT,
+                supported_endpoints TEXT
             )",
         )
         .execute(&pool)
@@ -4364,14 +4529,24 @@ mod tests {
         let state = AppState::new(pool, None);
 
         // `_` must be treated literally, not as a single-character wildcard.
-        let literal = find_prefixed_targets(&state, "a_b/x").await.unwrap();
+        let literal = find_prefixed_targets(&state, "a_b/x", OPENAI_CHAT_COMPLETIONS)
+            .await
+            .unwrap();
         assert_eq!(literal.len(), 1);
         assert_eq!(literal[0].upstream_model, "x");
-        assert!(find_prefixed_targets(&state, "aXb/x").await.is_err());
+        assert!(
+            find_prefixed_targets(&state, "aXb/x", OPENAI_CHAT_COMPLETIONS)
+                .await
+                .is_err()
+        );
 
         // Prefix comparison must stay case-sensitive so `A_B/x` cannot reach a
         // provider registered as `a_b`.
-        assert!(find_prefixed_targets(&state, "A_B/x").await.is_err());
+        assert!(
+            find_prefixed_targets(&state, "A_B/x", OPENAI_CHAT_COMPLETIONS)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -4427,7 +4602,8 @@ mod tests {
                 knowledge TEXT,
                 release_date TEXT,
                 last_updated TEXT,
-                canonical_model_id TEXT
+                canonical_model_id TEXT,
+                supported_endpoints TEXT
             )",
         )
         .execute(&pool)
@@ -5162,6 +5338,7 @@ mod tests {
             model_prefix: String::new(),
             api_key: None,
             provider_headers: "{}".to_string(),
+            supported_endpoints: None,
             tool_search_supported: 1,
             provider_health: None,
             upstream_model: "upstream".to_string(),

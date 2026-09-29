@@ -2056,11 +2056,15 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               pm.supported_endpoints,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
+        LEFT JOIN provider_models pm
+          ON pm.provider_id = rt.provider_id
+         AND pm.model_name = rt.upstream_model
         WHERE rt.route_id = ?
         ORDER BY rt.priority ASC, rt.id
         "#,

@@ -219,6 +219,8 @@ pub struct RouteTarget {
     pub model_prefix: String,
     pub api_key: Option<String>,
     pub provider_headers: String,
+    /// JSON array reported by the provider's models endpoint.
+    pub supported_endpoints: Option<String>,
     pub tool_search_supported: i64,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
