@@ -29,6 +29,7 @@ import {
 import type { Dayjs } from 'dayjs'
 import dayjs from 'dayjs'
 import { api, formatError, type Provider, type UsageLog } from '../api'
+import { formatCompact, formatExact } from '../format'
 import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
@@ -355,14 +356,18 @@ export default function Usage() {
                 const cached = (record.cache_read_tokens || 0) + (record.cache_write_tokens || 0)
                 return (
                   <div>
-                    <Tooltip title={`输入 ${record.prompt_tokens} / 输出 ${record.completion_tokens}`}>
-                      <span>{record.total_tokens}</span>
+                    <Tooltip
+                      title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)}`}
+                    >
+                      <span>{formatCompact(record.total_tokens)}</span>
                     </Tooltip>
                     {cached > 0 && (
                       <div>
-                        <Tooltip title={`缓存读取 ${record.cache_read_tokens} / 缓存写入 ${record.cache_write_tokens}`}>
+                        <Tooltip
+                          title={`缓存读取 ${formatExact(record.cache_read_tokens)} / 缓存写入 ${formatExact(record.cache_write_tokens)}`}
+                        >
                           <Typography.Text type="success" style={{ fontSize: 12 }}>
-                            缓存 {record.cache_read_tokens}
+                            缓存 {formatCompact(record.cache_read_tokens)}
                           </Typography.Text>
                         </Tooltip>
                       </div>
@@ -488,19 +493,37 @@ export default function Usage() {
                 {detail.output_tps != null ? `${detail.output_tps.toFixed(1)} tok/s` : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="输入 tokens">
-                {detail.prompt_tokens}
+                <Tooltip title={formatExact(detail.prompt_tokens)}>
+                  {formatCompact(detail.prompt_tokens)}
+                </Tooltip>
               </Descriptions.Item>
               <Descriptions.Item label="缓存读取 tokens">
-                {detail.cache_read_tokens > 0 ? detail.cache_read_tokens : '-'}
+                {detail.cache_read_tokens > 0 ? (
+                  <Tooltip title={formatExact(detail.cache_read_tokens)}>
+                    {formatCompact(detail.cache_read_tokens)}
+                  </Tooltip>
+                ) : (
+                  '-'
+                )}
               </Descriptions.Item>
               <Descriptions.Item label="缓存写入 tokens">
-                {detail.cache_write_tokens > 0 ? detail.cache_write_tokens : '-'}
+                {detail.cache_write_tokens > 0 ? (
+                  <Tooltip title={formatExact(detail.cache_write_tokens)}>
+                    {formatCompact(detail.cache_write_tokens)}
+                  </Tooltip>
+                ) : (
+                  '-'
+                )}
               </Descriptions.Item>
               <Descriptions.Item label="输出 tokens">
-                {detail.completion_tokens}
+                <Tooltip title={formatExact(detail.completion_tokens)}>
+                  {formatCompact(detail.completion_tokens)}
+                </Tooltip>
               </Descriptions.Item>
               <Descriptions.Item label="总 tokens">
-                {detail.total_tokens}
+                <Tooltip title={formatExact(detail.total_tokens)}>
+                  {formatCompact(detail.total_tokens)}
+                </Tooltip>
               </Descriptions.Item>
             </Descriptions>
             {detail.error_message && (

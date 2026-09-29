@@ -160,6 +160,19 @@ body {
   font-weight: 650;
 }
 
+/* Compact figures put the unit outside Statistic so the number can shrink
+   without the suffix wrapping onto its own line. */
+.metric-compact {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.metric-suffix {
+  font-size: 22px;
+  font-weight: 650;
+}
+
 .full-height-card {
   height: 100%;
 }

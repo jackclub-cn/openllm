@@ -26,6 +26,7 @@ import {
 } from 'antd'
 import { api, formatError, type ModelInfo } from '../api'
 import PageHeader from '../components/PageHeader'
+import { formatCompact } from '../format'
 
 const GATEWAY_KEY = 'openllm-gateway-key'
 const SETTINGS_KEY = 'openllm-playground-settings'
@@ -325,7 +326,7 @@ export default function Playground() {
         extra={
           <>
             {latency !== undefined && <Tag>{latency} ms</Tag>}
-            {usage && <Tag color="blue">{usage.total_tokens} tokens</Tag>}
+            {usage && <Tag color="blue">{formatCompact(usage.total_tokens)} tokens</Tag>}
             <Button
               icon={<HistoryOutlined />}
               onClick={() => void regenerate()}

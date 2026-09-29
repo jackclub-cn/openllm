@@ -15,6 +15,7 @@ import { Area } from '@ant-design/plots'
 import { api, formatError, type Overview } from '../api'
 import PageHeader from '../components/PageHeader'
 import MetricCard from '../components/MetricCard'
+import { formatCompact, formatExact } from '../format'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
 
@@ -88,7 +89,7 @@ export default function Dashboard() {
           <MetricCard label="今日请求" value={data.requests_today} icon={<ThunderboltOutlined />} tone="blue" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="今日令牌" value={data.tokens_today} icon={<ApiOutlined />} tone="cyan" />
+          <MetricCard label="今日令牌" value={data.tokens_today} compact icon={<ApiOutlined />} tone="cyan" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard label="成功率" value={data.success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
@@ -119,6 +120,7 @@ export default function Dashboard() {
           <MetricCard
             label="今日缓存读取"
             value={data.cache_read_today}
+            compact
             icon={<DatabaseOutlined />}
             tone="green"
           />
@@ -127,6 +129,7 @@ export default function Dashboard() {
           <MetricCard
             label="今日缓存写入"
             value={data.cache_write_today}
+            compact
             icon={<DatabaseOutlined />}
             tone="cyan"
           />
@@ -135,6 +138,7 @@ export default function Dashboard() {
           <MetricCard
             label="累计缓存读取"
             value={data.cache_read_total}
+            compact
             icon={<DatabaseOutlined />}
             tone="blue"
           />
@@ -233,7 +237,14 @@ export default function Dashboard() {
                     <Tag color={value ? 'success' : 'error'}>{value ? '成功' : record.status_code}</Tag>
                   ),
                 },
-                { title: '令牌', dataIndex: 'total_tokens', width: 90 },
+                {
+                  title: '令牌',
+                  dataIndex: 'total_tokens',
+                  width: 90,
+                  render: (value: number) => (
+                    <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+                  ),
+                },
                 {
                   title: '延迟',
                   dataIndex: 'latency_ms',
@@ -267,7 +278,11 @@ export default function Dashboard() {
               </div>
               <div>
                 <Typography.Text type="secondary">累计令牌</Typography.Text>
-                <div className="stat-line"><strong>{data.tokens_total}</strong></div>
+                <div className="stat-line">
+                  <Tooltip title={formatExact(data.tokens_total)}>
+                    <strong>{formatCompact(data.tokens_total)}</strong>
+                  </Tooltip>
+                </div>
               </div>
               <Progress percent={Math.round(data.success_rate)} status="active" strokeColor="#52c41a" />
             </Space>
@@ -295,6 +310,9 @@ export default function Dashboard() {
               dataIndex: 'tokens',
               width: 120,
               sorter: (a, b) => a.tokens - b.tokens,
+              render: (value: number) => (
+                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+              ),
             },
             {
               title: '成功率',
