@@ -25,11 +25,21 @@ use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 
-pub async fn public_models(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> AppResult<Json<ModelList>> {
-    authenticate_gateway(&state, &headers).await?;
+pub async fn public_models(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    match public_models_inner(&state, &headers).await {
+        Ok(response) => response,
+        // Match the error envelope to the protocol the caller speaks, so both
+        // client families can parse failures with their own error handling.
+        Err(error) if wants_anthropic_models(&headers) => anthropic_error_response(error),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn public_models_inner(state: &AppState, headers: &HeaderMap) -> AppResult<Response> {
+    authenticate_gateway(state, headers).await?;
+    if wants_anthropic_models(headers) {
+        return anthropic_models(state).await;
+    }
     let routes = crate::registry::route_models(&state.pool).await?;
     let synced = crate::registry::synced_models(&state.pool).await?;
     let created = std::time::SystemTime::now()
@@ -57,6 +67,7 @@ pub async fn public_models(
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
+                display_name: None,
             }
             .with_flat_limits(),
         );
@@ -77,6 +88,7 @@ pub async fn public_models(
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
+                display_name: model.display_name,
             }
             .with_flat_limits(),
         );
@@ -85,7 +97,60 @@ pub async fn public_models(
     Ok(Json(ModelList {
         object: "list",
         data,
+    })
+    .into_response())
+}
+
+/// True when the caller speaks the Anthropic protocol.
+///
+/// `/v1/models` is shared by both protocols but the payload shapes differ, and
+/// the `anthropic-version` header is the reliable discriminator: every
+/// Anthropic client sends it, no OpenAI client does. Everything else keeps the
+/// OpenAI shape so existing clients are unaffected.
+fn wants_anthropic_models(headers: &HeaderMap) -> bool {
+    headers.contains_key("anthropic-version")
+}
+
+/// Renders the model registry in Anthropic's `/v1/models` shape.
+///
+/// Anthropic returns `data` entries of `{type, id, display_name, created_at}`
+/// plus cursor fields, rather than OpenAI's `{id, object, created, owned_by}`.
+async fn anthropic_models(state: &AppState) -> AppResult<Response> {
+    let routes = crate::registry::route_models(&state.pool).await?;
+    let synced = crate::registry::synced_models(&state.pool).await?;
+    let mut models = Vec::new();
+    // Routes first, matching the precedence used by the OpenAI-shaped list.
+    for model in routes {
+        models.push(json!({
+            "type": "model",
+            "id": model.id,
+            "display_name": Value::Null,
+            "created_at": Value::Null,
+        }));
+    }
+    for model in synced {
+        // Prefer the provider's own label, then the upstream id, and only then
+        // the namespaced id — clients show this verbatim.
+        let display_name = model
+            .display_name
+            .clone()
+            .unwrap_or_else(|| model.upstream_model.clone());
+        models.push(json!({
+            "type": "model",
+            "id": model.id,
+            "display_name": display_name,
+            "created_at": Value::Null,
+        }));
+    }
+    let first = models.first().and_then(|m| m.get("id")).cloned();
+    let last = models.last().and_then(|m| m.get("id")).cloned();
+    Ok(Json(json!({
+        "data": models,
+        "has_more": false,
+        "first_id": first,
+        "last_id": last,
     }))
+    .into_response())
 }
 
 // ===== Inbound Anthropic Messages API compatibility =====
@@ -3220,6 +3285,20 @@ mod tests {
             estimate_request_tokens(&small)
         );
         assert!(estimate_request_tokens(&large) > estimate_request_tokens(&small));
+    }
+
+    #[test]
+    fn detects_anthropic_clients_from_the_version_header() {
+        let mut anthropic = HeaderMap::new();
+        anthropic.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        assert!(wants_anthropic_models(&anthropic));
+
+        // OpenAI clients authenticate with a bearer token and send no
+        // anthropic-version header, so they keep the OpenAI shape.
+        let mut openai = HeaderMap::new();
+        openai.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
+        assert!(!wants_anthropic_models(&openai));
+        assert!(!wants_anthropic_models(&HeaderMap::new()));
     }
 
     #[test]

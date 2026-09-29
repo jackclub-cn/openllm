@@ -610,6 +610,7 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
+                display_name: None,
             }
             .with_flat_limits(),
         );
@@ -630,6 +631,7 @@ pub async fn list_models(State(state): State<AppState>) -> AppResult<Json<Vec<Pu
                 max_input_tokens: None,
                 max_output_tokens: None,
                 max_completion_tokens: None,
+                display_name: model.display_name,
             }
             .with_flat_limits(),
         );
@@ -1117,8 +1119,8 @@ async fn replace_provider_models(
                 input_limit, attachment, reasoning, tool_call, structured_output,
                 temperature, open_weights, modalities, cost, family, knowledge,
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
-                upstream_context_limit, supported_endpoints
-            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                upstream_context_limit, supported_endpoints, display_name
+            ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(provider_id)
@@ -1155,6 +1157,7 @@ async fn replace_provider_models(
                 .transpose()
                 .unwrap_or_default(),
         )
+        .bind(upstream.display_name.clone())
         .execute(&mut **tx)
         .await?;
     }
@@ -1170,6 +1173,8 @@ async fn replace_provider_models(
 struct UpstreamModelInfo {
     context_limit: Option<i64>,
     supported_endpoints: Vec<String>,
+    /// Provider-supplied label, e.g. "DeepSeek V4.1 Flash".
+    display_name: Option<String>,
 }
 
 /// Parses an OpenAI-style model list, preserving each entry's name and any
@@ -1204,11 +1209,20 @@ fn parse_openai_model_entries(value: &Value) -> Vec<(String, UpstreamModelInfo)>
                         .collect()
                 })
                 .unwrap_or_default();
+            // Providers commonly send the friendly label as `name`. Only keep
+            // it when it adds information beyond the id itself.
+            let display_name = model
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty() && *label != name)
+                .map(ToOwned::to_owned);
             Some((
                 name.to_string(),
                 UpstreamModelInfo {
                     context_limit,
                     supported_endpoints,
+                    display_name,
                 },
             ))
         })

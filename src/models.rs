@@ -258,6 +258,9 @@ pub struct PublicModel {
     pub max_output_tokens: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<i64>,
+    /// Friendly label for clients that show one (Anthropic's `display_name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 impl PublicModel {

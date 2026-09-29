@@ -16,6 +16,8 @@ pub struct SyncedModel {
     pub id: String,
     pub upstream_model: String,
     pub provider_name: String,
+    /// Provider-supplied label, when it differs from the model id.
+    pub display_name: Option<String>,
     pub capabilities: Option<ModelCapabilities>,
 }
 
@@ -112,6 +114,7 @@ struct SyncedRow {
     id: String,
     upstream_model: String,
     provider_name: String,
+    display_name: Option<String>,
     #[sqlx(flatten)]
     capabilities: CapabilityRow,
 }
@@ -129,6 +132,7 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
         SELECT p.model_prefix || pm.model_name AS id,
                pm.model_name AS upstream_model,
                p.name AS provider_name,
+               pm.display_name AS display_name,
                {CAPABILITY_COLUMNS}
         FROM providers p
         JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
@@ -145,6 +149,7 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
             id: row.id,
             upstream_model: row.upstream_model,
             provider_name: row.provider_name,
+            display_name: row.display_name,
             capabilities: row.capabilities.into_capabilities(),
         })
         .collect())
