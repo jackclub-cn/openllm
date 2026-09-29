@@ -26,6 +26,7 @@ use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const OPENAI_RESPONSES: &str = "/v1/responses";
 
 pub async fn public_models(
     State(state): State<AppState>,
@@ -1197,14 +1198,18 @@ async fn proxy_anthropic_inner(
     .await;
 
     let mut last_error = None;
+    let mut last_target = None;
     for target in ordered_targets {
+        let target_provider_id = target.provider_id;
+        let target_upstream_model = target.upstream_model.clone();
         log_usage_target(
             state,
             &request_id,
-            target.provider_id,
-            &target.upstream_model,
+            target_provider_id,
+            &target_upstream_model,
         )
         .await;
+        last_target = Some((target_provider_id, target_upstream_model));
         let result = if target.provider_type == "anthropic" {
             // Native target: forward the caller's Anthropic payload unchanged,
             // only swapping in the resolved upstream model.
@@ -1253,9 +1258,11 @@ async fn proxy_anthropic_inner(
             request_id: &request_id,
             api_key_id: api_key.as_ref().map(|key| key.id),
             route_id,
-            provider_id: None,
+            provider_id: last_target.as_ref().map(|(provider_id, _)| *provider_id),
             requested_model: &requested_model,
-            upstream_model: None,
+            upstream_model: last_target
+                .as_ref()
+                .map(|(_, upstream_model)| upstream_model.as_str()),
             endpoint: &endpoint,
             usage: Usage::new(request_tokens, 0),
             latency_ms: started.elapsed().as_millis() as i64,
@@ -1626,7 +1633,11 @@ pub async fn proxy_openai(
     .await;
 
     let mut last_error = None;
+    let mut last_target = None;
     for target in ordered_targets {
+        let target_provider_id = target.provider_id;
+        let target_upstream_model = target.upstream_model.clone();
+        last_target = Some((target_provider_id, target_upstream_model.clone()));
         if target.provider_type == "anthropic" && endpoint != OPENAI_CHAT_COMPLETIONS {
             last_error = Some(format!(
                 "{} does not support the {} endpoint",
@@ -1638,8 +1649,8 @@ pub async fn proxy_openai(
         log_usage_target(
             &state,
             &request_id,
-            target.provider_id,
-            &target.upstream_model,
+            target_provider_id,
+            &target_upstream_model,
         )
         .await;
         match forward_to_target(
@@ -1678,9 +1689,11 @@ pub async fn proxy_openai(
             request_id: &request_id,
             api_key_id: api_key.as_ref().map(|key| key.id),
             route_id,
-            provider_id: None,
+            provider_id: last_target.as_ref().map(|(provider_id, _)| *provider_id),
             requested_model: &requested_model,
-            upstream_model: None,
+            upstream_model: last_target
+                .as_ref()
+                .map(|(_, upstream_model)| upstream_model.as_str()),
             endpoint: &endpoint,
             usage: Usage::new(request_tokens, 0),
             latency_ms: started.elapsed().as_millis() as i64,
@@ -1694,6 +1707,126 @@ pub async fn proxy_openai(
     )
     .await;
     Err(AppError::Upstream(message))
+}
+
+fn build_upstream_request(
+    state: &AppState,
+    url: &str,
+    provider_type: ProviderType,
+    target: &RouteTarget,
+    request_body: &Value,
+) -> AppResult<RequestBuilder> {
+    let mut request = state
+        .client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .json(request_body);
+
+    request = match provider_type {
+        ProviderType::Anthropic => {
+            if let Some(key) = &target.api_key {
+                request = request
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01");
+            }
+            request
+        }
+        _ => {
+            if let Some(key) = &target.api_key {
+                request = request.bearer_auth(key);
+            }
+            request
+        }
+    };
+    apply_custom_headers(request, &target.provider_headers)
+}
+
+fn strip_tool_search_tools(body: &Value) -> Option<Value> {
+    let mut compat = body.clone();
+    let tools = compat.get_mut("tools")?.as_array_mut()?;
+    let original_len = tools.len();
+    tools.retain(|tool| tool.get("type").and_then(Value::as_str) != Some("tool_search"));
+    if tools.len() == original_len {
+        return None;
+    }
+    if tools.is_empty() {
+        compat.as_object_mut()?.remove("tools");
+    }
+    Some(compat)
+}
+
+fn upstream_rejects_tool_search(body: &[u8]) -> bool {
+    let message = String::from_utf8_lossy(body).to_ascii_lowercase();
+    message.contains("tool_search")
+        && (message.contains("unknown tool type") || message.contains("tool.type"))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upstream_error_response(
+    state: &AppState,
+    request_id: &str,
+    endpoint: &str,
+    requested_model: &str,
+    target: &RouteTarget,
+    streamed: bool,
+    request_tokens: i64,
+    api_key: Option<&ApiKeyRecord>,
+    started: Instant,
+    status: StatusCode,
+    response_headers: HeaderMap,
+    response_body: Bytes,
+) -> AppResult<Response> {
+    let message = String::from_utf8_lossy(&response_body)
+        .chars()
+        .take(600)
+        .collect::<String>();
+
+    if retryable_status(status) {
+        tracing::warn!(
+            provider = %target.provider_name,
+            model = %target.upstream_model,
+            %status,
+            "upstream failed, trying next route target"
+        );
+        return Err(AppError::Upstream(format!(
+            "{} returned {}: {}",
+            target.provider_name, status, message
+        )));
+    }
+
+    let preview = response_preview(&response_body);
+    log_usage(
+        state,
+        UsageLogEntry {
+            request_id,
+            api_key_id: api_key.map(|key| key.id),
+            route_id: target.route_id,
+            provider_id: Some(target.provider_id),
+            requested_model,
+            upstream_model: Some(&target.upstream_model),
+            endpoint,
+            usage: Usage::new(request_tokens, 0),
+            latency_ms: started.elapsed().as_millis() as i64,
+            first_token_ms: None,
+            status_code: status.as_u16() as i64,
+            success: false,
+            streamed,
+            error_message: Some(&message),
+            response_preview: preview.as_deref(),
+        },
+    )
+    .await;
+
+    let mut builder = Response::builder().status(status);
+    if let Some(value) = response_headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        builder = builder.header(reqwest::header::CONTENT_TYPE, value);
+    }
+    Ok(builder
+        .body(Body::from(response_body))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1714,7 +1847,7 @@ async fn forward_to_target(
     let provider_type =
         ProviderType::from_str(&target.provider_type).map_err(AppError::BadRequest)?;
 
-    let (url, request_body) = match provider_type {
+    let (url, mut request_body) = match provider_type {
         ProviderType::Anthropic => (
             join_upstream_url(&target.base_url, "/v1/messages"),
             convert_request_to_anthropic(request_json, &target.upstream_model, streamed),
@@ -1726,34 +1859,13 @@ async fn forward_to_target(
         }
     };
 
-    let mut request = state
-        .client
-        .post(url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .json(&request_body);
-
-    request = match provider_type {
-        ProviderType::Anthropic => {
-            if let Some(key) = &target.api_key {
-                request = request
-                    .header("x-api-key", key)
-                    .header("anthropic-version", "2023-06-01");
-            }
-            request
-        }
-        _ => {
-            if let Some(key) = &target.api_key {
-                request = request.bearer_auth(key);
-            }
-            request
-        }
-    };
-    request = apply_custom_headers(request, &target.provider_headers)?;
-
-    let response = request.send().await.map_err(|error| {
-        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-    })?;
-    let status = response.status();
+    let mut response = build_upstream_request(state, &url, provider_type, &target, &request_body)?
+        .send()
+        .await
+        .map_err(|error| {
+            AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+        })?;
+    let mut status = response.status();
 
     if !status.is_success() {
         let response_headers = response.headers().clone();
@@ -1761,57 +1873,84 @@ async fn forward_to_target(
             .bytes()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))?;
-        let message = String::from_utf8_lossy(&response_body)
-            .chars()
-            .take(600)
-            .collect::<String>();
-
-        if retryable_status(status) {
-            tracing::warn!(
-                provider = %target.provider_name,
-                model = %target.upstream_model,
-                %status,
-                "upstream failed, trying next route target"
-            );
-            return Err(AppError::Upstream(format!(
-                "{} returned {}: {}",
-                target.provider_name, status, message
-            )));
-        }
-
-        let preview = response_preview(&response_body);
-        log_usage(
-            state,
-            UsageLogEntry {
-                request_id,
-                api_key_id: api_key.map(|key| key.id),
-                route_id: target.route_id,
-                provider_id: Some(target.provider_id),
-                requested_model,
-                upstream_model: Some(&target.upstream_model),
-                endpoint,
-                usage: Usage::new(request_tokens, 0),
-                latency_ms: started.elapsed().as_millis() as i64,
-                first_token_ms: None,
-                status_code: status.as_u16() as i64,
-                success: false,
-                streamed,
-                error_message: Some(&message),
-                response_preview: preview.as_deref(),
-            },
-        )
-        .await;
-
-        let mut builder = Response::builder().status(status);
-        if let Some(value) = response_headers
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
+        if status == StatusCode::BAD_REQUEST
+            && endpoint == OPENAI_RESPONSES
+            && upstream_rejects_tool_search(&response_body)
         {
-            builder = builder.header(reqwest::header::CONTENT_TYPE, value);
+            if let Some(compat_body) = strip_tool_search_tools(&request_body) {
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    "upstream rejected tool_search; retrying without it"
+                );
+                request_body = compat_body;
+                response =
+                    build_upstream_request(state, &url, provider_type, &target, &request_body)?
+                        .send()
+                        .await
+                        .map_err(|error| {
+                            AppError::Upstream(format!(
+                                "{} request failed: {error}",
+                                target.provider_name
+                            ))
+                        })?;
+                status = response.status();
+                if !status.is_success() {
+                    let response_headers = response.headers().clone();
+                    let response_body = response
+                        .bytes()
+                        .await
+                        .map_err(|error| AppError::Upstream(error.to_string()))?;
+                    return upstream_error_response(
+                        state,
+                        request_id,
+                        endpoint,
+                        requested_model,
+                        &target,
+                        streamed,
+                        request_tokens,
+                        api_key,
+                        started,
+                        status,
+                        response_headers,
+                        response_body,
+                    )
+                    .await;
+                }
+            } else {
+                return upstream_error_response(
+                    state,
+                    request_id,
+                    endpoint,
+                    requested_model,
+                    &target,
+                    streamed,
+                    request_tokens,
+                    api_key,
+                    started,
+                    status,
+                    response_headers,
+                    response_body,
+                )
+                .await;
+            }
+        } else {
+            return upstream_error_response(
+                state,
+                request_id,
+                endpoint,
+                requested_model,
+                &target,
+                streamed,
+                request_tokens,
+                api_key,
+                started,
+                status,
+                response_headers,
+                response_body,
+            )
+            .await;
         }
-        return Ok(builder
-            .body(Body::from(response_body))
-            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response()));
     }
 
     let response_content_type = response
@@ -4441,9 +4580,9 @@ mod tests {
                 request_id: "request-in-flight",
                 api_key_id: None,
                 route_id: None,
-                provider_id: None,
+                provider_id: Some(7),
                 requested_model: "test-model",
-                upstream_model: None,
+                upstream_model: Some("upstream-test-model"),
                 endpoint: "/v1/chat/completions",
                 usage: Usage::new(10, 5),
                 latency_ms: 120,
@@ -4457,14 +4596,27 @@ mod tests {
         )
         .await;
 
-        let completed: (i64, i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT in_flight, status_code, prompt_tokens, completion_tokens, total_tokens
+        let completed: (i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+            "SELECT in_flight, status_code, prompt_tokens, completion_tokens,
+                    total_tokens, provider_id, upstream_model
              FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(completed, (0, 200, 10, 5, 15));
+        assert_eq!(
+            completed,
+            (0, 200, 10, 5, 15, 7, "upstream-test-model".to_string())
+        );
+
+        log_usage_target(&state, "request-in-flight", 8, "late-update").await;
+        let provider_id: i64 = sqlx::query_scalar(
+            "SELECT provider_id FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(provider_id, 7);
     }
 
     #[tokio::test]
@@ -4865,6 +5017,148 @@ mod tests {
         // Non-JSON bodies must be left alone rather than replaced.
         assert!(inject_capability_receipt(b"not json", &receipt).is_none());
         assert!(inject_capability_receipt(b"{}", &None).is_none());
+    }
+
+    #[test]
+    fn strips_tool_search_for_compat_retry() {
+        let body = json!({
+            "model": "m",
+            "tools": [
+                {"type": "function", "name": "lookup"},
+                {"type": "tool_search", "execution": "client"}
+            ]
+        });
+        let stripped = strip_tool_search_tools(&body).unwrap();
+        assert_eq!(stripped["tools"].as_array().unwrap().len(), 1);
+        assert_eq!(stripped["tools"][0]["name"], "lookup");
+
+        let only_tool_search = json!({
+            "tools": [{"type": "tool_search", "execution": "client"}]
+        });
+        let stripped = strip_tool_search_tools(&only_tool_search).unwrap();
+        assert!(stripped.get("tools").is_none());
+
+        let standard_tools = json!({
+            "tools": [{"type": "function", "name": "lookup"}]
+        });
+        assert!(strip_tool_search_tools(&standard_tools).is_none());
+    }
+
+    #[test]
+    fn recognizes_unsupported_tool_search_error() {
+        let error = br#"{
+            "type": "BadRequest",
+            "code": "InvalidParameter",
+            "message": "The parameter `tool.type` is not valid: unknown tool type: tool_search."
+        }"#;
+        assert!(upstream_rejects_tool_search(error));
+        assert!(!upstream_rejects_tool_search(
+            br#"{"error":{"message":"rate limit exceeded"}}"#
+        ));
+    }
+
+    #[tokio::test]
+    async fn retries_responses_without_tool_search_when_upstream_rejects_it() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            OPENAI_RESPONSES,
+            axum::routing::post({
+                let attempts = attempts.clone();
+                move |Json(body): Json<Value>| {
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                            assert!(
+                                body["tools"]
+                                    .as_array()
+                                    .unwrap()
+                                    .iter()
+                                    .any(|tool| tool["type"] == "tool_search")
+                            );
+                            (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "type": "BadRequest",
+                                    "code": "InvalidParameter",
+                                    "message": "unknown tool type: tool_search"
+                                })),
+                            )
+                        } else {
+                            assert!(body.get("tools").is_none());
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id": "ok",
+                                    "object": "response",
+                                    "usage": {
+                                        "input_tokens": 10,
+                                        "output_tokens": 2,
+                                        "total_tokens": 12
+                                    }
+                                })),
+                            )
+                        }
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool, None);
+        let target = RouteTarget {
+            id: 1,
+            route_id: None,
+            provider_id: 1,
+            provider_name: "mock".to_string(),
+            provider_type: "openai".to_string(),
+            base_url: format!("http://{address}"),
+            model_prefix: String::new(),
+            api_key: None,
+            provider_headers: "{}".to_string(),
+            provider_health: None,
+            upstream_model: "upstream".to_string(),
+            weight: 100,
+            priority: 0,
+            enabled: 1,
+        };
+
+        let response = forward_to_target(
+            &state,
+            "tool-search-retry",
+            OPENAI_RESPONSES,
+            "requested-model",
+            &json!({
+                "model": "requested-model",
+                "input": "hello",
+                "tools": [{"type": "tool_search", "execution": "client"}]
+            }),
+            &Bytes::new(),
+            target,
+            false,
+            10,
+            None,
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+        server.abort();
     }
 
     #[test]
