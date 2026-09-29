@@ -216,6 +216,12 @@ body {
   border: 1px solid #ffa39e;
 }
 
+.detail-status-pending {
+  color: #0958d9;
+  background: #e6f4ff;
+  border: 1px solid #91caff;
+}
+
 .error-block {
   margin: 8px 0 0;
   padding: 12px;

@@ -1184,6 +1184,17 @@ async fn proxy_anthropic_inner(
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
         order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    log_usage_started(
+        state,
+        &request_id,
+        api_key.as_ref().map(|key| key.id),
+        route_id,
+        &requested_model,
+        &endpoint,
+        request_tokens,
+        streamed,
+    )
+    .await;
 
     let mut last_error = None;
     for target in ordered_targets {
@@ -1595,6 +1606,17 @@ pub async fn proxy_openai(
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets =
         order_targets(&state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    log_usage_started(
+        &state,
+        &request_id,
+        api_key.as_ref().map(|key| key.id),
+        route_id,
+        &requested_model,
+        &endpoint,
+        request_tokens,
+        streamed,
+    )
+    .await;
 
     let mut last_error = None;
     for target in ordered_targets {
@@ -3656,6 +3678,56 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
     });
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn log_usage_started(
+    state: &AppState,
+    request_id: &str,
+    api_key_id: Option<i64>,
+    route_id: Option<i64>,
+    requested_model: &str,
+    endpoint: &str,
+    request_tokens: i64,
+    streamed: bool,
+) {
+    let result = sqlx::query(
+        r#"
+        INSERT OR IGNORE INTO usage_logs (
+            request_id, api_key_id, route_id, provider_id, requested_model,
+            upstream_model, endpoint, prompt_tokens, completion_tokens,
+            total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
+            estimated_cost_micros, first_token_ms, status_code, in_flight,
+            success, streamed, error_message, response_preview
+        ) VALUES (?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?, NULL, NULL)
+        "#,
+    )
+    .bind(request_id)
+    .bind(api_key_id)
+    .bind(route_id)
+    .bind(requested_model)
+    .bind(endpoint)
+    .bind(request_tokens)
+    .bind(request_tokens)
+    .bind(streamed as i64)
+    .execute(&state.pool)
+    .await;
+
+    match result {
+        Ok(result) => {
+            if result.rows_affected() > 0 {
+                let _ = state.events.send(crate::state::UsageEvent {
+                    id: result.last_insert_rowid(),
+                    request_id: request_id.to_string(),
+                    success: false,
+                    streamed,
+                });
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, request_id, "failed to write in-flight usage log");
+        }
+    }
+}
+
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
     let estimated_cost_micros =
@@ -3675,9 +3747,30 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             request_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
-            estimated_cost_micros, first_token_ms, status_code, success,
-            streamed, error_message, response_preview
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            estimated_cost_micros, first_token_ms, status_code, in_flight,
+            success, streamed, error_message, response_preview
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+        ON CONFLICT(request_id) DO UPDATE SET
+            api_key_id = excluded.api_key_id,
+            route_id = excluded.route_id,
+            provider_id = excluded.provider_id,
+            requested_model = excluded.requested_model,
+            upstream_model = excluded.upstream_model,
+            endpoint = excluded.endpoint,
+            prompt_tokens = excluded.prompt_tokens,
+            completion_tokens = excluded.completion_tokens,
+            total_tokens = excluded.total_tokens,
+            cache_read_tokens = excluded.cache_read_tokens,
+            cache_write_tokens = excluded.cache_write_tokens,
+            latency_ms = excluded.latency_ms,
+            estimated_cost_micros = excluded.estimated_cost_micros,
+            first_token_ms = excluded.first_token_ms,
+            status_code = excluded.status_code,
+            in_flight = 0,
+            success = excluded.success,
+            streamed = excluded.streamed,
+            error_message = excluded.error_message,
+            response_preview = excluded.response_preview
         "#,
     )
     .bind(entry.request_id)
@@ -3704,13 +3797,28 @@ async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     .await;
 
     match result {
-        Ok(result) => {
-            let _ = state.events.send(crate::state::UsageEvent {
-                id: result.last_insert_rowid(),
-                request_id: entry.request_id.to_string(),
-                success: entry.success,
-                streamed: entry.streamed,
-            });
+        Ok(_) => {
+            let id = sqlx::query_scalar::<_, i64>("SELECT id FROM usage_logs WHERE request_id = ?")
+                .bind(entry.request_id)
+                .fetch_one(&state.pool)
+                .await;
+            match id {
+                Ok(id) => {
+                    let _ = state.events.send(crate::state::UsageEvent {
+                        id,
+                        request_id: entry.request_id.to_string(),
+                        success: entry.success,
+                        streamed: entry.streamed,
+                    });
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        request_id = entry.request_id,
+                        "failed to read usage log id after update"
+                    );
+                }
+            }
         }
         Err(error) => {
             tracing::error!(%error, request_id = %entry.request_id, "failed to write usage log");
@@ -4246,6 +4354,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn in_flight_usage_log_is_replaced_by_final_status() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool.clone(), None);
+
+        log_usage_started(
+            &state,
+            "request-in-flight",
+            None,
+            None,
+            "test-model",
+            "/v1/chat/completions",
+            10,
+            false,
+        )
+        .await;
+        let pending: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT in_flight, status_code, prompt_tokens, total_tokens
+             FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(pending, (1, 0, 10, 10));
+
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: "request-in-flight",
+                api_key_id: None,
+                route_id: None,
+                provider_id: None,
+                requested_model: "test-model",
+                upstream_model: None,
+                endpoint: "/v1/chat/completions",
+                usage: Usage::new(10, 5),
+                latency_ms: 120,
+                first_token_ms: None,
+                status_code: 200,
+                success: true,
+                streamed: false,
+                error_message: None,
+                response_preview: None,
+            },
+        )
+        .await;
+
+        let completed: (i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT in_flight, status_code, prompt_tokens, completion_tokens, total_tokens
+             FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, (0, 200, 10, 5, 15));
+    }
+
+    #[tokio::test]
     async fn api_key_daily_cost_quota_uses_estimated_cost() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
@@ -4300,7 +4470,7 @@ mod tests {
         sqlx::query(
             r#"
             CREATE TABLE usage_logs (
-                request_id TEXT NOT NULL,
+                request_id TEXT NOT NULL UNIQUE,
                 api_key_id INTEGER,
                 route_id INTEGER,
                 provider_id INTEGER,
@@ -4316,6 +4486,7 @@ mod tests {
                 estimated_cost_micros INTEGER,
                 first_token_ms INTEGER,
                 status_code INTEGER NOT NULL,
+                in_flight INTEGER NOT NULL DEFAULT 0,
                 success INTEGER NOT NULL,
                 streamed INTEGER NOT NULL DEFAULT 0,
                 error_message TEXT,

@@ -4,6 +4,7 @@ import {
   CloseCircleOutlined,
   CopyOutlined,
   DownloadOutlined,
+  LoadingOutlined,
   PauseCircleOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
@@ -405,12 +406,20 @@ export default function Usage() {
               title: '状态',
               dataIndex: 'success',
               width: 100,
-              render: (value: boolean, record) => <Tag color={value ? 'success' : 'error'}>{value ? '成功' : record.status_code}</Tag>,
+              render: (value: boolean, record) =>
+                record.in_flight ? (
+                  <Tag color="processing">请求中</Tag>
+                ) : (
+                  <Tag color={value ? 'success' : 'error'}>{value ? '成功' : record.status_code}</Tag>
+                ),
             },
             {
               title: '令牌',
               width: 150,
               render: (_, record) => {
+                if (record.in_flight) {
+                  return <Typography.Text type="secondary">-</Typography.Text>
+                }
                 const cached = (record.cache_read_tokens || 0) + (record.cache_write_tokens || 0)
                 return (
                   <div>
@@ -438,20 +447,24 @@ export default function Usage() {
               title: '延迟',
               dataIndex: 'latency_ms',
               width: 100,
-              render: (value: number) => `${value} ms`,
+              render: (value: number, record) =>
+                record.in_flight ? <Typography.Text type="secondary">-</Typography.Text> : `${value} ms`,
             },
             {
               title: '费用',
               dataIndex: 'estimated_cost_micros',
               width: 90,
-              render: (value: number | null) => formatCostMicros(value),
+              render: (value: number | null, record) =>
+                record.in_flight ? <Typography.Text type="secondary">-</Typography.Text> : formatCostMicros(value),
             },
             {
               title: '首 token',
               dataIndex: 'first_token_ms',
               width: 110,
               render: (value: number | undefined, record) =>
-                value != null ? (
+                record.in_flight ? (
+                  <Typography.Text type="secondary">-</Typography.Text>
+                ) : value != null ? (
                   `${value} ms`
                 ) : (
                   <Typography.Text type="secondary">{record.streamed ? '-' : '—'}</Typography.Text>
@@ -469,7 +482,7 @@ export default function Usage() {
                       : '含等待时间的整体速度'
                   }
                 >
-                  <span>{value != null ? `${value.toFixed(1)} tok/s` : '-'}</span>
+                  <span>{record.in_flight || value == null ? '-' : `${value.toFixed(1)} tok/s`}</span>
                 </Tooltip>
               ),
             },
@@ -520,9 +533,29 @@ export default function Usage() {
       >
         {detail && (
           <Space direction="vertical" size={16} style={{ width: '100%' }}>
-            <div className={`detail-status ${detail.success ? 'detail-status-success' : 'detail-status-error'}`}>
-              {detail.success ? <CheckCircleOutlined /> : <CloseCircleOutlined />}
-              <span>{detail.success ? '请求成功' : `请求失败 · HTTP ${detail.status_code}`}</span>
+            <div
+              className={`detail-status ${
+                detail.in_flight
+                  ? 'detail-status-pending'
+                  : detail.success
+                    ? 'detail-status-success'
+                    : 'detail-status-error'
+              }`}
+            >
+              {detail.in_flight ? (
+                <LoadingOutlined spin />
+              ) : detail.success ? (
+                <CheckCircleOutlined />
+              ) : (
+                <CloseCircleOutlined />
+              )}
+              <span>
+                {detail.in_flight
+                  ? '请求处理中'
+                  : detail.success
+                    ? '请求成功'
+                    : `请求失败 · HTTP ${detail.status_code}`}
+              </span>
             </div>
             <Descriptions column={1} size="small" bordered>
               <Descriptions.Item label="请求 ID">

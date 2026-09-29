@@ -1202,7 +1202,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
                      THEN 1 ELSE 0 END
             ), 0) AS unpriced_requests
         FROM api_keys k
-        LEFT JOIN usage_logs u ON u.api_key_id = k.id
+        LEFT JOIN usage_logs u ON u.api_key_id = k.id AND u.in_flight = 0
         GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
                  k.last_used_at, k.created_at, k.daily_token_limit,
                  k.daily_cost_limit_micros, k.allowed_models, k.expires_at
@@ -1475,7 +1475,8 @@ pub async fn list_usage(
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
-               u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
+               u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
+               u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
         FROM usage_logs u
@@ -1516,7 +1517,7 @@ pub async fn export_usage(
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
-               u.status_code, u.success, u.streamed, u.error_message,
+               u.status_code, u.in_flight, u.success, u.streamed, u.error_message,
                u.created_at, u.first_token_ms, NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
         FROM usage_logs u
@@ -1537,7 +1538,7 @@ pub async fn export_usage(
     let truncated = rows.len() as i64 == USAGE_EXPORT_LIMIT;
 
     let mut csv = String::from(
-        "\u{feff}created_at,request_id,api_key,provider,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,success,streamed,error_message\r\n",
+        "\u{feff}created_at,request_id,api_key,provider,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
     );
     for row in rows {
         let item = UsageLogView::from(row);
@@ -1590,6 +1591,7 @@ fn usage_csv_row(item: &UsageLogView) -> String {
         number(item.first_token_ms),
         tps,
         item.status_code.to_string(),
+        if item.in_flight { "true" } else { "false" }.to_string(),
         if item.success { "true" } else { "false" }.to_string(),
         if item.streamed { "true" } else { "false" }.to_string(),
         text(item.error_message.as_deref()),
@@ -1770,6 +1772,7 @@ pub async fn overview(
             COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
             COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
+        WHERE in_flight = 0
         "#,
     )
     .fetch_one(&state.pool)
@@ -1788,7 +1791,7 @@ pub async fn overview(
             COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
             COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
-        WHERE created_at >= ? AND created_at < ?
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         "#,
     )
     .bind(range_start.to_rfc3339())
@@ -1805,7 +1808,7 @@ pub async fn overview(
                COALESCE(SUM(estimated_cost_micros), 0) AS cost_micros,
                COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced
         FROM usage_logs
-        WHERE created_at >= ? AND created_at < ?
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         "#,
     )
     .bind(day_start.to_rfc3339())
@@ -1827,7 +1830,8 @@ pub async fn overview(
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
-               u.success, u.streamed, u.error_message, u.created_at, u.first_token_ms,
+               u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
+               u.first_token_ms,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
         FROM usage_logs u
@@ -1855,6 +1859,7 @@ pub async fn overview(
         FROM providers p
         LEFT JOIN usage_logs u
           ON u.provider_id = p.id AND u.created_at >= ? AND u.created_at < ?
+             AND u.in_flight = 0
         GROUP BY p.id, p.name
         ORDER BY requests DESC, tokens DESC
         "#,
@@ -1870,7 +1875,7 @@ pub async fn overview(
                COUNT(*) AS requests,
                COALESCE(SUM(total_tokens), 0) AS tokens
         FROM usage_logs
-        WHERE created_at >= ? AND created_at < ?
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         GROUP BY date(datetime(created_at), ? || ' minutes')
         ORDER BY day
         "#,
@@ -1911,7 +1916,7 @@ pub async fn overview(
                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
-        WHERE created_at >= ? AND created_at < ?
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         GROUP BY requested_model
         ORDER BY tokens DESC, requests DESC
         LIMIT 8
@@ -2465,6 +2470,9 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
     }
     if let Some(success) = query.success {
         builder.push(" AND u.success = ").push_bind(success as i64);
+        if !success {
+            builder.push(" AND u.in_flight = 0");
+        }
     }
     if let Some(from) = &query.from {
         builder.push(" AND u.created_at >= ").push_bind(from);
@@ -3069,6 +3077,18 @@ mod tests {
             .await
             .unwrap();
         }
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, prompt_tokens,
+                total_tokens, status_code, in_flight, success, created_at
+             ) VALUES (
+                'pending', 'test-model', '/v1/chat/completions', 25, 25, 0, 1, 0,
+                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let state = AppState::new(pool, None);
         let range_start = Utc::now() - Duration::days(2);
@@ -3091,7 +3111,8 @@ mod tests {
         assert_eq!(view.range_cache_read, 20);
         assert_eq!(view.range_success_rate, 50.0);
         assert_eq!(view.range_avg_latency_ms, 200.0);
-        assert_eq!(view.recent_requests.len(), 2);
+        assert_eq!(view.recent_requests.len(), 3);
+        assert!(view.recent_requests.iter().any(|row| row.in_flight));
         assert!(
             view.recent_requests
                 .iter()

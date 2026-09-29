@@ -192,6 +192,7 @@ export type UsageLog = {
   /** Output tokens per second. For streams this excludes the first-token wait. */
   output_tps?: number
   status_code: number
+  in_flight: boolean
   success: boolean
   streamed: boolean
   error_message?: string

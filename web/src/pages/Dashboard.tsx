@@ -290,29 +290,47 @@ export default function Dashboard() {
                   title: '状态',
                   dataIndex: 'success',
                   width: 92,
-                  render: (value: boolean, record) => (
-                    <Tag color={value ? 'success' : 'error'}>{value ? '成功' : record.status_code}</Tag>
-                  ),
+                  render: (value: boolean, record) =>
+                    record.in_flight ? (
+                      <Tag color="processing">请求中</Tag>
+                    ) : (
+                      <Tag color={value ? 'success' : 'error'}>
+                        {value ? '成功' : record.status_code}
+                      </Tag>
+                    ),
                 },
                 {
                   title: '令牌',
                   dataIndex: 'total_tokens',
                   width: 90,
-                  render: (value: number) => (
-                    <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-                  ),
+                  render: (value: number, record) =>
+                    record.in_flight ? (
+                      <Typography.Text type="secondary">-</Typography.Text>
+                    ) : (
+                      <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+                    ),
                 },
                 {
                   title: '费用',
                   dataIndex: 'estimated_cost_micros',
                   width: 90,
-                  render: (value: number | null) => formatCostMicros(value),
+                  render: (value: number | null, record) =>
+                    record.in_flight ? (
+                      <Typography.Text type="secondary">-</Typography.Text>
+                    ) : (
+                      formatCostMicros(value)
+                    ),
                 },
                 {
                   title: '延迟',
                   dataIndex: 'latency_ms',
                   width: 100,
-                  render: (value: number) => `${value} ms`,
+                  render: (value: number, record) =>
+                    record.in_flight ? (
+                      <Typography.Text type="secondary">-</Typography.Text>
+                    ) : (
+                      `${value} ms`
+                    ),
                 },
                 {
                   title: '时间',
