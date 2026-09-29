@@ -111,6 +111,7 @@ export type ProviderInput = {
 export type ProviderModelLimit = {
   model_name: string
   enabled: boolean
+  supported_endpoints: string[]
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null

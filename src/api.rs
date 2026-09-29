@@ -900,7 +900,7 @@ async fn provider_model_limits(
     state: &AppState,
     provider_id: i64,
 ) -> AppResult<Vec<ProviderModelLimitView>> {
-    Ok(sqlx::query_as::<_, ProviderModelLimitView>(
+    let rows = sqlx::query_as::<_, ProviderModelLimitRow>(
         r#"
         SELECT model_name, enabled,
                COALESCE(context_override, context_limit) AS context_limit,
@@ -917,7 +917,8 @@ async fn provider_model_limits(
                COALESCE(output_override, output_limit) AS output_limit,
                context_override,
                input_override,
-               output_override
+               output_override,
+               supported_endpoints
         FROM provider_models
         WHERE provider_id = ?
         ORDER BY model_name COLLATE NOCASE
@@ -925,7 +926,41 @@ async fn provider_model_limits(
     )
     .bind(provider_id)
     .fetch_all(&state.pool)
-    .await?)
+    .await?;
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ProviderModelLimitRow {
+    model_name: String,
+    enabled: bool,
+    context_limit: Option<i64>,
+    input_limit: Option<i64>,
+    output_limit: Option<i64>,
+    context_override: Option<i64>,
+    input_override: Option<i64>,
+    output_override: Option<i64>,
+    supported_endpoints: Option<String>,
+}
+
+impl From<ProviderModelLimitRow> for ProviderModelLimitView {
+    fn from(value: ProviderModelLimitRow) -> Self {
+        Self {
+            model_name: value.model_name,
+            enabled: value.enabled,
+            supported_endpoints: value
+                .supported_endpoints
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default(),
+            context_limit: value.context_limit,
+            input_limit: value.input_limit,
+            output_limit: value.output_limit,
+            context_override: value.context_override,
+            input_override: value.input_override,
+            output_override: value.output_override,
+        }
+    }
 }
 
 fn validate_limit(name: &str, value: Option<i64>) -> AppResult<()> {
@@ -3057,6 +3092,7 @@ mod tests {
                     "gpt-6-astra".to_string(),
                     UpstreamModelInfo {
                         context_limit: Some(1_050_000),
+                        supported_endpoints: vec!["/chat/completions".to_string()],
                         ..Default::default()
                     },
                 ),
@@ -3064,6 +3100,10 @@ mod tests {
                     "gpt-6-luna".to_string(),
                     UpstreamModelInfo {
                         context_limit: Some(1_050_000),
+                        supported_endpoints: vec![
+                            "/chat/completions".to_string(),
+                            "/responses".to_string(),
+                        ],
                         ..Default::default()
                     },
                 ),
@@ -3087,6 +3127,16 @@ mod tests {
         assert_eq!(astra.input_limit, Some(400_000));
         assert_eq!(astra.output_limit, Some(64_000));
         assert_eq!(astra.context_override, Some(400_000));
+        assert_eq!(astra.supported_endpoints, vec!["/chat/completions"]);
+
+        let luna = limits
+            .iter()
+            .find(|model| model.model_name == "gpt-6-luna")
+            .unwrap();
+        assert_eq!(
+            luna.supported_endpoints,
+            vec!["/chat/completions", "/responses"]
+        );
 
         let models = crate::registry::synced_models(&state.pool).await.unwrap();
         let model = models

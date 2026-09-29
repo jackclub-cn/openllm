@@ -727,7 +727,7 @@ export default function Providers() {
             showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
             onChange: setLimitPage,
           }}
-          scroll={{ x: 900, y: 520 }}
+          scroll={{ x: 1130, y: 520 }}
           locale={{ emptyText: '暂无模型' }}
           columns={[
             {
@@ -735,6 +735,23 @@ export default function Providers() {
               dataIndex: 'model_name',
               width: 250,
               render: (value: string) => <Typography.Text strong>{value}</Typography.Text>,
+            },
+            {
+              title: '支持接口',
+              dataIndex: 'supported_endpoints',
+              width: 230,
+              render: (value: string[]) =>
+                value.length ? (
+                  <Space size={4} wrap>
+                    {value.map((endpoint) => (
+                      <Tag key={endpoint}>
+                        {endpoint.replace(/^\/v1/, '') || endpoint}
+                      </Tag>
+                    ))}
+                  </Space>
+                ) : (
+                  <Typography.Text type="secondary">未声明</Typography.Text>
+                ),
             },
             {
               title: '启用',

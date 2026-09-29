@@ -165,10 +165,12 @@ pub struct ProviderUpdate {
     pub models_sync_interval_minutes: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 pub struct ProviderModelLimitView {
     pub model_name: String,
     pub enabled: bool,
+    /// Endpoint paths reported by the provider during model sync.
+    pub supported_endpoints: Vec<String>,
     /// Effective values after applying any manual overrides.
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
