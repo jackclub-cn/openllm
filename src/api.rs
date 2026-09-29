@@ -772,22 +772,38 @@ pub async fn preview_provider_model_sync(
         .await?
         .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
     let entries = fetch_provider_entries(&state, &provider).await?;
-    let existing = sqlx::query_as::<_, (String, i64)>(
-        "SELECT model_name, enabled FROM provider_models WHERE provider_id = ?",
+    let existing = sqlx::query_as::<_, ProviderModelPreviewRow>(
+        "SELECT model_name, enabled, context_limit, input_limit, output_limit, \
+                supported_endpoints, cost, display_name \
+         FROM provider_models WHERE provider_id = ?",
     )
     .bind(id)
     .fetch_all(&state.pool)
     .await?
     .into_iter()
+    .map(|row| (row.model_name.clone(), row))
     .collect::<HashMap<_, _>>();
+    let catalog = models_dev::try_load(&state).await;
+    let provider_hint = catalog
+        .as_ref()
+        .and_then(|catalog| catalog.match_provider(&provider.name, &provider.base_url));
+    let changed = detect_model_sync_changes(
+        &entries,
+        &existing,
+        catalog.as_deref(),
+        provider_hint.as_deref(),
+    );
 
-    Ok(Json(build_model_sync_preview(id, &entries, &existing)))
+    Ok(Json(build_model_sync_preview(
+        id, &entries, &existing, changed,
+    )))
 }
 
 fn build_model_sync_preview(
     provider_id: i64,
     entries: &[(String, UpstreamModelInfo)],
-    existing: &HashMap<String, i64>,
+    existing: &HashMap<String, ProviderModelPreviewRow>,
+    changed: Vec<ModelSyncChange>,
 ) -> ModelSyncPreview {
     let upstream = entries
         .iter()
@@ -809,15 +825,82 @@ fn build_model_sync_preview(
         .count();
     let disabled_retained = existing
         .iter()
-        .filter(|(name, enabled)| **enabled == 0 && upstream.contains(*name))
+        .filter(|(name, row)| row.enabled == 0 && upstream.contains(*name))
         .count();
     ModelSyncPreview {
         provider_id,
         added,
         removed,
+        changed,
         retained,
         disabled_retained,
     }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ProviderModelPreviewRow {
+    model_name: String,
+    enabled: i64,
+    context_limit: Option<i64>,
+    input_limit: Option<i64>,
+    output_limit: Option<i64>,
+    supported_endpoints: Option<String>,
+    cost: Option<String>,
+    display_name: Option<String>,
+}
+
+fn detect_model_sync_changes(
+    entries: &[(String, UpstreamModelInfo)],
+    existing: &HashMap<String, ProviderModelPreviewRow>,
+    catalog: Option<&models_dev::Catalog>,
+    provider_hint: Option<&str>,
+) -> Vec<ModelSyncChange> {
+    let mut changed = Vec::new();
+    for (model, upstream) in entries {
+        let Some(current) = existing.get(model) else {
+            continue;
+        };
+        let capabilities = catalog
+            .and_then(|catalog| catalog.lookup(provider_hint, model))
+            .unwrap_or_default()
+            .with_effective_input_limit();
+        let context_limit = min_known(upstream.context_limit, capabilities.context_limit);
+        let input_limit = min_known(context_limit, capabilities.input_limit);
+        let supported_endpoints = (!upstream.supported_endpoints.is_empty())
+            .then(|| serde_json::to_string(&upstream.supported_endpoints).ok())
+            .flatten();
+        let cost = capabilities
+            .cost
+            .as_ref()
+            .and_then(|cost| serde_json::to_string(cost).ok());
+
+        let mut fields = Vec::new();
+        if current.context_limit != context_limit {
+            fields.push("context_limit");
+        }
+        if current.input_limit != input_limit {
+            fields.push("input_limit");
+        }
+        if current.output_limit != capabilities.output_limit {
+            fields.push("output_limit");
+        }
+        if current.supported_endpoints != supported_endpoints {
+            fields.push("supported_endpoints");
+        }
+        if current.cost != cost {
+            fields.push("cost");
+        }
+        if current.display_name != upstream.display_name {
+            fields.push("display_name");
+        }
+        if !fields.is_empty() {
+            changed.push(ModelSyncChange {
+                model_name: model.clone(),
+                fields: fields.into_iter().map(ToOwned::to_owned).collect(),
+            });
+        }
+    }
+    changed
 }
 
 pub async fn list_provider_model_limits(
@@ -3086,22 +3169,74 @@ mod tests {
 
     #[test]
     fn builds_model_sync_preview() {
+        let row = |enabled: i64| ProviderModelPreviewRow {
+            model_name: String::new(),
+            enabled,
+            context_limit: None,
+            input_limit: None,
+            output_limit: None,
+            supported_endpoints: None,
+            cost: None,
+            display_name: None,
+        };
         let entries = vec![
             ("new-model".to_string(), UpstreamModelInfo::default()),
             ("kept-model".to_string(), UpstreamModelInfo::default()),
             ("disabled-model".to_string(), UpstreamModelInfo::default()),
         ];
         let existing = HashMap::from([
-            ("kept-model".to_string(), 1),
-            ("disabled-model".to_string(), 0),
-            ("removed-model".to_string(), 1),
+            ("kept-model".to_string(), row(1)),
+            ("disabled-model".to_string(), row(0)),
+            ("removed-model".to_string(), row(1)),
         ]);
-        let preview = build_model_sync_preview(7, &entries, &existing);
+        let changed = vec![ModelSyncChange {
+            model_name: "kept-model".to_string(),
+            fields: vec!["context_limit".to_string()],
+        }];
+        let preview = build_model_sync_preview(7, &entries, &existing, changed);
         assert_eq!(preview.provider_id, 7);
         assert_eq!(preview.added, vec!["new-model"]);
         assert_eq!(preview.removed, vec!["removed-model"]);
+        assert_eq!(preview.changed[0].model_name, "kept-model");
         assert_eq!(preview.retained, 2);
         assert_eq!(preview.disabled_retained, 1);
+    }
+
+    #[test]
+    fn detects_metadata_changes_during_sync_preview() {
+        let entries = vec![(
+            "model".to_string(),
+            UpstreamModelInfo {
+                context_limit: Some(128_000),
+                supported_endpoints: vec!["/responses".to_string()],
+                display_name: Some("Model".to_string()),
+            },
+        )];
+        let existing = HashMap::from([(
+            "model".to_string(),
+            ProviderModelPreviewRow {
+                model_name: "model".to_string(),
+                enabled: 1,
+                context_limit: Some(64_000),
+                input_limit: Some(64_000),
+                output_limit: Some(8_000),
+                supported_endpoints: Some(r#"["/chat/completions"]"#.to_string()),
+                cost: Some(r#"{"input":1.0}"#.to_string()),
+                display_name: None,
+            },
+        )]);
+
+        let changed = detect_model_sync_changes(&entries, &existing, None, None);
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed[0].model_name, "model");
+        assert!(changed[0].fields.contains(&"context_limit".to_string()));
+        assert!(
+            changed[0]
+                .fields
+                .contains(&"supported_endpoints".to_string())
+        );
+        assert!(changed[0].fields.contains(&"cost".to_string()));
+        assert!(changed[0].fields.contains(&"display_name".to_string()));
     }
 
     #[test]

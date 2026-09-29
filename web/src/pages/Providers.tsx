@@ -58,6 +58,15 @@ const endpointOptions = [
   '/v1/messages',
 ].map((value) => ({ value, label: value }))
 
+const syncFieldLabels: Record<string, string> = {
+  context_limit: '上下文上限',
+  input_limit: '输入上限',
+  output_limit: '输出上限',
+  supported_endpoints: '支持接口',
+  cost: '价格',
+  display_name: '显示名',
+}
+
 type ProviderForm = ProviderInput & {
   headersText: string
   modelsText: string
@@ -68,6 +77,7 @@ type ModelSyncPreview = {
   provider_id: number
   added: string[]
   removed: string[]
+  changed: Array<{ model_name: string; fields: string[] }>
   retained: number
   disabled_retained: number
 }
@@ -1001,6 +1011,7 @@ export default function Providers() {
             <Space wrap>
               <Tag color="green">新增 {syncPreview.added.length}</Tag>
               <Tag color="red">移除 {syncPreview.removed.length}</Tag>
+              <Tag color="orange">变更 {syncPreview.changed.length}</Tag>
               <Tag color="blue">保留 {syncPreview.retained}</Tag>
               <Tag>停用保留 {syncPreview.disabled_retained}</Tag>
             </Space>
@@ -1032,9 +1043,39 @@ export default function Providers() {
                 </div>
               ) : null,
             )}
-            {!syncPreview.added.length && !syncPreview.removed.length && (
+            {syncPreview.changed.length > 0 && (
+              <div>
+                <Typography.Text strong>元数据变更</Typography.Text>
+                <div
+                  style={{
+                    maxHeight: 180,
+                    overflow: 'auto',
+                    marginTop: 6,
+                    border: '1px solid #f0f0f0',
+                    borderRadius: 6,
+                    padding: 8,
+                  }}
+                >
+                  <Space direction="vertical" size={6} style={{ width: '100%' }}>
+                    {syncPreview.changed.map((change) => (
+                      <Space key={change.model_name} wrap>
+                        <Typography.Text code>{change.model_name}</Typography.Text>
+                        {change.fields.map((field) => (
+                          <Tag key={field} color="orange">
+                            {syncFieldLabels[field] || field}
+                          </Tag>
+                        ))}
+                      </Space>
+                    ))}
+                  </Space>
+                </div>
+              </div>
+            )}
+            {!syncPreview.added.length &&
+              !syncPreview.removed.length &&
+              !syncPreview.changed.length && (
               <Typography.Text type="secondary">
-                上游模型列表与本地一致，应用后不会改变模型数量。
+                上游模型列表与本地一致，应用后不会改变模型数据。
               </Typography.Text>
             )}
           </Space>

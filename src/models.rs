@@ -1028,8 +1028,15 @@ pub struct ModelSyncPreview {
     pub provider_id: i64,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub changed: Vec<ModelSyncChange>,
     pub retained: usize,
     pub disabled_retained: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelSyncChange {
+    pub model_name: String,
+    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
