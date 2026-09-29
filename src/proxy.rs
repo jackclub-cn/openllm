@@ -3236,11 +3236,14 @@ pub async fn diagnose_route(
         }
         disabled_match.get_or_insert(route);
     }
+    let direct = diagnose_direct_route(state, model, endpoint).await?;
+    if direct.matched {
+        return Ok(direct);
+    }
     if let Some(route) = disabled_match {
         return diagnose_explicit_route(state, model, endpoint, route, false).await;
     }
-
-    diagnose_direct_route(state, model, endpoint).await
+    Ok(direct)
 }
 
 async fn diagnose_explicit_route(
@@ -4955,6 +4958,47 @@ mod tests {
         assert!(diagnosis.targets[1].eligible);
         assert!(!diagnosis.targets[2].eligible);
         assert!(diagnosis.targets[2].reason.contains("provider is disabled"));
+    }
+
+    #[tokio::test]
+    async fn disabled_route_does_not_hide_direct_prefix_diagnosis() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, model_prefix
+             ) VALUES (1, 'prefixed', 'openai', 'http://prefixed', 'vendor/')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name)
+             VALUES (1, 'model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'disabled exact', 'vendor/model', 'priority', 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let diagnosis = diagnose_route(&state, "vendor/model", OPENAI_CHAT_COMPLETIONS)
+            .await
+            .unwrap();
+        assert!(diagnosis.matched);
+        assert!(diagnosis.resolved);
+        assert_eq!(diagnosis.match_type, "prefix");
+        assert_eq!(diagnosis.route_id, None);
     }
 
     #[tokio::test]
