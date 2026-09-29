@@ -2739,7 +2739,7 @@ async fn enforce_api_key_quota(state: &AppState, api_key: Option<&ApiKeyRecord>)
         .to_rfc3339();
     let (tokens, cost_micros) = sqlx::query_as::<_, (i64, Option<i64>)>(
         "SELECT COALESCE(SUM(total_tokens), 0), SUM(estimated_cost_micros) \
-         FROM usage_logs WHERE api_key_id = ? AND created_at >= ?",
+         FROM usage_logs WHERE api_key_id = ? AND created_at >= ? AND in_flight = 0",
     )
     .bind(api_key.id)
     .bind(day_start)
@@ -4320,6 +4320,7 @@ mod tests {
                 api_key_id INTEGER,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 estimated_cost_micros INTEGER,
+                in_flight INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )",
         )
@@ -4427,6 +4428,7 @@ mod tests {
                 api_key_id INTEGER,
                 total_tokens INTEGER NOT NULL DEFAULT 0,
                 estimated_cost_micros INTEGER,
+                in_flight INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             )",
         )
@@ -4454,6 +4456,60 @@ mod tests {
             expires_at: None,
         };
         let state = AppState::new(pool, None);
+        assert!(matches!(
+            enforce_api_key_quota(&state, Some(&key)).await,
+            Err(AppError::TooManyRequests(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn api_key_daily_quota_ignores_in_flight_requests() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE usage_logs (
+                api_key_id INTEGER,
+                total_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_micros INTEGER,
+                in_flight INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                api_key_id, total_tokens, estimated_cost_micros, in_flight, created_at
+             ) VALUES (1, 1000, 1000000, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let key = ApiKeyRecord {
+            id: 1,
+            name: "limited".to_string(),
+            key_prefix: "sk-openllm".to_string(),
+            key_suffix: "test".to_string(),
+            enabled: 1,
+            last_used_at: None,
+            created_at: String::new(),
+            daily_token_limit: Some(10),
+            daily_cost_limit_micros: Some(1),
+            allowed_models: None,
+            expires_at: None,
+        };
+        let state = AppState::new(pool.clone(), None);
+
+        assert!(enforce_api_key_quota(&state, Some(&key)).await.is_ok());
+
+        sqlx::query("UPDATE usage_logs SET in_flight = 0")
+            .execute(&pool)
+            .await
+            .unwrap();
         assert!(matches!(
             enforce_api_key_quota(&state, Some(&key)).await,
             Err(AppError::TooManyRequests(_))
