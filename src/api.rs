@@ -7,7 +7,7 @@ use axum::extract::{Path, Query, Request, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,7 @@ use crate::state::AppState;
 
 const SETTING_USAGE_RETENTION_DAYS: &str = "usage_retention_days";
 const USAGE_RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+const MAX_OVERVIEW_RANGE_DAYS: i64 = 366;
 
 pub async fn health() -> Json<Value> {
     Json(json!({
@@ -1697,6 +1698,42 @@ fn cache_hit_rate(prompt_tokens: i64, cache_read: i64) -> f64 {
     (cache_read as f64 / prompt_tokens as f64 * 100.0).clamp(0.0, 100.0)
 }
 
+fn parse_overview_time(
+    value: Option<&str>,
+    fallback: DateTime<Utc>,
+    name: &str,
+) -> AppResult<DateTime<Utc>> {
+    match value {
+        Some(value) => DateTime::parse_from_rfc3339(value)
+            .map(|value| value.with_timezone(&Utc))
+            .map_err(|error| {
+                AppError::BadRequest(format!("{name} must be an RFC3339 timestamp: {error}"))
+            }),
+        None => Ok(fallback),
+    }
+}
+
+fn normalize_overview_range(
+    from: Option<&str>,
+    to: Option<&str>,
+    default_start: DateTime<Utc>,
+    default_end: DateTime<Utc>,
+) -> AppResult<(DateTime<Utc>, DateTime<Utc>)> {
+    let start = parse_overview_time(from, default_start, "from")?;
+    let end = parse_overview_time(to, default_end, "to")?;
+    if start >= end {
+        return Err(AppError::BadRequest(
+            "overview range end must be after its start".to_string(),
+        ));
+    }
+    if end - start > Duration::days(MAX_OVERVIEW_RANGE_DAYS) {
+        return Err(AppError::BadRequest(format!(
+            "overview range cannot exceed {MAX_OVERVIEW_RANGE_DAYS} days"
+        )));
+    }
+    Ok((start, end))
+}
+
 pub async fn overview(
     State(state): State<AppState>,
     Query(query): Query<OverviewQuery>,
@@ -1713,7 +1750,12 @@ pub async fn overview(
         .expect("midnight is a valid time")
         .and_utc()
         - Duration::minutes(tz_offset);
-    let history_start = day_start - Duration::days(13);
+    let (range_start, range_end) = normalize_overview_range(
+        query.from.as_deref(),
+        query.to.as_deref(),
+        day_start - Duration::days(13),
+        day_start + Duration::days(1),
+    )?;
 
     let totals = sqlx::query(
         r#"
@@ -1730,6 +1772,27 @@ pub async fn overview(
         FROM usage_logs
         "#,
     )
+    .fetch_one(&state.pool)
+    .await?;
+
+    let range_totals = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) AS requests,
+            COALESCE(SUM(total_tokens), 0) AS tokens,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt,
+            COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
+            COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
+            COALESCE(SUM(estimated_cost_micros), 0) AS cost_micros,
+            COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced,
+            COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
+            COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
+        FROM usage_logs
+        WHERE created_at >= ? AND created_at < ?
+        "#,
+    )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
     .fetch_one(&state.pool)
     .await?;
 
@@ -1771,10 +1834,13 @@ pub async fn overview(
         LEFT JOIN api_keys k ON k.id = u.api_key_id
         LEFT JOIN routes r ON r.id = u.route_id
         LEFT JOIN providers p ON p.id = u.provider_id
+        WHERE u.created_at >= ? AND u.created_at < ?
         ORDER BY u.created_at DESC, u.id DESC
         LIMIT 8
         "#,
     )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool)
     .await?;
 
@@ -1787,12 +1853,14 @@ pub async fn overview(
                COALESCE(AVG(CASE WHEN u.success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(u.latency_ms), 0.0) AS avg_latency_ms
         FROM providers p
-        LEFT JOIN usage_logs u ON u.provider_id = p.id AND u.created_at >= ?
+        LEFT JOIN usage_logs u
+          ON u.provider_id = p.id AND u.created_at >= ? AND u.created_at < ?
         GROUP BY p.id, p.name
         ORDER BY requests DESC, tokens DESC
         "#,
     )
-    .bind(history_start.to_rfc3339())
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool)
     .await?;
 
@@ -1802,24 +1870,28 @@ pub async fn overview(
                COUNT(*) AS requests,
                COALESCE(SUM(total_tokens), 0) AS tokens
         FROM usage_logs
-        WHERE created_at >= ?
+        WHERE created_at >= ? AND created_at < ?
         GROUP BY date(datetime(created_at), ? || ' minutes')
         ORDER BY day
         "#,
     )
     .bind(tz_offset)
-    .bind(history_start.to_rfc3339())
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
     .bind(tz_offset)
     .fetch_all(&state.pool)
     .await?;
 
-    // Fill in days with no traffic so the 14-day chart has a continuous axis
+    // Fill in days with no traffic so the chart has a continuous axis
     // instead of collapsing to only the days that happened to have requests.
-    let mut daily_usage = Vec::with_capacity(14);
-    for offset in 0..14 {
-        // `history_start` is the first day's UTC instant; shift it into the
-        // caller's local day before formatting.
-        let day = (history_start + Duration::days(offset) + Duration::minutes(tz_offset))
+    let local_range_start = range_start + Duration::minutes(tz_offset);
+    let local_range_end = range_end + Duration::minutes(tz_offset);
+    let first_day = local_range_start.date_naive();
+    let last_day = (local_range_end - Duration::nanoseconds(1)).date_naive();
+    let day_count = (last_day - first_day).num_days() + 1;
+    let mut daily_usage = Vec::with_capacity(day_count.max(0) as usize);
+    for offset in 0..day_count {
+        let day = (first_day + Duration::days(offset))
             .format("%Y-%m-%d")
             .to_string();
         let existing = daily_rows.iter().find(|row| row.day == day);
@@ -1839,13 +1911,14 @@ pub async fn overview(
                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
         FROM usage_logs
-        WHERE created_at >= ?
+        WHERE created_at >= ? AND created_at < ?
         GROUP BY requested_model
         ORDER BY tokens DESC, requests DESC
         LIMIT 8
         "#,
     )
-    .bind(history_start.to_rfc3339())
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool)
     .await?;
 
@@ -1863,6 +1936,18 @@ pub async fn overview(
         cost_total_micros: totals.get("cost_total_micros"),
         unpriced_today: today.get("unpriced"),
         unpriced_total: totals.get("unpriced_total"),
+        range_requests: range_totals.get("requests"),
+        range_tokens: range_totals.get("tokens"),
+        range_cache_read: range_totals.get("cache_read"),
+        range_cache_write: range_totals.get("cache_write"),
+        range_cache_hit_rate: cache_hit_rate(
+            range_totals.get("prompt"),
+            range_totals.get("cache_read"),
+        ),
+        range_cost_micros: range_totals.get("cost_micros"),
+        range_unpriced: range_totals.get("unpriced"),
+        range_success_rate: range_totals.get("success_rate"),
+        range_avg_latency_ms: range_totals.get("avg_latency_ms"),
         success_rate: totals.get("success_rate"),
         avg_latency_ms: totals.get("avg_latency_ms"),
         active_providers,
@@ -2601,6 +2686,50 @@ mod tests {
     }
 
     #[test]
+    fn validates_overview_ranges() {
+        let default_start = Utc::now() - Duration::days(13);
+        let default_end = Utc::now() + Duration::days(1);
+        assert_eq!(
+            normalize_overview_range(None, None, default_start, default_end).unwrap(),
+            (default_start, default_end)
+        );
+
+        let start = Utc::now() - Duration::days(7);
+        let end = Utc::now();
+        assert_eq!(
+            normalize_overview_range(
+                Some(&start.to_rfc3339()),
+                Some(&end.to_rfc3339()),
+                default_start,
+                default_end,
+            )
+            .unwrap(),
+            (start, end)
+        );
+        assert!(
+            normalize_overview_range(Some("not-a-date"), None, default_start, default_end).is_err()
+        );
+        assert!(
+            normalize_overview_range(
+                Some(&end.to_rfc3339()),
+                Some(&start.to_rfc3339()),
+                default_start,
+                default_end,
+            )
+            .is_err()
+        );
+        assert!(
+            normalize_overview_range(
+                Some(&(Utc::now() - Duration::days(367)).to_rfc3339()),
+                Some(&Utc::now().to_rfc3339()),
+                default_start,
+                default_end,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn generates_api_key_material() {
         let (raw, hash, prefix, suffix) = generate_api_key_material();
         assert!(raw.starts_with("sk-openllm-"));
@@ -2903,5 +3032,72 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(request_ids, vec!["recent"]);
+    }
+
+    #[tokio::test]
+    async fn overview_range_filters_dashboard_usage() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        let old = (Utc::now() - Duration::days(20)).to_rfc3339();
+        let recent = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let today = Utc::now().to_rfc3339();
+        for (request_id, tokens, cache_read, latency_ms, success, created_at) in [
+            ("old", 900_i64, 0_i64, 500_i64, 1_i64, old),
+            ("recent", 100, 20, 100, 1, recent),
+            ("today", 50, 0, 300, 0, today),
+        ] {
+            sqlx::query(
+                "INSERT INTO usage_logs (
+                    request_id, requested_model, endpoint, prompt_tokens,
+                    total_tokens, cache_read_tokens, latency_ms, status_code,
+                    success, created_at
+                 ) VALUES (?, 'test-model', '/v1/chat/completions', ?, ?, ?, ?, 200, ?, ?)",
+            )
+            .bind(request_id)
+            .bind(tokens)
+            .bind(tokens)
+            .bind(cache_read)
+            .bind(latency_ms)
+            .bind(success)
+            .bind(created_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let state = AppState::new(pool, None);
+        let range_start = Utc::now() - Duration::days(2);
+        let range_end = Utc::now() + Duration::days(1);
+        let Json(view) = overview(
+            State(state),
+            Query(OverviewQuery {
+                tz_offset_minutes: 0,
+                from: Some(range_start.to_rfc3339()),
+                to: Some(range_end.to_rfc3339()),
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(view.requests_today, 1);
+        assert_eq!(view.requests_total, 3);
+        assert_eq!(view.range_requests, 2);
+        assert_eq!(view.range_tokens, 150);
+        assert_eq!(view.range_cache_read, 20);
+        assert_eq!(view.range_success_rate, 50.0);
+        assert_eq!(view.range_avg_latency_ms, 200.0);
+        assert_eq!(view.recent_requests.len(), 2);
+        assert!(
+            view.recent_requests
+                .iter()
+                .all(|row| row.request_id != "old")
+        );
+        assert_eq!(view.model_usage[0].requests, 2);
+        assert_eq!(view.model_usage[0].tokens, 150);
     }
 }

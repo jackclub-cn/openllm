@@ -808,6 +808,10 @@ pub struct OverviewQuery {
     /// UTC+8). Lets "today" respect the operator's timezone instead of UTC.
     #[serde(default)]
     pub tz_offset_minutes: i64,
+    /// Inclusive start of the dashboard range as an RFC3339 timestamp.
+    pub from: Option<String>,
+    /// Exclusive end of the dashboard range as an RFC3339 timestamp.
+    pub to: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -826,6 +830,15 @@ pub struct Overview {
     pub cost_total_micros: i64,
     pub unpriced_today: i64,
     pub unpriced_total: i64,
+    pub range_requests: i64,
+    pub range_tokens: i64,
+    pub range_cache_read: i64,
+    pub range_cache_write: i64,
+    pub range_cache_hit_rate: f64,
+    pub range_cost_micros: i64,
+    pub range_unpriced: i64,
+    pub range_success_rate: f64,
+    pub range_avg_latency_ms: f64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
     pub active_providers: i64,

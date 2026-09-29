@@ -213,6 +213,15 @@ export type Overview = {
   cost_total_micros: number
   unpriced_today: number
   unpriced_total: number
+  range_requests: number
+  range_tokens: number
+  range_cache_read: number
+  range_cache_write: number
+  range_cache_hit_rate: number
+  range_cost_micros: number
+  range_unpriced: number
+  range_success_rate: number
+  range_avg_latency_ms: number
   success_rate: number
   avg_latency_ms: number
   active_providers: number

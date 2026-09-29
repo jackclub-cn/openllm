@@ -10,8 +10,23 @@ import {
   ReloadOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import { Alert, Button, Card, Col, Empty, Progress, Row, Skeleton, Space, Table, Tag, Tooltip, Typography } from 'antd'
-import dayjs from 'dayjs'
+import {
+  Alert,
+  Button,
+  Card,
+  Col,
+  DatePicker,
+  Empty,
+  Progress,
+  Row,
+  Skeleton,
+  Space,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd'
+import dayjs, { type Dayjs } from 'dayjs'
 import { Area } from '@ant-design/plots'
 import { api, formatError, type Overview } from '../api'
 import PageHeader from '../components/PageHeader'
@@ -23,18 +38,27 @@ import { useCoalescedUsageEvents, useRealtime } from '../realtime'
 export default function Dashboard() {
   const [data, setData] = useState<Overview>()
   const [error, setError] = useState('')
+  const [dates, setDates] = useState<[Dayjs, Dayjs]>(() => [
+    dayjs().subtract(13, 'day').startOf('day'),
+    dayjs().endOf('day'),
+  ])
 
   const load = useCallback(async () => {
     try {
       // Let the server bucket "today" and the daily chart by the viewer's
       // timezone rather than UTC.
       const offset = -new Date().getTimezoneOffset()
-      setData(await api.get<Overview>(`/api/overview?tz_offset_minutes=${offset}`))
+      const params = new URLSearchParams({
+        tz_offset_minutes: String(offset),
+        from: dates[0].startOf('day').toISOString(),
+        to: dates[1].add(1, 'day').startOf('day').toISOString(),
+      })
+      setData(await api.get<Overview>(`/api/overview?${params}`))
       setError('')
     } catch (reason) {
       setError(formatError(reason))
     }
-  }, [])
+  }, [dates])
 
   useEffect(() => {
     void load()
@@ -52,6 +76,22 @@ export default function Dashboard() {
   if (error) return <Alert type="error" showIcon message="无法加载仪表盘" description={error} />
   if (!data) return <Skeleton active paragraph={{ rows: 10 }} />
 
+  const rangePresets = [
+    { label: '今天', value: [dayjs().startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs] },
+    {
+      label: '近 7 天',
+      value: [dayjs().subtract(6, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
+    },
+    {
+      label: '近 14 天',
+      value: [dayjs().subtract(13, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
+    },
+    {
+      label: '近 30 天',
+      value: [dayjs().subtract(29, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
+    },
+  ]
+
   return (
     <>
       <PageHeader
@@ -59,6 +99,15 @@ export default function Dashboard() {
         description="网关请求、模型令牌与提供商健康状态"
         extra={
           <>
+            <DatePicker.RangePicker
+              allowClear={false}
+              value={dates}
+              presets={rangePresets}
+              disabledDate={(current) => current && current > dayjs().endOf('day')}
+              onChange={(value) => {
+                if (value?.[0] && value[1]) setDates(value as [Dayjs, Dayjs])
+              }}
+            />
             {autoRefresh.lastUpdated && (
               <Typography.Text type="secondary">
                 更新于 {dayjs(autoRefresh.lastUpdated).format('HH:mm:ss')}
@@ -87,18 +136,18 @@ export default function Dashboard() {
       />
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="今日请求" value={data.requests_today} icon={<ThunderboltOutlined />} tone="blue" />
+          <MetricCard label="请求" value={data.range_requests} icon={<ThunderboltOutlined />} tone="blue" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="今日令牌" value={data.tokens_today} compact icon={<ApiOutlined />} tone="cyan" />
+          <MetricCard label="令牌" value={data.range_tokens} compact icon={<ApiOutlined />} tone="cyan" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="成功率" value={data.success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
+          <MetricCard label="成功率" value={data.range_success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
             label="平均延迟"
-            value={data.avg_latency_ms}
+            value={data.range_avg_latency_ms}
             precision={0}
             suffix="ms"
             icon={<ClockCircleOutlined />}
@@ -110,7 +159,7 @@ export default function Dashboard() {
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
             label="缓存命中率"
-            value={data.cache_hit_rate}
+            value={data.range_cache_hit_rate}
             precision={1}
             suffix="%"
             icon={<DollarOutlined />}
@@ -119,8 +168,8 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="今日缓存读取"
-            value={data.cache_read_today}
+            label="缓存读取"
+            value={data.range_cache_read}
             compact
             icon={<DatabaseOutlined />}
             tone="green"
@@ -128,8 +177,8 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="今日缓存写入"
-            value={data.cache_write_today}
+            label="缓存写入"
+            value={data.range_cache_write}
             compact
             icon={<DatabaseOutlined />}
             tone="cyan"
@@ -137,8 +186,8 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="今日费用"
-            value={data.cost_today_micros / 1_000_000}
+            label="费用"
+            value={data.range_cost_micros / 1_000_000}
             precision={4}
             suffix="USD"
             icon={<DatabaseOutlined />}
@@ -149,7 +198,7 @@ export default function Dashboard() {
 
       <Row gutter={[16, 16]} className="section-row">
         <Col xs={24} xl={15}>
-          <Card title="近 14 天请求量" bordered={false}>
+          <Card title="请求趋势" bordered={false}>
             {data.daily_usage.length ? (
               <Area
                 data={data.daily_usage}
@@ -318,13 +367,17 @@ export default function Dashboard() {
                   )}
                 </div>
               </div>
-              <Progress percent={Math.round(data.success_rate)} status="active" strokeColor="#52c41a" />
+              <Progress
+                percent={Math.round(data.range_success_rate)}
+                status="active"
+                strokeColor="#52c41a"
+              />
             </Space>
           </Card>
         </Col>
       </Row>
 
-      <Card title="模型用量（近 14 天）" bordered={false} className="section-row">
+      <Card title="模型用量" bordered={false} className="section-row">
         <Table
           rowKey="model"
           size="middle"

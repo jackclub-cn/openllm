@@ -14,8 +14,7 @@ export default function PageHeader({ title, description, extra }: Props) {
         <Typography.Title level={3}>{title}</Typography.Title>
         <Typography.Text type="secondary">{description}</Typography.Text>
       </div>
-      {extra && <Space>{extra}</Space>}
+      {extra && <Space wrap>{extra}</Space>}
     </div>
   )
 }
-
