@@ -29,7 +29,7 @@ import {
 } from 'antd'
 import type { Dayjs } from 'dayjs'
 import dayjs from 'dayjs'
-import { api, formatError, type Provider, type UsageLog } from '../api'
+import { api, formatError, type ApiKey, type Provider, type UsageLog } from '../api'
 import { formatCompact, formatCostMicros, formatExact } from '../format'
 import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
@@ -46,6 +46,7 @@ export default function Usage() {
   const { message } = App.useApp()
   const [items, setItems] = useState<UsageLog[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
   const [loading, setLoading] = useState(true)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
@@ -53,6 +54,7 @@ export default function Usage() {
   const [model, setModel] = useState('')
   const [requestId, setRequestId] = useState('')
   const [providerId, setProviderId] = useState<number>()
+  const [apiKeyId, setApiKeyId] = useState<number>()
   const [success, setSuccess] = useState<boolean>()
   const [dates, setDates] = useState<[Dayjs, Dayjs]>()
   const [newRequests, setNewRequests] = useState(0)
@@ -64,9 +66,17 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, providerId, success, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, providerId, success, dates, autoScroll }
-  const filterKey = JSON.stringify([model, requestId, providerId, success, dates?.[0]?.toISOString(), dates?.[1]?.toISOString()])
+  const queryRef = useRef({ page, pageSize, model, providerId, apiKeyId, success, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, providerId, apiKeyId, success, dates, autoScroll }
+  const filterKey = JSON.stringify([
+    model,
+    requestId,
+    providerId,
+    apiKeyId,
+    success,
+    dates?.[0]?.toISOString(),
+    dates?.[1]?.toISOString(),
+  ])
 
   useEffect(() => {
     // A different filter set produces a different total, so any pending
@@ -87,6 +97,7 @@ export default function Usage() {
     if (model) params.set('model', model)
     if (requestId) params.set('request_id', requestId)
     if (providerId) params.set('provider_id', String(providerId))
+    if (apiKeyId) params.set('api_key_id', String(apiKeyId))
     if (success !== undefined) params.set('success', String(success))
     if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
     if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
@@ -96,6 +107,7 @@ export default function Usage() {
         model,
         requestId,
         providerId,
+        apiKeyId,
         success,
         dates?.[0]?.toISOString(),
         dates?.[1]?.toISOString(),
@@ -132,7 +144,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [autoScroll, dates, model, page, pageSize, providerId, requestId, success])
+  }, [apiKeyId, autoScroll, dates, model, page, pageSize, providerId, requestId, success])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -142,6 +154,7 @@ export default function Usage() {
   useEffect(() => {
     void Promise.all([
       api.get<Provider[]>('/api/providers').then(setProviders),
+      api.get<ApiKey[]>('/api/api-keys').then(setApiKeys),
       load(1, 20),
     ]).catch((error) => message.error(formatError(error)))
   }, [])
@@ -200,6 +213,7 @@ export default function Usage() {
       if (model) params.set('model', model)
       if (requestId) params.set('request_id', requestId)
       if (providerId) params.set('provider_id', String(providerId))
+      if (apiKeyId) params.set('api_key_id', String(apiKeyId))
       if (success !== undefined) params.set('success', String(success))
       if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
       if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
@@ -307,6 +321,16 @@ export default function Usage() {
             value={providerId}
             onChange={(value) => { setProviderId(value); setTimeout(() => load(1), 0) }}
             options={providers.map((provider) => ({ value: provider.id, label: provider.name }))}
+            style={{ width: 180 }}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="访问密钥"
+            value={apiKeyId}
+            onChange={(value) => { setApiKeyId(value); setTimeout(() => load(1), 0) }}
+            options={apiKeys.map((item) => ({ value: item.id, label: item.name }))}
             style={{ width: 180 }}
           />
           <Select

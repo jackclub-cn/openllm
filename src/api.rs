@@ -2194,6 +2194,9 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
     if let Some(provider_id) = query.provider_id {
         builder.push(" AND u.provider_id = ").push_bind(provider_id);
     }
+    if let Some(api_key_id) = query.api_key_id {
+        builder.push(" AND u.api_key_id = ").push_bind(api_key_id);
+    }
     if let Some(route_id) = query.route_id {
         builder.push(" AND u.route_id = ").push_bind(route_id);
     }

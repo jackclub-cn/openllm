@@ -764,6 +764,7 @@ pub struct UsageQuery {
     #[serde(default = "default_page_size")]
     pub page_size: i64,
     pub provider_id: Option<i64>,
+    pub api_key_id: Option<i64>,
     pub route_id: Option<i64>,
     pub model: Option<String>,
     pub request_id: Option<String>,
