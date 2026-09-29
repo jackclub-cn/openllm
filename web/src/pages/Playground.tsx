@@ -26,7 +26,7 @@ import {
 } from 'antd'
 import { api, formatError, type ModelInfo } from '../api'
 import PageHeader from '../components/PageHeader'
-import { formatCompact } from '../format'
+import { formatCompact, formatExact } from '../format'
 
 const GATEWAY_KEY = 'openllm-gateway-key'
 const SETTINGS_KEY = 'openllm-playground-settings'
@@ -458,10 +458,14 @@ export default function Playground() {
                 <Typography.Text strong>模型能力</Typography.Text>
                 <div className="capability-tags">
                   {capabilities.context_limit != null && (
-                    <Tag>上下文 {capabilities.context_limit.toLocaleString()}</Tag>
+                    <Tooltip title={formatExact(capabilities.context_limit)}>
+                      <Tag>上下文 {formatCompact(capabilities.context_limit)}</Tag>
+                    </Tooltip>
                   )}
                   {capabilities.output_limit != null && (
-                    <Tag>输出上限 {capabilities.output_limit.toLocaleString()}</Tag>
+                    <Tooltip title={formatExact(capabilities.output_limit)}>
+                      <Tag>输出上限 {formatCompact(capabilities.output_limit)}</Tag>
+                    </Tooltip>
                   )}
                   {capabilities.reasoning && <Tag color="geekblue">推理</Tag>}
                   {capabilities.tool_call && <Tag color="green">工具调用</Tag>}
