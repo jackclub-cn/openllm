@@ -57,6 +57,7 @@ export default function Usage() {
   const [total, setTotal] = useState(0)
   const [model, setModel] = useState('')
   const [requestId, setRequestId] = useState('')
+  const [endpoint, setEndpoint] = useState('')
   const [providerId, setProviderId] = useState<number>()
   const [apiKeyId, setApiKeyId] = useState<number>()
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>('all')
@@ -70,11 +71,12 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, providerId, apiKeyId, statusFilter, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, providerId, apiKeyId, statusFilter, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, apiKeyId, statusFilter, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, apiKeyId, statusFilter, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
+    endpoint,
     providerId,
     apiKeyId,
     statusFilter,
@@ -100,6 +102,7 @@ export default function Usage() {
     })
     if (model) params.set('model', model)
     if (requestId) params.set('request_id', requestId)
+    if (endpoint) params.set('endpoint', endpoint)
     if (providerId) params.set('provider_id', String(providerId))
     if (apiKeyId) params.set('api_key_id', String(apiKeyId))
     if (statusFilter === 'success') params.set('success', 'true')
@@ -112,6 +115,7 @@ export default function Usage() {
       const currentFilter = JSON.stringify([
         model,
         requestId,
+        endpoint,
         providerId,
         apiKeyId,
         statusFilter,
@@ -150,7 +154,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, model, page, pageSize, providerId, requestId, statusFilter])
+  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerId, requestId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -218,6 +222,7 @@ export default function Usage() {
       const params = new URLSearchParams()
       if (model) params.set('model', model)
       if (requestId) params.set('request_id', requestId)
+      if (endpoint) params.set('endpoint', endpoint)
       if (providerId) params.set('provider_id', String(providerId))
       if (apiKeyId) params.set('api_key_id', String(apiKeyId))
       if (statusFilter === 'success') params.set('success', 'true')
@@ -322,6 +327,14 @@ export default function Usage() {
             onChange={(event) => setRequestId(event.target.value)}
             onSearch={() => load(1)}
             style={{ width: 240 }}
+          />
+          <Input.Search
+            allowClear
+            placeholder="接口路径"
+            value={endpoint}
+            onChange={(event) => setEndpoint(event.target.value)}
+            onSearch={() => load(1)}
+            style={{ width: 220 }}
           />
           <Select
             allowClear

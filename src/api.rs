@@ -2728,6 +2728,13 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
             .push(" AND u.request_id LIKE ")
             .push_bind(format!("%{}%", request_id.trim()));
     }
+    if let Some(endpoint) = &query.endpoint
+        && !endpoint.trim().is_empty()
+    {
+        builder
+            .push(" AND u.endpoint LIKE ")
+            .push_bind(format!("%{}%", endpoint.trim()));
+    }
     if let Some(success) = query.success {
         builder.push(" AND u.success = ").push_bind(success as i64);
         if !success {
@@ -3543,6 +3550,7 @@ mod tests {
                 route_id: None,
                 model: None,
                 request_id: None,
+                endpoint: None,
                 success: None,
                 in_flight: Some(true),
                 from: None,
@@ -3555,6 +3563,53 @@ mod tests {
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].request_id, "pending");
         assert!(page.items[0].in_flight);
+    }
+
+    #[tokio::test]
+    async fn usage_filter_can_select_endpoint() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code,
+                in_flight, success, created_at
+             ) VALUES
+                ('chat', 'm', '/v1/chat/completions', 200, 0, 1,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                ('responses', 'm', '/v1/responses', 200, 0, 1,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let Json(page) = list_usage(
+            State(state),
+            Query(UsageQuery {
+                page: 1,
+                page_size: 20,
+                provider_id: None,
+                api_key_id: None,
+                route_id: None,
+                model: None,
+                request_id: None,
+                endpoint: Some("/v1/responses".to_string()),
+                success: None,
+                in_flight: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "responses");
     }
 
     #[tokio::test]

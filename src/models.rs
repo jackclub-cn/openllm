@@ -858,6 +858,7 @@ pub struct UsageQuery {
     pub route_id: Option<i64>,
     pub model: Option<String>,
     pub request_id: Option<String>,
+    pub endpoint: Option<String>,
     pub success: Option<bool>,
     pub in_flight: Option<bool>,
     pub from: Option<String>,
