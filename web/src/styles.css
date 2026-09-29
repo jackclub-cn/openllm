@@ -284,6 +284,14 @@ body {
   margin-left: 12px;
 }
 
+.api-key-value {
+  white-space: nowrap;
+}
+
+.settings-retention {
+  margin-top: 16px;
+}
+
 .playground-grid {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 320px;

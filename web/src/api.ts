@@ -244,6 +244,10 @@ export type Settings = {
   version: string
 }
 
+export type RuntimeSettings = {
+  usage_retention_days?: number | null
+}
+
 export type ModelCapabilities = {
   context_limit?: number
   output_limit?: number

@@ -21,11 +21,12 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
-    delete_api_key, delete_provider, delete_route, event_stream, export_usage, get_settings,
-    get_usage_detail, health, list_api_keys, list_models, list_provider_model_limits,
-    list_providers, list_routes, list_usage, overview, preview_provider_model_sync, rotate_api_key,
-    sync_provider_models, test_all_providers, test_provider, update_api_key, update_provider,
-    update_provider_model_limits, update_route,
+    delete_api_key, delete_provider, delete_route, event_stream, export_usage,
+    get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys, list_models,
+    list_provider_model_limits, list_providers, list_routes, list_usage, overview,
+    preview_provider_model_sync, rotate_api_key, sync_provider_models, test_all_providers,
+    test_provider, update_api_key, update_provider, update_provider_model_limits, update_route,
+    update_runtime_settings,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -49,6 +50,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             crate::api::run_due_provider_health_checks(health_state.clone()).await;
             crate::api::run_due_provider_model_syncs(health_state.clone()).await;
+            crate::api::run_due_usage_retention(health_state.clone()).await;
         }
     });
 
@@ -99,6 +101,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/usage/export", get(export_usage))
         .route("/usage/cleanup", post(cleanup_usage))
         .route("/usage/{request_id}", get(get_usage_detail))
+        .route(
+            "/settings/runtime",
+            get(get_runtime_settings).put(update_runtime_settings),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth,

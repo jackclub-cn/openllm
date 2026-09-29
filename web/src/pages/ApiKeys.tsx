@@ -189,7 +189,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 1140 }}
+          scroll={{ x: 1420 }}
           columns={[
             {
               title: '名称',
@@ -198,7 +198,14 @@ export default function ApiKeys() {
             },
             {
               title: '密钥',
-              render: (_, record) => <Typography.Text code>{record.key_prefix}...{record.key_suffix}</Typography.Text>,
+              width: 220,
+              render: (_, record) => (
+                <Tooltip title={`${record.key_prefix}...${record.key_suffix}`}>
+                  <Typography.Text code className="api-key-value">
+                    {record.key_prefix}...{record.key_suffix}
+                  </Typography.Text>
+                </Tooltip>
+              ),
             },
             {
               title: '最后使用',

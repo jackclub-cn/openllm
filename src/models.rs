@@ -871,6 +871,17 @@ pub struct SettingsView {
     pub version: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+pub struct RuntimeSettingsView {
+    pub usage_retention_days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RuntimeSettingsUpdate {
+    #[serde(default)]
+    pub usage_retention_days: Option<i64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminTokenQuery {
     pub admin_token: Option<String>,

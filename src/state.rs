@@ -19,6 +19,8 @@ pub struct AppState {
     /// Throttles `last_used_at` writes so the hot request path does not take a
     /// SQLite write lock on every single call.
     pub key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Throttles automatic usage-retention cleanup to once per hour.
+    pub retention_last_run: Arc<Mutex<Option<Instant>>>,
     /// Cached models.dev capability catalog plus the instant it was fetched.
     /// Held behind a read-mostly lock because provider sync refreshes it only
     /// once per TTL.
@@ -59,6 +61,7 @@ impl AppState {
             events,
             auth_required: Arc::new(RwLock::new(None)),
             key_touched: Arc::new(Mutex::new(HashMap::new())),
+            retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
         }
     }

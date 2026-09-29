@@ -1,12 +1,31 @@
 import { useEffect, useState } from 'react'
 import {
   CheckCircleOutlined,
+  ClockCircleOutlined,
   DatabaseOutlined,
   DownloadOutlined,
   SafetyCertificateOutlined,
 } from '@ant-design/icons'
-import { Alert, App, Button, Card, Descriptions, Form, Input, Space, Tag, Typography } from 'antd'
-import { api, formatError, getAdminToken, type Settings } from '../api'
+import {
+  Alert,
+  App,
+  Button,
+  Card,
+  Descriptions,
+  Form,
+  Input,
+  InputNumber,
+  Space,
+  Tag,
+  Typography,
+} from 'antd'
+import {
+  api,
+  formatError,
+  getAdminToken,
+  type RuntimeSettings,
+  type Settings,
+} from '../api'
 import PageHeader from '../components/PageHeader'
 
 export default function SettingsPage({ onSave }: { onSave: (value: string) => void }) {
@@ -15,9 +34,15 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [saved, setSaved] = useState(false)
   const [token, setToken] = useState(getAdminToken())
   const [backingUp, setBackingUp] = useState(false)
+  const [retentionDays, setRetentionDays] = useState<number | null>(null)
+  const [savingRetention, setSavingRetention] = useState(false)
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
+    api
+      .get<RuntimeSettings>('/api/settings/runtime')
+      .then((runtime) => setRetentionDays(runtime.usage_retention_days ?? null))
+      .catch(() => undefined)
   }, [])
 
   const backup = async () => {
@@ -35,6 +60,21 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setBackingUp(false)
+    }
+  }
+
+  const saveRetention = async () => {
+    setSavingRetention(true)
+    try {
+      const runtime = await api.put<RuntimeSettings>('/api/settings/runtime', {
+        usage_retention_days: retentionDays && retentionDays > 0 ? retentionDays : null,
+      })
+      setRetentionDays(runtime.usage_retention_days ?? null)
+      message.success('日志保留策略已保存')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setSavingRetention(false)
     }
   }
 
@@ -100,6 +140,37 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
           </Descriptions>
         </Card>
       </div>
+      <Card
+        className="settings-retention"
+        title={<Space><ClockCircleOutlined />日志保留</Space>}
+        bordered={false}
+      >
+        <Form layout="vertical">
+          <Form.Item
+            label="保留天数"
+            extra="留空或设为 0 表示永久保留。启用后每小时自动清理过期日志，最多保留 3650 天。"
+          >
+            <InputNumber
+              min={0}
+              max={3650}
+              precision={0}
+              value={retentionDays}
+              onChange={(value) => setRetentionDays(value ?? null)}
+              placeholder="永久保留"
+              addonAfter="天"
+              style={{ width: 220 }}
+            />
+          </Form.Item>
+          <Button
+            type="primary"
+            icon={<CheckCircleOutlined />}
+            loading={savingRetention}
+            onClick={() => void saveRetention()}
+          >
+            保存保留策略
+          </Button>
+        </Form>
+      </Card>
     </>
   )
 }

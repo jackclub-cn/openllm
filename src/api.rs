@@ -19,6 +19,9 @@ use crate::models_dev;
 use crate::proxy::{apply_custom_headers, join_upstream_url};
 use crate::state::AppState;
 
+const SETTING_USAGE_RETENTION_DAYS: &str = "usage_retention_days";
+const USAGE_RETENTION_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
 pub async fn health() -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -55,6 +58,45 @@ pub async fn get_settings(State(state): State<AppState>) -> Json<SettingsView> {
         database: "sqlite",
         version: env!("CARGO_PKG_VERSION"),
     })
+}
+
+pub async fn get_runtime_settings(
+    State(state): State<AppState>,
+) -> AppResult<Json<RuntimeSettingsView>> {
+    let raw = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+        .bind(SETTING_USAGE_RETENTION_DAYS)
+        .fetch_optional(&state.pool)
+        .await?;
+    let usage_retention_days = raw.and_then(|value| value.parse::<i64>().ok());
+    Ok(Json(RuntimeSettingsView {
+        usage_retention_days,
+    }))
+}
+
+pub async fn update_runtime_settings(
+    State(state): State<AppState>,
+    Json(input): Json<RuntimeSettingsUpdate>,
+) -> AppResult<Json<RuntimeSettingsView>> {
+    let usage_retention_days = normalize_retention_days(input.usage_retention_days)?;
+    if let Some(days) = usage_retention_days {
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(SETTING_USAGE_RETENTION_DAYS)
+        .bind(days.to_string())
+        .execute(&state.pool)
+        .await?;
+    } else {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(SETTING_USAGE_RETENTION_DAYS)
+            .execute(&state.pool)
+            .await?;
+    }
+    *state.retention_last_run.lock().await = None;
+    Ok(Json(RuntimeSettingsView {
+        usage_retention_days,
+    }))
 }
 
 pub async fn event_stream(
@@ -536,6 +578,57 @@ pub async fn run_due_provider_model_syncs(state: AppState) {
     .buffer_unordered(2)
     .for_each(|_| async {})
     .await;
+}
+
+pub async fn run_due_usage_retention(state: AppState) {
+    {
+        let last_run = state.retention_last_run.lock().await;
+        if last_run.is_some_and(|last_run| last_run.elapsed() < USAGE_RETENTION_CHECK_INTERVAL) {
+            return;
+        }
+    }
+
+    let raw = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+        .bind(SETTING_USAGE_RETENTION_DAYS)
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%error, "failed to read usage retention setting");
+            return;
+        }
+    };
+
+    if let Some(days) = raw.and_then(|value| value.parse::<i64>().ok())
+        && days > 0
+    {
+        let cutoff = (Utc::now() - Duration::days(days)).to_rfc3339();
+        match sqlx::query("DELETE FROM usage_logs WHERE created_at < ?")
+            .bind(&cutoff)
+            .execute(&state.pool)
+            .await
+        {
+            Ok(result) => {
+                tracing::info!(
+                    deleted = result.rows_affected(),
+                    retention_days = days,
+                    %cutoff,
+                    "automatic usage retention cleanup completed"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    retention_days = days,
+                    "automatic usage retention cleanup failed"
+                );
+                return;
+            }
+        }
+    }
+
+    *state.retention_last_run.lock().await = Some(std::time::Instant::now());
 }
 
 async fn persist_provider_test(
@@ -1353,6 +1446,16 @@ fn normalize_expiration(value: Option<String>) -> AppResult<Option<String>> {
     Ok(Some(parsed.with_timezone(&Utc).to_rfc3339()))
 }
 
+fn normalize_retention_days(value: Option<i64>) -> AppResult<Option<i64>> {
+    match value {
+        Some(value) if !(0..=3650).contains(&value) => Err(AppError::BadRequest(
+            "usage retention must be between 0 and 3650 days".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
 pub async fn list_usage(
     State(state): State<AppState>,
     Query(query): Query<UsageQuery>,
@@ -1800,6 +1903,7 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
+               p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
@@ -2487,6 +2591,16 @@ mod tests {
     }
 
     #[test]
+    fn validates_usage_retention_days() {
+        assert_eq!(normalize_retention_days(None).unwrap(), None);
+        assert_eq!(normalize_retention_days(Some(0)).unwrap(), None);
+        assert_eq!(normalize_retention_days(Some(30)).unwrap(), Some(30));
+        assert_eq!(normalize_retention_days(Some(3650)).unwrap(), Some(3650));
+        assert!(normalize_retention_days(Some(-1)).is_err());
+        assert!(normalize_retention_days(Some(3651)).is_err());
+    }
+
+    #[test]
     fn generates_api_key_material() {
         let (raw, hash, prefix, suffix) = generate_api_key_material();
         assert!(raw.starts_with("sk-openllm-"));
@@ -2740,5 +2854,54 @@ mod tests {
         assert_eq!(capabilities.context_limit, Some(400_000));
         assert_eq!(capabilities.input_limit, Some(400_000));
         assert_eq!(capabilities.output_limit, Some(64_000));
+    }
+
+    #[tokio::test]
+    async fn automatic_usage_retention_deletes_only_expired_logs() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO settings (key, value) VALUES ('usage_retention_days', '30')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let old = (Utc::now() - Duration::days(31)).to_rfc3339();
+        let recent = (Utc::now() - Duration::days(2)).to_rfc3339();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code, success, created_at
+             ) VALUES (?, ?, '/v1/chat/completions', 200, 1, ?)",
+        )
+        .bind("expired")
+        .bind("test-model")
+        .bind(old)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code, success, created_at
+             ) VALUES (?, ?, '/v1/chat/completions', 200, 1, ?)",
+        )
+        .bind("recent")
+        .bind("test-model")
+        .bind(recent)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool.clone(), None);
+        run_due_usage_retention(state).await;
+
+        let request_ids =
+            sqlx::query_scalar::<_, String>("SELECT request_id FROM usage_logs ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(request_ids, vec!["recent"]);
     }
 }
