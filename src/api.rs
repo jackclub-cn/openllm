@@ -229,6 +229,7 @@ pub async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec
 pub async fn provider_quota(
     State(state): State<AppState>,
     Path(id): Path<i64>,
+    Query(query): Query<ProviderQuotaQuery>,
 ) -> AppResult<Json<ProviderQuotaView>> {
     let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
         .bind(id)
@@ -237,24 +238,79 @@ pub async fn provider_quota(
         .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
     let kind = provider_quota_kind(&provider.base_url)
         .ok_or_else(|| AppError::BadRequest("this provider has no quota API".to_string()))?;
-    let key = provider_key_candidates(&state, &provider)
-        .await?
-        .into_iter()
-        .find_map(|(_, secret)| normalize_optional(secret))
-        .ok_or_else(|| AppError::BadRequest("provider has no credentials to query".to_string()))?;
+    let credential = provider_quota_credential(&state, &provider, query.key_id).await?;
     let prices = provider_prices(&state, provider.id).await?;
     let mut view = match kind {
-        "command_code" => fetch_command_code_quota(&state, &key).await?,
-        "opencode_go" => fetch_opencode_go_quota(&state, &key).await?,
-        "deepseek" => fetch_deepseek_quota(&state, &key).await?,
+        "command_code" => fetch_command_code_quota(&state, &credential.secret).await?,
+        "opencode_go" => fetch_opencode_go_quota(&state, &credential.secret).await?,
+        "deepseek" => fetch_deepseek_quota(&state, &credential.secret).await?,
         _ => {
             return Err(AppError::BadRequest(
                 "this provider has no quota API".to_string(),
             ));
         }
     };
+    view.key_id = credential.key_id;
+    view.key_name = Some(credential.key_name);
+    view.key_suffix = Some(credential.key_suffix);
     view.prices = prices;
     Ok(Json(view))
+}
+
+struct ProviderQuotaCredential {
+    key_id: Option<i64>,
+    key_name: String,
+    key_suffix: String,
+    secret: String,
+}
+
+async fn provider_quota_credential(
+    state: &AppState,
+    provider: &Provider,
+    key_id: Option<i64>,
+) -> AppResult<ProviderQuotaCredential> {
+    let records = provider_api_key_records(&state.pool, provider.id).await?;
+    if let Some(key_id) = key_id {
+        let record = records
+            .into_iter()
+            .find(|record| record.id == key_id)
+            .ok_or_else(|| AppError::NotFound("provider API key not found".to_string()))?;
+        return quota_credential_from_record(record);
+    }
+    if let Some(record) = records
+        .iter()
+        .find(|record| record.enabled != 0 && !record.secret.is_empty())
+        .or_else(|| records.iter().find(|record| !record.secret.is_empty()))
+        .cloned()
+    {
+        return quota_credential_from_record(record);
+    }
+    let secret = normalize_optional(provider.api_key.clone())
+        .ok_or_else(|| AppError::BadRequest("provider has no credentials to query".to_string()))?;
+    Ok(ProviderQuotaCredential {
+        key_id: None,
+        key_name: "Default".to_string(),
+        key_suffix: api_key_suffix(&secret),
+        secret,
+    })
+}
+
+fn quota_credential_from_record(
+    record: ProviderApiKeyRecord,
+) -> AppResult<ProviderQuotaCredential> {
+    let secret = normalize_optional(Some(record.secret))
+        .ok_or_else(|| AppError::BadRequest("provider API key is empty".to_string()))?;
+    let key_name = if record.name.trim().is_empty() {
+        format!("Key {}", record.id)
+    } else {
+        record.name
+    };
+    Ok(ProviderQuotaCredential {
+        key_id: Some(record.id),
+        key_name,
+        key_suffix: api_key_suffix(&secret),
+        secret,
+    })
 }
 
 pub(crate) fn provider_quota_kind(base_url: &str) -> Option<&'static str> {
@@ -409,6 +465,9 @@ async fn fetch_command_code_quota(state: &AppState, api_key: &str) -> AppResult<
         kind: "command_code".to_string(),
         title: quota_title("command_code").to_string(),
         plan_name,
+        key_id: None,
+        key_name: None,
+        key_suffix: None,
         source_url: Some("https://commandcode.ai/".to_string()),
         items,
         details,
@@ -443,6 +502,9 @@ async fn fetch_opencode_go_quota(state: &AppState, api_key: &str) -> AppResult<P
         kind: "opencode_go".to_string(),
         title: quota_title("opencode_go").to_string(),
         plan_name: Some("Go".to_string()),
+        key_id: None,
+        key_name: None,
+        key_suffix: None,
         source_url: Some("https://opencode.ai/docs/go".to_string()),
         items,
         details: Vec::new(),
@@ -502,6 +564,9 @@ async fn fetch_deepseek_quota(state: &AppState, api_key: &str) -> AppResult<Prov
         kind: "deepseek".to_string(),
         title: quota_title("deepseek").to_string(),
         plan_name: None,
+        key_id: None,
+        key_name: None,
+        key_suffix: None,
         source_url: Some("https://api-docs.deepseek.com/quick_start/pricing".to_string()),
         items,
         details,
@@ -4521,6 +4586,58 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(mirrored, None);
+    }
+
+    #[tokio::test]
+    async fn provider_quota_credential_uses_selected_or_first_enabled_key() {
+        let state = provider_key_test_state().await;
+        let (_, Json(created)) = create_provider(
+            State(state.clone()),
+            Json(provider_input(
+                None,
+                vec![
+                    provider_key_input(None, "Primary", Some("sk-one"), true),
+                    provider_key_input(None, "Backup", Some("sk-two"), true),
+                ],
+            )),
+        )
+        .await
+        .unwrap();
+        let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+            .bind(created.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+
+        let selected = provider_quota_credential(&state, &provider, Some(created.api_keys[1].id))
+            .await
+            .unwrap();
+        assert_eq!(selected.key_id, Some(created.api_keys[1].id));
+        assert_eq!(selected.key_name, "Backup");
+        assert_eq!(selected.secret, "sk-two");
+
+        let default = provider_quota_credential(&state, &provider, None)
+            .await
+            .unwrap();
+        assert_eq!(default.key_id, Some(created.api_keys[0].id));
+        assert_eq!(default.key_name, "Primary");
+
+        sqlx::query("UPDATE provider_api_keys SET enabled = 0 WHERE id = ?")
+            .bind(created.api_keys[0].id)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let fallback = provider_quota_credential(&state, &provider, None)
+            .await
+            .unwrap();
+        assert_eq!(fallback.key_id, Some(created.api_keys[1].id));
+        assert_eq!(fallback.key_name, "Backup");
+
+        assert!(
+            provider_quota_credential(&state, &provider, Some(999_999))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

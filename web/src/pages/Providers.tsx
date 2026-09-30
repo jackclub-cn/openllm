@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   ApiOutlined,
   AppstoreOutlined,
@@ -18,6 +18,7 @@ import {
   WalletOutlined,
 } from '@ant-design/icons'
 import {
+  Alert,
   App,
   AutoComplete,
   Button,
@@ -141,6 +142,9 @@ export default function Providers() {
   const [quotaLoading, setQuotaLoading] = useState(false)
   const [quotaProvider, setQuotaProvider] = useState<Provider>()
   const [quota, setQuota] = useState<ProviderQuota>()
+  const [quotaKeyId, setQuotaKeyId] = useState<number>()
+  const [quotaError, setQuotaError] = useState<string>()
+  const quotaRequestSeq = useRef(0)
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [limitsLoading, setLimitsLoading] = useState(false)
   const [limitsSaving, setLimitsSaving] = useState(false)
@@ -231,19 +235,32 @@ export default function Providers() {
     setOpen(true)
   }
 
-  const openQuota = async (provider: Provider) => {
+  const loadQuota = async (provider: Provider, keyId?: number) => {
+    const requestSeq = ++quotaRequestSeq.current
+    setQuotaLoading(true)
+    setQuotaError(undefined)
+    try {
+      const query = keyId == null ? '' : `?key_id=${keyId}`
+      const next = await api.get<ProviderQuota>(`/api/providers/${provider.id}/quota${query}`)
+      if (requestSeq !== quotaRequestSeq.current) return
+      setQuota(next)
+    } catch (error) {
+      if (requestSeq !== quotaRequestSeq.current) return
+      setQuota(undefined)
+      setQuotaError(formatError(error))
+    } finally {
+      if (requestSeq === quotaRequestSeq.current) setQuotaLoading(false)
+    }
+  }
+
+  const openQuota = (provider: Provider) => {
+    const defaultKey = provider.api_keys.find((key) => key.enabled) ?? provider.api_keys[0]
     setQuotaProvider(provider)
     setQuota(undefined)
+    setQuotaKeyId(defaultKey?.id)
+    setQuotaError(undefined)
     setQuotaOpen(true)
-    setQuotaLoading(true)
-    try {
-      setQuota(await api.get<ProviderQuota>(`/api/providers/${provider.id}/quota`))
-    } catch (error) {
-      message.error(formatError(error))
-      setQuotaOpen(false)
-    } finally {
-      setQuotaLoading(false)
-    }
+    void loadQuota(provider, defaultKey?.id)
   }
 
   const save = async () => {
@@ -1597,19 +1614,54 @@ export default function Providers() {
       <Modal
         title={quotaProvider ? `额度与价格 · ${quotaProvider.name}` : '额度与价格'}
         open={quotaOpen}
-        onCancel={() => setQuotaOpen(false)}
+        onCancel={() => {
+          quotaRequestSeq.current += 1
+          setQuotaOpen(false)
+        }}
         footer={null}
         width={860}
         destroyOnHidden
       >
+        {quotaProvider && quotaProvider.api_keys.length > 0 && (
+          <Space wrap style={{ marginBottom: 16 }}>
+            <Typography.Text type="secondary">查询密钥</Typography.Text>
+            <Select
+              value={quotaKeyId}
+              loading={quotaLoading}
+              style={{ minWidth: 280 }}
+              onChange={(value) => {
+                setQuotaKeyId(value)
+                void loadQuota(quotaProvider, value)
+              }}
+              options={quotaProvider.api_keys.map((key) => ({
+                value: key.id,
+                label: `${key.name} (${key.api_key_suffix})${key.enabled ? '' : ' · 已停用'}`,
+              }))}
+            />
+          </Space>
+        )}
         {quotaLoading && (
           <Typography.Text type="secondary">正在向上游查询额度...</Typography.Text>
+        )}
+        {quotaError && (
+          <Alert
+            type="error"
+            showIcon
+            message="额度查询失败"
+            description={quotaError}
+            style={{ marginBottom: 16 }}
+          />
         )}
         {quota && (
           <Space direction="vertical" size={18} style={{ width: '100%' }}>
             <Space wrap>
               <Typography.Text strong>{quota.title}</Typography.Text>
               {quota.plan_name && <Tag color="blue">{quota.plan_name}</Tag>}
+              {quota.key_name && (
+                <Tag>
+                  {quota.key_name} · {quota.key_suffix}
+                </Tag>
+              )}
               <Typography.Text type="secondary">
                 查询于 {dayjs(quota.fetched_at).format('YYYY-MM-DD HH:mm:ss')}
               </Typography.Text>

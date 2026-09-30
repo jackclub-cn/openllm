@@ -128,11 +128,20 @@ pub struct ProviderQuotaView {
     pub kind: String,
     pub title: String,
     pub plan_name: Option<String>,
+    pub key_id: Option<i64>,
+    pub key_name: Option<String>,
+    pub key_suffix: Option<String>,
     pub source_url: Option<String>,
     pub items: Vec<ProviderQuotaItem>,
     pub details: Vec<ProviderQuotaDetail>,
     pub prices: Vec<ProviderPriceView>,
     pub fetched_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ProviderQuotaQuery {
+    #[serde(default)]
+    pub key_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]

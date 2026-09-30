@@ -154,6 +154,9 @@ export type ProviderQuota = {
   kind: string
   title: string
   plan_name?: string | null
+  key_id?: number | null
+  key_name?: string | null
+  key_suffix?: string | null
   source_url?: string | null
   items: ProviderQuotaItem[]
   details: ProviderQuotaDetail[]
