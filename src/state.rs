@@ -14,6 +14,8 @@ pub struct AppState {
     pub round_robin: Arc<Mutex<HashMap<i64, usize>>>,
     /// Per-provider cursor used to rotate upstream API keys across requests.
     pub provider_key_cursor: Arc<Mutex<HashMap<i64, usize>>>,
+    /// In-memory cooldowns for provider keys that recently failed.
+    pub provider_key_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
     /// Throttles provider-key usage timestamps on the request hot path.
     pub provider_key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
     pub events: broadcast::Sender<UsageEvent>,
@@ -63,6 +65,7 @@ impl AppState {
             admin_token: admin_token.filter(|token| !token.is_empty()),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cursor: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_required: Arc::new(RwLock::new(None)),

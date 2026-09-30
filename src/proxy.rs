@@ -1384,7 +1384,12 @@ async fn proxy_anthropic_inner(
             .await
         };
         match result {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                if response.status().is_success() {
+                    mark_provider_api_key_success(state, target_provider_key_id).await;
+                }
+                return Ok(response);
+            }
             Err(error) => last_error = Some(error),
         }
     }
@@ -1472,6 +1477,7 @@ async fn forward_anthropic_native(
             mark_provider_api_key_error(
                 state,
                 target.provider_api_key_id,
+                status,
                 &format!("{} returned {}: {}", target.provider_name, status, message),
             )
             .await;
@@ -1615,6 +1621,7 @@ async fn forward_openai_as_anthropic(
             mark_provider_api_key_error(
                 state,
                 target.provider_api_key_id,
+                status,
                 &format!("{} returned {}: {}", target.provider_name, status, message),
             )
             .await;
@@ -1862,7 +1869,12 @@ async fn proxy_openai_inner(
         )
         .await
         {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                if response.status().is_success() {
+                    mark_provider_api_key_success(state, target_provider_key_id).await;
+                }
+                return Ok(response);
+            }
             Err(AppError::BadRequest(message)) => {
                 last_error = Some(message);
             }
@@ -1991,6 +2003,7 @@ async fn upstream_error_response(
         mark_provider_api_key_error(
             state,
             target.provider_api_key_id,
+            status,
             &format!("{} returned {}: {}", target.provider_name, status, message),
         )
         .await;
@@ -4046,6 +4059,14 @@ fn provider_health_rank(health: Option<i64>) -> u8 {
 
 const PROVIDER_KEY_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
+fn provider_key_cooldown(status: StatusCode) -> Duration {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Duration::from_secs(300),
+        StatusCode::TOO_MANY_REQUESTS => Duration::from_secs(30),
+        _ => Duration::from_secs(20),
+    }
+}
+
 async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Option<i64>) {
     let Some(provider_api_key_id) = provider_api_key_id else {
         return;
@@ -4080,11 +4101,16 @@ async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Optio
 async fn mark_provider_api_key_error(
     state: &AppState,
     provider_api_key_id: Option<i64>,
+    status: StatusCode,
     message: &str,
 ) {
     let Some(provider_api_key_id) = provider_api_key_id else {
         return;
     };
+    state.provider_key_cooldown.lock().await.insert(
+        provider_api_key_id,
+        Instant::now() + provider_key_cooldown(status),
+    );
     let message = message.chars().take(1000).collect::<String>();
     let state = state.clone();
     tokio::spawn(async move {
@@ -4103,6 +4129,17 @@ async fn mark_provider_api_key_error(
             tracing::warn!(%error, provider_api_key_id, "failed to record provider key error");
         }
     });
+}
+
+async fn mark_provider_api_key_success(state: &AppState, provider_api_key_id: Option<i64>) {
+    let Some(provider_api_key_id) = provider_api_key_id else {
+        return;
+    };
+    state
+        .provider_key_cooldown
+        .lock()
+        .await
+        .remove(&provider_api_key_id);
 }
 
 async fn expand_target_provider_keys(
@@ -4125,10 +4162,13 @@ async fn expand_target_provider_keys(
         keys_by_provider.insert(target.provider_id, keys);
     }
 
+    let mut cooldowns = state.provider_key_cooldown.lock().await;
+    let now = Instant::now();
+    cooldowns.retain(|_, until| *until > now);
     let mut cursors = state.provider_key_cursor.lock().await;
     let mut expanded = Vec::new();
     for target in targets {
-        let mut keys = keys_by_provider
+        let keys = keys_by_provider
             .get(&target.provider_id)
             .cloned()
             .unwrap_or_default();
@@ -4137,6 +4177,16 @@ async fn expand_target_provider_keys(
             continue;
         }
 
+        let available = keys
+            .iter()
+            .filter(|(id, _)| !cooldowns.contains_key(id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut keys = if available.is_empty() {
+            keys
+        } else {
+            available
+        };
         let cursor = cursors.entry(target.provider_id).or_default();
         let offset = *cursor % keys.len();
         keys.rotate_left(offset);
@@ -6825,6 +6875,66 @@ mod tests {
                 .map(|target| target.api_key.as_deref())
                 .collect::<Vec<_>>(),
             vec![Some("sk-second"), Some("sk-first")]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_keys_skip_cooling_candidates_when_alternatives_exist() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Cooling', 'openai', 'https://example.com/v1', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'First', 'sk-first', 1),
+                    (12, 1, 'Second', 'sk-second', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let mut target = endpoint_test_target("openai", None);
+        target.id = 1;
+
+        state
+            .provider_key_cooldown
+            .lock()
+            .await
+            .insert(11, Instant::now() + Duration::from_secs(60));
+        let available = order_targets(&state, 1, "priority", vec![target.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            available
+                .iter()
+                .map(|target| target.api_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("sk-second")]
+        );
+
+        state
+            .provider_key_cooldown
+            .lock()
+            .await
+            .insert(12, Instant::now() + Duration::from_secs(60));
+        let fallback = order_targets(&state, 1, "priority", vec![target])
+            .await
+            .unwrap();
+        assert_eq!(fallback.len(), 2);
+        assert!(
+            fallback
+                .iter()
+                .all(|target| target.provider_api_key_id.is_some())
         );
     }
 
