@@ -762,8 +762,9 @@ pub struct UsageLog {
     pub cache_write_tokens: i64,
     pub estimated_cost_micros: Option<i64>,
     pub latency_ms: i64,
-    /// Time to first streamed content token, in milliseconds. `None` for
-    /// non-streamed requests or when the upstream sent no content at all.
+    /// Time to first content token, in milliseconds. Non-streamed responses
+    /// use the total response time because no incremental token timestamp is
+    /// available, while failed requests leave this empty.
     pub first_token_ms: Option<i64>,
     pub status_code: i64,
     pub in_flight: i64,
@@ -802,8 +803,7 @@ pub struct UsageLogView {
     ///
     /// For streamed requests this measures the generation phase only, i.e. it
     /// excludes the wait for the first token, which is what "tokens per second"
-    /// means in practice. Non-streamed requests have no first-token timestamp,
-    /// so the whole latency is used and the figure includes queue time.
+    /// means in practice. Non-streamed requests use the whole request time.
     /// `None` when it cannot be derived (no output, or no elapsed time).
     pub output_tps: Option<f64>,
     pub status_code: i64,
@@ -817,10 +817,12 @@ pub struct UsageLogView {
 
 impl From<UsageLog> for UsageLogView {
     fn from(value: UsageLog) -> Self {
+        let streamed = value.streamed != 0;
         let output_tps = output_tps_of(
             value.completion_tokens,
             value.latency_ms,
             value.first_token_ms,
+            streamed,
         );
         Self {
             id: value.id,
@@ -848,7 +850,7 @@ impl From<UsageLog> for UsageLogView {
             status_code: value.status_code,
             in_flight: value.in_flight != 0,
             success: value.success != 0,
-            streamed: value.streamed != 0,
+            streamed,
             error_message: value.error_message,
             response_preview: value.response_preview,
             created_at: value.created_at,
@@ -890,10 +892,12 @@ pub struct UsageLogDetailRow {
 
 impl From<UsageLogDetailRow> for UsageLogView {
     fn from(value: UsageLogDetailRow) -> Self {
+        let streamed = value.streamed != 0;
         let output_tps = output_tps_of(
             value.completion_tokens,
             value.latency_ms,
             value.first_token_ms,
+            streamed,
         );
         Self {
             id: value.id,
@@ -921,7 +925,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
             status_code: value.status_code,
             in_flight: value.in_flight != 0,
             success: value.success != 0,
-            streamed: value.streamed != 0,
+            streamed,
             error_message: value.error_message,
             response_preview: value.response_preview,
             created_at: value.created_at,
@@ -1287,16 +1291,20 @@ fn output_tps_of(
     completion_tokens: i64,
     latency_ms: i64,
     first_token_ms: Option<i64>,
+    streamed: bool,
 ) -> Option<f64> {
     if completion_tokens <= 0 {
         return None;
     }
-    let elapsed_ms = match first_token_ms {
-        // Guard against a first-token stamp that exceeds the total (possible
-        // with clock granularity): fall back to the full latency.
-        Some(first) if latency_ms > first => latency_ms - first,
-        Some(_) => return None,
-        None => latency_ms,
+    let elapsed_ms = if streamed {
+        match first_token_ms {
+            // Guard against a first-token stamp that exceeds the total
+            // (possible with clock granularity): fall back to full latency.
+            Some(first) if latency_ms > first => latency_ms - first,
+            _ => latency_ms,
+        }
+    } else {
+        latency_ms
     };
     if elapsed_ms <= 0 {
         return None;
@@ -1432,27 +1440,28 @@ mod capability_tests {
     fn tps_measures_generation_phase_for_streams() {
         // 100 tokens emitted over 2s after a 3s first-token wait:
         // generation phase is 2s, so 50 tok/s (not 20, which the total would give).
-        let tps = output_tps_of(100, 5000, Some(3000)).unwrap();
+        let tps = output_tps_of(100, 5000, Some(3000), true).unwrap();
         assert!((tps - 50.0).abs() < 0.001, "got {tps}");
     }
 
     #[test]
-    fn tps_falls_back_to_full_latency_without_first_token() {
-        // Non-streamed: no first-token stamp, so the whole 2s counts.
-        let tps = output_tps_of(100, 2000, None).unwrap();
+    fn tps_falls_back_to_full_latency_for_non_streams() {
+        // Non-streamed responses use the whole request time even when the log
+        // carries the same timestamp in `first_token_ms`.
+        let tps = output_tps_of(100, 2000, Some(2000), false).unwrap();
         assert!((tps - 50.0).abs() < 0.001, "got {tps}");
     }
 
     #[test]
     fn tps_is_absent_when_undefined() {
         // No output tokens means no throughput to report.
-        assert_eq!(output_tps_of(0, 1000, Some(100)), None);
+        assert_eq!(output_tps_of(0, 1000, Some(100), true), None);
         // Zero elapsed time would divide by zero.
-        assert_eq!(output_tps_of(10, 0, None), None);
-        assert_eq!(output_tps_of(10, 500, Some(500)), None);
-        // A first-token stamp beyond the total must not underflow into a
-        // nonsensical negative duration.
-        assert_eq!(output_tps_of(10, 100, Some(5000)), None);
+        assert_eq!(output_tps_of(10, 0, None, false), None);
+        // A first-token stamp beyond the total falls back to full latency
+        // instead of underflowing into a negative duration.
+        let tps = output_tps_of(10, 100, Some(5000), true).unwrap();
+        assert!((tps - 100.0).abs() < 0.001, "got {tps}");
     }
 
     #[test]

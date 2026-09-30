@@ -437,7 +437,7 @@ export default function Usage() {
           rowKey="id"
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1760 }}
+          scroll={{ x: 1780 }}
           onRow={(record) => ({
             onClick: () => void openDetail(record),
             style: { cursor: 'pointer' },
@@ -556,16 +556,24 @@ export default function Usage() {
                 record.in_flight ? <Typography.Text type="secondary">-</Typography.Text> : formatCostMicros(value),
             },
             {
-              title: '首 token',
+              title: '首 token 用时',
               dataIndex: 'first_token_ms',
-              width: 110,
+              width: 130,
               render: (value: number | undefined, record) =>
                 record.in_flight ? (
                   <Typography.Text type="secondary">-</Typography.Text>
                 ) : value != null ? (
-                  `${value} ms`
+                  <Tooltip
+                    title={
+                      record.streamed
+                        ? '从请求开始到收到首个输出片段'
+                        : '标准响应没有增量时间戳，按完整响应总用时记录'
+                    }
+                  >
+                    <span>{value} ms</span>
+                  </Tooltip>
                 ) : (
-                  <Typography.Text type="secondary">{record.streamed ? '-' : '—'}</Typography.Text>
+                  <Typography.Text type="secondary">不适用</Typography.Text>
                 ),
             },
             {
@@ -702,7 +710,19 @@ export default function Usage() {
                 {detail.latency_ms} ms
               </Descriptions.Item>
               <Descriptions.Item label="首 token 用时">
-                {detail.first_token_ms != null ? `${detail.first_token_ms} ms` : '-'}
+                {detail.first_token_ms != null ? (
+                  <Tooltip
+                    title={
+                      detail.streamed
+                        ? '从请求开始到收到首个输出片段'
+                        : '标准响应没有增量时间戳，按完整响应总用时记录'
+                    }
+                  >
+                    <span>{detail.first_token_ms} ms</span>
+                  </Tooltip>
+                ) : (
+                  '不适用'
+                )}
               </Descriptions.Item>
               <Descriptions.Item label="生成速度 (TPS)">
                 {detail.output_tps != null ? `${detail.output_tps.toFixed(1)} tok/s` : '-'}

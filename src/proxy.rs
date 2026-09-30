@@ -663,6 +663,7 @@ struct AnthropicStreamState {
     cache_read_tokens: i64,
     cache_write_tokens: i64,
     text: String,
+    first_token_ms: Option<i64>,
 }
 
 async fn send_anthropic_event(
@@ -674,6 +675,12 @@ async fn send_anthropic_event(
 }
 
 impl AnthropicStreamState {
+    fn mark_first_token(&mut self, started: Instant) {
+        if self.first_token_ms.is_none() {
+            self.first_token_ms = Some(started.elapsed().as_millis() as i64);
+        }
+    }
+
     /// Emits `message_start` once, before any content block.
     async fn ensure_started(
         &mut self,
@@ -735,6 +742,7 @@ struct StreamContext {
     message_id: String,
     model: String,
     input_tokens: i64,
+    started: Instant,
 }
 
 /// Handles one OpenAI SSE line, emitting the matching Anthropic events.
@@ -790,6 +798,7 @@ async fn process_openai_line_for_anthropic(
         .and_then(Value::as_str)
         && !text.is_empty()
     {
+        state.mark_first_token(ctx.started);
         state.ensure_started(tx, ctx).await;
         let index = match state.text_index {
             Some(index) => index,
@@ -834,6 +843,7 @@ async fn process_openai_line_for_anthropic(
                 *index
             } else {
                 // A new tool call: text must not stay open alongside it.
+                state.mark_first_token(ctx.started);
                 state.ensure_started(tx, ctx).await;
                 state.close_text_block(tx).await;
                 let index = state.next_index;
@@ -863,6 +873,7 @@ async fn process_openai_line_for_anthropic(
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str)
                 && !arguments.is_empty()
             {
+                state.mark_first_token(ctx.started);
                 send_anthropic_event(
                     tx,
                     "content_block_delta",
@@ -967,6 +978,7 @@ fn openai_stream_to_anthropic(
             message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
             model: requested_model.clone(),
             input_tokens: request_tokens,
+            started,
         };
         let mut stream_state = AnthropicStreamState::default();
         let mut upstream = response.bytes_stream();
@@ -1018,6 +1030,10 @@ fn openai_stream_to_anthropic(
         }
         .normalized();
         let preview = response_preview(stream_state.text.as_bytes());
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms = stream_state
+            .first_token_ms
+            .or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
         log_usage(
             &state,
             UsageLogEntry {
@@ -1029,8 +1045,8 @@ fn openai_stream_to_anthropic(
                 upstream_model: Some(&target.upstream_model),
                 endpoint: ANTHROPIC_MESSAGES,
                 usage,
-                latency_ms: started.elapsed().as_millis() as i64,
-                first_token_ms: None,
+                latency_ms,
+                first_token_ms,
                 status_code: if stream_error.is_some() { 502 } else { 200 },
                 success: stream_error.is_none(),
                 streamed: true,
@@ -1547,6 +1563,7 @@ async fn forward_anthropic_native(
     let usage = extract_usage_from_json(&response_bytes)
         .unwrap_or_else(|| estimated_completion_usage(request_tokens, &response_bytes));
     let preview = response_preview(&response_bytes);
+    let latency_ms = started.elapsed().as_millis() as i64;
     log_usage_detached(
         state.clone(),
         OwnedUsageLogEntry {
@@ -1558,8 +1575,8 @@ async fn forward_anthropic_native(
             upstream_model: Some(target.upstream_model.clone()),
             endpoint: ANTHROPIC_MESSAGES.to_string(),
             usage,
-            latency_ms: started.elapsed().as_millis() as i64,
-            first_token_ms: None,
+            latency_ms,
+            first_token_ms: Some(latency_ms),
             status_code: status.as_u16() as i64,
             success: true,
             streamed: false,
@@ -1688,6 +1705,7 @@ async fn forward_openai_as_anthropic(
     let (converted, usage) = openai_response_to_anthropic(&upstream, requested_model);
     let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
     let preview = response_preview(converted_bytes.as_slice());
+    let latency_ms = started.elapsed().as_millis() as i64;
     log_usage(
         state,
         UsageLogEntry {
@@ -1699,8 +1717,8 @@ async fn forward_openai_as_anthropic(
             upstream_model: Some(&target.upstream_model),
             endpoint: ANTHROPIC_MESSAGES,
             usage: fill_usage(usage, request_tokens, &converted),
-            latency_ms: started.elapsed().as_millis() as i64,
-            first_token_ms: None,
+            latency_ms,
+            first_token_ms: Some(latency_ms),
             status_code: status.as_u16() as i64,
             success: true,
             streamed: false,
@@ -2222,6 +2240,7 @@ async fn forward_to_target(
         let converted_bytes =
             inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
         let preview = response_preview(&converted_bytes);
+        let latency_ms = started.elapsed().as_millis() as i64;
         log_usage(
             state,
             UsageLogEntry {
@@ -2233,8 +2252,8 @@ async fn forward_to_target(
                 upstream_model: Some(&target.upstream_model),
                 endpoint,
                 usage: fill_usage(usage, request_tokens, &converted),
-                latency_ms: started.elapsed().as_millis() as i64,
-                first_token_ms: None,
+                latency_ms,
+                first_token_ms: Some(latency_ms),
                 status_code: status.as_u16() as i64,
                 success: true,
                 streamed: false,
@@ -2279,6 +2298,7 @@ async fn forward_to_target(
         .take(600)
         .collect::<String>();
     let preview = response_preview(&response_bytes);
+    let latency_ms = started.elapsed().as_millis() as i64;
     // Detach: the caller should not wait on a SQLite write to receive the
     // upstream response they already paid for.
     log_usage_detached(
@@ -2292,8 +2312,8 @@ async fn forward_to_target(
             upstream_model: Some(target.upstream_model.clone()),
             endpoint: endpoint.to_string(),
             usage,
-            latency_ms: started.elapsed().as_millis() as i64,
-            first_token_ms: None,
+            latency_ms,
+            first_token_ms: Some(latency_ms),
             status_code: status.as_u16() as i64,
             success: true,
             streamed: false,
@@ -2370,6 +2390,10 @@ fn passthrough_stream_response(
                 cache_read_tokens: 0,
                 cache_write_tokens: 0,
             });
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms = parser
+            .first_token_ms
+            .or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
         let preview = parser.preview();
         log_usage(
             &state,
@@ -2382,8 +2406,8 @@ fn passthrough_stream_response(
                 upstream_model: Some(&target.upstream_model),
                 endpoint: &endpoint,
                 usage,
-                latency_ms: started.elapsed().as_millis() as i64,
-                first_token_ms: parser.first_token_ms,
+                latency_ms,
+                first_token_ms,
                 status_code: if stream_error.is_some() { 502 } else { 200 },
                 success: stream_error.is_none(),
                 streamed: true,
@@ -2537,6 +2561,9 @@ fn anthropic_stream_response(
                 serde_json::to_string(&usage_chunk).unwrap_or_default()
             ))))
             .await;
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms =
+            first_token_ms.or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
         let preview = response_preview(text.as_bytes());
         log_usage(
             &state,
@@ -2549,7 +2576,7 @@ fn anthropic_stream_response(
                 upstream_model: Some(&target.upstream_model),
                 endpoint: OPENAI_CHAT_COMPLETIONS,
                 usage: usage.normalized(),
-                latency_ms: started.elapsed().as_millis() as i64,
+                latency_ms,
                 first_token_ms,
                 status_code: 200,
                 success: stream_error.is_none(),
@@ -2657,6 +2684,14 @@ async fn process_anthropic_line(
                     ))))
                     .await;
             }
+            if let Some(thinking) = value.pointer("/delta/thinking").and_then(Value::as_str)
+                && !thinking.is_empty()
+            {
+                if first_token_ms.is_none() {
+                    *first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
+                *output_chars += thinking.chars().count();
+            }
             // Tool call arguments stream as JSON fragments; OpenAI expects
             // them accumulated under `tool_calls[].function.arguments`.
             if value.pointer("/delta/type").and_then(Value::as_str) == Some("input_json_delta")
@@ -2689,6 +2724,9 @@ async fn process_anthropic_line(
         }
         "content_block_start" => {
             if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
+                if first_token_ms.is_none() {
+                    *first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
                 let id = value
                     .pointer("/content_block/id")
                     .cloned()
@@ -4361,6 +4399,29 @@ impl UsageParser {
                 .normalized(),
                 None => usage,
             });
+        }
+        // Native Anthropic streams emit text, reasoning, and tool arguments as
+        // content block deltas instead of OpenAI choices.
+        if let Some(delta) = value.get("delta") {
+            let delta_type = delta.get("type").and_then(Value::as_str);
+            let content = match delta_type {
+                Some("text_delta") => delta.get("text").and_then(Value::as_str),
+                Some("thinking_delta") => delta.get("thinking").and_then(Value::as_str),
+                Some("input_json_delta") => delta.get("partial_json").and_then(Value::as_str),
+                _ => None,
+            };
+            if let Some(content) = content.filter(|content| !content.is_empty()) {
+                self.mark_first_token();
+                self.output_chars += content.chars().count();
+                if delta_type == Some("text_delta") {
+                    push_preview_text(&mut self.text, content);
+                }
+            }
+        }
+        // Tool names arrive before their argument deltas. Count the block start
+        // as the first output token for tool-only responses.
+        if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
+            self.mark_first_token();
         }
         if let Some(content) = value
             .pointer("/choices/0/delta/content")
@@ -7377,6 +7438,7 @@ mod tests {
             message_id: "msg_test".to_string(),
             model: "claude-x".to_string(),
             input_tokens: 7,
+            started: Instant::now(),
         };
         let mut state = AnthropicStreamState::default();
 
@@ -7416,6 +7478,7 @@ mod tests {
         assert!(all.contains("event: message_stop"), "{all}");
         assert_eq!(state.output_tokens, 2);
         assert_eq!(state.text, "Hello");
+        assert!(state.first_token_ms.is_some());
     }
 
     #[tokio::test]
@@ -7425,6 +7488,7 @@ mod tests {
             message_id: "msg_test".to_string(),
             model: "claude-x".to_string(),
             input_tokens: 5,
+            started: Instant::now(),
         };
         let mut state = AnthropicStreamState::default();
         // Build the frames with serde so nested JSON escaping stays correct.
@@ -7449,6 +7513,7 @@ mod tests {
         assert!(all.contains("\"type\":\"input_json_delta\""), "{all}");
         assert!(all.contains("partial_json"), "{all}");
         assert!(state.has_tool_use);
+        assert!(state.first_token_ms.is_some());
         assert_eq!(state.finish_reason, None);
     }
 
@@ -7707,6 +7772,30 @@ mod tests {
             .finish()
             .expect("tool-call arguments should produce an estimate");
         assert!(usage.completion_tokens > 0);
+    }
+
+    #[test]
+    fn stream_parser_times_native_anthropic_content() {
+        let mut text = UsageParser::new(Instant::now());
+        text.push(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\n",
+        );
+        assert!(text.first_token_ms.is_some());
+
+        let mut tool = UsageParser::new(Instant::now());
+        tool.push(
+            b"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"name\":\"get_weather\"}}\n\n",
+        );
+        assert!(
+            tool.first_token_ms.is_some(),
+            "tool block starts should be treated as the beginning of output"
+        );
+
+        let mut thinking = UsageParser::new(Instant::now());
+        thinking.push(
+            b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"thinking_delta\",\"thinking\":\"plan\"}}\n\n",
+        );
+        assert!(thinking.first_token_ms.is_some());
     }
 
     #[test]

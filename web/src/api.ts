@@ -263,6 +263,7 @@ export type UsageLog = {
   cache_write_tokens: number
   estimated_cost_micros?: number | null
   latency_ms: number
+  /** Streamed requests measure the first output chunk; standard requests use total time. */
   first_token_ms?: number
   /** Output tokens per second. For streams this excludes the first-token wait. */
   output_tps?: number
