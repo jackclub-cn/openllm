@@ -2808,6 +2808,8 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             requests: 0,
             success_rate: 0.0,
             avg_latency_ms: 0.0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
             cooldown_seconds: None,
             created_at: value.created_at,
         }
@@ -2858,10 +2860,12 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
         .into_iter()
         .map(Into::into)
         .collect();
-    let stats = sqlx::query_as::<_, (i64, i64, f64, f64)>(
+    let stats = sqlx::query_as::<_, (i64, i64, f64, f64, i64, i64)>(
         "SELECT provider_api_key_id, COUNT(*), \
                 COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0), \
-                COALESCE(AVG(latency_ms), 0.0) \
+                COALESCE(AVG(latency_ms), 0.0), \
+                COALESCE(SUM(prompt_tokens), 0), \
+                COALESCE(SUM(completion_tokens), 0) \
          FROM usage_logs \
          WHERE provider_id = ? AND provider_api_key_id IS NOT NULL AND in_flight = 0 \
          GROUP BY provider_api_key_id",
@@ -2871,15 +2875,30 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
     .await?;
     let stats = stats
         .into_iter()
-        .map(|(id, requests, success_rate, avg_latency_ms)| {
-            (id, (requests, success_rate, avg_latency_ms))
-        })
+        .map(
+            |(id, requests, success_rate, avg_latency_ms, prompt_tokens, completion_tokens)| {
+                (
+                    id,
+                    (
+                        requests,
+                        success_rate,
+                        avg_latency_ms,
+                        prompt_tokens,
+                        completion_tokens,
+                    ),
+                )
+            },
+        )
         .collect::<HashMap<_, _>>();
     for key in &mut view.api_keys {
-        if let Some((requests, success_rate, avg_latency_ms)) = stats.get(&key.id) {
+        if let Some((requests, success_rate, avg_latency_ms, prompt_tokens, completion_tokens)) =
+            stats.get(&key.id)
+        {
             key.requests = *requests;
             key.success_rate = *success_rate;
             key.avg_latency_ms = *avg_latency_ms;
+            key.prompt_tokens = *prompt_tokens;
+            key.completion_tokens = *completion_tokens;
         }
     }
     let now = std::time::Instant::now();
@@ -3726,10 +3745,11 @@ mod tests {
             "INSERT INTO usage_logs (
                 request_id, provider_id, provider_api_key_id, provider_api_key_name,
                 requested_model,
-                endpoint, prompt_tokens, total_tokens, latency_ms, status_code, success
+                endpoint, prompt_tokens, completion_tokens, total_tokens,
+                latency_ms, status_code, success
              ) VALUES (
                 'request-with-provider-key', 1, 11, 'Primary', 'gpt-test',
-                '/v1/chat/completions', 10, 10, 123, 200, 1
+                '/v1/chat/completions', 10, 4, 14, 123, 200, 1
              )",
         )
         .execute(&state.pool)
@@ -3760,6 +3780,8 @@ mod tests {
         assert_eq!(provider.api_keys[0].requests, 1);
         assert_eq!(provider.api_keys[0].success_rate, 100.0);
         assert_eq!(provider.api_keys[0].avg_latency_ms, 123.0);
+        assert_eq!(provider.api_keys[0].prompt_tokens, 10);
+        assert_eq!(provider.api_keys[0].completion_tokens, 4);
         state.provider_key_cooldown.lock().await.insert(
             11,
             std::time::Instant::now() + std::time::Duration::from_secs(120),

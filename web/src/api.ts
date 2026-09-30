@@ -79,6 +79,8 @@ export type ProviderApiKey = {
   requests: number
   success_rate: number
   avg_latency_ms: number
+  prompt_tokens: number
+  completion_tokens: number
   cooldown_seconds?: number
   created_at: string
 }

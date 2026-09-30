@@ -495,7 +495,7 @@ export default function Providers() {
                     {key.enabled ? '启用' : '停用'}
                     {key.cooldown_seconds ? ` · 冷却 ${key.cooldown_seconds}s` : ''}
                     {key.requests > 0
-                      ? ` · ${key.requests} 次 · ${key.success_rate.toFixed(1)}% · ${Math.round(key.avg_latency_ms)} ms`
+                      ? ` · ${key.requests} 次 · ${key.success_rate.toFixed(1)}% · ${Math.round(key.avg_latency_ms)} ms · 输入 ${formatCompact(key.prompt_tokens)} / 输出 ${formatCompact(key.completion_tokens)}`
                       : ' · 暂无请求'}
                     {key.last_error ? ` · ${key.last_error}` : ''}
                   </div>
