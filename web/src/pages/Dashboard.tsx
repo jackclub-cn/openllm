@@ -405,6 +405,24 @@ export default function Dashboard() {
                 <div className="stat-line"><strong>{data.active_routes}</strong> 条</div>
               </div>
               <div>
+                <Typography.Text type="secondary">当前请求</Typography.Text>
+                <div className="stat-line"><strong>{data.in_flight_requests}</strong> 条</div>
+              </div>
+              <div>
+                <Typography.Text type="secondary">提供商健康</Typography.Text>
+                <div className="stat-line">
+                  正常 <strong>{data.healthy_providers}</strong> · 异常{' '}
+                  <strong>{data.failed_providers}</strong> · 未检测{' '}
+                  <strong>{data.untested_providers}</strong>
+                </div>
+              </div>
+              {data.cooling_provider_keys > 0 && (
+                <div>
+                  <Typography.Text type="secondary">冷却中的上游密钥</Typography.Text>
+                  <div className="stat-line"><strong>{data.cooling_provider_keys}</strong> 把</div>
+                </div>
+              )}
+              <div>
                 <Typography.Text type="secondary">累计请求</Typography.Text>
                 <div className="stat-line"><strong>{data.requests_total}</strong> 次</div>
               </div>

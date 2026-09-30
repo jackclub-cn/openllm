@@ -315,6 +315,11 @@ export type Overview = {
   avg_latency_ms: number
   active_providers: number
   active_routes: number
+  healthy_providers: number
+  failed_providers: number
+  untested_providers: number
+  cooling_provider_keys: number
+  in_flight_requests: number
   recent_requests: UsageLog[]
   provider_usage: Array<{
     provider_id: number

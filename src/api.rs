@@ -2265,6 +2265,28 @@ pub async fn overview(
     let active_routes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE enabled = 1")
         .fetch_one(&state.pool)
         .await?;
+    let (healthy_providers, failed_providers, untested_providers) =
+        sqlx::query_as::<_, (i64, i64, i64)>(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok = 1 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok = 0 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok IS NULL THEN 1 ELSE 0 END), 0) \
+             FROM providers",
+        )
+        .fetch_one(&state.pool)
+        .await?;
+    let in_flight_requests: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
+            .fetch_one(&state.pool)
+            .await?;
+    let now = std::time::Instant::now();
+    let cooling_provider_keys = state
+        .provider_key_cooldown
+        .lock()
+        .await
+        .values()
+        .filter(|until| **until > now)
+        .count() as i64;
 
     let recent = sqlx::query_as::<_, UsageLogDetailRow>(
         r#"
@@ -2416,6 +2438,11 @@ pub async fn overview(
         avg_latency_ms: totals.get("avg_latency_ms"),
         active_providers,
         active_routes,
+        healthy_providers,
+        failed_providers,
+        untested_providers,
+        cooling_provider_keys,
+        in_flight_requests,
         recent_requests: recent.into_iter().map(Into::into).collect(),
         provider_usage,
         model_usage,
@@ -4380,8 +4407,23 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO providers (name, provider_type, base_url, enabled, last_test_ok)
+             VALUES
+                ('healthy', 'openai', 'https://healthy.example/v1', 1, 1),
+                ('failed', 'openai', 'https://failed.example/v1', 1, 0),
+                ('untested', 'openai', 'https://untested.example/v1', 1, NULL),
+                ('disabled', 'openai', 'https://disabled.example/v1', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let state = AppState::new(pool, None);
+        state.provider_key_cooldown.lock().await.insert(
+            99,
+            std::time::Instant::now() + std::time::Duration::from_secs(120),
+        );
         let range_start = Utc::now() - Duration::days(2);
         let range_end = Utc::now() + Duration::days(1);
         let Json(view) = overview(
@@ -4408,6 +4450,12 @@ mod tests {
         assert_eq!(view.range_cache_read, 20);
         assert_eq!(view.range_success_rate, 50.0);
         assert_eq!(view.range_avg_latency_ms, 200.0);
+        assert_eq!(view.active_providers, 3);
+        assert_eq!(view.healthy_providers, 1);
+        assert_eq!(view.failed_providers, 1);
+        assert_eq!(view.untested_providers, 1);
+        assert_eq!(view.cooling_provider_keys, 1);
+        assert_eq!(view.in_flight_requests, 1);
         assert_eq!(
             view.daily_usage
                 .iter()
