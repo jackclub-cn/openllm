@@ -145,6 +145,7 @@ pub struct ProviderApiKeyView {
     pub requests: i64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
+    pub cooldown_seconds: Option<i64>,
     pub created_at: String,
 }
 

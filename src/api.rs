@@ -296,6 +296,16 @@ pub async fn update_provider(
         api_key_update
             .map(|secret| vec![provider_api_key_input(None, "Default", Some(secret), true)])
     };
+    let api_keys_changed = api_keys_update.is_some();
+    let previous_key_ids = if api_keys_changed {
+        provider_api_key_records(&state.pool, id)
+            .await?
+            .into_iter()
+            .map(|record| record.id)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let headers = match input.headers {
         Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
         None => current.headers,
@@ -348,6 +358,16 @@ pub async fn update_provider(
         .await?;
     }
     tx.commit().await?;
+
+    if api_keys_changed {
+        let current_key_ids =
+            sqlx::query_scalar::<_, i64>("SELECT id FROM provider_api_keys WHERE provider_id = ?")
+                .bind(id)
+                .fetch_all(&state.pool)
+                .await?;
+        clear_provider_key_cooldowns(&state, previous_key_ids.into_iter().chain(current_key_ids))
+            .await;
+    }
 
     if input.auto_sync_models == Some(true)
         && let Err(error) = sync_provider(state.clone(), id).await
@@ -415,7 +435,7 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     // A provider may have several credentials. Test every enabled key and
     // consider the provider healthy when any one of them succeeds.
     let mut result = None;
-    for (_, key) in provider_key_candidates(state, &provider).await? {
+    for (key_id, key) in provider_key_candidates(state, &provider).await? {
         let checked = if model.is_some() {
             "inference"
         } else {
@@ -431,6 +451,9 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
         let attempt =
             probe_provider(request, started, checked, model.as_deref().unwrap_or("")).await;
         if attempt.ok {
+            if let Some(key_id) = key_id {
+                state.provider_key_cooldown.lock().await.remove(&key_id);
+            }
             result = Some(attempt);
             break;
         }
@@ -2753,6 +2776,7 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             requests: 0,
             success_rate: 0.0,
             avg_latency_ms: 0.0,
+            cooldown_seconds: None,
             created_at: value.created_at,
         }
     }
@@ -2768,6 +2792,16 @@ async fn provider_api_key_records(
     .bind(provider_id)
     .fetch_all(pool)
     .await?)
+}
+
+async fn clear_provider_key_cooldowns(
+    state: &AppState,
+    provider_api_key_ids: impl IntoIterator<Item = i64>,
+) {
+    let mut cooldowns = state.provider_key_cooldown.lock().await;
+    for provider_api_key_id in provider_api_key_ids {
+        cooldowns.remove(&provider_api_key_id);
+    }
 }
 
 async fn provider_key_candidates(
@@ -2814,6 +2848,16 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
             key.requests = *requests;
             key.success_rate = *success_rate;
             key.avg_latency_ms = *avg_latency_ms;
+        }
+    }
+    let now = std::time::Instant::now();
+    let cooldowns = state.provider_key_cooldown.lock().await;
+    for key in &mut view.api_keys {
+        if let Some(until) = cooldowns.get(&key.id) {
+            let remaining = until.saturating_duration_since(now);
+            if !remaining.is_zero() {
+                key.cooldown_seconds = Some((remaining.as_secs_f64().ceil() as i64).max(1));
+            }
         }
     }
     view.api_key_set = !view.api_keys.is_empty();
@@ -3512,6 +3556,10 @@ mod tests {
         assert_eq!(created.api_keys[1].api_key_suffix, "-two");
 
         let first_id = created.api_keys[0].id;
+        state.provider_key_cooldown.lock().await.insert(
+            first_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         let Json(updated) = update_provider(
             State(state.clone()),
             Path(created.id),
@@ -3525,6 +3573,13 @@ mod tests {
         assert_eq!(updated.api_keys.len(), 2);
         assert!(!updated.api_keys[0].enabled);
         assert_eq!(updated.api_keys[1].name, "Replacement");
+        assert!(
+            !state
+                .provider_key_cooldown
+                .lock()
+                .await
+                .contains_key(&first_id)
+        );
 
         let retained_secret: String =
             sqlx::query_scalar("SELECT secret FROM provider_api_keys WHERE id = ?")
@@ -3646,6 +3701,13 @@ mod tests {
         assert_eq!(provider.api_keys[0].requests, 1);
         assert_eq!(provider.api_keys[0].success_rate, 100.0);
         assert_eq!(provider.api_keys[0].avg_latency_ms, 123.0);
+        state.provider_key_cooldown.lock().await.insert(
+            11,
+            std::time::Instant::now() + std::time::Duration::from_secs(120),
+        );
+        let provider = get_provider(&state, 1).await.unwrap();
+        assert!(provider.api_keys[0].cooldown_seconds.is_some());
+        assert!(provider.api_keys[0].cooldown_seconds.unwrap() > 0);
     }
 
     #[tokio::test]

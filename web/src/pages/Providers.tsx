@@ -488,10 +488,12 @@ export default function Providers() {
                   return <Tag color="default">无需密钥</Tag>
                 }
                 const enabled = keys.filter((key) => key.enabled).length
+                const cooling = keys.filter((key) => key.cooldown_seconds).length
                 const detail = keys.map((key) => (
                   <div key={key.id}>
                     {key.name || `Key ${key.id}`} · {key.api_key_suffix || '****'} ·{' '}
                     {key.enabled ? '启用' : '停用'}
+                    {key.cooldown_seconds ? ` · 冷却 ${key.cooldown_seconds}s` : ''}
                     {key.requests > 0
                       ? ` · ${key.requests} 次 · ${key.success_rate.toFixed(1)}% · ${Math.round(key.avg_latency_ms)} ms`
                       : ' · 暂无请求'}
@@ -500,8 +502,8 @@ export default function Providers() {
                 ))
                 return (
                   <Tooltip title={<div>{detail}</div>}>
-                    <Tag color={enabled ? 'green' : 'default'}>
-                      {enabled}/{keys.length} 个可用
+                    <Tag color={cooling ? 'orange' : enabled ? 'green' : 'default'}>
+                      {enabled}/{keys.length} 个可用{cooling ? ` · ${cooling} 冷却` : ''}
                     </Tag>
                   </Tooltip>
                 )
