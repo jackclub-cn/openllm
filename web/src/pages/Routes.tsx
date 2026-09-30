@@ -199,12 +199,13 @@ export default function RoutesPage() {
     if (!model) return
     handledDiagnosisQuery.current = queryKey
     const endpoint = searchParams.get('diagnose_endpoint') || '/v1/chat/completions'
+    const sessionId = searchParams.get('diagnose_session_id')?.trim() || ''
     setDiagnoseModel(model)
     setDiagnoseEndpoint(endpoint)
-    setDiagnoseSessionId('')
+    setDiagnoseSessionId(sessionId)
     setDiagnosis(undefined)
     setDiagnoseOpen(true)
-    void runDiagnosis(model, endpoint, '')
+    void runDiagnosis(model, endpoint, sessionId)
     setSearchParams({}, { replace: true })
   }, [searchParams, setSearchParams])
 
@@ -550,7 +551,22 @@ export default function RoutesPage() {
               </Descriptions>
               {diagnosis.runtime_targets && diagnosis.runtime_targets.length > 0 && (
                 <>
-                  <Typography.Text strong>会话实际顺序</Typography.Text>
+                  <Space>
+                    <Typography.Text strong>会话实际顺序</Typography.Text>
+                    {diagnosis.session_id && (
+                      <Button
+                        type="link"
+                        size="small"
+                        icon={<HistoryOutlined />}
+                        onClick={() => {
+                          const params = new URLSearchParams({ session_id: diagnosis.session_id! })
+                          navigate(`/usage?${params}`)
+                        }}
+                      >
+                        查看会话日志
+                      </Button>
+                    )}
+                  </Space>
                   <Table
                     rowKey={(record) =>
                       `${record.order}-${record.provider_id}-${record.upstream_model}-${record.provider_api_key_id ?? 0}`

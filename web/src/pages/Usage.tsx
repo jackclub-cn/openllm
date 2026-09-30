@@ -798,6 +798,9 @@ export default function Usage() {
                   diagnose_model: detail.requested_model,
                   diagnose_endpoint: detail.endpoint,
                 })
+                if (detail.session_id) {
+                  params.set('diagnose_session_id', detail.session_id)
+                }
                 navigate(`/routes?${params}`)
               }}
             >
