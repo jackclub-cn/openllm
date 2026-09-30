@@ -131,6 +131,11 @@ pub struct ProviderApiKeyRecord {
     pub last_used_at: Option<String>,
     pub last_error_at: Option<String>,
     pub last_error: Option<String>,
+    pub last_test_at: Option<String>,
+    pub last_test_ok: Option<i64>,
+    pub last_test_latency_ms: Option<i64>,
+    pub last_test_checked: Option<String>,
+    pub last_test_message: Option<String>,
     pub created_at: String,
 }
 
@@ -144,6 +149,11 @@ pub struct ProviderApiKeyView {
     pub last_used_at: Option<String>,
     pub last_error_at: Option<String>,
     pub last_error: Option<String>,
+    pub last_test_at: Option<String>,
+    pub last_test_ok: Option<bool>,
+    pub last_test_latency_ms: Option<i64>,
+    pub last_test_checked: Option<String>,
+    pub last_test_message: Option<String>,
     pub requests: i64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,

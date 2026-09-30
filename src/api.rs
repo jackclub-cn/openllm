@@ -529,7 +529,7 @@ async fn test_provider_keys_inner(state: &AppState, id: i64) -> AppResult<Provid
             key.secret.as_deref(),
         )?;
         let attempt = probe_provider(request, std::time::Instant::now(), checked, model_name).await;
-        results.push(ProviderKeyTestItem {
+        let result = ProviderKeyTestItem {
             key_id: key.id,
             key_name: key.name,
             api_key_suffix: key.api_key_suffix,
@@ -537,7 +537,9 @@ async fn test_provider_keys_inner(state: &AppState, id: i64) -> AppResult<Provid
             latency_ms: attempt.latency_ms,
             message: attempt.message,
             checked: attempt.checked,
-        });
+        };
+        persist_provider_key_test(state, &result).await?;
+        results.push(result);
     }
     let ok = results.iter().filter(|result| result.ok).count();
     let total = results.len();
@@ -909,6 +911,46 @@ async fn persist_provider_test(
     .bind(provider_id)
     .execute(&state.pool)
     .await?;
+    Ok(())
+}
+
+async fn persist_provider_key_test(
+    state: &AppState,
+    result: &ProviderKeyTestItem,
+) -> AppResult<()> {
+    let Some(key_id) = result.key_id else {
+        return Ok(());
+    };
+    if result.ok {
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_test_at = ?, last_test_ok = 1, last_test_latency_ms = ?, \
+                 last_test_checked = ?, last_test_message = ?, \
+                 last_error_at = NULL, last_error = NULL \
+             WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(result.latency_ms)
+        .bind(&result.checked)
+        .bind(&result.message)
+        .bind(key_id)
+        .execute(&state.pool)
+        .await?;
+    } else {
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_test_at = ?, last_test_ok = 0, last_test_latency_ms = ?, \
+                 last_test_checked = ?, last_test_message = ? \
+             WHERE id = ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(result.latency_ms)
+        .bind(&result.checked)
+        .bind(&result.message)
+        .bind(key_id)
+        .execute(&state.pool)
+        .await?;
+    }
     Ok(())
 }
 
@@ -2964,6 +3006,11 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             last_used_at: value.last_used_at,
             last_error_at: value.last_error_at,
             last_error: value.last_error,
+            last_test_at: value.last_test_at,
+            last_test_ok: value.last_test_ok.map(|value| value != 0),
+            last_test_latency_ms: value.last_test_latency_ms,
+            last_test_checked: value.last_test_checked,
+            last_test_message: value.last_test_message,
             requests: 0,
             success_rate: 0.0,
             avg_latency_ms: 0.0,
@@ -4167,6 +4214,14 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_error_at = '2026-01-01T00:00:00Z', last_error = 'stale unauthorized' \
+             WHERE id = 12",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
         state.provider_key_cooldown.lock().await.insert(
             11,
             std::time::Instant::now() + std::time::Duration::from_secs(60),
@@ -4194,6 +4249,32 @@ mod tests {
             &["Bearer sk-bad".to_string(), "Bearer sk-good".to_string()]
         );
         assert!(state.provider_key_cooldown.lock().await.contains_key(&11));
+        let failed: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT last_test_ok, last_test_checked, last_test_message \
+             FROM provider_api_keys WHERE id = 11",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(failed.0, Some(0));
+        assert_eq!(failed.1.as_deref(), Some("inference"));
+        assert!(failed.2.unwrap().contains("401"));
+        let recovered: (Option<i64>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as(
+                "SELECT last_test_ok, last_test_checked, last_test_message, last_error \
+                 FROM provider_api_keys WHERE id = 12",
+            )
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(recovered.0, Some(1));
+        assert_eq!(recovered.1.as_deref(), Some("inference"));
+        assert!(recovered.2.is_some());
+        assert_eq!(recovered.3, None);
+        let provider = get_provider(&state, 1).await.unwrap();
+        assert_eq!(provider.api_keys[0].last_test_ok, Some(false));
+        assert_eq!(provider.api_keys[1].last_test_ok, Some(true));
+        assert!(provider.api_keys[1].last_test_at.is_some());
         server.abort();
     }
 

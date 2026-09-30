@@ -522,21 +522,36 @@ export default function Providers() {
                 }
                 const enabled = keys.filter((key) => key.enabled).length
                 const cooling = keys.filter((key) => key.cooldown_seconds).length
+                const failedTests = keys.filter(
+                  (key) => key.enabled && key.last_test_ok === false,
+                ).length
                 const detail = keys.map((key) => (
                   <div key={key.id}>
                     {key.name || `Key ${key.id}`} · {key.api_key_suffix || '****'} ·{' '}
                     {key.enabled ? '启用' : '停用'}
                     {key.cooldown_seconds ? ` · 冷却 ${key.cooldown_seconds}s` : ''}
+                    {key.last_test_ok != null
+                      ? ` · 检测${key.last_test_ok ? '正常' : '异常'} ${key.last_test_latency_ms ?? 0} ms`
+                      : ''}
                     {key.requests > 0
                       ? ` · ${key.requests} 次 · ${key.success_rate.toFixed(1)}% · ${Math.round(key.avg_latency_ms)} ms · 输入 ${formatCompact(key.prompt_tokens)} / 输出 ${formatCompact(key.completion_tokens)}`
                       : ' · 暂无请求'}
+                    {key.last_test_ok === false && key.last_test_message
+                      ? ` · ${key.last_test_message}`
+                      : ''}
                     {key.last_error ? ` · ${key.last_error}` : ''}
                   </div>
                 ))
                 return (
                   <Tooltip title={<div>{detail}</div>}>
-                    <Tag color={cooling ? 'orange' : enabled ? 'green' : 'default'}>
-                      {enabled}/{keys.length} 个可用{cooling ? ` · ${cooling} 冷却` : ''}
+                    <Tag
+                      color={
+                        failedTests ? 'red' : cooling ? 'orange' : enabled ? 'green' : 'default'
+                      }
+                    >
+                      {enabled}/{keys.length} 个可用
+                      {failedTests ? ` · ${failedTests} 检测异常` : ''}
+                      {cooling ? ` · ${cooling} 冷却` : ''}
                     </Tag>
                   </Tooltip>
                 )
