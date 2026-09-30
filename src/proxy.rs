@@ -4336,19 +4336,54 @@ impl UsageParser {
             self.output_chars += text.chars().count();
             push_preview_text(&mut self.text, text);
         }
-        // Responses API streams `response.output_text.delta` events whose text
-        // lives in a top-level `delta` string rather than a choices array.
-        if value
+        for path in [
+            "/choices/0/delta/reasoning_content",
+            "/choices/0/delta/reasoning",
+        ] {
+            if let Some(delta) = value.pointer(path).and_then(Value::as_str)
+                && !delta.is_empty()
+            {
+                self.mark_first_token();
+                self.output_chars += delta.chars().count();
+            }
+        }
+        if let Some(tool_calls) = value
+            .pointer("/choices/0/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for call in tool_calls {
+                if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                    && !arguments.is_empty()
+                {
+                    self.mark_first_token();
+                    self.output_chars += arguments.chars().count();
+                }
+            }
+        }
+        if let Some(arguments) = value
+            .pointer("/choices/0/delta/function_call/arguments")
+            .and_then(Value::as_str)
+            && !arguments.is_empty()
+        {
+            self.mark_first_token();
+            self.output_chars += arguments.chars().count();
+        }
+        // Responses API emits several output delta families: visible text,
+        // reasoning summaries, and function-call arguments. Tool-only turns
+        // still produce tokens, so any non-empty `response.*.delta` starts the
+        // first-token clock.
+        if let Some(kind) = value
             .get("type")
             .and_then(Value::as_str)
-            .is_some_and(|kind| kind == "response.output_text.delta")
+            .filter(|kind| kind.starts_with("response.") && kind.ends_with(".delta"))
             && let Some(delta) = value.get("delta").and_then(Value::as_str)
+            && !delta.is_empty()
         {
-            if !delta.is_empty() {
-                self.mark_first_token();
-            }
+            self.mark_first_token();
             self.output_chars += delta.chars().count();
-            push_preview_text(&mut self.text, delta);
+            if kind == "response.output_text.delta" {
+                push_preview_text(&mut self.text, delta);
+            }
         }
     }
 }
@@ -7453,6 +7488,7 @@ mod tests {
         let mut parser = UsageParser::new(Instant::now());
         parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello \"}\n\n");
         parser.push(b"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"world\"}\n\n");
+        assert!(parser.first_token_ms.is_some());
         let usage = parser
             .finish()
             .expect("estimated usage should be produced from streamed text");
@@ -7460,6 +7496,30 @@ mod tests {
             usage.completion_tokens > 0,
             "estimated completion tokens should be non-zero"
         );
+    }
+
+    #[test]
+    fn stream_parser_times_tool_call_and_reasoning_output() {
+        let mut parser = UsageParser::new(Instant::now());
+        parser.push(b"data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"thinking\"}\n\n");
+        let first = parser
+            .first_token_ms
+            .expect("reasoning output should start the first-token clock");
+        parser.push(b"data: {\"type\":\"response.function_call_arguments.delta\",\"delta\":\"{\\\"path\\\":\"}\n\n");
+        assert_eq!(parser.first_token_ms, Some(first));
+
+        let mut chat = UsageParser::new(Instant::now());
+        chat.push(
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"arguments\":\"{\\\"city\\\":\"}}]}}]}\n\n",
+        );
+        assert!(
+            chat.first_token_ms.is_some(),
+            "tool-call argument deltas should count as output"
+        );
+        let usage = chat
+            .finish()
+            .expect("tool-call arguments should produce an estimate");
+        assert!(usage.completion_tokens > 0);
     }
 
     #[test]

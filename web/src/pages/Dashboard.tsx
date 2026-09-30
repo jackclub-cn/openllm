@@ -146,7 +146,7 @@ export default function Dashboard() {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="平均延迟"
+            label="平均总用时"
             value={data.range_avg_latency_ms}
             precision={0}
             suffix="ms"
@@ -249,7 +249,7 @@ export default function Dashboard() {
                       ),
                   },
                   {
-                    title: '延迟',
+                    title: '平均总用时',
                     dataIndex: 'avg_latency_ms',
                     width: 90,
                     render: (value: number, record) =>
@@ -300,9 +300,20 @@ export default function Dashboard() {
                     ),
                 },
                 {
-                  title: '令牌',
-                  dataIndex: 'total_tokens',
-                  width: 90,
+                  title: '输入',
+                  dataIndex: 'prompt_tokens',
+                  width: 80,
+                  render: (value: number, record) =>
+                    record.in_flight ? (
+                      <Typography.Text type="secondary">-</Typography.Text>
+                    ) : (
+                      <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+                    ),
+                },
+                {
+                  title: '输出',
+                  dataIndex: 'completion_tokens',
+                  width: 80,
                   render: (value: number, record) =>
                     record.in_flight ? (
                       <Typography.Text type="secondary">-</Typography.Text>
@@ -322,7 +333,7 @@ export default function Dashboard() {
                     ),
                 },
                 {
-                  title: '延迟',
+                  title: '总用时',
                   dataIndex: 'latency_ms',
                   width: 100,
                   render: (value: number, record) =>
@@ -438,7 +449,7 @@ export default function Dashboard() {
               ),
             },
             {
-              title: '平均延迟',
+              title: '平均总用时',
               dataIndex: 'avg_latency_ms',
               width: 120,
               sorter: (a, b) => a.avg_latency_ms - b.avg_latency_ms,

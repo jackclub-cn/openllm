@@ -275,7 +275,7 @@ export default function Usage() {
     <>
       <PageHeader
         title="请求日志"
-        description="查询每一次模型调用、令牌用量、延迟与错误"
+        description="查询每一次模型调用、令牌用量、总用时与错误"
         extra={
           <>
             {autoRefresh.lastUpdated && (
@@ -415,7 +415,7 @@ export default function Usage() {
           rowKey="id"
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1680 }}
+          scroll={{ x: 1760 }}
           onRow={(record) => ({
             onClick: () => void openDetail(record),
             style: { cursor: 'pointer' },
@@ -471,9 +471,10 @@ export default function Usage() {
                 ),
             },
             {
-              title: '令牌',
-              width: 150,
-              render: (_, record) => {
+              title: '输入 tokens',
+              dataIndex: 'prompt_tokens',
+              width: 120,
+              render: (value: number, record) => {
                 if (record.in_flight) {
                   return <Typography.Text type="secondary">-</Typography.Text>
                 }
@@ -481,9 +482,9 @@ export default function Usage() {
                 return (
                   <div>
                     <Tooltip
-                      title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)}`}
+                      title={`输入 ${formatExact(value)} / 总 tokens ${formatExact(record.total_tokens)}`}
                     >
-                      <span>{formatCompact(record.total_tokens)}</span>
+                      <span>{formatCompact(value)}</span>
                     </Tooltip>
                     {cached > 0 && (
                       <div>
@@ -501,7 +502,18 @@ export default function Usage() {
               },
             },
             {
-              title: '延迟',
+              title: '输出 tokens',
+              dataIndex: 'completion_tokens',
+              width: 110,
+              render: (value: number, record) =>
+                record.in_flight ? (
+                  <Typography.Text type="secondary">-</Typography.Text>
+                ) : (
+                  <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+                ),
+            },
+            {
+              title: '总用时',
               dataIndex: 'latency_ms',
               width: 100,
               render: (value: number, record) =>
@@ -654,10 +666,10 @@ export default function Usage() {
               <Descriptions.Item label="流式">
                 <Tag>{detail.streamed ? '是' : '否'}</Tag>
               </Descriptions.Item>
-              <Descriptions.Item label="延迟">
+              <Descriptions.Item label="总用时">
                 {detail.latency_ms} ms
               </Descriptions.Item>
-              <Descriptions.Item label="首 token 延迟">
+              <Descriptions.Item label="首 token 用时">
                 {detail.first_token_ms != null ? `${detail.first_token_ms} ms` : '-'}
               </Descriptions.Item>
               <Descriptions.Item label="生成速度 (TPS)">
