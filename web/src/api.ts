@@ -345,6 +345,11 @@ export type Overview = {
   healthy_providers: number
   failed_providers: number
   untested_providers: number
+  provider_keys_total: number
+  healthy_provider_keys: number
+  failed_provider_keys: number
+  untested_provider_keys: number
+  runtime_error_provider_keys: number
   cooling_provider_keys: number
   in_flight_requests: number
   recent_requests: UsageLog[]

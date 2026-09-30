@@ -2451,6 +2451,25 @@ pub async fn overview(
         )
         .fetch_one(&state.pool)
         .await?;
+    let (
+        provider_keys_total,
+        healthy_provider_keys,
+        failed_provider_keys,
+        untested_provider_keys,
+        runtime_error_provider_keys,
+    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        "SELECT \
+            COUNT(*), \
+            COALESCE(SUM(CASE WHEN k.last_test_ok = 1 THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN k.last_test_ok = 0 THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN k.last_test_ok IS NULL THEN 1 ELSE 0 END), 0), \
+            COALESCE(SUM(CASE WHEN k.last_error IS NOT NULL THEN 1 ELSE 0 END), 0) \
+         FROM provider_api_keys k \
+         JOIN providers p ON p.id = k.provider_id \
+         WHERE p.enabled = 1 AND k.enabled = 1",
+    )
+    .fetch_one(&state.pool)
+    .await?;
     let in_flight_requests: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
             .fetch_one(&state.pool)
@@ -2617,6 +2636,11 @@ pub async fn overview(
         healthy_providers,
         failed_providers,
         untested_providers,
+        provider_keys_total,
+        healthy_provider_keys,
+        failed_provider_keys,
+        untested_provider_keys,
+        runtime_error_provider_keys,
         cooling_provider_keys,
         in_flight_requests,
         recent_requests: recent.into_iter().map(Into::into).collect(),
@@ -5037,6 +5061,18 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (
+                provider_id, name, secret, enabled, last_test_ok, last_error
+             ) VALUES
+                (1, 'Healthy', 'sk-healthy', 1, 1, NULL),
+                (2, 'Failed', 'sk-failed', 1, 0, 'upstream 401'),
+                (3, 'Untested', 'sk-untested', 1, NULL, NULL),
+                (4, 'Disabled provider', 'sk-disabled-provider', 1, 1, NULL)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let state = AppState::new(pool, None);
         state.provider_key_cooldown.lock().await.insert(
@@ -5073,6 +5109,11 @@ mod tests {
         assert_eq!(view.healthy_providers, 1);
         assert_eq!(view.failed_providers, 1);
         assert_eq!(view.untested_providers, 1);
+        assert_eq!(view.provider_keys_total, 3);
+        assert_eq!(view.healthy_provider_keys, 1);
+        assert_eq!(view.failed_provider_keys, 1);
+        assert_eq!(view.untested_provider_keys, 1);
+        assert_eq!(view.runtime_error_provider_keys, 1);
         assert_eq!(view.cooling_provider_keys, 1);
         assert_eq!(view.in_flight_requests, 1);
         assert_eq!(

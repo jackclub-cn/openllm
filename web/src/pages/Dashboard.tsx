@@ -416,6 +416,26 @@ export default function Dashboard() {
                   <strong>{data.untested_providers}</strong>
                 </div>
               </div>
+              <div>
+                <Typography.Text type="secondary">上游密钥健康</Typography.Text>
+                <div className="stat-line">
+                  {data.provider_keys_total > 0 ? (
+                    <>
+                      正常 <strong>{data.healthy_provider_keys}</strong> · 异常{' '}
+                      <strong>{data.failed_provider_keys}</strong> · 未检测{' '}
+                      <strong>{data.untested_provider_keys}</strong>
+                      {data.runtime_error_provider_keys > 0 && (
+                        <>
+                          {' '}· 运行错误{' '}
+                          <strong>{data.runtime_error_provider_keys}</strong>
+                        </>
+                      )}
+                    </>
+                  ) : (
+                    '未配置'
+                  )}
+                </div>
+              </div>
               {data.cooling_provider_keys > 0 && (
                 <div>
                   <Typography.Text type="secondary">冷却中的上游密钥</Typography.Text>
