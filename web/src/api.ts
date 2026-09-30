@@ -279,11 +279,15 @@ export type UsageLog = {
 export type Overview = {
   requests_today: number
   tokens_today: number
+  prompt_tokens_today: number
+  completion_tokens_today: number
   cache_read_today: number
   cache_write_today: number
   cache_hit_rate: number
   requests_total: number
   tokens_total: number
+  prompt_tokens_total: number
+  completion_tokens_total: number
   cache_read_total: number
   cache_write_total: number
   cost_today_micros: number
@@ -292,6 +296,8 @@ export type Overview = {
   unpriced_total: number
   range_requests: number
   range_tokens: number
+  range_prompt_tokens: number
+  range_completion_tokens: number
   range_cache_read: number
   range_cache_write: number
   range_cache_hit_rate: number
@@ -309,6 +315,8 @@ export type Overview = {
     provider_name: string
     requests: number
     tokens: number
+    prompt_tokens: number
+    completion_tokens: number
     cost_micros?: number | null
     success_rate: number
     avg_latency_ms: number
@@ -317,11 +325,19 @@ export type Overview = {
     model: string
     requests: number
     tokens: number
+    prompt_tokens: number
+    completion_tokens: number
     cost_micros?: number | null
     success_rate: number
     avg_latency_ms: number
   }>
-  daily_usage: Array<{ day: string; requests: number; tokens: number }>
+  daily_usage: Array<{
+    day: string
+    requests: number
+    tokens: number
+    prompt_tokens: number
+    completion_tokens: number
+  }>
 }
 
 export type Settings = {

@@ -14,6 +14,7 @@ type Props = {
   compact?: boolean
   icon: ReactNode
   tone: 'blue' | 'cyan' | 'green' | 'orange' | 'purple'
+  hint?: ReactNode
 }
 
 export default function MetricCard({
@@ -24,6 +25,7 @@ export default function MetricCard({
   compact,
   icon,
   tone,
+  hint,
 }: Props) {
   // A compact card renders pre-formatted text, so Statistic's own precision and
   // suffix handling must step aside.
@@ -42,6 +44,11 @@ export default function MetricCard({
           </Tooltip>
         ) : (
           <Statistic value={value} suffix={suffix} precision={precision} />
+        )}
+        {hint && (
+          <Typography.Text type="secondary" className="metric-hint">
+            {hint}
+          </Typography.Text>
         )}
       </div>
     </Card>

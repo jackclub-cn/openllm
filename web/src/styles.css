@@ -173,6 +173,13 @@ body {
   font-weight: 650;
 }
 
+.metric-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 18px;
+}
+
 .full-height-card {
   height: 100%;
 }

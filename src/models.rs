@@ -990,12 +990,16 @@ pub struct OverviewQuery {
 pub struct Overview {
     pub requests_today: i64,
     pub tokens_today: i64,
+    pub prompt_tokens_today: i64,
+    pub completion_tokens_today: i64,
     /// Prompt tokens served from cache today, and the resulting hit ratio.
     pub cache_read_today: i64,
     pub cache_write_today: i64,
     pub cache_hit_rate: f64,
     pub requests_total: i64,
     pub tokens_total: i64,
+    pub prompt_tokens_total: i64,
+    pub completion_tokens_total: i64,
     pub cache_read_total: i64,
     pub cache_write_total: i64,
     pub cost_today_micros: i64,
@@ -1004,6 +1008,8 @@ pub struct Overview {
     pub unpriced_total: i64,
     pub range_requests: i64,
     pub range_tokens: i64,
+    pub range_prompt_tokens: i64,
+    pub range_completion_tokens: i64,
     pub range_cache_read: i64,
     pub range_cache_write: i64,
     pub range_cache_hit_rate: f64,
@@ -1027,6 +1033,8 @@ pub struct ProviderUsage {
     pub provider_name: String,
     pub requests: i64,
     pub tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
     pub cost_micros: Option<i64>,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
@@ -1037,6 +1045,8 @@ pub struct ModelUsage {
     pub model: String,
     pub requests: i64,
     pub tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
     pub cost_micros: Option<i64>,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
@@ -1047,6 +1057,8 @@ pub struct DailyUsage {
     pub day: String,
     pub requests: i64,
     pub tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
 }
 
 #[derive(Debug, Serialize)]

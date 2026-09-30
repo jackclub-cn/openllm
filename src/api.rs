@@ -2188,6 +2188,8 @@ pub async fn overview(
         SELECT
             COUNT(*) AS requests_total,
             COALESCE(SUM(total_tokens), 0) AS tokens_total,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens_total,
+            COALESCE(SUM(completion_tokens), 0) AS completion_tokens_total,
             COALESCE(SUM(prompt_tokens), 0) AS prompt_total,
             COALESCE(SUM(cache_read_tokens), 0) AS cache_read_total,
             COALESCE(SUM(cache_write_tokens), 0) AS cache_write_total,
@@ -2207,6 +2209,8 @@ pub async fn overview(
         SELECT
             COUNT(*) AS requests,
             COALESCE(SUM(total_tokens), 0) AS tokens,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+            COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
             COALESCE(SUM(prompt_tokens), 0) AS prompt,
             COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
             COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
@@ -2226,6 +2230,8 @@ pub async fn overview(
     let today = sqlx::query(
         r#"
         SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                COALESCE(SUM(prompt_tokens), 0) AS prompt,
                COALESCE(SUM(cache_read_tokens), 0) AS cache_read,
                COALESCE(SUM(cache_write_tokens), 0) AS cache_write,
@@ -2280,6 +2286,8 @@ pub async fn overview(
         SELECT p.id AS provider_id, p.name AS provider_name,
                COUNT(u.id) AS requests,
                COALESCE(SUM(u.total_tokens), 0) AS tokens,
+               COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
                SUM(u.estimated_cost_micros) AS cost_micros,
                COALESCE(AVG(CASE WHEN u.success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(u.latency_ms), 0.0) AS avg_latency_ms
@@ -2300,7 +2308,9 @@ pub async fn overview(
         r#"
         SELECT date(datetime(created_at), ? || ' minutes') AS day,
                COUNT(*) AS requests,
-               COALESCE(SUM(total_tokens), 0) AS tokens
+               COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens
         FROM usage_logs
         WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         GROUP BY date(datetime(created_at), ? || ' minutes')
@@ -2331,6 +2341,8 @@ pub async fn overview(
             day,
             requests: existing.map_or(0, |row| row.requests),
             tokens: existing.map_or(0, |row| row.tokens),
+            prompt_tokens: existing.map_or(0, |row| row.prompt_tokens),
+            completion_tokens: existing.map_or(0, |row| row.completion_tokens),
         });
     }
 
@@ -2339,6 +2351,8 @@ pub async fn overview(
         SELECT requested_model AS model,
                COUNT(*) AS requests,
                COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
                SUM(estimated_cost_micros) AS cost_micros,
                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
                COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
@@ -2357,11 +2371,15 @@ pub async fn overview(
     Ok(Json(Overview {
         requests_today: today.get("requests"),
         tokens_today: today.get("tokens"),
+        prompt_tokens_today: today.get("prompt_tokens"),
+        completion_tokens_today: today.get("completion_tokens"),
         cache_read_today: today.get("cache_read"),
         cache_write_today: today.get("cache_write"),
         cache_hit_rate: cache_hit_rate(today.get("prompt"), today.get("cache_read")),
         requests_total: totals.get("requests_total"),
         tokens_total: totals.get("tokens_total"),
+        prompt_tokens_total: totals.get("prompt_tokens_total"),
+        completion_tokens_total: totals.get("completion_tokens_total"),
         cache_read_total: totals.get("cache_read_total"),
         cache_write_total: totals.get("cache_write_total"),
         cost_today_micros: today.get("cost_micros"),
@@ -2370,6 +2388,8 @@ pub async fn overview(
         unpriced_total: totals.get("unpriced_total"),
         range_requests: range_totals.get("requests"),
         range_tokens: range_totals.get("tokens"),
+        range_prompt_tokens: range_totals.get("prompt_tokens"),
+        range_completion_tokens: range_totals.get("completion_tokens"),
         range_cache_read: range_totals.get("cache_read"),
         range_cache_write: range_totals.get("cache_write"),
         range_cache_hit_rate: cache_hit_rate(
@@ -4263,21 +4283,22 @@ mod tests {
         let old = (Utc::now() - Duration::days(20)).to_rfc3339();
         let recent = (Utc::now() - Duration::days(1)).to_rfc3339();
         let today = Utc::now().to_rfc3339();
-        for (request_id, tokens, cache_read, latency_ms, success, created_at) in [
-            ("old", 900_i64, 0_i64, 500_i64, 1_i64, old),
-            ("recent", 100, 20, 100, 1, recent),
-            ("today", 50, 0, 300, 0, today),
+        for (request_id, prompt, completion, cache_read, latency_ms, success, created_at) in [
+            ("old", 700_i64, 200_i64, 0_i64, 500_i64, 1_i64, old),
+            ("recent", 60, 40, 20, 100, 1, recent),
+            ("today", 50, 0, 0, 300, 0, today),
         ] {
             sqlx::query(
                 "INSERT INTO usage_logs (
                     request_id, requested_model, endpoint, prompt_tokens,
-                    total_tokens, cache_read_tokens, latency_ms, status_code,
-                    success, created_at
-                 ) VALUES (?, 'test-model', '/v1/chat/completions', ?, ?, ?, ?, 200, ?, ?)",
+                    completion_tokens, total_tokens, cache_read_tokens, latency_ms,
+                    status_code, success, created_at
+                 ) VALUES (?, 'test-model', '/v1/chat/completions', ?, ?, ?, ?, ?, 200, ?, ?)",
             )
             .bind(request_id)
-            .bind(tokens)
-            .bind(tokens)
+            .bind(prompt)
+            .bind(completion)
+            .bind(prompt + completion)
             .bind(cache_read)
             .bind(latency_ms)
             .bind(success)
@@ -4315,8 +4336,14 @@ mod tests {
 
         assert_eq!(view.requests_today, 1);
         assert_eq!(view.requests_total, 3);
+        assert_eq!(view.prompt_tokens_today, 50);
+        assert_eq!(view.completion_tokens_today, 0);
+        assert_eq!(view.prompt_tokens_total, 810);
+        assert_eq!(view.completion_tokens_total, 240);
         assert_eq!(view.range_requests, 2);
         assert_eq!(view.range_tokens, 150);
+        assert_eq!(view.range_prompt_tokens, 110);
+        assert_eq!(view.range_completion_tokens, 40);
         assert_eq!(view.range_cache_read, 20);
         assert_eq!(view.range_success_rate, 50.0);
         assert_eq!(view.range_avg_latency_ms, 200.0);
@@ -4329,6 +4356,8 @@ mod tests {
         );
         assert_eq!(view.model_usage[0].requests, 2);
         assert_eq!(view.model_usage[0].tokens, 150);
+        assert_eq!(view.model_usage[0].prompt_tokens, 110);
+        assert_eq!(view.model_usage[0].completion_tokens, 40);
     }
 
     #[tokio::test]

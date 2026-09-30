@@ -139,7 +139,14 @@ export default function Dashboard() {
           <MetricCard label="请求" value={data.range_requests} icon={<ThunderboltOutlined />} tone="blue" />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="令牌" value={data.range_tokens} compact icon={<ApiOutlined />} tone="cyan" />
+          <MetricCard
+            label="总 tokens"
+            value={data.range_tokens}
+            compact
+            icon={<ApiOutlined />}
+            tone="cyan"
+            hint={`输入 ${formatCompact(data.range_prompt_tokens)} · 输出 ${formatCompact(data.range_completion_tokens)}`}
+          />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard label="成功率" value={data.range_success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
@@ -229,6 +236,18 @@ export default function Dashboard() {
                     ellipsis: true,
                   },
                   { title: '请求', dataIndex: 'requests', width: 70 },
+                  {
+                    title: 'tokens',
+                    dataIndex: 'tokens',
+                    width: 82,
+                    render: (value: number, record) => (
+                      <Tooltip
+                        title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)}`}
+                      >
+                        <span>{formatCompact(value)}</span>
+                      </Tooltip>
+                    ),
+                  },
                   {
                     title: '费用',
                     dataIndex: 'cost_micros',
@@ -369,10 +388,18 @@ export default function Dashboard() {
                 <div className="stat-line"><strong>{data.requests_total}</strong> 次</div>
               </div>
               <div>
-                <Typography.Text type="secondary">累计令牌</Typography.Text>
+                <Typography.Text type="secondary">累计输入 tokens</Typography.Text>
                 <div className="stat-line">
-                  <Tooltip title={formatExact(data.tokens_total)}>
-                    <strong>{formatCompact(data.tokens_total)}</strong>
+                  <Tooltip title={formatExact(data.prompt_tokens_total)}>
+                    <strong>{formatCompact(data.prompt_tokens_total)}</strong>
+                  </Tooltip>
+                </div>
+              </div>
+              <div>
+                <Typography.Text type="secondary">累计输出 tokens</Typography.Text>
+                <div className="stat-line">
+                  <Tooltip title={formatExact(data.completion_tokens_total)}>
+                    <strong>{formatCompact(data.completion_tokens_total)}</strong>
                   </Tooltip>
                 </div>
               </div>
@@ -413,7 +440,7 @@ export default function Dashboard() {
           pagination={false}
           dataSource={data.model_usage}
           locale={{ emptyText: '暂无模型用量' }}
-          scroll={{ x: 720 }}
+          scroll={{ x: 900 }}
           columns={[
             {
               title: '模型',
@@ -422,10 +449,19 @@ export default function Dashboard() {
             },
             { title: '请求数', dataIndex: 'requests', width: 100 },
             {
-              title: '令牌',
-              dataIndex: 'tokens',
+              title: '输入 tokens',
+              dataIndex: 'prompt_tokens',
               width: 120,
-              sorter: (a, b) => a.tokens - b.tokens,
+              sorter: (a, b) => a.prompt_tokens - b.prompt_tokens,
+              render: (value: number) => (
+                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+              ),
+            },
+            {
+              title: '输出 tokens',
+              dataIndex: 'completion_tokens',
+              width: 120,
+              sorter: (a, b) => a.completion_tokens - b.completion_tokens,
               render: (value: number) => (
                 <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
               ),
