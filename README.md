@@ -1,71 +1,77 @@
 # OpenLLM Gateway
 
-一个自托管的 LLM 网关，后端使用 Rust + Axum，管理界面使用 React + Ant Design，数据保存在 SQLite，前端静态资源会嵌入最终可执行文件。
+OpenLLM Gateway 是一个自托管的 LLM 网关，提供多提供商聚合、模型路由、访问密钥、OpenAI 与 Anthropic 协议兼容、用量统计和管理控制台。后端使用 Rust + Axum，数据保存在 SQLite，前端资源会嵌入单个可执行文件。
 
-## 功能
-
-- 添加 OpenAI 兼容、Anthropic、Ollama 和自定义上游提供商。
-- 提供商密钥支持留空保留、输入新值覆盖，也可在编辑表单中显式清除已保存的密钥。
-- 每个提供商可配置多把上游密钥，凭证提示会显示每把密钥的启用状态、冷却剩余时间、请求数、成功率、平均总用时及输入/输出 token 消耗；替换密钥值时会清空旧密钥遗留的错误与检测状态。
-- 可从 OpenAI `/models`、Anthropic `/v1/models` 或 Ollama `/api/tags` 同步提供商模型。
-- 同步前可预览新增、移除、保留的模型，以及上下文、输出上限、支持接口、价格和显示名等元数据变更，确认后再覆盖本地模型列表，并支持可配置的定时模型同步。
-- 提供商列表保留最近一次连接测试结果，支持一键并发测试、全部密钥批量检测、逐密钥诊断和可配置的定时健康检查；逐密钥结果会持久化，定时检查也会更新实际探测过的密钥状态，检测成功或后续真实请求成功的密钥会清除历史错误标记；可为每个提供商指定健康检查模型，留空时自动使用第一个已启用模型；模型仅支持 `/responses` 时检测会自动改走该接口，并显示状态、耗时、检测时间和错误摘要。
-- 路由会优先使用最近检测正常或尚未检测的目标，把明确异常的目标排到最后；仅当其他目标都失败时才继续尝试它们。
-- 路由会读取模型同步或手动覆盖的 `supported_endpoints`，自动跳过不支持当前接口的上游目标；路由列表会显示每个目标的有效接口，避免目标被静默跳过。
-- 路由页面内置诊断工具，可按模型和接口查看匹配到显式路由、模型前缀还是直接模型，并列出每个候选目标被选中的依据或跳过原因；请求详情可一键携带原模型和接口跳转诊断。
-- 模型管理支持搜索、状态筛选、分页，以及按当前结果批量启用、停用或清除覆盖；列表会显示同步到的支持接口，也可单独覆盖支持接口、上下文、输入、输出上限和输入/输出/缓存单价，设置值在重新同步后仍保留，并作用于 `/v1/models`、路由筛选、费用统计和每日费用限额。
-- 可为提供商设置 `vendor/` 形式的模型前缀，直接用 `vendor/model` 调用而不必先建路由。
-- 按模型通配符创建路由，例如 `gpt-*`、`claude-*` 或 `*`。
-- 每个路由可配置多个上游目标，支持优先级、加权随机和轮询策略。
-- 上游失败时按候选顺序自动切换，并记录最终结果。
-- 提供 OpenAI 兼容的 `/v1/models`、模型详情 `/v1/models/{model}`、`/v1/chat/completions`、`/v1/completions`、`/v1/embeddings` 和 `/v1/responses` 接口。
-- 每次 OpenAI 对话、响应、向量调用以及 Anthropic Messages 调用都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可直接与请求日志中的记录关联。
-- 上游不识别 `tool_search` 工具时，网关会记录提供商兼容状态并自动移除后重试；该兼容逻辑覆盖 OpenAI 的 Responses 和 Chat Completions 转发，后续请求直接按兼容模式发送，也可在提供商编辑页重新启用。
-- 支持流式响应转发；Anthropic 流会转换为 OpenAI SSE 格式。
-- 控制台通过 SSE 实时获取新请求事件，日志与仪表盘自动刷新。
-- 控制台内置模型调试台，可直接验证路由、鉴权与流式输出。
-- 控制台按页面懒加载，图表、页面代码与常用依赖分包，减少非当前页面的下载量。
-- 使用网关 API Key 鉴权，密钥只保存 SHA-256 摘要，支持可选到期时间、每日 token/费用上限、每分钟请求上限、最大并发数，以及不改变限额、权限、到期时间的一键轮换。
-- 请求发往上游前会按路由有效上下文窗口做输入预检，明确超限时返回 400 并记录零费用日志。
-- 访问密钥列表汇总每个密钥的请求数、输入/输出 token、预估费用、今日限额进度及当前分钟/并发占用，并支持按名称、密钥尾号或模型权限搜索、按状态筛选和分页；每把密钥可配置每日总 token、费用、每分钟请求数、最大并发数及模型通配符权限；`/v1/models` 会按当前密钥权限过滤模型，调用和 token 计数也会统一校验模型权限。
-- 记录请求、模型、提供商、路由、输入/输出 token、缓存、预估费用、总用时、状态码和错误；首页支持日期筛选，按选定区间汇总请求、输入/输出 token、缓存、费用、成功率和总用时，并按提供商、模型和日期拆分，同时显示提供商与上游密钥健康汇总、冷却密钥数、当前请求数和全量累计数据。
-- 请求日志会在请求开始后立即写入“请求中”占位记录，并显示当前尝试或最后失败的上游目标，完成后更新最终结果；路由预检失败也会记录原因。流式请求每 30 秒刷新活动时间，中断记录在 15 分钟无活动后自动收尾，服务重启时也会清理遗留记录。支持筛选请求中、成功和失败状态，日志可按模型、接口、提供商、访问密钥和日期过滤，并导出当前筛选结果的 CSV，包含输入/输出 token、缓存、费用、总用时、TPS 和错误信息。
-- 提供商列表支持按名称、地址、模型或密钥搜索，并可按启用状态、提供商健康和密钥异常筛选，列表分页展示；仪表盘健康数字可直接跳转到对应筛选结果。
-- 路由列表支持按路由名、模型规则、上游提供商或上游模型搜索，并可按启用状态和分发策略筛选，列表分页展示。
-- 提供仪表盘、提供商、路由、访问密钥和请求日志管理界面。
-- SQLite 自动创建与迁移，Release 构建生成单个可执行文件。
-- 设置页支持下载 SQLite 在线一致性备份，不需要停服或直接复制 WAL 文件，并显示数据库文件位置、占用空间、可回收空间及各主要数据表记录数。
+[![Release](https://img.shields.io/github/v/release/jackclub-cn/openllm)](https://github.com/jackclub-cn/openllm/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ## 快速开始
 
-直接运行已构建的 Windows 单文件版本：
+从 GitHub Releases 下载对应平台的二进制文件：
+
+**下载地址：<https://github.com/jackclub-cn/openllm/releases>**
+
+Release 目前提供：
+
+- `openllm-windows.exe`：Windows x86_64
+- `openllm-linux`：Linux x86_64
+- `openllm-macos`：macOS
+
+每个文件都附带对应的 `.sha256` 校验文件。下载后直接运行：
+
+Windows：
 
 ```powershell
-.\dist\openllm.exe
+.\openllm-windows.exe
 ```
 
-默认监听 `http://127.0.0.1:8080`，数据保存在 `data/openllm.db`。打开浏览器访问控制台，先添加提供商，可以勾选“保存后自动同步模型”，也可以稍后在提供商列表点击同步按钮。模型前缀可选填，例如 `openai/`。
+Linux 或 macOS：
 
-在提供商列表点击“模型管理”可以搜索模型、控制可用性，并在上游或 models.dev 的上限不准确时填写覆盖值。上限留空表示继续使用同步值。
+```bash
+chmod +x ./openllm-linux
+./openllm-linux
+```
 
-访问密钥可设置每日 token、每日费用、每分钟请求数和最大并发数。每日额度按 UTC 自然日统计，费用上限只统计已有价格数据的请求；每分钟请求数与并发数使用原子预留，在请求发往上游前检查，不会因并发突发同时穿透。被限额拒绝的请求会以 429、0 token、0 费用的记录写入请求日志，便于审计调用方行为。
+默认监听 `http://127.0.0.1:8080`，数据保存在当前目录的 `data/openllm.db`。打开浏览器访问控制台，先添加提供商，再同步模型、配置路由和访问密钥。
 
 ```powershell
-.\dist\openllm.exe --bind 0.0.0.0:8080 --data-dir D:\openllm-data
+.\openllm-windows.exe --bind 0.0.0.0:8080 --data-dir D:\openllm-data
 ```
 
-也可以设置环境变量：
+也可以使用环境变量：
 
 ```powershell
 $env:OPENLLM_BIND = "0.0.0.0:8080"
 $env:OPENLLM_DATA_DIR = "D:\openllm-data"
 $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
-.\dist\openllm.exe
+.\openllm-windows.exe
 ```
 
-如果不设置 `OPENLLM_ADMIN_TOKEN`，管理接口默认开放，适合本机使用。一旦设置该变量，启动参数仍然是命令行参数，环境变量已经生效。控制台“设置”页可保存管理令牌到浏览器。
+未设置 `OPENLLM_ADMIN_TOKEN` 时，管理接口默认开放，适合本机使用。对公网或局域网提供服务时，应设置该变量，并建议部署在反向代理或私网之后。
 
-## 调用示例
+## 核心能力
+
+- 聚合 OpenAI 兼容、Anthropic、Ollama 和自定义上游，支持提供商多密钥、优先级、加权随机、轮询和故障切换。
+- 从上游同步模型，并结合 models.dev 保存上下文、输出上限、接口、模态和价格等能力信息；支持手动覆盖并保留重新同步结果。
+- 通过显式路由或 `vendor/model` 前缀对外提供稳定的模型列表，多目标路由会按最严格的公共能力限制输入和输出预算。
+- 兼容 OpenAI `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings` 和 Anthropic Messages 协议。
+- 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
+- 记录请求、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出。
+
+## 使用说明
+
+预编译版本请从 [GitHub Releases](https://github.com/jackclub-cn/openllm/releases) 下载；从源码运行请先完成构建步骤。
+
+### 配置流程
+
+1. 在“提供商”页面添加上游并填写 API Key，完成后可立即测试连接。
+2. 同步模型或手动维护模型列表，在“模型管理”中检查上下文、输出上限、支持接口和价格。
+3. 创建路由，或为提供商填写 `vendor/` 前缀后直接通过 `vendor/model` 调用。
+4. 在“访问密钥”页面创建网关 API Key，按需设置模型权限、到期时间和调用限额。
+
+提供商可以配置多把上游密钥。列表会显示每把密钥的启用状态、冷却时间、请求数、成功率、平均总用时和输入/输出 Token；支持单密钥检测、全部密钥批量检测和定时健康检查。健康检查模型可以手动指定，留空时使用第一个已启用模型。
+
+### 调用 API
 
 创建访问密钥后，通过网关调用模型：
 
@@ -80,26 +86,30 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-只要创建过任意网关访问密钥，所有 `/v1` 请求都必须携带 `Authorization: Bearer sk-openllm-...`。没有创建任何密钥时，网关允许匿名调用，便于本地快速验证。密钥可以在“访问密钥”页随时启用或停用；停用后该密钥立即失效，但不会重新打开匿名访问。
+只要创建过任意网关访问密钥，所有 `/v1` 请求都必须携带 `Authorization: Bearer sk-openllm-...`。没有创建任何密钥时，网关允许匿名调用，便于本地快速验证。停用密钥后它会立即失效，但不会重新打开匿名访问。
 
-控制台“模型调试”页可以直接选择模型并发起流式对话，实时显示生成内容、总用时和输入/输出 token 用量。若已创建访问密钥，在该页填写网关 API Key 即可。
+控制台“模型调试”页可以直接选择模型并发起流式对话，实时显示生成内容、总用时和输入/输出 Token。若已创建访问密钥，在该页填写网关 API Key 即可。
 
-## 路由逻辑
+### 模型前缀与路由
 
 路由按以下顺序匹配：
 
 1. 显式路由中的精确模型名优先。
 2. 显式路由中的通配符模型名按长度从长到短匹配。
 3. 没有显式路由时，按提供商的 `model_prefix` 自动匹配已同步模型，例如 `openai/gpt-4.1`。
-4. 同一个路由内的上游按所选策略排序。
-5. `priority` 使用较小优先级值优先；`weighted` 按权重随机；`round_robin` 在每个网关进程内轮询。
+4. 同一路由内的上游按所选策略排序。
+5. `priority` 使用较小的优先级值优先；`weighted` 按权重随机；`round_robin` 在每个网关进程内轮询。
 6. 收到连接错误或 HTTP `408`、`409`、`425`、`429`、`5xx` 时尝试下一个上游。
 
-提供商模型名保存为上游原始名称。前缀只用于对外命名空间和自动路由，不会拼接到发送给上游的 `model` 字段。
+提供商模型名保存为上游原始名称。前缀只用于对外命名空间和自动路由，不会拼接到发送给上游的 `model` 字段。如果多个无前缀提供商暴露同名模型，网关会拒绝自动路由，此时请设置提供商前缀或创建显式路由。
 
-如果多个无前缀提供商暴露同名模型，网关会拒绝自动路由；此时请设置提供商前缀或创建显式路由。
+### 协议兼容
 
-Anthropic 上游目前用于转换 `/v1/chat/completions`，其他 OpenAI 兼容端点不向 Anthropic 目标转发。
+- OpenAI 与 Anthropic 请求都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可与请求日志关联。
+- Anthropic 上游目前用于转换 `/v1/chat/completions` 和 Anthropic Messages 请求，其他 OpenAI 兼容端点不向 Anthropic 目标转发。
+- 上游不支持 `tool_search` 时，网关会记录提供商兼容状态、移除该工具并自动重试。
+- 上游模型只支持 `/responses` 时，健康检查会自动走 Responses 接口。
+- 多目标路由会计算公共能力上限，并将超过共同输出上限的请求向下兼容到最严格目标允许的值。
 
 ## 从源码构建
 
@@ -109,7 +119,7 @@ Anthropic 上游目前用于转换 `/v1/chat/completions`，其他 OpenAI 兼容
 .\build.ps1
 ```
 
-Linux/macOS：
+Linux 或 macOS：
 
 ```bash
 chmod +x build.sh
@@ -119,7 +129,7 @@ chmod +x build.sh
 脚本会先构建 `web/dist`，再执行 `cargo build --release`，最后复制为：
 
 - Windows：`dist/openllm.exe`
-- Linux/macOS：`dist/openllm`
+- Linux 或 macOS：`dist/openllm`
 
 开发模式：
 
@@ -140,7 +150,25 @@ Vite 会把 `/api` 和 `/v1` 代理到 `127.0.0.1:8080`。
 ## 数据与安全
 
 - 上游 API Key 按原值保存在 SQLite，用于向提供商发起请求；网关访问密钥只保存 SHA-256 摘要。
-- 开启 `OPENLLM_ADMIN_TOKEN` 时，SSE 事件接口使用 `admin_token` 查询参数鉴权，因为浏览器 EventSource 不支持自定义请求头。
-- 生产环境应设置 `OPENLLM_ADMIN_TOKEN`，并建议放在反向代理或私网之后。
-- SQLite 默认启用 WAL 和 10 秒 busy timeout，适合单实例部署。多个网关实例不应同时写入同一个数据库文件。
+- 设置页支持在线一致性备份，不需要停服或直接复制 WAL 文件，并显示数据库文件位置、占用空间、可回收空间和各主要数据表记录数。
+- 日志保留策略支持自动清理历史请求记录。数据长期增长时，建议根据审计需求和磁盘容量设置合理的保留天数。
+- SQLite 默认启用 WAL、`synchronous=NORMAL` 和 busy timeout，适合单实例部署。多个网关实例不应同时写入同一个数据库文件。
+- 开启 `OPENLLM_ADMIN_TOKEN` 时，SSE 事件接口通过 `admin_token` 查询参数鉴权，因为浏览器 EventSource 不支持自定义请求头。
 - `data/`、`dist/`、`target/` 和 `web/node_modules/` 默认不纳入版本控制。
+
+## 发布流程
+
+GitHub Actions 会在分支推送和 Pull Request 中执行测试与构建。推送 `v*` 格式的标签时，会额外创建 GitHub Release，并上传 Linux、Windows 和 macOS 二进制及校验文件。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+发布后的文件会出现在 Releases 页面：
+
+<https://github.com/jackclub-cn/openllm/releases>
+
+## License
+
+MIT License，Copyright (c) 2026 jackclub-cn。完整条款见 [LICENSE](LICENSE)。

@@ -1,4 +1,4 @@
-name: Build
+name: Build and Release
 
 on:
   push:
@@ -24,15 +24,18 @@ jobs:
           - name: linux
             os: ubuntu-latest
             binary: target/release/openllm
-            output: openllm
+            output: openllm-linux
+            checksum: openllm-linux.sha256
           - name: windows
             os: windows-latest
             binary: target/release/openllm.exe
-            output: openllm.exe
+            output: openllm-windows.exe
+            checksum: openllm-windows.exe.sha256
           - name: macos
             os: macos-latest
             binary: target/release/openllm
-            output: openllm
+            output: openllm-macos
+            checksum: openllm-macos.sha256
 
     steps:
       - name: Check out source
@@ -68,13 +71,14 @@ jobs:
         env:
           BINARY: ${{ matrix.binary }}
           OUTPUT: ${{ matrix.output }}
+          CHECKSUM: ${{ matrix.checksum }}
         run: |
           mkdir -p artifact
           cp "$BINARY" "artifact/$OUTPUT"
           if command -v sha256sum >/dev/null 2>&1; then
-            (cd artifact && sha256sum "$OUTPUT" > SHA256SUMS)
+            (cd artifact && sha256sum "$OUTPUT" > "$CHECKSUM")
           else
-            (cd artifact && shasum -a 256 "$OUTPUT" > SHA256SUMS)
+            (cd artifact && shasum -a 256 "$OUTPUT" > "$CHECKSUM")
           fi
 
       - name: Prepare Windows artifact
@@ -83,11 +87,12 @@ jobs:
         env:
           BINARY: ${{ matrix.binary }}
           OUTPUT: ${{ matrix.output }}
+          CHECKSUM: ${{ matrix.checksum }}
         run: |
           New-Item -ItemType Directory -Force -Path artifact | Out-Null
           Copy-Item $env:BINARY (Join-Path artifact $env:OUTPUT)
           $hash = (Get-FileHash (Join-Path artifact $env:OUTPUT) -Algorithm SHA256).Hash.ToLower()
-          "$hash *$env:OUTPUT" | Set-Content artifact/SHA256SUMS
+          "$hash *$env:OUTPUT" | Set-Content (Join-Path artifact $env:CHECKSUM)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -96,3 +101,25 @@ jobs:
           path: artifact
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: release-assets/*
