@@ -3227,20 +3227,41 @@ async fn replace_provider_api_keys(
 
         if let Some(current) = current {
             retained.insert(current.id);
-            sqlx::query(
-                "UPDATE provider_api_keys \
-                 SET name = ?, secret = ?, enabled = ?, \
-                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
-                 WHERE id = ? AND provider_id = ?",
-            )
-            .bind(name)
-            .bind(secret)
-            .bind(input.enabled as i64)
-            .bind(current.id)
-            .bind(provider_id)
-            .execute(&mut **tx)
-            .await
-            .map_err(map_sqlite_conflict)?;
+            if current.secret != secret {
+                sqlx::query(
+                    "UPDATE provider_api_keys \
+                     SET name = ?, secret = ?, enabled = ?, \
+                         last_used_at = NULL, last_error_at = NULL, last_error = NULL, \
+                         last_test_at = NULL, last_test_ok = NULL, \
+                         last_test_latency_ms = NULL, last_test_checked = NULL, \
+                         last_test_message = NULL, \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE id = ? AND provider_id = ?",
+                )
+                .bind(name)
+                .bind(secret)
+                .bind(input.enabled as i64)
+                .bind(current.id)
+                .bind(provider_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(map_sqlite_conflict)?;
+            } else {
+                sqlx::query(
+                    "UPDATE provider_api_keys \
+                     SET name = ?, secret = ?, enabled = ?, \
+                         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                     WHERE id = ? AND provider_id = ?",
+                )
+                .bind(name)
+                .bind(secret)
+                .bind(input.enabled as i64)
+                .bind(current.id)
+                .bind(provider_id)
+                .execute(&mut **tx)
+                .await
+                .map_err(map_sqlite_conflict)?;
+            }
         } else {
             let result = sqlx::query(
                 "INSERT INTO provider_api_keys (provider_id, name, secret, enabled) \
@@ -3952,6 +3973,76 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(mirrored, None);
+    }
+
+    #[tokio::test]
+    async fn provider_api_key_rotation_resets_stale_health_state() {
+        let state = provider_key_test_state().await;
+        let (_, Json(created)) = create_provider(
+            State(state.clone()),
+            Json(provider_input(
+                None,
+                vec![provider_key_input(None, "Primary", Some("sk-old"), true)],
+            )),
+        )
+        .await
+        .unwrap();
+        let key_id = created.api_keys[0].id;
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_used_at = '2026-01-01T00:00:00Z', \
+                 last_error_at = '2026-01-01T00:00:00Z', last_error = 'stale 401', \
+                 last_test_at = '2026-01-01T00:00:00Z', last_test_ok = 0, \
+                 last_test_latency_ms = 42, last_test_checked = 'inference', \
+                 last_test_message = 'old failure' \
+             WHERE id = ?",
+        )
+        .bind(key_id)
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.provider_key_cooldown.lock().await.insert(
+            key_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let Json(updated) = update_provider(
+            State(state.clone()),
+            Path(created.id),
+            Json(provider_update_with_keys(Some(vec![provider_key_input(
+                Some(key_id),
+                "Primary",
+                Some("sk-rotated"),
+                true,
+            )]))),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.api_keys[0].api_key_suffix, "ated");
+        assert_eq!(updated.api_keys[0].last_test_ok, None);
+        assert_eq!(updated.api_keys[0].last_error, None);
+        assert!(
+            !state
+                .provider_key_cooldown
+                .lock()
+                .await
+                .contains_key(&key_id)
+        );
+        let stale_fields: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM provider_api_keys \
+             WHERE id = ? AND ( \
+                 last_used_at IS NOT NULL OR last_error_at IS NOT NULL OR last_error IS NOT NULL \
+                 OR last_test_at IS NOT NULL OR last_test_ok IS NOT NULL \
+                 OR last_test_latency_ms IS NOT NULL OR last_test_checked IS NOT NULL \
+                 OR last_test_message IS NOT NULL \
+             )",
+        )
+        .bind(key_id)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(stale_fields, 0);
     }
 
     #[tokio::test]
