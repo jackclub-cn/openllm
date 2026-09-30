@@ -741,12 +741,14 @@ fn build_provider_probe_request(
                 if !provider_probe_supports(&model.supported_endpoints, "/v1/chat/completions")
                     && provider_probe_supports(&model.supported_endpoints, "/v1/responses") =>
             {
+                // Some compatibility gateways reject max_output_tokens when the
+                // underlying provider cannot enforce it. A health check owns
+                // this budget, so omit it rather than making the probe fail.
                 (
                     join_upstream_url(&provider.base_url, "/v1/responses"),
                     json!({
                         "model": model.name.as_str(),
-                        "input": "ping",
-                        "max_output_tokens": 1
+                        "input": "ping"
                     }),
                 )
             }
@@ -4392,7 +4394,7 @@ mod tests {
         let body = body.as_ref().unwrap();
         assert_eq!(body["model"], "responses-model");
         assert_eq!(body["input"], "ping");
-        assert_eq!(body["max_output_tokens"], 1);
+        assert!(body.get("max_output_tokens").is_none());
         server.abort();
     }
 
