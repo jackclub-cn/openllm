@@ -112,11 +112,11 @@ export type Provider = {
   models: string[]
   models_synced_at?: string
   models_sync_error?: string
-  last_test_at?: string
-  last_test_ok?: boolean
-  last_test_latency_ms?: number
-  last_test_checked?: 'inference' | 'models'
-  last_test_message?: string
+  last_test_at?: string | null
+  last_test_ok?: boolean | null
+  last_test_latency_ms?: number | null
+  last_test_checked?: 'inference' | 'models' | null
+  last_test_message?: string | null
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
   models_sync_interval_minutes?: number | null

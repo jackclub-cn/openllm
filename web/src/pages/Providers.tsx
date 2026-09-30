@@ -94,6 +94,12 @@ export default function Providers() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testingAll, setTestingAll] = useState(false)
+  const [providerSearch, setProviderSearch] = useState('')
+  const [providerStatus, setProviderStatus] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [providerHealth, setProviderHealth] = useState<
+    'all' | 'healthy' | 'failed' | 'untested' | 'key_error'
+  >('all')
+  const [providerPage, setProviderPage] = useState(1)
   const [keyTestOpen, setKeyTestOpen] = useState(false)
   const [keyTestLoading, setKeyTestLoading] = useState(false)
   const [keyTestProvider, setKeyTestProvider] = useState<Provider>()
@@ -465,6 +471,41 @@ export default function Providers() {
     }
   }
 
+  const filteredProviders = items.filter((provider) => {
+    const query = providerSearch.trim().toLowerCase()
+    if (query) {
+      const searchable = [
+        provider.name,
+        provider.base_url,
+        provider.model_prefix,
+        ...provider.models,
+        ...provider.api_keys.flatMap((key) => [
+          key.name,
+          key.api_key_suffix,
+          key.last_error || '',
+        ]),
+      ]
+        .join(' ')
+        .toLowerCase()
+      if (!searchable.includes(query)) return false
+    }
+    if (providerStatus === 'enabled' && !provider.enabled) return false
+    if (providerStatus === 'disabled' && provider.enabled) return false
+    if (providerHealth === 'healthy' && provider.last_test_ok !== true) return false
+    if (providerHealth === 'failed' && provider.last_test_ok !== false) return false
+    if (providerHealth === 'untested' && provider.last_test_ok != null) return false
+    if (
+      providerHealth === 'key_error' &&
+      !provider.api_keys.some(
+        (key) =>
+          key.enabled && (key.last_test_ok === false || Boolean(key.last_error)),
+      )
+    ) {
+      return false
+    }
+    return true
+  })
+
   return (
     <>
       <PageHeader
@@ -472,6 +513,48 @@ export default function Providers() {
         description="管理 OpenAI、Anthropic、Ollama 及任意兼容 API"
         extra={
           <Space>
+            <Input
+              allowClear
+              prefix={<SearchOutlined />}
+              value={providerSearch}
+              onChange={(event) => {
+                setProviderSearch(event.target.value)
+                setProviderPage(1)
+              }}
+              placeholder="搜索名称、地址、模型或密钥"
+              style={{ width: 250 }}
+            />
+            <Select
+              value={providerStatus}
+              onChange={(value) => {
+                setProviderStatus(value)
+                setProviderPage(1)
+              }}
+              style={{ width: 120 }}
+              options={[
+                { value: 'all', label: '全部状态' },
+                { value: 'enabled', label: '已启用' },
+                { value: 'disabled', label: '已停用' },
+              ]}
+            />
+            <Select
+              value={providerHealth}
+              onChange={(value) => {
+                setProviderHealth(value)
+                setProviderPage(1)
+              }}
+              style={{ width: 140 }}
+              options={[
+                { value: 'all', label: '全部健康' },
+                { value: 'healthy', label: '提供商正常' },
+                { value: 'failed', label: '提供商异常' },
+                { value: 'untested', label: '提供商未检测' },
+                { value: 'key_error', label: '密钥异常' },
+              ]}
+            />
+            <Tag>
+              {filteredProviders.length}/{items.length}
+            </Tag>
             <Button
               icon={<ThunderboltOutlined />}
               loading={testingAll}
@@ -490,8 +573,18 @@ export default function Providers() {
         <Table
           rowKey="id"
           loading={loading}
-          dataSource={items}
-          pagination={false}
+          dataSource={filteredProviders}
+          pagination={{
+            current: providerPage,
+            defaultPageSize: 20,
+            pageSizeOptions: [10, 20, 50, 100],
+            showSizeChanger: true,
+            showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
+            onChange: (page) => setProviderPage(page),
+          }}
+          locale={{
+            emptyText: items.length ? '没有符合筛选条件的提供商' : '暂无提供商',
+          }}
           scroll={{ x: 1190 }}
           columns={[
             {
@@ -562,7 +655,7 @@ export default function Providers() {
               width: 160,
               render: (_, record) => {
                 const state =
-                  record.last_test_ok === undefined
+                  record.last_test_ok == null
                     ? { color: 'default', label: '未检测' }
                     : record.last_test_ok
                       ? { color: 'success', label: '正常' }
