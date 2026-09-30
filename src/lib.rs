@@ -46,6 +46,9 @@ pub struct Config {
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let database = Database::connect(&config).await?;
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
+    if let Err(error) = state.load_provider_key_error_state().await {
+        tracing::warn!(%error, "failed to load provider key error state");
+    }
     if let Err(error) = crate::api::reconcile_interrupted_usage_requests(&state).await {
         tracing::warn!(%error, "failed to reconcile interrupted usage logs on startup");
     }

@@ -4149,6 +4149,11 @@ async fn mark_provider_api_key_error(
         provider_api_key_id,
         Instant::now() + provider_key_cooldown(status),
     );
+    state
+        .provider_key_error_state
+        .lock()
+        .await
+        .insert(provider_api_key_id);
     let message = message.chars().take(1000).collect::<String>();
     let state = state.clone();
     tokio::spawn(async move {
@@ -4178,6 +4183,34 @@ async fn mark_provider_api_key_success(state: &AppState, provider_api_key_id: Op
         .lock()
         .await
         .remove(&provider_api_key_id);
+    let had_error = state
+        .provider_key_error_state
+        .lock()
+        .await
+        .remove(&provider_api_key_id);
+    if !had_error {
+        return;
+    }
+    if let Err(error) = sqlx::query(
+        "UPDATE provider_api_keys \
+         SET last_error_at = NULL, last_error = NULL \
+         WHERE id = ?",
+    )
+    .bind(provider_api_key_id)
+    .execute(&state.pool)
+    .await
+    {
+        state
+            .provider_key_error_state
+            .lock()
+            .await
+            .insert(provider_api_key_id);
+        tracing::warn!(
+            %error,
+            provider_api_key_id,
+            "failed to clear recovered provider key error"
+        );
+    }
 }
 
 async fn expand_target_provider_keys(
@@ -6997,6 +7030,53 @@ mod tests {
                 .iter()
                 .all(|target| target.provider_api_key_id.is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn provider_key_success_clears_recovered_error_state() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Recovered', 'openai', 'https://example.com/v1', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (
+                id, provider_id, name, secret, enabled, last_error_at, last_error
+             ) VALUES (
+                11, 1, 'Primary', 'sk-primary', 1,
+                '2026-01-01T00:00:00Z', 'stale unauthorized'
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool.clone(), None);
+        state.load_provider_key_error_state().await.unwrap();
+        state
+            .provider_key_cooldown
+            .lock()
+            .await
+            .insert(11, Instant::now() + Duration::from_secs(60));
+
+        mark_provider_api_key_success(&state, Some(11)).await;
+
+        assert!(!state.provider_key_cooldown.lock().await.contains_key(&11));
+        assert!(!state.provider_key_error_state.lock().await.contains(&11));
+        let error: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT last_error_at, last_error FROM provider_api_keys WHERE id = 11")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(error, (None, None));
     }
 
     #[test]

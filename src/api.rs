@@ -922,6 +922,7 @@ async fn persist_provider_key_test(
         return Ok(());
     };
     if result.ok {
+        state.provider_key_error_state.lock().await.remove(&key_id);
         sqlx::query(
             "UPDATE provider_api_keys \
              SET last_test_at = ?, last_test_ok = 1, last_test_latency_ms = ?, \

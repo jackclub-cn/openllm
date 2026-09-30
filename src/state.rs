@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,9 @@ pub struct AppState {
     pub provider_key_cursor: Arc<Mutex<HashMap<i64, usize>>>,
     /// In-memory cooldowns for provider keys that recently failed.
     pub provider_key_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Provider keys whose latest persisted runtime state contains an error.
+    /// A later successful request clears the database field only once.
+    pub provider_key_error_state: Arc<Mutex<HashSet<i64>>>,
     /// Throttles provider-key usage timestamps on the request hot path.
     pub provider_key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
     pub events: broadcast::Sender<UsageEvent>,
@@ -66,6 +69,7 @@ impl AppState {
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cursor: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_required: Arc::new(RwLock::new(None)),
@@ -73,5 +77,17 @@ impl AppState {
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub async fn load_provider_key_error_state(&self) -> Result<(), sqlx::Error> {
+        let ids = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM provider_api_keys WHERE last_error IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut errors = self.provider_key_error_state.lock().await;
+        errors.clear();
+        errors.extend(ids);
+        Ok(())
     }
 }
