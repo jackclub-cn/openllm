@@ -245,6 +245,23 @@ export type ProviderModelLimitInput = {
   cost_cache_write_override?: number | null
 }
 
+export type ModelInventory = {
+  provider_id: number
+  provider_name: string
+  provider_enabled: boolean
+  model_prefix: string
+  model_name: string
+  enabled: boolean
+  context_limit?: number | null
+  input_limit?: number | null
+  output_limit?: number | null
+  supported_endpoints: string[]
+  cost_input?: number | null
+  cost_output?: number | null
+  cost_cache_read?: number | null
+  cost_cache_write?: number | null
+}
+
 export type RouteTarget = {
   id?: number
   provider_id: number

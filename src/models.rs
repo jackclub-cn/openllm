@@ -334,6 +334,87 @@ pub struct ProviderModelLimitsUpdate {
     pub models: Vec<ProviderModelLimitInput>,
 }
 
+#[derive(Debug, FromRow)]
+pub struct ModelInventoryRow {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub provider_enabled: bool,
+    pub model_prefix: String,
+    pub model_name: String,
+    pub enabled: bool,
+    pub context_limit: Option<i64>,
+    pub input_limit: Option<i64>,
+    pub output_limit: Option<i64>,
+    pub supported_endpoints: Option<String>,
+    pub cost: Option<String>,
+    pub cost_input_override: Option<f64>,
+    pub cost_output_override: Option<f64>,
+    pub cost_cache_read_override: Option<f64>,
+    pub cost_cache_write_override: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ModelInventoryView {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub provider_enabled: bool,
+    pub model_prefix: String,
+    pub model_name: String,
+    pub enabled: bool,
+    pub context_limit: Option<i64>,
+    pub input_limit: Option<i64>,
+    pub output_limit: Option<i64>,
+    pub supported_endpoints: Vec<String>,
+    pub cost_input: Option<f64>,
+    pub cost_output: Option<f64>,
+    pub cost_cache_read: Option<f64>,
+    pub cost_cache_write: Option<f64>,
+}
+
+impl From<ModelInventoryRow> for ModelInventoryView {
+    fn from(value: ModelInventoryRow) -> Self {
+        let cost = value
+            .cost
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+        let effective_cost = crate::models::effective_cost_value(
+            cost.as_ref(),
+            value.cost_input_override,
+            value.cost_output_override,
+            value.cost_cache_read_override,
+            value.cost_cache_write_override,
+        );
+        Self {
+            provider_id: value.provider_id,
+            provider_name: value.provider_name,
+            provider_enabled: value.provider_enabled,
+            model_prefix: value.model_prefix,
+            model_name: value.model_name,
+            enabled: value.enabled,
+            context_limit: value.context_limit,
+            input_limit: value.input_limit,
+            output_limit: value.output_limit,
+            supported_endpoints: value
+                .supported_endpoints
+                .as_deref()
+                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+                .unwrap_or_default(),
+            cost_input: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "input")),
+            cost_output: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "output")),
+            cost_cache_read: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "cache_read")),
+            cost_cache_write: effective_cost
+                .as_ref()
+                .and_then(|cost| crate::models::cost_base_price(cost, "cache_write")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, FromRow)]
 pub struct Route {
     pub id: i64,

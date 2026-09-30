@@ -22,11 +22,12 @@ use tower_http::trace::TraceLayer;
 use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
     delete_api_key, delete_provider, delete_route, diagnose_route, event_stream, export_usage,
-    get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys, list_models,
-    list_provider_model_limits, list_providers, list_routes, list_usage, overview,
-    preview_provider_model_sync, provider_quota, rotate_api_key, sync_provider_models,
-    test_all_provider_keys, test_all_providers, test_provider, test_provider_keys, update_api_key,
-    update_provider, update_provider_model_limits, update_route, update_runtime_settings,
+    get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys,
+    list_model_inventory, list_models, list_provider_model_limits, list_providers, list_routes,
+    list_usage, overview, preview_provider_model_sync, provider_quota, rotate_api_key,
+    sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
+    test_provider_keys, update_api_key, update_provider, update_provider_model_limits,
+    update_route, update_runtime_settings,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -103,6 +104,7 @@ pub fn build_router(state: AppState) -> Router {
             get(list_provider_model_limits).put(update_provider_model_limits),
         )
         .route("/providers/{id}/quota", get(provider_quota))
+        .route("/model-inventory", get(list_model_inventory))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/diagnose", post(diagnose_route))
         .route("/routes/{id}", put(update_route).delete(delete_route))

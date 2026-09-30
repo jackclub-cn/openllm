@@ -1697,6 +1697,46 @@ pub async fn list_provider_model_limits(
     Ok(Json(provider_model_limits(&state, id).await?))
 }
 
+pub async fn list_model_inventory(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ModelInventoryView>>> {
+    let rows = sqlx::query_as::<_, ModelInventoryRow>(
+        r#"
+        SELECT pm.provider_id,
+               p.name AS provider_name,
+               p.enabled AS provider_enabled,
+               p.model_prefix,
+               pm.model_name,
+               pm.enabled,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               CASE
+                   WHEN COALESCE(pm.input_override, pm.input_limit) IS NULL
+                       THEN COALESCE(pm.context_override, pm.context_limit)
+                   WHEN COALESCE(pm.context_override, pm.context_limit) IS NULL
+                       THEN COALESCE(pm.input_override, pm.input_limit)
+                   ELSE MIN(
+                       COALESCE(pm.input_override, pm.input_limit),
+                       COALESCE(pm.context_override, pm.context_limit)
+                   )
+               END AS input_limit,
+               COALESCE(pm.output_override, pm.output_limit) AS output_limit,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               pm.cost,
+               pm.cost_input_override,
+               pm.cost_output_override,
+               pm.cost_cache_read_override,
+               pm.cost_cache_write_override
+        FROM provider_models pm
+        JOIN providers p ON p.id = pm.provider_id
+        ORDER BY p.name COLLATE NOCASE, pm.model_name COLLATE NOCASE
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(Json(rows.into_iter().map(Into::into).collect()))
+}
+
 pub async fn update_provider_model_limits(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -5613,6 +5653,51 @@ mod tests {
                 "/responses".to_string()
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn model_inventory_exposes_effective_limits_and_prices() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url, model_prefix, enabled) \
+             VALUES (1, 'Inventory', 'openai', 'https://inventory.example/v1', 'inv/', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, enabled, context_limit, input_limit, output_limit,
+                context_override, input_override, output_override, supported_endpoints,
+                supported_endpoints_override, cost, cost_input_override
+             ) VALUES
+                (1, 'model-a', 1, 100000, 90000, 8000, 50000, NULL, 4000,
+                 '[\"/chat/completions\"]', NULL, '{\"input\":1,\"output\":2}', 1.5)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+
+        let Json(rows) = list_model_inventory(State(state)).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.provider_id, 1);
+        assert_eq!(row.provider_name, "Inventory");
+        assert!(row.provider_enabled);
+        assert_eq!(row.model_prefix, "inv/");
+        assert_eq!(row.model_name, "model-a");
+        assert_eq!(row.context_limit, Some(50_000));
+        assert_eq!(row.input_limit, Some(50_000));
+        assert_eq!(row.output_limit, Some(4_000));
+        assert_eq!(row.supported_endpoints, vec!["/chat/completions"]);
+        assert_eq!(row.cost_input, Some(1.5));
+        assert_eq!(row.cost_output, Some(2.0));
     }
 
     #[tokio::test]

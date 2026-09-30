@@ -1,6 +1,7 @@
 import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   ApiOutlined,
+  AppstoreOutlined,
   DashboardOutlined,
   KeyOutlined,
   MessageOutlined,
@@ -17,6 +18,7 @@ import { RealtimeProvider, useRealtime } from './realtime'
 const { Header, Sider, Content } = Layout
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
+const ModelCatalog = lazy(() => import('./pages/ModelCatalog'))
 const Providers = lazy(() => import('./pages/Providers'))
 const RoutesPage = lazy(() => import('./pages/Routes'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
@@ -27,6 +29,7 @@ const Playground = lazy(() => import('./pages/Playground'))
 const navigation = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/providers', icon: <ApiOutlined />, label: '提供商' },
+  { key: '/models', icon: <AppstoreOutlined />, label: '模型目录' },
   { key: '/routes', icon: <NodeIndexOutlined />, label: '路由' },
   { key: '/playground', icon: <MessageOutlined />, label: '模型调试' },
   { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
@@ -142,6 +145,7 @@ function AppLayout({
             <Routes>
               <Route path="/" element={<Dashboard />} />
               <Route path="/providers" element={<Providers />} />
+              <Route path="/models" element={<ModelCatalog />} />
               <Route path="/routes" element={<RoutesPage />} />
               <Route path="/playground" element={<Playground />} />
               <Route path="/keys" element={<ApiKeys />} />

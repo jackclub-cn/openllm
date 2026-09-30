@@ -54,6 +54,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - 聚合 OpenAI 兼容、Anthropic、Ollama 和自定义上游，支持提供商多密钥、优先级、加权随机、轮询和故障切换。
 - 添加提供商时先选择模板卡片，内置 Command Code、Kimi Code、GLM Token Plan、火山引擎 Token Plan、OpenCode Zen、OpenCode Go 和自定义协议模板。
 - 从上游同步模型，并结合 models.dev 保存上下文、输出上限、接口、模态和价格等能力信息；支持手动覆盖并保留重新同步结果。
+- 提供跨提供商的模型目录，可搜索模型、筛选能力与接口，并直接进入该模型的请求日志或路由诊断。
 - 通过显式路由或 `vendor/model` 前缀对外提供稳定的模型列表，多目标路由会按最严格的公共能力限制输入和输出预算。
 - 兼容 OpenAI `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings` 和 Anthropic Messages 协议。
 - 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
