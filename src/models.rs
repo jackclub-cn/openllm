@@ -1153,6 +1153,29 @@ pub struct ProviderKeyTestResult {
 }
 
 #[derive(Debug, Serialize)]
+pub struct ProviderKeyTestSummary {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub total: usize,
+    pub ok: usize,
+    pub failed: usize,
+    pub model: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderKeyTestAllResult {
+    pub total_providers: usize,
+    pub tested_providers: usize,
+    pub healthy_providers: usize,
+    pub failed_providers: usize,
+    pub total_keys: usize,
+    pub healthy_keys: usize,
+    pub failed_keys: usize,
+    pub results: Vec<ProviderKeyTestSummary>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct ProviderTestSummary {
     pub provider_id: i64,
     pub provider_name: String,

@@ -145,6 +145,16 @@ export type ProviderKeyTestResult = {
   results: ProviderKeyTestItem[]
 }
 
+export type ProviderKeyTestAllResult = {
+  total_providers: number
+  tested_providers: number
+  healthy_providers: number
+  failed_providers: number
+  total_keys: number
+  healthy_keys: number
+  failed_keys: number
+}
+
 export type ProviderInput = {
   name: string
   provider_type: Provider['provider_type']

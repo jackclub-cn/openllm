@@ -424,6 +424,69 @@ pub async fn test_provider_keys(
     Ok(Json(test_provider_keys_inner(&state, id).await?))
 }
 
+pub async fn test_all_provider_keys(
+    State(state): State<AppState>,
+) -> AppResult<Json<ProviderKeyTestAllResult>> {
+    let providers = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, name FROM providers WHERE enabled = 1 ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let results = futures_util::stream::iter(providers.into_iter().map(|(id, name)| {
+        let state = state.clone();
+        async move {
+            match test_provider_keys_inner(&state, id).await {
+                Ok(result) => ProviderKeyTestSummary {
+                    provider_id: id,
+                    provider_name: name,
+                    total: result.total,
+                    ok: result.ok,
+                    failed: result.failed,
+                    model: result.model,
+                    message: if result.total == 0 {
+                        "provider has no enabled keys".to_string()
+                    } else {
+                        format!("{} healthy, {} failed", result.ok, result.failed)
+                    },
+                },
+                Err(error) => ProviderKeyTestSummary {
+                    provider_id: id,
+                    provider_name: name,
+                    total: 0,
+                    ok: 0,
+                    failed: 1,
+                    model: None,
+                    message: error.to_string(),
+                },
+            }
+        }
+    }))
+    .buffer_unordered(4)
+    .collect::<Vec<_>>()
+    .await;
+
+    let tested_providers = results.iter().filter(|result| result.total > 0).count();
+    let healthy_providers = results
+        .iter()
+        .filter(|result| result.total > 0 && result.failed == 0)
+        .count();
+    let failed_providers = results.iter().filter(|result| result.failed > 0).count();
+    let total_keys = results.iter().map(|result| result.total).sum();
+    let healthy_keys = results.iter().map(|result| result.ok).sum();
+    let failed_keys = results.iter().map(|result| result.failed).sum();
+    Ok(Json(ProviderKeyTestAllResult {
+        total_providers: results.len(),
+        tested_providers,
+        healthy_providers,
+        failed_providers,
+        total_keys,
+        healthy_keys,
+        failed_keys,
+        results,
+    }))
+}
+
 #[derive(Debug)]
 struct ProviderProbeModel {
     name: String,
@@ -4450,6 +4513,15 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(recovered_error, None);
+
+        let Json(all) = test_all_provider_keys(State(state.clone())).await.unwrap();
+        assert_eq!(all.total_providers, 1);
+        assert_eq!(all.tested_providers, 1);
+        assert_eq!(all.healthy_providers, 0);
+        assert_eq!(all.failed_providers, 1);
+        assert_eq!(all.total_keys, 2);
+        assert_eq!(all.healthy_keys, 1);
+        assert_eq!(all.failed_keys, 1);
         server.abort();
     }
 

@@ -40,6 +40,7 @@ import {
   type Provider,
   type ProviderApiKeyInput,
   type ProviderInput,
+  type ProviderKeyTestAllResult,
   type ProviderKeyTestResult,
   type ProviderModelLimit,
   type ProviderModelLimitInput,
@@ -95,6 +96,7 @@ export default function Providers() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testingAll, setTestingAll] = useState(false)
+  const [testingAllKeys, setTestingAllKeys] = useState(false)
   const [providerSearch, setProviderSearch] = useState(() => searchParams.get('q') || '')
   const [providerStatus, setProviderStatus] = useState<'all' | 'enabled' | 'disabled'>(() => {
     const status = searchParams.get('status')
@@ -328,6 +330,27 @@ export default function Providers() {
       message.error(formatError(error))
     } finally {
       setTestingAll(false)
+    }
+  }
+
+  const testAllKeys = async () => {
+    setTestingAllKeys(true)
+    try {
+      const result = await api.post<ProviderKeyTestAllResult>('/api/providers/test-all-keys')
+      if (result.failed_keys > 0) {
+        message.warning(
+          `密钥检测完成：${result.healthy_keys} 正常，${result.failed_keys} 异常`,
+        )
+      } else {
+        message.success(
+          `密钥检测完成：${result.tested_providers} 个提供商、${result.healthy_keys} 把密钥全部正常`,
+        )
+      }
+      await load()
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setTestingAllKeys(false)
     }
   }
 
@@ -591,6 +614,23 @@ export default function Providers() {
             >
               测试全部
             </Button>
+            <Popconfirm
+              title="逐个探测所有启用密钥？"
+              description="每个密钥都会向上游发送一个最小请求。"
+              onConfirm={() => void testAllKeys()}
+            >
+              <Button
+                icon={<KeyOutlined />}
+                loading={testingAllKeys}
+                disabled={
+                  !items.some((provider) =>
+                    provider.api_keys.some((key) => key.enabled),
+                  )
+                }
+              >
+                测试全部密钥
+              </Button>
+            </Popconfirm>
             <Button type="primary" icon={<PlusOutlined />} onClick={() => openEditor()}>
               添加提供商
             </Button>

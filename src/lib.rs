@@ -24,8 +24,8 @@ use crate::api::{
     delete_api_key, delete_provider, delete_route, diagnose_route, event_stream, export_usage,
     get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys, list_models,
     list_provider_model_limits, list_providers, list_routes, list_usage, overview,
-    preview_provider_model_sync, rotate_api_key, sync_provider_models, test_all_providers,
-    test_provider, test_provider_keys, update_api_key, update_provider,
+    preview_provider_model_sync, rotate_api_key, sync_provider_models, test_all_provider_keys,
+    test_all_providers, test_provider, test_provider_keys, update_api_key, update_provider,
     update_provider_model_limits, update_route, update_runtime_settings,
 };
 use crate::assets::static_handler;
@@ -86,6 +86,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/database/backup", get(backup_database))
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/test-all", post(test_all_providers))
+        .route("/providers/test-all-keys", post(test_all_provider_keys))
         .route(
             "/providers/{id}",
             put(update_provider).delete(delete_provider),
