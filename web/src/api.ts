@@ -120,6 +120,26 @@ export type Provider = {
   updated_at: string
 }
 
+export type ProviderKeyTestItem = {
+  key_id?: number | null
+  key_name: string
+  api_key_suffix: string
+  ok: boolean
+  latency_ms: number
+  message: string
+  checked: 'inference' | 'models'
+}
+
+export type ProviderKeyTestResult = {
+  provider_id: number
+  provider_name: string
+  total: number
+  ok: number
+  failed: number
+  model?: string | null
+  results: ProviderKeyTestItem[]
+}
+
 export type ProviderInput = {
   name: string
   provider_type: Provider['provider_type']

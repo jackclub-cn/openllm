@@ -6,6 +6,7 @@ import {
   DeleteOutlined,
   EditOutlined,
   HistoryOutlined,
+  KeyOutlined,
   PlusOutlined,
   SearchOutlined,
   SettingOutlined,
@@ -39,6 +40,7 @@ import {
   type Provider,
   type ProviderApiKeyInput,
   type ProviderInput,
+  type ProviderKeyTestResult,
   type ProviderModelLimit,
   type ProviderModelLimitInput,
 } from '../api'
@@ -92,6 +94,10 @@ export default function Providers() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testingAll, setTestingAll] = useState(false)
+  const [keyTestOpen, setKeyTestOpen] = useState(false)
+  const [keyTestLoading, setKeyTestLoading] = useState(false)
+  const [keyTestProvider, setKeyTestProvider] = useState<Provider>()
+  const [keyTestResult, setKeyTestResult] = useState<ProviderKeyTestResult>()
   const [previewingSync, setPreviewingSync] = useState(false)
   const [applyingSync, setApplyingSync] = useState(false)
   const [syncTarget, setSyncTarget] = useState<Provider>()
@@ -251,6 +257,29 @@ export default function Providers() {
       await load()
     } catch (error) {
       message.error({ content: formatError(error), key })
+    }
+  }
+
+  const testKeys = async (provider: Provider) => {
+    setKeyTestProvider(provider)
+    setKeyTestResult(undefined)
+    setKeyTestOpen(true)
+    setKeyTestLoading(true)
+    try {
+      const result = await api.post<ProviderKeyTestResult>(
+        `/api/providers/${provider.id}/keys/test`,
+      )
+      setKeyTestResult(result)
+      if (result.failed > 0) {
+        message.warning(`密钥检测完成：${result.ok} 正常，${result.failed} 异常`)
+      } else {
+        message.success(`密钥检测完成：${result.ok} 把密钥全部正常`)
+      }
+    } catch (error) {
+      message.error(formatError(error))
+      setKeyTestOpen(false)
+    } finally {
+      setKeyTestLoading(false)
     }
   }
 
@@ -603,7 +632,7 @@ export default function Providers() {
             },
             {
               title: '操作',
-              width: 280,
+              width: 320,
               fixed: 'right',
               render: (_, record) => (
                 <Space>
@@ -624,6 +653,16 @@ export default function Providers() {
                   <Tooltip title="测试连接">
                     <Button type="text" icon={<ThunderboltOutlined />} onClick={() => test(record.id)} />
                   </Tooltip>
+                  {record.api_keys.length > 0 && (
+                    <Tooltip title="逐个测试全部启用密钥">
+                      <Button
+                        type="text"
+                        icon={<KeyOutlined />}
+                        disabled={!record.api_keys.some((key) => key.enabled)}
+                        onClick={() => void testKeys(record)}
+                      />
+                    </Tooltip>
+                  )}
                   <Tooltip title="模型管理">
                     <Button
                       type="text"
@@ -1183,6 +1222,95 @@ export default function Providers() {
             )}
           </Space>
         )}
+      </Modal>
+
+      <Modal
+        title={keyTestProvider ? `密钥检测 · ${keyTestProvider.name}` : '密钥检测'}
+        open={keyTestOpen}
+        onCancel={() => setKeyTestOpen(false)}
+        footer={null}
+        width={780}
+        destroyOnHidden
+      >
+        <Space direction="vertical" size={12} style={{ width: '100%' }}>
+          {keyTestResult && (
+            <Space wrap>
+              <Tag color="green">正常 {keyTestResult.ok}</Tag>
+              <Tag color={keyTestResult.failed ? 'red' : 'default'}>
+                异常 {keyTestResult.failed}
+              </Tag>
+              <Tag>共 {keyTestResult.total} 把</Tag>
+              {keyTestResult.model && (
+                <Typography.Text type="secondary">
+                  检测模型 {keyTestResult.model}
+                </Typography.Text>
+              )}
+            </Space>
+          )}
+          <Table
+            rowKey={(record) =>
+              String(record.key_id ?? `${record.key_name}-${record.api_key_suffix}`)
+            }
+            size="small"
+            loading={keyTestLoading}
+            dataSource={keyTestResult?.results || []}
+            pagination={false}
+            locale={{ emptyText: keyTestLoading ? '正在检测...' : '暂无启用密钥' }}
+            columns={[
+              {
+                title: '密钥',
+                dataIndex: 'key_name',
+                width: 180,
+                render: (value: string, record) => (
+                  <div>
+                    <Typography.Text strong>{value || `Key ${record.key_id ?? ''}`}</Typography.Text>
+                    <div>
+                      <Typography.Text type="secondary">
+                        尾号 {record.api_key_suffix || '****'}
+                      </Typography.Text>
+                    </div>
+                  </div>
+                ),
+              },
+              {
+                title: '结果',
+                dataIndex: 'ok',
+                width: 80,
+                render: (value: boolean) => (
+                  <Tag color={value ? 'success' : 'error'}>{value ? '正常' : '异常'}</Tag>
+                ),
+              },
+              {
+                title: '检测方式',
+                dataIndex: 'checked',
+                width: 110,
+                render: (value: string) =>
+                  value === 'inference' ? '推理凭证' : '仅主机可达',
+              },
+              {
+                title: '耗时',
+                dataIndex: 'latency_ms',
+                width: 90,
+                render: (value: number) => `${value} ms`,
+              },
+              {
+                title: '详情',
+                dataIndex: 'message',
+                render: (value: string) => (
+                  <Tooltip title={value}>
+                    <Typography.Text
+                      type="secondary"
+                      ellipsis
+                      style={{ display: 'block', maxWidth: 260 }}
+                    >
+                      {value}
+                    </Typography.Text>
+                  </Tooltip>
+                ),
+              },
+            ]}
+          />
+        </Space>
       </Modal>
     </>
   )

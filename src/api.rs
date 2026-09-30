@@ -417,10 +417,25 @@ pub async fn test_provider(
     Ok(Json(test_provider_inner(&state, id).await?))
 }
 
+pub async fn test_provider_keys(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> AppResult<Json<ProviderKeyTestResult>> {
+    Ok(Json(test_provider_keys_inner(&state, id).await?))
+}
+
 #[derive(Debug)]
 struct ProviderProbeModel {
     name: String,
     supported_endpoints: Vec<String>,
+}
+
+#[derive(Debug)]
+struct ProviderProbeKey {
+    id: Option<i64>,
+    name: String,
+    api_key_suffix: String,
+    secret: Option<String>,
 }
 
 async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTestResult> {
@@ -438,37 +453,7 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     // it cannot tell the operator whether their key works. When a model is
     // known, probe the inference endpoint instead: it is the one that actually
     // enforces auth, so a bad key fails the test instead of looking healthy.
-    let model = match normalize_health_check_model(provider.health_check_model.as_deref()) {
-        Some(name) => {
-            let endpoints = sqlx::query_scalar::<_, Option<String>>(
-                "SELECT COALESCE(supported_endpoints_override, supported_endpoints) \
-                 FROM provider_models \
-                 WHERE provider_id = ? AND model_name = ? AND enabled = 1",
-            )
-            .bind(id)
-            .bind(&name)
-            .fetch_optional(&state.pool)
-            .await?
-            .flatten();
-            Some(ProviderProbeModel {
-                name,
-                supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
-            })
-        }
-        None => sqlx::query_as::<_, (String, Option<String>)>(
-            "SELECT model_name, \
-                        COALESCE(supported_endpoints_override, supported_endpoints) \
-                 FROM provider_models WHERE provider_id = ? AND enabled = 1 \
-                 ORDER BY model_name LIMIT 1",
-        )
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .map(|(name, endpoints)| ProviderProbeModel {
-            name,
-            supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
-        }),
-    };
+    let model = resolve_provider_probe_model(state, &provider).await?;
 
     // A provider may have several credentials. Test every enabled key and
     // consider the provider healthy when any one of them succeeds.
@@ -488,7 +473,7 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
         )?;
         let attempt = probe_provider(
             request,
-            started,
+            std::time::Instant::now(),
             checked,
             model
                 .as_ref()
@@ -513,6 +498,95 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     });
     persist_provider_test(state, id, &result).await?;
     Ok(result)
+}
+
+async fn test_provider_keys_inner(state: &AppState, id: i64) -> AppResult<ProviderKeyTestResult> {
+    let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
+    let provider_type =
+        ProviderType::from_str(&provider.provider_type).map_err(AppError::BadRequest)?;
+    let model = resolve_provider_probe_model(state, &provider).await?;
+    let model_name = model
+        .as_ref()
+        .map(|model| model.name.as_str())
+        .unwrap_or("");
+    let checked = if model.is_some() {
+        "inference"
+    } else {
+        "models"
+    };
+
+    let mut results = Vec::new();
+    for key in provider_probe_keys(state, &provider).await? {
+        let request = build_provider_probe_request(
+            state,
+            &provider,
+            provider_type,
+            model.as_ref(),
+            key.secret.as_deref(),
+        )?;
+        let attempt = probe_provider(request, std::time::Instant::now(), checked, model_name).await;
+        results.push(ProviderKeyTestItem {
+            key_id: key.id,
+            key_name: key.name,
+            api_key_suffix: key.api_key_suffix,
+            ok: attempt.ok,
+            latency_ms: attempt.latency_ms,
+            message: attempt.message,
+            checked: attempt.checked,
+        });
+    }
+    let ok = results.iter().filter(|result| result.ok).count();
+    let total = results.len();
+    Ok(ProviderKeyTestResult {
+        provider_id: provider.id,
+        provider_name: provider.name,
+        total,
+        ok,
+        failed: total - ok,
+        model: model.map(|model| model.name),
+        results,
+    })
+}
+
+async fn resolve_provider_probe_model(
+    state: &AppState,
+    provider: &Provider,
+) -> AppResult<Option<ProviderProbeModel>> {
+    match normalize_health_check_model(provider.health_check_model.as_deref()) {
+        Some(name) => {
+            let endpoints = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT COALESCE(supported_endpoints_override, supported_endpoints) \
+                 FROM provider_models \
+                 WHERE provider_id = ? AND model_name = ? AND enabled = 1",
+            )
+            .bind(provider.id)
+            .bind(&name)
+            .fetch_optional(&state.pool)
+            .await?
+            .flatten();
+            Ok(Some(ProviderProbeModel {
+                name,
+                supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
+            }))
+        }
+        None => Ok(sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT model_name, \
+                    COALESCE(supported_endpoints_override, supported_endpoints) \
+             FROM provider_models WHERE provider_id = ? AND enabled = 1 \
+             ORDER BY model_name LIMIT 1",
+        )
+        .bind(provider.id)
+        .fetch_optional(&state.pool)
+        .await?
+        .map(|(name, endpoints)| ProviderProbeModel {
+            name,
+            supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
+        })),
+    }
 }
 
 fn build_provider_probe_request(
@@ -2880,8 +2954,7 @@ fn validate_provider_input(input: &ProviderInput) -> AppResult<()> {
 
 impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
     fn from(value: ProviderApiKeyRecord) -> Self {
-        let api_key_suffix = value.secret.chars().rev().take(4).collect::<String>();
-        let api_key_suffix = api_key_suffix.chars().rev().collect::<String>();
+        let api_key_suffix = api_key_suffix(&value.secret);
         Self {
             id: value.id,
             name: value.name,
@@ -2900,6 +2973,11 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             created_at: value.created_at,
         }
     }
+}
+
+fn api_key_suffix(secret: &str) -> String {
+    let suffix = secret.chars().rev().take(4).collect::<String>();
+    suffix.chars().rev().collect()
 }
 
 async fn provider_api_key_records(
@@ -2938,6 +3016,34 @@ async fn provider_key_candidates(
         candidates.push((None, provider.api_key.clone()));
     }
     Ok(candidates)
+}
+
+async fn provider_probe_keys(
+    state: &AppState,
+    provider: &Provider,
+) -> AppResult<Vec<ProviderProbeKey>> {
+    let mut keys = provider_api_key_records(&state.pool, provider.id)
+        .await?
+        .into_iter()
+        .filter(|record| record.enabled != 0)
+        .map(|record| ProviderProbeKey {
+            id: Some(record.id),
+            name: record.name,
+            api_key_suffix: api_key_suffix(&record.secret),
+            secret: Some(record.secret),
+        })
+        .collect::<Vec<_>>();
+    if keys.is_empty()
+        && let Some(secret) = normalize_optional(provider.api_key.clone())
+    {
+        keys.push(ProviderProbeKey {
+            id: None,
+            name: "Default".to_string(),
+            api_key_suffix: api_key_suffix(&secret),
+            secret: Some(secret),
+        });
+    }
+    Ok(keys)
 }
 
 async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> AppResult<()> {
@@ -3985,6 +4091,109 @@ mod tests {
         assert_eq!(body["model"], "responses-model");
         assert_eq!(body["input"], "ping");
         assert_eq!(body["max_output_tokens"], 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_key_health_check_tests_every_enabled_key() {
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |headers: HeaderMap, Json(_body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        let authorization = headers
+                            .get(header::AUTHORIZATION)
+                            .and_then(|value| value.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string();
+                        seen.lock().await.push(authorization.clone());
+                        let ok = authorization == "Bearer sk-good";
+                        (
+                            if ok {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::UNAUTHORIZED
+                            },
+                            Json(json!({
+                                "id": "key-health",
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": 1,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 1
+                                },
+                                "error": if ok {
+                                    Value::Null
+                                } else {
+                                    json!({"message": "invalid API key"})
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'multi-key', 'openai', ?)",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'probe-model', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled) VALUES
+                (11, 1, 'Broken', 'sk-bad', 1),
+                (12, 1, 'Healthy', 'sk-good', 1),
+                (13, 1, 'Disabled', 'sk-disabled', 0)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        state.provider_key_cooldown.lock().await.insert(
+            11,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+
+        let result = test_provider_keys_inner(&state, 1).await.unwrap();
+
+        assert_eq!(result.provider_name, "multi-key");
+        assert_eq!(result.model.as_deref(), Some("probe-model"));
+        assert_eq!(result.total, 2);
+        assert_eq!(result.ok, 1);
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.results[0].key_id, Some(11));
+        assert_eq!(result.results[0].key_name, "Broken");
+        assert_eq!(result.results[0].api_key_suffix, "-bad");
+        assert!(!result.results[0].ok);
+        assert!(result.results[0].message.contains("401"));
+        assert_eq!(result.results[1].key_id, Some(12));
+        assert_eq!(result.results[1].key_name, "Healthy");
+        assert_eq!(result.results[1].api_key_suffix, "good");
+        assert!(result.results[1].ok);
+        assert_eq!(result.results[1].checked, "inference");
+        assert_eq!(
+            seen.lock().await.as_slice(),
+            &["Bearer sk-bad".to_string(), "Bearer sk-good".to_string()]
+        );
+        assert!(state.provider_key_cooldown.lock().await.contains_key(&11));
         server.abort();
     }
 

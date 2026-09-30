@@ -25,8 +25,8 @@ use crate::api::{
     get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys, list_models,
     list_provider_model_limits, list_providers, list_routes, list_usage, overview,
     preview_provider_model_sync, rotate_api_key, sync_provider_models, test_all_providers,
-    test_provider, update_api_key, update_provider, update_provider_model_limits, update_route,
-    update_runtime_settings,
+    test_provider, test_provider_keys, update_api_key, update_provider,
+    update_provider_model_limits, update_route, update_runtime_settings,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -88,6 +88,7 @@ pub fn build_router(state: AppState) -> Router {
             put(update_provider).delete(delete_provider),
         )
         .route("/providers/{id}/test", post(test_provider))
+        .route("/providers/{id}/keys/test", post(test_provider_keys))
         .route("/providers/{id}/models/sync", post(sync_provider_models))
         .route(
             "/providers/{id}/models/preview",
