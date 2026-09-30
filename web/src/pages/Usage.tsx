@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
 import {
   CheckCircleOutlined,
+  ClearOutlined,
   CloseCircleOutlined,
   CopyOutlined,
   DownloadOutlined,
@@ -234,6 +235,25 @@ export default function Usage() {
     const current = queryRef.current
     await load(current.page, current.pageSize, mode)
   }, [load])
+  const reloadFiltered = useEffectEvent(() => {
+    void load(1, pageSize, 'manual')
+  })
+
+  const filtersReady = useRef(false)
+  useEffect(() => {
+    if (!filtersReady.current) {
+      filtersReady.current = true
+      return
+    }
+    reloadFiltered()
+  }, [
+    apiKeyId,
+    dates,
+    providerApiKeyId,
+    providerId,
+    routeId,
+    statusFilter,
+  ])
 
   useEffect(() => {
     void Promise.all([
@@ -256,6 +276,38 @@ export default function Usage() {
   const showLatest = async () => {
     setNewRequests(0)
     await load(1, pageSize)
+  }
+
+  const resetFilters = () => {
+    setModel('')
+    setRequestId('')
+    setEndpoint('')
+    setProviderId(undefined)
+    setProviderApiKeyId(undefined)
+    setApiKeyId(undefined)
+    setRouteId(undefined)
+    setStatusFilter('all')
+    setDates(undefined)
+  }
+
+  const changeProvider = (value?: number) => {
+    setProviderId(value)
+    if (value == null) return
+    const keyOwner = providers.find((provider) =>
+      provider.api_keys.some((key) => key.id === providerApiKeyId),
+    )
+    if (keyOwner && keyOwner.id !== value) {
+      setProviderApiKeyId(undefined)
+    }
+  }
+
+  const changeProviderApiKey = (value?: number) => {
+    setProviderApiKeyId(value)
+    if (value == null) return
+    const keyOwner = providers.find((provider) =>
+      provider.api_keys.some((key) => key.id === value),
+    )
+    if (keyOwner) setProviderId(keyOwner.id)
   }
 
   const openDetail = async (record: UsageLog) => {
@@ -394,7 +446,7 @@ export default function Usage() {
             placeholder="模型名称"
             value={model}
             onChange={(event) => setModel(event.target.value)}
-            onSearch={() => load(1)}
+            onSearch={reloadFiltered}
             style={{ width: 220 }}
           />
           <Input.Search
@@ -402,7 +454,7 @@ export default function Usage() {
             placeholder="请求 ID"
             value={requestId}
             onChange={(event) => setRequestId(event.target.value)}
-            onSearch={() => load(1)}
+            onSearch={reloadFiltered}
             style={{ width: 240 }}
           />
           <Input.Search
@@ -410,14 +462,14 @@ export default function Usage() {
             placeholder="接口路径"
             value={endpoint}
             onChange={(event) => setEndpoint(event.target.value)}
-            onSearch={() => load(1)}
+            onSearch={reloadFiltered}
             style={{ width: 220 }}
           />
           <Select
             allowClear
             placeholder="提供商"
             value={providerId}
-            onChange={(value) => { setProviderId(value); setTimeout(() => load(1), 0) }}
+            onChange={changeProvider}
             options={providers.map((provider) => ({ value: provider.id, label: provider.name }))}
             style={{ width: 180 }}
           />
@@ -427,13 +479,15 @@ export default function Usage() {
             optionFilterProp="label"
             placeholder="上游密钥"
             value={providerApiKeyId}
-            onChange={(value) => { setProviderApiKeyId(value); setTimeout(() => load(1), 0) }}
-            options={providers.flatMap((provider) =>
-              provider.api_keys.map((key) => ({
-                value: key.id,
-                label: `${provider.name} · ${key.name || `Key ${key.id}`}`,
-              })),
-            )}
+            onChange={changeProviderApiKey}
+            options={providers
+              .filter((provider) => !providerId || provider.id === providerId)
+              .flatMap((provider) =>
+                provider.api_keys.map((key) => ({
+                  value: key.id,
+                  label: `${provider.name} · ${key.name || `Key ${key.id}`} (${key.api_key_suffix})`,
+                })),
+              )}
             style={{ width: 220 }}
           />
           <Select
@@ -442,7 +496,7 @@ export default function Usage() {
             optionFilterProp="label"
             placeholder="访问密钥"
             value={apiKeyId}
-            onChange={(value) => { setApiKeyId(value); setTimeout(() => load(1), 0) }}
+            onChange={setApiKeyId}
             options={apiKeys.map((item) => ({ value: item.id, label: item.name }))}
             style={{ width: 180 }}
           />
@@ -452,14 +506,14 @@ export default function Usage() {
             optionFilterProp="label"
             placeholder="路由"
             value={routeId}
-            onChange={(value) => { setRouteId(value); setTimeout(() => load(1), 0) }}
+            onChange={setRouteId}
             options={routes.map((item) => ({ value: item.id, label: item.name }))}
             style={{ width: 180 }}
           />
           <Select
             placeholder="调用结果"
             value={statusFilter}
-            onChange={(value) => { setStatusFilter(value); setTimeout(() => load(1), 0) }}
+            onChange={setStatusFilter}
             options={[
               { value: 'all', label: '全部状态' },
               { value: 'success', label: '成功' },
@@ -473,7 +527,8 @@ export default function Usage() {
             onChange={(value) => setDates(value as [Dayjs, Dayjs] | undefined)}
             showTime
           />
-          <Button type="primary" onClick={() => load(1)}>查询</Button>
+          <Button icon={<ClearOutlined />} onClick={resetFilters}>重置</Button>
+          <Button type="primary" onClick={reloadFiltered}>查询</Button>
         </Space>
       </Card>
       <Card bordered={false} className="table-card">
