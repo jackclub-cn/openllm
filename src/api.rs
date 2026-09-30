@@ -4347,6 +4347,20 @@ mod tests {
         assert_eq!(view.range_cache_read, 20);
         assert_eq!(view.range_success_rate, 50.0);
         assert_eq!(view.range_avg_latency_ms, 200.0);
+        assert_eq!(
+            view.daily_usage
+                .iter()
+                .map(|row| row.prompt_tokens)
+                .sum::<i64>(),
+            view.range_prompt_tokens
+        );
+        assert_eq!(
+            view.daily_usage
+                .iter()
+                .map(|row| row.completion_tokens)
+                .sum::<i64>(),
+            view.range_completion_tokens
+        );
         assert_eq!(view.recent_requests.len(), 3);
         assert!(view.recent_requests.iter().any(|row| row.in_flight));
         assert!(

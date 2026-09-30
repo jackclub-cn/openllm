@@ -19,6 +19,7 @@ import {
   Empty,
   Progress,
   Row,
+  Segmented,
   Skeleton,
   Space,
   Table,
@@ -42,6 +43,9 @@ export default function Dashboard() {
     dayjs().subtract(13, 'day').startOf('day'),
     dayjs().endOf('day'),
   ])
+  const [chartMetric, setChartMetric] = useState<
+    'requests' | 'tokens' | 'prompt_tokens' | 'completion_tokens'
+  >('requests')
 
   const load = useCallback(async () => {
     try {
@@ -205,12 +209,29 @@ export default function Dashboard() {
 
       <Row gutter={[16, 16]} className="section-row">
         <Col xs={24} xl={15}>
-          <Card title="请求趋势" bordered={false}>
+          <Card title="用量趋势" bordered={false}>
+            <Segmented
+              block
+              size="small"
+              value={chartMetric}
+              onChange={(value) =>
+                setChartMetric(
+                  value as 'requests' | 'tokens' | 'prompt_tokens' | 'completion_tokens',
+                )
+              }
+              options={[
+                { label: '请求数', value: 'requests' },
+                { label: '总 tokens', value: 'tokens' },
+                { label: '输入 tokens', value: 'prompt_tokens' },
+                { label: '输出 tokens', value: 'completion_tokens' },
+              ]}
+              style={{ marginBottom: 16 }}
+            />
             {data.daily_usage.length ? (
               <Area
                 data={data.daily_usage}
                 xField="day"
-                yField="requests"
+                yField={chartMetric}
                 height={260}
                 axis={{ x: { title: false }, y: { title: false } }}
                 style={{ fill: 'linear-gradient(-90deg, white 0%, #1677ff 100%)' }}
