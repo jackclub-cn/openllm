@@ -7,6 +7,7 @@ import {
   KeyOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SearchOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
@@ -19,6 +20,7 @@ import {
   InputNumber,
   Modal,
   Popconfirm,
+  Select,
   Space,
   Switch,
   Table,
@@ -47,6 +49,9 @@ export default function ApiKeys() {
   const navigate = useNavigate()
   const [items, setItems] = useState<ApiKey[]>([])
   const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState<'all' | 'enabled' | 'disabled' | 'expired'>('all')
+  const [page, setPage] = useState(1)
   const [open, setOpen] = useState(false)
   const [saving, setSaving] = useState(false)
   const [createdKey, setCreatedKey] = useState('')
@@ -181,12 +186,66 @@ export default function ApiKeys() {
     }
   }
 
+  const filteredItems = items.filter((item) => {
+    const query = search.trim().toLowerCase()
+    if (query) {
+      const searchable = [
+        item.name,
+        item.key_prefix,
+        item.key_suffix,
+        ...item.allowed_models,
+      ]
+        .join(' ')
+        .toLowerCase()
+      if (!searchable.includes(query)) return false
+    }
+    const expired = item.expires_at ? dayjs(item.expires_at).isBefore(dayjs()) : false
+    if (status === 'enabled') return item.enabled && !expired
+    if (status === 'disabled') return !item.enabled && !expired
+    if (status === 'expired') return expired
+    return true
+  })
+
   return (
     <>
       <PageHeader
         title="访问密钥"
         description="为调用方签发网关密钥；密钥仅在创建时显示一次"
-        extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>创建密钥</Button>}
+        extra={
+          <Space>
+            <Input
+              allowClear
+              prefix={<SearchOutlined />}
+              value={search}
+              onChange={(event) => {
+                setSearch(event.target.value)
+                setPage(1)
+              }}
+              placeholder="搜索名称、密钥或模型权限"
+              style={{ width: 250 }}
+            />
+            <Select
+              value={status}
+              onChange={(value) => {
+                setStatus(value)
+                setPage(1)
+              }}
+              style={{ width: 120 }}
+              options={[
+                { value: 'all', label: '全部状态' },
+                { value: 'enabled', label: '已启用' },
+                { value: 'disabled', label: '已停用' },
+                { value: 'expired', label: '已过期' },
+              ]}
+            />
+            <Tag>
+              {filteredItems.length}/{items.length}
+            </Tag>
+            <Button type="primary" icon={<PlusOutlined />} onClick={() => setOpen(true)}>
+              创建密钥
+            </Button>
+          </Space>
+        }
       />
       <Alert
         className="page-alert"
@@ -198,8 +257,16 @@ export default function ApiKeys() {
         <Table
           rowKey="id"
           loading={loading}
-          dataSource={items}
-          pagination={false}
+          dataSource={filteredItems}
+          pagination={{
+            current: page,
+            defaultPageSize: 20,
+            pageSizeOptions: [10, 20, 50, 100],
+            showSizeChanger: true,
+            showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
+            onChange: (nextPage) => setPage(nextPage),
+          }}
+          locale={{ emptyText: items.length ? '没有符合筛选条件的密钥' : '暂无访问密钥' }}
           scroll={{ x: 1920 }}
           columns={[
             {
