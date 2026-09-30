@@ -1403,8 +1403,14 @@ async fn proxy_anthropic_inner(
         clamped_output_tokens,
     );
     let ordering_key = route_id.unwrap_or(-1);
-    let ordered_targets =
-        order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    let ordered_targets = order_targets(
+        state,
+        ordering_key,
+        &resolved.strategy,
+        resolved.targets,
+        session_id.as_deref(),
+    )
+    .await?;
     enforce_api_key_rate_limit_or_log(
         state,
         api_key.as_ref(),
@@ -1913,8 +1919,14 @@ async fn proxy_openai_inner(
         clamped_output_tokens,
     );
     let ordering_key = route_id.unwrap_or(-1);
-    let ordered_targets =
-        order_targets(state, ordering_key, &resolved.strategy, resolved.targets).await?;
+    let ordered_targets = order_targets(
+        state,
+        ordering_key,
+        &resolved.strategy,
+        resolved.targets,
+        session_id.as_deref(),
+    )
+    .await?;
     enforce_api_key_rate_limit_or_log(
         state,
         api_key.as_ref(),
@@ -4340,9 +4352,97 @@ async fn mark_provider_api_key_success(state: &AppState, provider_api_key_id: Op
     }
 }
 
+fn stable_hash64(parts: &[&[u8]]) -> u64 {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let digest = hasher.finalize();
+    u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digests contain at least eight bytes"),
+    )
+}
+
+fn session_target_hash(session_id: &str, ordering_key: i64, target: &RouteTarget) -> u64 {
+    stable_hash64(&[
+        b"openllm-session-target-v1",
+        &ordering_key.to_be_bytes(),
+        &target.id.to_be_bytes(),
+        &target.provider_id.to_be_bytes(),
+        target.upstream_model.as_bytes(),
+        session_id.as_bytes(),
+    ])
+}
+
+fn session_provider_key_hash(session_id: &str, provider_id: i64, key_id: i64) -> u64 {
+    stable_hash64(&[
+        b"openllm-session-provider-key-v1",
+        &provider_id.to_be_bytes(),
+        &key_id.to_be_bytes(),
+        session_id.as_bytes(),
+    ])
+}
+
+/// Orders weighted and round-robin targets without storing per-session state.
+///
+/// Weighted routes use weighted rendezvous hashing, so sessions still spread
+/// according to target weights while a given session keeps the same preference
+/// order. Priority routes already have a deterministic order and are left
+/// untouched.
+fn order_targets_for_session(
+    session_id: &str,
+    ordering_key: i64,
+    strategy: RouteStrategy,
+    targets: &mut Vec<RouteTarget>,
+) {
+    match strategy {
+        RouteStrategy::Priority => {}
+        RouteStrategy::Weighted => {
+            let mut ranked = targets
+                .drain(..)
+                .map(|target| {
+                    let hash = session_target_hash(session_id, ordering_key, &target);
+                    let uniform = (hash as f64 + 1.0) / (u64::MAX as f64 + 1.0);
+                    let score = -uniform.ln() / target.weight.max(1) as f64;
+                    (score, target)
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|left, right| {
+                right
+                    .0
+                    .total_cmp(&left.0)
+                    .then_with(|| left.1.id.cmp(&right.1.id))
+            });
+            targets.extend(ranked.into_iter().map(|(_, target)| target));
+        }
+        RouteStrategy::RoundRobin => {
+            let mut ranked = targets
+                .drain(..)
+                .map(|target| {
+                    (
+                        session_target_hash(session_id, ordering_key, &target),
+                        target,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ranked.sort_by(|left, right| {
+                right
+                    .0
+                    .cmp(&left.0)
+                    .then_with(|| left.1.id.cmp(&right.1.id))
+            });
+            targets.extend(ranked.into_iter().map(|(_, target)| target));
+        }
+    }
+}
+
 async fn expand_target_provider_keys(
     state: &AppState,
     targets: Vec<RouteTarget>,
+    session_id: Option<&str>,
 ) -> AppResult<Vec<RouteTarget>> {
     let mut keys_by_provider = HashMap::new();
     for target in &targets {
@@ -4385,10 +4485,25 @@ async fn expand_target_provider_keys(
         } else {
             available
         };
-        let cursor = cursors.entry(target.provider_id).or_default();
-        let offset = *cursor % keys.len();
-        keys.rotate_left(offset);
-        *cursor = cursor.wrapping_add(1);
+        if let Some(session_id) = session_id {
+            let mut ranked = keys
+                .drain(..)
+                .map(|key| {
+                    (
+                        session_provider_key_hash(session_id, target.provider_id, key.0),
+                        key,
+                    )
+                })
+                .collect::<Vec<_>>();
+            ranked
+                .sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.0.cmp(&right.1.0)));
+            keys.extend(ranked.into_iter().map(|(_, key)| key));
+        } else {
+            let cursor = cursors.entry(target.provider_id).or_default();
+            let offset = *cursor % keys.len();
+            keys.rotate_left(offset);
+            *cursor = cursor.wrapping_add(1);
+        }
 
         for (key_id, secret) in keys {
             let mut candidate = target.clone();
@@ -4410,40 +4525,49 @@ async fn order_targets(
     route_id: i64,
     strategy: &str,
     mut targets: Vec<RouteTarget>,
+    session_id: Option<&str>,
 ) -> AppResult<Vec<RouteTarget>> {
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
-    match strategy {
-        RouteStrategy::Priority => {
+    let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(session_id) = session_id {
+        if strategy == RouteStrategy::Priority {
             targets.sort_by_key(|target| (target.priority, target.id));
         }
-        RouteStrategy::Weighted => {
-            let mut rng = rand::thread_rng();
-            let mut selected = Vec::with_capacity(targets.len());
-            while !targets.is_empty() {
-                let weights = targets
-                    .iter()
-                    .map(|target| target.weight.max(1) as u32)
-                    .collect::<Vec<_>>();
-                let index = WeightedIndex::new(&weights)
-                    .map(|distribution| distribution.sample(&mut rng))
-                    .unwrap_or(0);
-                selected.push(targets.remove(index));
+        order_targets_for_session(session_id, route_id, strategy, &mut targets);
+    } else {
+        match strategy {
+            RouteStrategy::Priority => {
+                targets.sort_by_key(|target| (target.priority, target.id));
             }
-            targets = selected;
-        }
-        RouteStrategy::RoundRobin => {
-            let mut cursors = state.round_robin.lock().await;
-            let cursor = cursors.entry(route_id).or_default();
-            let offset = *cursor % targets.len();
-            targets.rotate_left(offset);
-            *cursor = cursor.wrapping_add(1);
+            RouteStrategy::Weighted => {
+                let mut rng = rand::thread_rng();
+                let mut selected = Vec::with_capacity(targets.len());
+                while !targets.is_empty() {
+                    let weights = targets
+                        .iter()
+                        .map(|target| target.weight.max(1) as u32)
+                        .collect::<Vec<_>>();
+                    let index = WeightedIndex::new(&weights)
+                        .map(|distribution| distribution.sample(&mut rng))
+                        .unwrap_or(0);
+                    selected.push(targets.remove(index));
+                }
+                targets = selected;
+            }
+            RouteStrategy::RoundRobin => {
+                let mut cursors = state.round_robin.lock().await;
+                let cursor = cursors.entry(route_id).or_default();
+                let offset = *cursor % targets.len();
+                targets.rotate_left(offset);
+                *cursor = cursor.wrapping_add(1);
+            }
         }
     }
     // Keep strategy order within each health group, but try explicitly failed
     // providers last. Unknown health stays ahead of failed providers so a
     // previously-tested outage does not permanently suppress a recovery.
     targets.sort_by_key(|target| provider_health_rank(target.provider_health));
-    expand_target_provider_keys(state, targets).await
+    expand_target_provider_keys(state, targets, session_id).await
 }
 
 struct UsageParser {
@@ -7160,6 +7284,119 @@ mod tests {
         assert_eq!(provider_health_rank(Some(7)), 0);
     }
 
+    #[test]
+    fn session_target_order_is_stable_and_spreads_weighted_sessions() {
+        let base = (1..=4)
+            .map(|id| {
+                let mut target = endpoint_test_target("openai", None);
+                target.id = id;
+                target.provider_id = id;
+                target.upstream_model = format!("model-{id}");
+                target
+            })
+            .collect::<Vec<_>>();
+
+        for strategy in [RouteStrategy::Weighted, RouteStrategy::RoundRobin] {
+            let ordered_ids = |session_id: &str| {
+                let mut targets = base.clone();
+                order_targets_for_session(session_id, 7, strategy, &mut targets);
+                targets
+                    .into_iter()
+                    .map(|target| target.id)
+                    .collect::<Vec<_>>()
+            };
+
+            let first = ordered_ids("session-a");
+            assert_eq!(first, ordered_ids("session-a"));
+
+            let mut primaries = Vec::new();
+            for index in 0..64 {
+                let primary = ordered_ids(&format!("session-{index}"))[0];
+                if !primaries.contains(&primary) {
+                    primaries.push(primary);
+                }
+            }
+            assert_eq!(
+                primaries.len(),
+                base.len(),
+                "sessions should spread across every target for {strategy:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_keys_are_sticky_per_session_without_advancing_rotation() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Sticky', 'openai', 'https://example.com/v1', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'First', 'sk-first', 1),
+                    (12, 1, 'Second', 'sk-second', 1),
+                    (13, 1, 'Third', 'sk-third', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let mut target = endpoint_test_target("openai", None);
+        target.id = 1;
+        let keys = |targets: Vec<RouteTarget>| {
+            targets
+                .into_iter()
+                .map(|target| target.api_key.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let first = keys(
+            order_targets(
+                &state,
+                1,
+                "priority",
+                vec![target.clone()],
+                Some("session-a"),
+            )
+            .await
+            .unwrap(),
+        );
+        let repeated = keys(
+            order_targets(
+                &state,
+                1,
+                "priority",
+                vec![target.clone()],
+                Some("session-a"),
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(first, repeated);
+
+        let no_session_first = keys(
+            order_targets(&state, 1, "priority", vec![target.clone()], None)
+                .await
+                .unwrap(),
+        );
+        let no_session_second = keys(
+            order_targets(&state, 1, "priority", vec![target], None)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(no_session_first[0], "sk-first");
+        assert_eq!(no_session_second[0], "sk-second");
+    }
+
     #[tokio::test]
     async fn provider_keys_rotate_and_expand_a_route_target() {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -7187,7 +7424,7 @@ mod tests {
         let mut target = endpoint_test_target("openai", None);
         target.id = 1;
 
-        let first = order_targets(&state, 1, "priority", vec![target.clone()])
+        let first = order_targets(&state, 1, "priority", vec![target.clone()], None)
             .await
             .unwrap();
         assert_eq!(
@@ -7205,7 +7442,7 @@ mod tests {
                 .all(|target| target.provider_api_key_id.is_some())
         );
 
-        let second = order_targets(&state, 1, "priority", vec![target])
+        let second = order_targets(&state, 1, "priority", vec![target], None)
             .await
             .unwrap();
         assert_eq!(
@@ -7250,7 +7487,7 @@ mod tests {
             .lock()
             .await
             .insert(11, Instant::now() + Duration::from_secs(60));
-        let available = order_targets(&state, 1, "priority", vec![target.clone()])
+        let available = order_targets(&state, 1, "priority", vec![target.clone()], None)
             .await
             .unwrap();
         assert_eq!(
@@ -7266,7 +7503,7 @@ mod tests {
             .lock()
             .await
             .insert(12, Instant::now() + Duration::from_secs(60));
-        let fallback = order_targets(&state, 1, "priority", vec![target])
+        let fallback = order_targets(&state, 1, "priority", vec![target], None)
             .await
             .unwrap();
         assert_eq!(fallback.len(), 2);
