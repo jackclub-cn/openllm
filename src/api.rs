@@ -2244,8 +2244,13 @@ pub async fn diagnose_route(
             "endpoint must start with '/'".to_string(),
         ));
     }
+    let session_id = input
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
     Ok(Json(
-        crate::proxy::diagnose_route(&state, model, endpoint).await?,
+        crate::proxy::diagnose_route(&state, model, endpoint, session_id).await?,
     ))
 }
 

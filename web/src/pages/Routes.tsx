@@ -95,6 +95,7 @@ export default function RoutesPage() {
   const [diagnoseOpen, setDiagnoseOpen] = useState(false)
   const [diagnoseModel, setDiagnoseModel] = useState('')
   const [diagnoseEndpoint, setDiagnoseEndpoint] = useState('/v1/chat/completions')
+  const [diagnoseSessionId, setDiagnoseSessionId] = useState('')
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnosis, setDiagnosis] = useState<RouteDiagnose>()
   const [searchParams, setSearchParams] = useSearchParams()
@@ -167,8 +168,10 @@ export default function RoutesPage() {
   const runDiagnosis = async (
     modelValue = diagnoseModel,
     endpointValue = diagnoseEndpoint,
+    sessionValue = diagnoseSessionId,
   ) => {
     const model = modelValue.trim()
+    const sessionId = sessionValue.trim()
     if (!model) {
       message.warning('请输入要诊断的模型')
       return
@@ -179,6 +182,7 @@ export default function RoutesPage() {
         await api.post<RouteDiagnose>('/api/routes/diagnose', {
           model,
           endpoint: endpointValue,
+          session_id: sessionId || undefined,
         }),
       )
     } catch (error) {
@@ -197,9 +201,10 @@ export default function RoutesPage() {
     const endpoint = searchParams.get('diagnose_endpoint') || '/v1/chat/completions'
     setDiagnoseModel(model)
     setDiagnoseEndpoint(endpoint)
+    setDiagnoseSessionId('')
     setDiagnosis(undefined)
     setDiagnoseOpen(true)
-    void runDiagnosis(model, endpoint)
+    void runDiagnosis(model, endpoint, '')
     setSearchParams({}, { replace: true })
   }, [searchParams, setSearchParams])
 
@@ -501,6 +506,13 @@ export default function RoutesPage() {
               诊断
             </Button>
           </Space.Compact>
+          <Input
+            allowClear
+            value={diagnoseSessionId}
+            onChange={(event) => setDiagnoseSessionId(event.target.value)}
+            onPressEnter={() => void runDiagnosis()}
+            placeholder="会话 ID（可选，用于查看粘性路由顺序）"
+          />
 
           {diagnosis && (
             <>
@@ -536,6 +548,50 @@ export default function RoutesPage() {
                   {diagnosis.barrel_incomplete ? '（信息不完整）' : ''}
                 </Descriptions.Item>
               </Descriptions>
+              {diagnosis.runtime_targets && diagnosis.runtime_targets.length > 0 && (
+                <>
+                  <Typography.Text strong>会话实际顺序</Typography.Text>
+                  <Table
+                    rowKey={(record) =>
+                      `${record.order}-${record.provider_id}-${record.upstream_model}-${record.provider_api_key_id ?? 0}`
+                    }
+                    size="small"
+                    pagination={false}
+                    dataSource={diagnosis.runtime_targets}
+                    scroll={{ x: 720 }}
+                    columns={[
+                      {
+                        title: '顺序',
+                        dataIndex: 'order',
+                        width: 70,
+                      },
+                      {
+                        title: '提供商',
+                        dataIndex: 'provider_name',
+                        width: 170,
+                        render: (value: string, record) => (
+                          <Space size={4}>
+                            <Typography.Text strong>{value}</Typography.Text>
+                            {record.provider_health === false && <Tag color="error">异常</Tag>}
+                          </Space>
+                        ),
+                      },
+                      {
+                        title: '上游模型',
+                        dataIndex: 'upstream_model',
+                        width: 210,
+                        render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+                      },
+                      {
+                        title: '上游 Key',
+                        dataIndex: 'provider_api_key_name',
+                        render: (value?: string | null) =>
+                          value ? <Typography.Text>{value}</Typography.Text> : '-',
+                      },
+                    ]}
+                  />
+                </>
+              )}
               {diagnosis.targets.length ? (
                 <Table
                   rowKey={(record) => `${record.provider_id}-${record.upstream_model}`}

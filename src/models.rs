@@ -450,6 +450,9 @@ pub struct RouteTarget {
     /// route_targets column and defaults to `None` for database-loaded rows.
     #[sqlx(default)]
     pub provider_api_key_id: Option<i64>,
+    /// Provider credential name selected for this runtime candidate.
+    #[sqlx(default)]
+    pub provider_api_key_name: Option<String>,
     /// Whether an authentication failure should fall through to a later
     /// candidate instead of being returned to the caller.
     #[sqlx(default)]
@@ -521,6 +524,8 @@ pub struct RouteTargetInput {
 pub struct RouteDiagnoseInput {
     pub model: String,
     pub endpoint: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -537,7 +542,22 @@ pub struct RouteDiagnoseView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub barrel: Option<ModelCapabilities>,
     pub barrel_incomplete: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_targets: Option<Vec<RouteDiagnoseRuntimeTarget>>,
     pub targets: Vec<RouteDiagnoseTarget>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RouteDiagnoseRuntimeTarget {
+    pub order: usize,
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub upstream_model: String,
+    pub provider_api_key_id: Option<i64>,
+    pub provider_api_key_name: Option<String>,
+    pub provider_health: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

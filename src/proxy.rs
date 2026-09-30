@@ -20,9 +20,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteDiagnoseTarget,
-    RouteDiagnoseView, RouteStrategy, RouteTarget, Usage, effective_cost_value,
-    estimate_cost_micros,
+    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteDiagnoseRuntimeTarget,
+    RouteDiagnoseTarget, RouteDiagnoseView, RouteStrategy, RouteTarget, Usage,
+    effective_cost_value, estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -3744,7 +3744,12 @@ pub async fn diagnose_route(
     state: &AppState,
     model: &str,
     endpoint: &str,
+    session_id: Option<&str>,
 ) -> AppResult<RouteDiagnoseView> {
+    let session_id = session_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.chars().take(SESSION_ID_MAX_CHARS).collect::<String>());
     let routes = sqlx::query_as::<_, Route>(
         r#"
         SELECT * FROM routes
@@ -3766,16 +3771,32 @@ pub async fn diagnose_route(
             continue;
         }
         if route.enabled != 0 {
-            return diagnose_explicit_route(state, model, endpoint, route, true).await;
+            return diagnose_explicit_route(
+                state,
+                model,
+                endpoint,
+                route,
+                true,
+                session_id.as_deref(),
+            )
+            .await;
         }
         disabled_match.get_or_insert(route);
     }
-    let direct = diagnose_direct_route(state, model, endpoint).await?;
+    let direct = diagnose_direct_route(state, model, endpoint, session_id.as_deref()).await?;
     if direct.matched {
         return Ok(direct);
     }
     if let Some(route) = disabled_match {
-        return diagnose_explicit_route(state, model, endpoint, route, false).await;
+        return diagnose_explicit_route(
+            state,
+            model,
+            endpoint,
+            route,
+            false,
+            session_id.as_deref(),
+        )
+        .await;
     }
     Ok(direct)
 }
@@ -3786,11 +3807,13 @@ async fn diagnose_explicit_route(
     endpoint: &str,
     route: Route,
     route_enabled: bool,
+    session_id: Option<&str>,
 ) -> AppResult<RouteDiagnoseView> {
     let rows = sqlx::query_as::<_, DiagnosticTargetRow>(
         r#"
         SELECT p.id AS provider_id, p.name AS provider_name,
-               p.provider_type, rt.upstream_model,
+               p.provider_type, rt.id AS target_id, rt.upstream_model,
+               rt.weight AS target_weight, rt.priority AS target_priority,
                rt.enabled AS target_enabled,
                p.enabled AS provider_enabled,
                CASE WHEN pm.model_name IS NULL THEN 0 ELSE 1 END AS model_exists,
@@ -3823,6 +3846,19 @@ async fn diagnose_explicit_route(
         .collect::<Vec<_>>();
     let barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
     let resolved = route_enabled && !eligible_pairs.is_empty();
+    let runtime_targets = if resolved {
+        diagnostic_runtime_targets(
+            state,
+            Some(route.id),
+            &route.strategy,
+            &rows,
+            &diagnosed,
+            session_id,
+        )
+        .await?
+    } else {
+        None
+    };
     let message = if !route_enabled {
         format!("route '{}' is disabled", route.name)
     } else if resolved {
@@ -3846,6 +3882,8 @@ async fn diagnose_explicit_route(
         message,
         barrel: barrel.capabilities,
         barrel_incomplete: barrel.incomplete,
+        session_id: session_id.map(ToOwned::to_owned),
+        runtime_targets,
         targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
     })
 }
@@ -3854,11 +3892,13 @@ async fn diagnose_direct_route(
     state: &AppState,
     model: &str,
     endpoint: &str,
+    session_id: Option<&str>,
 ) -> AppResult<RouteDiagnoseView> {
     let prefixed = sqlx::query_as::<_, DiagnosticTargetRow>(
         r#"
         SELECT p.id AS provider_id, p.name AS provider_name,
-               p.provider_type, pm.model_name AS upstream_model,
+               p.provider_type, p.id AS target_id, pm.model_name AS upstream_model,
+               100 AS target_weight, 0 AS target_priority,
                1 AS target_enabled,
                p.enabled AS provider_enabled,
                1 AS model_exists,
@@ -3890,6 +3930,7 @@ async fn diagnose_direct_route(
             "prefix",
             prefixed,
             prefixed_diagnosed,
+            session_id,
         )
         .await;
     }
@@ -3897,7 +3938,8 @@ async fn diagnose_direct_route(
     let unprefixed = sqlx::query_as::<_, DiagnosticTargetRow>(
         r#"
         SELECT p.id AS provider_id, p.name AS provider_name,
-               p.provider_type, pm.model_name AS upstream_model,
+               p.provider_type, p.id AS target_id, pm.model_name AS upstream_model,
+               100 AS target_weight, 0 AS target_priority,
                1 AS target_enabled,
                p.enabled AS provider_enabled,
                1 AS model_exists,
@@ -3926,6 +3968,7 @@ async fn diagnose_direct_route(
             "direct",
             unprefixed,
             unprefixed_diagnosed,
+            session_id,
         )
         .await;
     }
@@ -3942,6 +3985,7 @@ async fn diagnose_direct_route(
         match_type,
         prefixed,
         prefixed_diagnosed,
+        session_id,
     )
     .await
 }
@@ -3953,6 +3997,7 @@ async fn build_direct_diagnosis(
     match_type: &str,
     rows: Vec<DiagnosticTargetRow>,
     diagnosed: Vec<(RouteDiagnoseTarget, bool)>,
+    session_id: Option<&str>,
 ) -> AppResult<RouteDiagnoseView> {
     let eligible_pairs = rows
         .iter()
@@ -3978,6 +4023,19 @@ async fn build_direct_diagnosis(
         format!("model '{model}' exists but no target can serve {endpoint}")
     };
     let barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
+    let runtime_targets = if resolved {
+        diagnostic_runtime_targets(
+            state,
+            None,
+            RouteStrategy::Priority.as_str(),
+            &rows,
+            &diagnosed,
+            session_id,
+        )
+        .await?
+    } else {
+        None
+    };
 
     Ok(RouteDiagnoseView {
         model: model.to_string(),
@@ -3991,6 +4049,8 @@ async fn build_direct_diagnosis(
         message,
         barrel: barrel.capabilities,
         barrel_incomplete: barrel.incomplete,
+        session_id: session_id.map(ToOwned::to_owned),
+        runtime_targets,
         targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
     })
 }
@@ -4000,7 +4060,10 @@ struct DiagnosticTargetRow {
     provider_id: i64,
     provider_name: String,
     provider_type: String,
+    target_id: i64,
     upstream_model: String,
+    target_weight: i64,
+    target_priority: i64,
     target_enabled: i64,
     provider_enabled: i64,
     model_exists: i64,
@@ -4051,6 +4114,68 @@ impl DiagnosticTargetRow {
             eligible,
         )
     }
+}
+
+async fn diagnostic_runtime_targets(
+    state: &AppState,
+    route_id: Option<i64>,
+    strategy: &str,
+    rows: &[DiagnosticTargetRow],
+    diagnosed: &[(RouteDiagnoseTarget, bool)],
+    session_id: Option<&str>,
+) -> AppResult<Option<Vec<RouteDiagnoseRuntimeTarget>>> {
+    let Some(session_id) = session_id else {
+        return Ok(None);
+    };
+    let targets = rows
+        .iter()
+        .zip(diagnosed)
+        .filter(|(_, (_, eligible))| *eligible)
+        .map(|(row, _)| RouteTarget {
+            id: row.target_id,
+            route_id,
+            provider_id: row.provider_id,
+            provider_name: row.provider_name.clone(),
+            provider_type: row.provider_type.clone(),
+            base_url: String::new(),
+            model_prefix: String::new(),
+            api_key: None,
+            provider_headers: "{}".to_string(),
+            supported_endpoints: row.supported_endpoints.clone(),
+            tool_search_supported: 1,
+            provider_health: row.provider_health,
+            upstream_model: row.upstream_model.clone(),
+            weight: row.target_weight,
+            priority: row.target_priority,
+            enabled: 1,
+            provider_api_key_id: None,
+            provider_api_key_name: None,
+            auth_retryable: false,
+        })
+        .collect::<Vec<_>>();
+    let ordered = order_targets(
+        state,
+        route_id.unwrap_or(-1),
+        strategy,
+        targets,
+        Some(session_id),
+    )
+    .await?;
+    Ok(Some(
+        ordered
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| RouteDiagnoseRuntimeTarget {
+                order: index + 1,
+                provider_id: target.provider_id,
+                provider_name: target.provider_name,
+                upstream_model: target.upstream_model,
+                provider_api_key_id: target.provider_api_key_id,
+                provider_api_key_name: target.provider_api_key_name,
+                provider_health: target.provider_health.map(|value| value != 0),
+            })
+            .collect(),
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4449,8 +4574,8 @@ async fn expand_target_provider_keys(
         if keys_by_provider.contains_key(&target.provider_id) {
             continue;
         }
-        let keys = sqlx::query_as::<_, (i64, String)>(
-            "SELECT id, secret FROM provider_api_keys \
+        let keys = sqlx::query_as::<_, (i64, String, String)>(
+            "SELECT id, name, secret FROM provider_api_keys \
              WHERE provider_id = ? AND enabled = 1 \
              ORDER BY id",
         )
@@ -4477,7 +4602,7 @@ async fn expand_target_provider_keys(
 
         let available = keys
             .iter()
-            .filter(|(id, _)| !cooldowns.contains_key(id))
+            .filter(|(id, _, _)| !cooldowns.contains_key(id))
             .cloned()
             .collect::<Vec<_>>();
         let mut keys = if available.is_empty() {
@@ -4505,10 +4630,11 @@ async fn expand_target_provider_keys(
             *cursor = cursor.wrapping_add(1);
         }
 
-        for (key_id, secret) in keys {
+        for (key_id, key_name, secret) in keys {
             let mut candidate = target.clone();
             candidate.api_key = Some(secret);
             candidate.provider_api_key_id = Some(key_id);
+            candidate.provider_api_key_name = Some(key_name);
             expanded.push(candidate);
         }
     }
@@ -5858,6 +5984,7 @@ mod tests {
             priority: 0,
             enabled: 1,
             provider_api_key_id: None,
+            provider_api_key_name: None,
             auth_retryable: false,
         }
     }
@@ -6072,7 +6199,7 @@ mod tests {
         .unwrap();
 
         let state = AppState::new(pool, None);
-        let diagnosis = diagnose_route(&state, "shared", OPENAI_RESPONSES)
+        let diagnosis = diagnose_route(&state, "shared", OPENAI_RESPONSES, None)
             .await
             .unwrap();
         assert!(diagnosis.matched);
@@ -6084,6 +6211,93 @@ mod tests {
         assert!(diagnosis.targets[1].eligible);
         assert!(!diagnosis.targets[2].eligible);
         assert!(diagnosis.targets[2].reason.contains("provider is disabled"));
+        assert!(diagnosis.runtime_targets.is_none());
+    }
+
+    #[tokio::test]
+    async fn route_diagnosis_returns_sticky_runtime_order_and_key_names() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, enabled, last_test_ok
+             ) VALUES
+                (1, 'primary', 'openai', 'http://primary', 1, 1),
+                (2, 'secondary', 'openai', 'http://secondary', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name)
+             VALUES (1, 'model'), (2, 'model')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'primary-a', 'sk-a', 1),
+                    (12, 1, 'primary-b', 'sk-b', 1),
+                    (21, 2, 'secondary-a', 'sk-c', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'sticky route', 'shared', 'weighted', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO route_targets (
+                id, route_id, provider_id, upstream_model, weight, priority, enabled
+             ) VALUES
+                (1, 1, 1, 'model', 1, 0, 1),
+                (2, 1, 2, 'model', 100, 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let first = diagnose_route(&state, "shared", OPENAI_CHAT_COMPLETIONS, Some("session-a"))
+            .await
+            .unwrap();
+        let repeated = diagnose_route(&state, "shared", OPENAI_CHAT_COMPLETIONS, Some("session-a"))
+            .await
+            .unwrap();
+
+        let first_runtime = first.runtime_targets.as_ref().unwrap();
+        let repeated_runtime = repeated.runtime_targets.as_ref().unwrap();
+        assert_eq!(first.session_id.as_deref(), Some("session-a"));
+        assert_eq!(first_runtime.len(), 3);
+        assert_eq!(
+            first_runtime
+                .iter()
+                .map(|target| (target.order, target.provider_id, target.provider_api_key_id,))
+                .collect::<Vec<_>>(),
+            repeated_runtime
+                .iter()
+                .map(|target| (target.order, target.provider_id, target.provider_api_key_id,))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            first_runtime
+                .iter()
+                .any(|target| target.provider_api_key_name.as_deref() == Some("primary-a"))
+        );
+        assert!(
+            first_runtime
+                .iter()
+                .all(|target| target.order > 0 && target.order <= first_runtime.len())
+        );
     }
 
     #[tokio::test]
@@ -6118,7 +6332,7 @@ mod tests {
         .unwrap();
 
         let state = AppState::new(pool, None);
-        let diagnosis = diagnose_route(&state, "vendor/model", OPENAI_CHAT_COMPLETIONS)
+        let diagnosis = diagnose_route(&state, "vendor/model", OPENAI_CHAT_COMPLETIONS, None)
             .await
             .unwrap();
         assert!(diagnosis.matched);
@@ -7805,6 +8019,7 @@ mod tests {
                 priority: 0,
                 enabled: 1,
                 provider_api_key_id: None,
+                provider_api_key_name: None,
                 auth_retryable: false,
             };
 

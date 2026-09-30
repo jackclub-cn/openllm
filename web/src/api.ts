@@ -297,6 +297,16 @@ export type RouteDiagnoseTarget = {
   provider_health?: boolean | null
 }
 
+export type RouteDiagnoseRuntimeTarget = {
+  order: number
+  provider_id: number
+  provider_name: string
+  upstream_model: string
+  provider_api_key_id?: number | null
+  provider_api_key_name?: string | null
+  provider_health?: boolean | null
+}
+
 export type RouteDiagnose = {
   model: string
   endpoint: string
@@ -309,6 +319,8 @@ export type RouteDiagnose = {
   message: string
   barrel?: ModelCapabilities
   barrel_incomplete: boolean
+  session_id?: string
+  runtime_targets?: RouteDiagnoseRuntimeTarget[]
   targets: RouteDiagnoseTarget[]
 }
 
