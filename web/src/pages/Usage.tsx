@@ -79,6 +79,7 @@ export default function Usage() {
   const [total, setTotal] = useState(0)
   const [model, setModel] = useState(() => searchParams.get('model') || '')
   const [requestId, setRequestId] = useState(() => searchParams.get('request_id') || '')
+  const [sessionId, setSessionId] = useState(() => searchParams.get('session_id') || '')
   const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') || '')
   const [providerId, setProviderId] = useState<number | undefined>(
     () => positiveIntegerParam(searchParams.get('provider_id')),
@@ -109,11 +110,12 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
+    sessionId,
     endpoint,
     providerId,
     providerApiKeyId,
@@ -134,6 +136,7 @@ export default function Usage() {
     const next = new URLSearchParams()
     if (model) next.set('model', model)
     if (requestId) next.set('request_id', requestId)
+    if (sessionId) next.set('session_id', sessionId)
     if (endpoint) next.set('endpoint', endpoint)
     if (providerId) next.set('provider_id', String(providerId))
     if (providerApiKeyId) next.set('provider_api_key_id', String(providerApiKeyId))
@@ -156,6 +159,7 @@ export default function Usage() {
     providerId,
     requestId,
     routeId,
+    sessionId,
     searchParams,
     setSearchParams,
     statusFilter,
@@ -173,6 +177,7 @@ export default function Usage() {
     })
     if (model) params.set('model', model)
     if (requestId) params.set('request_id', requestId)
+    if (sessionId) params.set('session_id', sessionId)
     if (endpoint) params.set('endpoint', endpoint)
     if (providerId) params.set('provider_id', String(providerId))
     if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
@@ -188,6 +193,7 @@ export default function Usage() {
       const currentFilter = JSON.stringify([
         model,
         requestId,
+        sessionId,
         endpoint,
         providerId,
         providerApiKeyId,
@@ -229,7 +235,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerApiKeyId, providerId, requestId, routeId, statusFilter])
+  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerApiKeyId, providerId, requestId, routeId, sessionId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -281,6 +287,7 @@ export default function Usage() {
   const resetFilters = () => {
     setModel('')
     setRequestId('')
+    setSessionId('')
     setEndpoint('')
     setProviderId(undefined)
     setProviderApiKeyId(undefined)
@@ -349,6 +356,7 @@ export default function Usage() {
       const params = new URLSearchParams()
       if (model) params.set('model', model)
       if (requestId) params.set('request_id', requestId)
+      if (sessionId) params.set('session_id', sessionId)
       if (endpoint) params.set('endpoint', endpoint)
       if (providerId) params.set('provider_id', String(providerId))
       if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
@@ -459,6 +467,14 @@ export default function Usage() {
           />
           <Input.Search
             allowClear
+            placeholder="会话 ID"
+            value={sessionId}
+            onChange={(event) => setSessionId(event.target.value)}
+            onSearch={reloadFiltered}
+            style={{ width: 220 }}
+          />
+          <Input.Search
+            allowClear
             placeholder="接口路径"
             value={endpoint}
             onChange={(event) => setEndpoint(event.target.value)}
@@ -536,7 +552,7 @@ export default function Usage() {
           rowKey="id"
           loading={loading}
           dataSource={items}
-          scroll={{ x: 1780 }}
+          scroll={{ x: 2000 }}
           onRow={(record) => ({
             onClick: () => void openDetail(record),
             style: { cursor: 'pointer' },
@@ -555,6 +571,19 @@ export default function Usage() {
               dataIndex: 'created_at',
               width: 170,
               render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm:ss'),
+            },
+            {
+              title: '会话 ID',
+              dataIndex: 'session_id',
+              width: 150,
+              render: (value: string | undefined) =>
+                value ? (
+                  <Typography.Text copyable={{ text: value }} ellipsis style={{ maxWidth: 140 }}>
+                    {value}
+                  </Typography.Text>
+                ) : (
+                  '-'
+                ),
             },
             {
               title: '模型',
@@ -777,6 +806,15 @@ export default function Usage() {
             <Descriptions column={1} size="small" bordered>
               <Descriptions.Item label="请求 ID">
                 <Typography.Text copyable={{ text: detail.request_id }}>{detail.request_id}</Typography.Text>
+              </Descriptions.Item>
+              <Descriptions.Item label="会话 ID">
+                {detail.session_id ? (
+                  <Typography.Text copyable={{ text: detail.session_id }}>
+                    {detail.session_id}
+                  </Typography.Text>
+                ) : (
+                  '-'
+                )}
               </Descriptions.Item>
               <Descriptions.Item label="时间">
                 {dayjs(detail.created_at).format('YYYY-MM-DD HH:mm:ss.SSS')}

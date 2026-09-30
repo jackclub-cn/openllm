@@ -2670,7 +2670,7 @@ pub async fn list_usage(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
-               u.first_token_ms,
+               u.first_token_ms, u.session_id,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
@@ -2715,7 +2715,7 @@ pub async fn export_usage(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
                u.status_code, u.in_flight, u.success, u.streamed, u.error_message,
-               u.created_at, u.first_token_ms, NULL AS response_preview,
+               u.created_at, u.first_token_ms, u.session_id, NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
         FROM usage_logs u
@@ -2737,7 +2737,7 @@ pub async fn export_usage(
     let truncated = rows.len() as i64 == USAGE_EXPORT_LIMIT;
 
     let mut csv = String::from(
-        "\u{feff}created_at,request_id,api_key,provider,provider_api_key,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
+        "\u{feff}created_at,request_id,session_id,api_key,provider,provider_api_key,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
     );
     for row in rows {
         let item = UsageLogView::from(row);
@@ -2774,6 +2774,7 @@ fn usage_csv_row(item: &UsageLogView) -> String {
     [
         item.created_at.clone(),
         item.request_id.clone(),
+        text(item.session_id.as_deref()),
         text(item.api_key_name.as_deref()),
         text(item.provider_name.as_deref()),
         text(item.provider_api_key_name.as_deref()),
@@ -3085,7 +3086,7 @@ pub async fn overview(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
-               u.first_token_ms,
+               u.first_token_ms, u.session_id,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
@@ -4106,6 +4107,13 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
         builder
             .push(" AND u.request_id LIKE ")
             .push_bind(format!("%{}%", request_id.trim()));
+    }
+    if let Some(session_id) = &query.session_id
+        && !session_id.trim().is_empty()
+    {
+        builder
+            .push(" AND u.session_id LIKE ")
+            .push_bind(format!("%{}%", session_id.trim()));
     }
     if let Some(endpoint) = &query.endpoint
         && !endpoint.trim().is_empty()
@@ -6039,6 +6047,7 @@ mod tests {
                 route_id: None,
                 model: None,
                 request_id: None,
+                session_id: None,
                 endpoint: None,
                 success: None,
                 in_flight: Some(true),
@@ -6088,6 +6097,7 @@ mod tests {
                 route_id: None,
                 model: None,
                 request_id: None,
+                session_id: None,
                 endpoint: Some("/v1/responses".to_string()),
                 success: None,
                 in_flight: None,
@@ -6100,6 +6110,56 @@ mod tests {
 
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].request_id, "responses");
+    }
+
+    #[tokio::test]
+    async fn usage_filter_can_select_session() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, session_id, requested_model, endpoint, status_code,
+                in_flight, success, created_at
+             ) VALUES
+                ('session-a', 'codex-session-a', 'm', '/v1/responses', 200, 0, 1,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                ('session-b', 'codex-session-b', 'm', '/v1/responses', 200, 0, 1,
+                 strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let Json(page) = list_usage(
+            State(state),
+            Query(UsageQuery {
+                page: 1,
+                page_size: 20,
+                provider_id: None,
+                provider_api_key_id: None,
+                api_key_id: None,
+                route_id: None,
+                model: None,
+                request_id: None,
+                session_id: Some("session-a".to_string()),
+                endpoint: None,
+                success: None,
+                in_flight: None,
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "session-a");
+        assert_eq!(page.items[0].session_id.as_deref(), Some("codex-session-a"));
     }
 
     #[tokio::test]

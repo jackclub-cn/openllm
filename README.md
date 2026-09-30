@@ -58,7 +58,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - 通过显式路由或 `vendor/model` 前缀对外提供稳定的模型列表，多目标路由会按最严格的公共能力限制输入和输出预算。
 - 兼容 OpenAI `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings` 和 Anthropic Messages 协议。
 - 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
-- 记录请求、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出；仪表盘可下钻到带筛选条件的请求日志，日志筛选条件会同步到 URL。
+- 记录请求、会话 ID、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出；仪表盘可下钻到带筛选条件的请求日志，日志筛选条件会同步到 URL。
 - 支持额度接口的提供商可直接查看额度窗口和价格，多密钥时可切换具体 Key 查询；例如 Command Code 的 5 小时、周、月额度，OpenCode Go 的滚动、周、月窗口，以及 DeepSeek 余额和模型价格。
 
 ## 使用说明

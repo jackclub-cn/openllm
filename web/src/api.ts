@@ -344,6 +344,7 @@ export type ApiKey = {
 export type UsageLog = {
   id: number
   request_id: string
+  session_id?: string
   api_key_id?: number
   api_key_name?: string
   route_id?: number

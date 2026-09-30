@@ -29,6 +29,7 @@ use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
 const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
+const SESSION_ID_MAX_CHARS: usize = 256;
 #[cfg(test)]
 const OPENAI_RESPONSES: &str = "/v1/responses";
 
@@ -216,7 +217,7 @@ fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Some(value.to_string());
+            return Some(value.chars().take(SESSION_ID_MAX_CHARS).collect());
         }
     }
 
@@ -231,7 +232,7 @@ fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<String> {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return Some(value.to_string());
+            return Some(value.chars().take(SESSION_ID_MAX_CHARS).collect());
         }
     }
 
@@ -1358,6 +1359,7 @@ async fn proxy_anthropic_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         streamed,
@@ -1368,6 +1370,7 @@ async fn proxy_anthropic_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         streamed,
@@ -1380,6 +1383,7 @@ async fn proxy_anthropic_inner(
             state,
             api_key.as_ref(),
             request_id,
+            session_id.as_deref(),
             &requested_model,
             &endpoint,
             streamed,
@@ -1405,6 +1409,7 @@ async fn proxy_anthropic_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         request_tokens,
@@ -1415,6 +1420,7 @@ async fn proxy_anthropic_inner(
     log_usage_started(
         state,
         request_id,
+        session_id.as_deref(),
         api_key.as_ref().map(|key| key.id),
         route_id,
         &requested_model,
@@ -1857,6 +1863,7 @@ async fn proxy_openai_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         streamed,
@@ -1867,6 +1874,7 @@ async fn proxy_openai_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         streamed,
@@ -1879,6 +1887,7 @@ async fn proxy_openai_inner(
             state,
             api_key.as_ref(),
             request_id,
+            session_id.as_deref(),
             &requested_model,
             &endpoint,
             streamed,
@@ -1910,6 +1919,7 @@ async fn proxy_openai_inner(
         state,
         api_key.as_ref(),
         request_id,
+        session_id.as_deref(),
         &requested_model,
         &endpoint,
         request_tokens,
@@ -1920,6 +1930,7 @@ async fn proxy_openai_inner(
     log_usage_started(
         state,
         request_id,
+        session_id.as_deref(),
         api_key.as_ref().map(|key| key.id),
         route_id,
         &requested_model,
@@ -3307,6 +3318,7 @@ async fn reserve_api_key_rate_limit(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
+    session_id: Option<&str>,
     requested_model: &str,
     endpoint: &str,
     request_tokens: i64,
@@ -3327,13 +3339,13 @@ async fn reserve_api_key_rate_limit(
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logs (
-            request_id, api_key_id, route_id, provider_id, requested_model,
+            request_id, session_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
             success, streamed, error_message, response_preview, last_activity_at
         )
-        SELECT ?, ?, NULL, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0,
+        SELECT ?, ?, ?, NULL, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0,
                NULL, NULL, 0, 1, 0, ?, NULL, NULL,
                strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         WHERE (
@@ -3352,6 +3364,7 @@ async fn reserve_api_key_rate_limit(
         "#,
     )
     .bind(request_id)
+    .bind(session_id)
     .bind(api_key.id)
     .bind(requested_model)
     .bind(endpoint)
@@ -3449,10 +3462,12 @@ fn enforce_api_key_model_access(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enforce_policy_or_log(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
+    session_id: Option<&str>,
     requested_model: &str,
     endpoint: &str,
     streamed: bool,
@@ -3475,6 +3490,7 @@ async fn enforce_policy_or_log(
                 state,
                 api_key,
                 request_id,
+                session_id,
                 requested_model,
                 endpoint,
                 streamed,
@@ -3493,6 +3509,7 @@ async fn enforce_api_key_rate_limit_or_log(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
+    session_id: Option<&str>,
     requested_model: &str,
     endpoint: &str,
     request_tokens: i64,
@@ -3503,6 +3520,7 @@ async fn enforce_api_key_rate_limit_or_log(
         state,
         api_key,
         request_id,
+        session_id,
         requested_model,
         endpoint,
         request_tokens,
@@ -3521,6 +3539,7 @@ async fn enforce_api_key_rate_limit_or_log(
                 state,
                 api_key,
                 request_id,
+                session_id,
                 requested_model,
                 endpoint,
                 streamed,
@@ -3539,6 +3558,7 @@ async fn log_request_rejection(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
+    session_id: Option<&str>,
     requested_model: &str,
     endpoint: &str,
     streamed: bool,
@@ -3567,6 +3587,15 @@ async fn log_request_rejection(
         },
     )
     .await;
+    if let Some(session_id) = session_id
+        && let Err(error) = sqlx::query("UPDATE usage_logs SET session_id = ? WHERE request_id = ?")
+            .bind(session_id)
+            .bind(request_id)
+            .execute(&state.pool)
+            .await
+    {
+        tracing::warn!(%error, request_id, "failed to attach session to rejected usage log");
+    }
 }
 
 fn enforce_context_capacity(request_tokens: i64, barrel: Option<&BarrelEnvelope>) -> AppResult<()> {
@@ -4017,6 +4046,7 @@ async fn resolve_route_or_log(
     state: &AppState,
     api_key: Option<&ApiKeyRecord>,
     request_id: &str,
+    session_id: Option<&str>,
     model: &str,
     endpoint: &str,
     streamed: bool,
@@ -4040,6 +4070,7 @@ async fn resolve_route_or_log(
                 state,
                 api_key,
                 request_id,
+                session_id,
                 model,
                 endpoint,
                 streamed,
@@ -5062,6 +5093,7 @@ fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
 async fn log_usage_started(
     state: &AppState,
     request_id: &str,
+    session_id: Option<&str>,
     api_key_id: Option<i64>,
     route_id: Option<i64>,
     requested_model: &str,
@@ -5072,16 +5104,17 @@ async fn log_usage_started(
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logs (
-            request_id, api_key_id, route_id, provider_id, requested_model,
+            request_id, session_id, api_key_id, route_id, provider_id, requested_model,
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
             success, streamed, error_message, response_preview, last_activity_at
         ) VALUES (
-            ?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?,
+            ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?,
             NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
         ON CONFLICT(request_id) DO UPDATE SET
+            session_id = COALESCE(excluded.session_id, usage_logs.session_id),
             route_id = excluded.route_id,
             requested_model = excluded.requested_model,
             endpoint = excluded.endpoint,
@@ -5094,6 +5127,7 @@ async fn log_usage_started(
         "#,
     )
     .bind(request_id)
+    .bind(session_id)
     .bind(api_key_id)
     .bind(route_id)
     .bind(requested_model)
@@ -5983,6 +6017,7 @@ mod tests {
             &state,
             None,
             "route-rejection",
+            None,
             "missing-model",
             OPENAI_RESPONSES,
             false,
@@ -6308,6 +6343,7 @@ mod tests {
         log_usage_started(
             &state,
             "request-in-flight",
+            Some("session-123"),
             None,
             None,
             "test-model",
@@ -6316,14 +6352,14 @@ mod tests {
             false,
         )
         .await;
-        let pending: (i64, i64, i64, i64) = sqlx::query_as(
-            "SELECT in_flight, status_code, prompt_tokens, total_tokens
+        let pending: (i64, i64, i64, i64, Option<String>) = sqlx::query_as(
+            "SELECT in_flight, status_code, prompt_tokens, total_tokens, session_id
              FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(pending, (1, 0, 10, 10));
+        assert_eq!(pending, (1, 0, 10, 10, Some("session-123".to_string())));
 
         sqlx::query(
             "INSERT INTO providers (id, name, provider_type, base_url)
@@ -6386,6 +6422,7 @@ mod tests {
         )
         .await;
 
+        #[allow(clippy::type_complexity)]
         let completed: (
             i64,
             i64,
@@ -6396,10 +6433,11 @@ mod tests {
             String,
             Option<i64>,
             Option<String>,
+            Option<String>,
         ) = sqlx::query_as(
             "SELECT in_flight, status_code, prompt_tokens, completion_tokens,
                     total_tokens, provider_id, upstream_model, provider_api_key_id,
-                    provider_api_key_name
+                    provider_api_key_name, session_id
              FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
         .fetch_one(&pool)
@@ -6416,7 +6454,8 @@ mod tests {
                 7,
                 "upstream-test-model".to_string(),
                 Some(11),
-                Some("Primary".to_string())
+                Some("Primary".to_string()),
+                Some("session-123".to_string())
             )
         );
 
@@ -6543,6 +6582,7 @@ mod tests {
                 &state,
                 Some(&key),
                 request_id,
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6556,6 +6596,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "third",
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6609,6 +6650,7 @@ mod tests {
             &state,
             Some(&key),
             "active",
+            None,
             "model",
             "/v1/chat/completions",
             10,
@@ -6621,6 +6663,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "blocked",
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6639,6 +6682,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "next",
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6677,6 +6721,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "unlimited",
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6724,6 +6769,7 @@ mod tests {
             &state,
             Some(&key),
             "active",
+            None,
             "model",
             "/v1/chat/completions",
             10,
@@ -6737,6 +6783,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "blocked",
+                None,
                 "model",
                 "/v1/chat/completions",
                 10,
@@ -6892,6 +6939,7 @@ mod tests {
                 &state,
                 Some(&key),
                 "rejected",
+                None,
                 "model",
                 "/v1/chat/completions",
                 false,

@@ -903,6 +903,7 @@ pub struct ApiKeyCreated {
 pub struct UsageLog {
     pub id: i64,
     pub request_id: String,
+    pub session_id: Option<String>,
     pub api_key_id: Option<i64>,
     pub route_id: Option<i64>,
     pub provider_id: Option<i64>,
@@ -935,6 +936,8 @@ pub struct UsageLog {
 pub struct UsageLogView {
     pub id: i64,
     pub request_id: String,
+    /// Stable client conversation identifier when the caller supplied one.
+    pub session_id: Option<String>,
     pub api_key_id: Option<i64>,
     pub api_key_name: Option<String>,
     pub route_id: Option<i64>,
@@ -983,6 +986,7 @@ impl From<UsageLog> for UsageLogView {
         Self {
             id: value.id,
             request_id: value.request_id,
+            session_id: value.session_id,
             api_key_id: value.api_key_id,
             api_key_name: None,
             route_id: value.route_id,
@@ -1018,6 +1022,7 @@ impl From<UsageLog> for UsageLogView {
 pub struct UsageLogDetailRow {
     pub id: i64,
     pub request_id: String,
+    pub session_id: Option<String>,
     pub api_key_id: Option<i64>,
     pub api_key_name: Option<String>,
     pub route_id: Option<i64>,
@@ -1058,6 +1063,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
         Self {
             id: value.id,
             request_id: value.request_id,
+            session_id: value.session_id,
             api_key_id: value.api_key_id,
             api_key_name: value.api_key_name,
             route_id: value.route_id,
@@ -1101,6 +1107,7 @@ pub struct UsageQuery {
     pub route_id: Option<i64>,
     pub model: Option<String>,
     pub request_id: Option<String>,
+    pub session_id: Option<String>,
     pub endpoint: Option<String>,
     pub success: Option<bool>,
     pub in_flight: Option<bool>,
