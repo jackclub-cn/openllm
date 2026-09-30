@@ -5,6 +5,7 @@ import {
   ExperimentOutlined,
   HistoryOutlined,
   PlusOutlined,
+  SearchOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
@@ -84,6 +85,10 @@ export default function RoutesPage() {
   const [items, setItems] = useState<GatewayRoute[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
+  const [search, setSearch] = useState('')
+  const [status, setStatus] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [strategy, setStrategy] = useState<'all' | GatewayRoute['strategy']>('all')
+  const [page, setPage] = useState(1)
   const [saving, setSaving] = useState(false)
   const [editing, setEditing] = useState<GatewayRoute>()
   const [open, setOpen] = useState(false)
@@ -198,6 +203,27 @@ export default function RoutesPage() {
     setSearchParams({}, { replace: true })
   }, [searchParams, setSearchParams])
 
+  const filteredItems = items.filter((item) => {
+    const query = search.trim().toLowerCase()
+    if (query) {
+      const searchable = [
+        item.name,
+        item.model_pattern,
+        ...item.targets.flatMap((target) => [
+          providers.find((provider) => provider.id === target.provider_id)?.name || '',
+          target.upstream_model,
+        ]),
+      ]
+        .join(' ')
+        .toLowerCase()
+      if (!searchable.includes(query)) return false
+    }
+    if (status === 'enabled' && !item.enabled) return false
+    if (status === 'disabled' && item.enabled) return false
+    if (strategy !== 'all' && item.strategy !== strategy) return false
+    return true
+  })
+
   return (
     <>
       <PageHeader
@@ -205,6 +231,48 @@ export default function RoutesPage() {
         description="按模型通配符选择上游，并配置故障切换与负载均衡"
         extra={
           <Space>
+            <Input
+              allowClear
+              prefix={<SearchOutlined />}
+              value={search}
+              onChange={(event) => {
+                setSearch(event.target.value)
+                setPage(1)
+              }}
+              placeholder="搜索路由、模型或上游目标"
+              style={{ width: 250 }}
+            />
+            <Select
+              value={status}
+              onChange={(value) => {
+                setStatus(value)
+                setPage(1)
+              }}
+              style={{ width: 120 }}
+              options={[
+                { value: 'all', label: '全部状态' },
+                { value: 'enabled', label: '已启用' },
+                { value: 'disabled', label: '已停用' },
+              ]}
+            />
+            <Select
+              value={strategy}
+              onChange={(value) => {
+                setStrategy(value)
+                setPage(1)
+              }}
+              style={{ width: 130 }}
+              options={[
+                { value: 'all', label: '全部策略' },
+                ...Object.entries(strategyLabels).map(([value, label]) => ({
+                  value,
+                  label,
+                })),
+              ]}
+            />
+            <Tag>
+              {filteredItems.length}/{items.length}
+            </Tag>
             <Button
               icon={<ExperimentOutlined />}
               onClick={() => {
@@ -224,8 +292,16 @@ export default function RoutesPage() {
         <Table
           rowKey="id"
           loading={loading}
-          dataSource={items}
-          pagination={false}
+          dataSource={filteredItems}
+          pagination={{
+            current: page,
+            defaultPageSize: 20,
+            pageSizeOptions: [10, 20, 50, 100],
+            showSizeChanger: true,
+            showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
+            onChange: (nextPage) => setPage(nextPage),
+          }}
+          locale={{ emptyText: items.length ? '没有符合筛选条件的路由' : '暂无路由' }}
           scroll={{ x: 900 }}
           columns={[
             {
