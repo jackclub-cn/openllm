@@ -75,6 +75,9 @@ export default function Usage() {
   const [providerId, setProviderId] = useState<number | undefined>(
     () => positiveIntegerParam(searchParams.get('provider_id')),
   )
+  const [providerApiKeyId, setProviderApiKeyId] = useState<number | undefined>(
+    () => positiveIntegerParam(searchParams.get('provider_api_key_id')),
+  )
   const [apiKeyId, setApiKeyId] = useState<number | undefined>(
     () => positiveIntegerParam(searchParams.get('api_key_id')),
   )
@@ -92,13 +95,14 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, apiKeyId, routeId, statusFilter, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, apiKeyId, routeId, statusFilter, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, requestId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, requestId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
     endpoint,
     providerId,
+    providerApiKeyId,
     apiKeyId,
     routeId,
     statusFilter,
@@ -126,6 +130,7 @@ export default function Usage() {
     if (requestId) params.set('request_id', requestId)
     if (endpoint) params.set('endpoint', endpoint)
     if (providerId) params.set('provider_id', String(providerId))
+    if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
     if (apiKeyId) params.set('api_key_id', String(apiKeyId))
     if (routeId) params.set('route_id', String(routeId))
     if (statusFilter === 'success') params.set('success', 'true')
@@ -140,6 +145,7 @@ export default function Usage() {
         requestId,
         endpoint,
         providerId,
+        providerApiKeyId,
         apiKeyId,
         routeId,
         statusFilter,
@@ -178,7 +184,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerId, requestId, routeId, statusFilter])
+  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerApiKeyId, providerId, requestId, routeId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -249,6 +255,7 @@ export default function Usage() {
       if (requestId) params.set('request_id', requestId)
       if (endpoint) params.set('endpoint', endpoint)
       if (providerId) params.set('provider_id', String(providerId))
+      if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
       if (apiKeyId) params.set('api_key_id', String(apiKeyId))
       if (routeId) params.set('route_id', String(routeId))
       if (statusFilter === 'success') params.set('success', 'true')
@@ -369,6 +376,21 @@ export default function Usage() {
             onChange={(value) => { setProviderId(value); setTimeout(() => load(1), 0) }}
             options={providers.map((provider) => ({ value: provider.id, label: provider.name }))}
             style={{ width: 180 }}
+          />
+          <Select
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            placeholder="上游密钥"
+            value={providerApiKeyId}
+            onChange={(value) => { setProviderApiKeyId(value); setTimeout(() => load(1), 0) }}
+            options={providers.flatMap((provider) =>
+              provider.api_keys.map((key) => ({
+                value: key.id,
+                label: `${provider.name} · ${key.name || `Key ${key.id}`}`,
+              })),
+            )}
+            style={{ width: 220 }}
           />
           <Select
             allowClear

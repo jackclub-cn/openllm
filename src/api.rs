@@ -3060,6 +3060,11 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
     if let Some(provider_id) = query.provider_id {
         builder.push(" AND u.provider_id = ").push_bind(provider_id);
     }
+    if let Some(provider_api_key_id) = query.provider_api_key_id {
+        builder
+            .push(" AND u.provider_api_key_id = ")
+            .push_bind(provider_api_key_id);
+    }
     if let Some(api_key_id) = query.api_key_id {
         builder.push(" AND u.api_key_id = ").push_bind(api_key_id);
     }
@@ -3607,6 +3612,49 @@ mod tests {
                 .unwrap();
         assert_eq!(detail.provider_api_key_id, Some(11));
         assert_eq!(detail.provider_api_key_name.as_deref(), Some("Primary"));
+    }
+
+    #[tokio::test]
+    async fn usage_filter_can_select_provider_api_key() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'Provider', 'openai', 'https://example.com/v1')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'Primary', 'sk-primary', 1),
+                    (12, 1, 'Backup', 'sk-backup', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, provider_id, provider_api_key_id, provider_api_key_name,
+                requested_model, endpoint, status_code, success
+             ) VALUES
+                ('primary', 1, 11, 'Primary', 'gpt-test', '/v1/chat/completions', 200, 1),
+                ('backup', 1, 12, 'Backup', 'gpt-test', '/v1/chat/completions', 200, 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let query: UsageQuery = serde_json::from_value(json!({
+            "provider_api_key_id": 12
+        }))
+        .unwrap();
+        let Json(page) = list_usage(State(state), Query(query)).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "backup");
+        assert_eq!(
+            page.items[0].provider_api_key_name.as_deref(),
+            Some("Backup")
+        );
     }
 
     #[test]
@@ -4216,6 +4264,7 @@ mod tests {
                 page: 1,
                 page_size: 20,
                 provider_id: None,
+                provider_api_key_id: None,
                 api_key_id: None,
                 route_id: None,
                 model: None,
@@ -4264,6 +4313,7 @@ mod tests {
                 page: 1,
                 page_size: 20,
                 provider_id: None,
+                provider_api_key_id: None,
                 api_key_id: None,
                 route_id: None,
                 model: None,
