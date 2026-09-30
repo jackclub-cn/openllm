@@ -113,6 +113,7 @@ export type Provider = {
   last_test_checked?: 'inference' | 'models'
   last_test_message?: string
   health_check_interval_minutes?: number | null
+  health_check_model?: string | null
   models_sync_interval_minutes?: number | null
   models_sync_attempted_at?: string
   created_at: string
@@ -132,6 +133,7 @@ export type ProviderInput = {
   auto_sync_models: boolean
   models: string[]
   health_check_interval_minutes?: number | null
+  health_check_model?: string | null
   models_sync_interval_minutes?: number | null
 }
 

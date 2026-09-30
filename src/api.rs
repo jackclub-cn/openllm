@@ -194,6 +194,7 @@ pub async fn create_provider(
     let base_url = normalize_base_url(&input.base_url);
     let health_check_interval_minutes =
         normalize_health_interval(input.health_check_interval_minutes)?;
+    let health_check_model = normalize_health_check_model(input.health_check_model.as_deref());
     let models_sync_interval_minutes =
         normalize_health_interval(input.models_sync_interval_minutes)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
@@ -209,8 +210,9 @@ pub async fn create_provider(
         "INSERT INTO providers (
             name, provider_type, base_url, model_prefix, models_dev_id,
             api_key, headers, enabled, tool_search_supported,
-            health_check_interval_minutes, models_sync_interval_minutes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            health_check_interval_minutes, health_check_model,
+            models_sync_interval_minutes
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -222,6 +224,7 @@ pub async fn create_provider(
     .bind(input.enabled as i64)
     .bind(input.tool_search_supported as i64)
     .bind(health_check_interval_minutes)
+    .bind(health_check_model)
     .bind(models_sync_interval_minutes)
     .execute(&mut *tx)
     .await
@@ -283,6 +286,10 @@ pub async fn update_provider(
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.health_check_interval_minutes,
     };
+    let health_check_model = match input.health_check_model.as_deref() {
+        Some(value) => normalize_health_check_model(Some(value)),
+        None => current.health_check_model,
+    };
     let models_sync_interval_minutes = match input.models_sync_interval_minutes {
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.models_sync_interval_minutes,
@@ -325,7 +332,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -336,6 +343,7 @@ pub async fn update_provider(
     .bind(enabled as i64)
     .bind(tool_search_supported as i64)
     .bind(health_check_interval_minutes)
+    .bind(health_check_model)
     .bind(models_sync_interval_minutes)
     .bind(id)
     .execute(&mut *tx)
@@ -424,13 +432,18 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     // it cannot tell the operator whether their key works. When a model is
     // known, probe the inference endpoint instead: it is the one that actually
     // enforces auth, so a bad key fails the test instead of looking healthy.
-    let model = sqlx::query_scalar::<_, String>(
-        "SELECT model_name FROM provider_models WHERE provider_id = ? AND enabled = 1 \
-         ORDER BY model_name LIMIT 1",
-    )
-    .bind(id)
-    .fetch_optional(&state.pool)
-    .await?;
+    let model = match normalize_health_check_model(provider.health_check_model.as_deref()) {
+        Some(model) => Some(model),
+        None => {
+            sqlx::query_scalar::<_, String>(
+                "SELECT model_name FROM provider_models WHERE provider_id = ? AND enabled = 1 \
+                 ORDER BY model_name LIMIT 1",
+            )
+            .bind(id)
+            .fetch_optional(&state.pool)
+            .await?
+        }
+    };
 
     // A provider may have several credentials. Test every enabled key and
     // consider the provider healthy when any one of them succeeds.
@@ -3152,6 +3165,13 @@ fn normalize_optional(value: Option<String>) -> Option<String> {
     })
 }
 
+fn normalize_health_check_model(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn normalize_health_interval(value: Option<i64>) -> AppResult<Option<i64>> {
     match value {
         Some(value) if value < 0 => Err(AppError::BadRequest(
@@ -3354,6 +3374,7 @@ mod tests {
             auto_sync_models: false,
             models: Vec::new(),
             health_check_interval_minutes: None,
+            health_check_model: None,
             models_sync_interval_minutes: None,
         }
     }
@@ -3387,6 +3408,7 @@ mod tests {
             auto_sync_models: None,
             models: None,
             health_check_interval_minutes: None,
+            health_check_model: None,
             models_sync_interval_minutes: None,
         }
     }
@@ -3749,6 +3771,99 @@ mod tests {
         assert_eq!(created.api_keys.len(), 1);
         assert_eq!(created.api_keys[0].name, "Default");
         assert_eq!(created.api_keys[0].api_key_suffix, "gacy");
+    }
+
+    #[tokio::test]
+    async fn persists_provider_health_check_model() {
+        let state = provider_key_test_state().await;
+        let (_, Json(created)) =
+            create_provider(State(state.clone()), Json(provider_input(None, Vec::new())))
+                .await
+                .unwrap();
+        assert_eq!(created.health_check_model, None);
+
+        let mut update = provider_update_with_keys(None);
+        update.health_check_model = Some("  claude-haiku-4-5  ".to_string());
+        let Json(updated) = update_provider(State(state.clone()), Path(created.id), Json(update))
+            .await
+            .unwrap();
+        assert_eq!(
+            updated.health_check_model.as_deref(),
+            Some("claude-haiku-4-5")
+        );
+
+        let mut clear = provider_update_with_keys(None);
+        clear.health_check_model = Some(String::new());
+        let Json(cleared) = update_provider(State(state), Path(created.id), Json(clear))
+            .await
+            .unwrap();
+        assert_eq!(cleared.health_check_model, None);
+    }
+
+    #[tokio::test]
+    async fn provider_health_check_uses_configured_model() {
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().await = Some(body);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "health",
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": 1,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 1
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, health_check_model
+             ) VALUES (1, 'mock', 'openai', ?, 'configured-model')",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'fallback-model', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = test_provider_inner(&state, 1).await.unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked, "inference");
+        assert!(result.message.contains("configured-model"));
+        assert_eq!(
+            seen.lock()
+                .await
+                .as_ref()
+                .and_then(|body| body.get("model"))
+                .and_then(Value::as_str),
+            Some("configured-model")
+        );
+        server.abort();
     }
 
     #[tokio::test]

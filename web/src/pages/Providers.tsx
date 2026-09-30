@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons'
 import {
   App,
+  AutoComplete,
   Button,
   Card,
   Form,
@@ -136,6 +137,7 @@ export default function Providers() {
       // Never re-sync implicitly while editing: doing so would overwrite a
       // manually curated model list. The user must opt in explicitly.
       auto_sync_models: false,
+      health_check_model: item.health_check_model || '',
       headersText: JSON.stringify(item.headers || {}, null, 2),
       modelsText: item.models.join('\n'),
     } as never : {
@@ -148,6 +150,7 @@ export default function Providers() {
       tool_search_supported: true,
       auto_sync_models: true,
       health_check_interval_minutes: 0,
+      health_check_model: '',
       models_sync_interval_minutes: 0,
       headersText: '{}',
       modelsText: '',
@@ -200,6 +203,7 @@ export default function Providers() {
       auto_sync_models: values.auto_sync_models,
       models: values.modelsText.split('\n').map((item) => item.trim()).filter(Boolean),
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
+      health_check_model: values.health_check_model?.trim() || '',
       models_sync_interval_minutes: values.models_sync_interval_minutes ?? 0,
     }
     setSaving(true)
@@ -522,6 +526,7 @@ export default function Providers() {
                 const detail = [
                   record.last_test_message,
                   record.last_test_latency_ms != null ? `${record.last_test_latency_ms} ms` : '',
+                  record.health_check_model ? `检测模型 ${record.health_check_model}` : '',
                   record.last_test_checked === 'models' ? '仅验证主机可达' : '',
                   record.health_check_interval_minutes
                     ? `自动每 ${record.health_check_interval_minutes} 分钟`
@@ -771,6 +776,17 @@ export default function Providers() {
             extra="0 或留空表示关闭；启用后后台会按间隔检测并更新健康状态。"
           >
             <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="health_check_model"
+            label="健康检查模型"
+            extra="留空时使用同步模型列表中的第一个启用模型；也可手动填写仅供检测使用的模型名。"
+          >
+            <AutoComplete
+              allowClear
+              options={(editing?.models || []).map((model) => ({ value: model }))}
+              placeholder="例如 gpt-5.4-mini"
+            />
           </Form.Item>
           <Form.Item
             name="models_sync_interval_minutes"
