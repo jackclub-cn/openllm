@@ -1344,6 +1344,7 @@ async fn proxy_anthropic_inner(
             request_id,
             target_provider_id,
             &target_upstream_model,
+            target_provider_key_id,
         )
         .await;
         mark_provider_api_key_used(state, target_provider_key_id).await;
@@ -1841,6 +1842,7 @@ async fn proxy_openai_inner(
             request_id,
             target_provider_id,
             &target_upstream_model,
+            target_provider_key_id,
         )
         .await;
         mark_provider_api_key_used(state, target_provider_key_id).await;
@@ -4895,13 +4897,18 @@ async fn log_usage_target(
     request_id: &str,
     provider_id: i64,
     upstream_model: &str,
+    provider_api_key_id: Option<i64>,
 ) {
     if let Err(error) = sqlx::query(
-        "UPDATE usage_logs SET provider_id = ?, upstream_model = ?, \
+        "UPDATE usage_logs SET provider_id = ?, provider_api_key_id = ?, \
+             provider_api_key_name = (SELECT name FROM provider_api_keys WHERE id = ?), \
+             upstream_model = ?, \
              last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
          WHERE request_id = ? AND in_flight = 1",
     )
     .bind(provider_id)
+    .bind(provider_api_key_id)
+    .bind(provider_api_key_id)
     .bind(upstream_model)
     .bind(request_id)
     .execute(&state.pool)
@@ -5984,15 +5991,37 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        log_usage_target(&state, "request-in-flight", 7, "upstream-test-model").await;
-        let target: (i64, String) = sqlx::query_as(
-            "SELECT provider_id, upstream_model
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 7, 'Primary', 'sk-primary', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        log_usage_target(
+            &state,
+            "request-in-flight",
+            7,
+            "upstream-test-model",
+            Some(11),
+        )
+        .await;
+        let target: (i64, String, Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT provider_id, upstream_model, provider_api_key_id, provider_api_key_name
              FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(target, (7, "upstream-test-model".to_string()));
+        assert_eq!(
+            target,
+            (
+                7,
+                "upstream-test-model".to_string(),
+                Some(11),
+                Some("Primary".to_string())
+            )
+        );
 
         log_usage(
             &state,
@@ -6016,9 +6045,20 @@ mod tests {
         )
         .await;
 
-        let completed: (i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        let completed: (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<i64>,
+            Option<String>,
+        ) = sqlx::query_as(
             "SELECT in_flight, status_code, prompt_tokens, completion_tokens,
-                    total_tokens, provider_id, upstream_model
+                    total_tokens, provider_id, upstream_model, provider_api_key_id,
+                    provider_api_key_name
              FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
         .fetch_one(&pool)
@@ -6026,10 +6066,20 @@ mod tests {
         .unwrap();
         assert_eq!(
             completed,
-            (0, 200, 10, 5, 15, 7, "upstream-test-model".to_string())
+            (
+                0,
+                200,
+                10,
+                5,
+                15,
+                7,
+                "upstream-test-model".to_string(),
+                Some(11),
+                Some("Primary".to_string())
+            )
         );
 
-        log_usage_target(&state, "request-in-flight", 8, "late-update").await;
+        log_usage_target(&state, "request-in-flight", 8, "late-update", None).await;
         let provider_id: i64 = sqlx::query_scalar(
             "SELECT provider_id FROM usage_logs WHERE request_id = 'request-in-flight'",
         )
@@ -6037,6 +6087,33 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(provider_id, 7);
+        let provider_api_key_id: Option<i64> = sqlx::query_scalar(
+            "SELECT provider_api_key_id FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(provider_api_key_id, Some(11));
+        let provider_api_key_name: Option<String> = sqlx::query_scalar(
+            "SELECT provider_api_key_name FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(provider_api_key_name.as_deref(), Some("Primary"));
+
+        sqlx::query("DELETE FROM provider_api_keys WHERE id = 11")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let snapshot: (Option<i64>, Option<String>) = sqlx::query_as(
+            "SELECT provider_api_key_id, provider_api_key_name
+             FROM usage_logs WHERE request_id = 'request-in-flight'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(snapshot, (None, Some("Primary".to_string())));
     }
 
     #[tokio::test]

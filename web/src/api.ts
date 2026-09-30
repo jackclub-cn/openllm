@@ -247,6 +247,8 @@ export type UsageLog = {
   route_name?: string
   provider_id?: number
   provider_name?: string
+  provider_api_key_id?: number
+  provider_api_key_name?: string
   requested_model: string
   upstream_model?: string
   endpoint: string

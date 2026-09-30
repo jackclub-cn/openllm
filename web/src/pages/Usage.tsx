@@ -451,7 +451,14 @@ export default function Usage() {
               width: 170,
               render: (_, record) => (
                 <div>
-                  <div>{record.provider_name || (record.provider_id ? `#${record.provider_id}` : '-')}</div>
+                  <Space size={4}>
+                    <span>{record.provider_name || (record.provider_id ? `#${record.provider_id}` : '-')}</span>
+                    {record.provider_api_key_name && (
+                      <Tooltip title={`上游密钥 #${record.provider_api_key_id ?? '-'}`}>
+                        <Tag color="blue">{record.provider_api_key_name}</Tag>
+                      </Tooltip>
+                    )}
+                  </Space>
                   <Typography.Text type="secondary">
                     {record.route_name || (record.route_id ? `#${record.route_id}` : '自动路由')}
                   </Typography.Text>
@@ -656,6 +663,9 @@ export default function Usage() {
               </Descriptions.Item>
               <Descriptions.Item label="提供商">
                 {detail.provider_name || (detail.provider_id ? `#${detail.provider_id}` : '-')}
+              </Descriptions.Item>
+              <Descriptions.Item label="上游密钥">
+                {detail.provider_api_key_name || (detail.provider_api_key_id ? `#${detail.provider_api_key_id}` : '-')}
               </Descriptions.Item>
               <Descriptions.Item label="路由">
                 {detail.route_name || (detail.route_id ? `#${detail.route_id}` : '自动路由')}

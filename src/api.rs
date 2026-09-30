@@ -1866,17 +1866,20 @@ pub async fn list_usage(
     let mut items = QueryBuilder::<Sqlite>::new(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
+               u.provider_api_key_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
                u.first_token_ms,
                NULL AS response_preview,
-               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
+               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
+               COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
         FROM usage_logs u
         LEFT JOIN api_keys k ON k.id = u.api_key_id
         LEFT JOIN routes r ON r.id = u.route_id
         LEFT JOIN providers p ON p.id = u.provider_id
+        LEFT JOIN provider_api_keys pk ON pk.id = u.provider_api_key_id
         WHERE 1 = 1
         "#,
     );
@@ -1908,16 +1911,19 @@ pub async fn export_usage(
     let mut items = QueryBuilder::<Sqlite>::new(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
+               u.provider_api_key_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
                u.status_code, u.in_flight, u.success, u.streamed, u.error_message,
                u.created_at, u.first_token_ms, NULL AS response_preview,
-               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
+               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
+               COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
         FROM usage_logs u
         LEFT JOIN api_keys k ON k.id = u.api_key_id
         LEFT JOIN routes r ON r.id = u.route_id
         LEFT JOIN providers p ON p.id = u.provider_id
+        LEFT JOIN provider_api_keys pk ON pk.id = u.provider_api_key_id
         WHERE 1 = 1
         "#,
     );
@@ -1932,7 +1938,7 @@ pub async fn export_usage(
     let truncated = rows.len() as i64 == USAGE_EXPORT_LIMIT;
 
     let mut csv = String::from(
-        "\u{feff}created_at,request_id,api_key,provider,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
+        "\u{feff}created_at,request_id,api_key,provider,provider_api_key,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
     );
     for row in rows {
         let item = UsageLogView::from(row);
@@ -1971,6 +1977,7 @@ fn usage_csv_row(item: &UsageLogView) -> String {
         item.request_id.clone(),
         text(item.api_key_name.as_deref()),
         text(item.provider_name.as_deref()),
+        text(item.provider_api_key_name.as_deref()),
         text(item.route_name.as_deref()),
         item.requested_model.clone(),
         text(item.upstream_model.as_deref()),
@@ -2221,17 +2228,20 @@ pub async fn overview(
     let recent = sqlx::query_as::<_, UsageLogDetailRow>(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
+               u.provider_api_key_id,
                u.requested_model, u.upstream_model, u.endpoint, u.prompt_tokens,
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
                u.first_token_ms,
                NULL AS response_preview,
-               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name
+               k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
+               COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
         FROM usage_logs u
         LEFT JOIN api_keys k ON k.id = u.api_key_id
         LEFT JOIN routes r ON r.id = u.route_id
         LEFT JOIN providers p ON p.id = u.provider_id
+        LEFT JOIN provider_api_keys pk ON pk.id = u.provider_api_key_id
         WHERE u.created_at >= ? AND u.created_at < ?
         ORDER BY u.created_at DESC, u.id DESC
         LIMIT 8
@@ -3547,6 +3557,56 @@ mod tests {
         assert_eq!(created.api_keys.len(), 1);
         assert_eq!(created.api_keys[0].name, "Default");
         assert_eq!(created.api_keys[0].api_key_suffix, "gacy");
+    }
+
+    #[tokio::test]
+    async fn usage_views_expose_provider_api_key_name() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'Provider', 'openai', 'https://example.com/v1')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'Primary', 'sk-primary', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, provider_id, provider_api_key_id, provider_api_key_name,
+                requested_model,
+                endpoint, prompt_tokens, total_tokens, status_code, success
+             ) VALUES (
+                'request-with-provider-key', 1, 11, 'Primary', 'gpt-test',
+                '/v1/chat/completions', 10, 10, 200, 1
+             )",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let query: UsageQuery = serde_json::from_value(json!({})).unwrap();
+        let Json(page) = list_usage(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].provider_api_key_id, Some(11));
+        assert_eq!(
+            page.items[0].provider_api_key_name.as_deref(),
+            Some("Primary")
+        );
+
+        let Json(detail) =
+            get_usage_detail(State(state), Path("request-with-provider-key".to_string()))
+                .await
+                .unwrap();
+        assert_eq!(detail.provider_api_key_id, Some(11));
+        assert_eq!(detail.provider_api_key_name.as_deref(), Some("Primary"));
     }
 
     #[test]
