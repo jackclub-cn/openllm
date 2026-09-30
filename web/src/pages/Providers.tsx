@@ -33,6 +33,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
+import dayjs from 'dayjs'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   api,
@@ -745,7 +746,7 @@ export default function Providers() {
                       <Tag color={state.color}>{state.label}</Tag>
                       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                         {record.last_test_at
-                          ? record.last_test_at.slice(0, 16).replace('T', ' ')
+                          ? dayjs(record.last_test_at).format('YYYY-MM-DD HH:mm')
                           : '尚未检测'}
                       </Typography.Text>
                     </Space>
@@ -760,7 +761,14 @@ export default function Providers() {
               render: (models: string[], record) => (
                 <div>
                   <div>{models.length ? `${models.length} 个` : '-'}</div>
-                  <Tooltip title={record.models_sync_error || undefined}>
+                  <Tooltip
+                    title={
+                      record.models_sync_error ||
+                      (record.models_synced_at
+                        ? `同步时间 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm:ss')}`
+                        : undefined)
+                    }
+                  >
                     <Typography.Text
                       type={record.models_sync_error ? 'danger' : 'secondary'}
                       ellipsis
@@ -769,7 +777,7 @@ export default function Providers() {
                       {record.models_sync_error
                         ? `同步失败：${record.models_sync_error}`
                         : record.models_synced_at
-                          ? `同步于 ${record.models_synced_at.slice(0, 16).replace('T', ' ')}`
+                          ? `同步于 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm')}`
                           : '尚未同步'}
                     </Typography.Text>
                   </Tooltip>
