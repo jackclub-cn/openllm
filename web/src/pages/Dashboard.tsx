@@ -252,6 +252,10 @@ export default function Dashboard() {
                 size="small"
                 pagination={false}
                 dataSource={data.provider_usage}
+                onRow={(record) => ({
+                  onClick: () => navigate(`/usage?provider_id=${record.provider_id}`),
+                  style: { cursor: 'pointer' },
+                })}
                 columns={[
                   {
                     title: '提供商',
@@ -314,6 +318,10 @@ export default function Dashboard() {
               size="middle"
               pagination={false}
               dataSource={data.recent_requests}
+              onRow={(record) => ({
+                onClick: () => navigate(`/usage?request_id=${encodeURIComponent(record.request_id)}`),
+                style: { cursor: 'pointer' },
+              })}
               locale={{ emptyText: '暂无请求' }}
               columns={[
                 {
@@ -518,6 +526,10 @@ export default function Dashboard() {
           size="middle"
           pagination={false}
           dataSource={data.model_usage}
+          onRow={(record) => ({
+            onClick: () => navigate(`/usage?model=${encodeURIComponent(record.model)}`),
+            style: { cursor: 'pointer' },
+          })}
           locale={{ emptyText: '暂无模型用量' }}
           scroll={{ x: 900 }}
           columns={[

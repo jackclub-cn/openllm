@@ -57,10 +57,17 @@ function positiveIntegerParam(value: string | null) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
+function statusParam(searchParams: URLSearchParams): 'all' | 'success' | 'failed' | 'pending' {
+  if (searchParams.get('success') === 'true') return 'success'
+  if (searchParams.get('success') === 'false') return 'failed'
+  if (searchParams.get('in_flight') === 'true') return 'pending'
+  return 'all'
+}
+
 export default function Usage() {
   const { message } = App.useApp()
   const navigate = useNavigate()
-  const [searchParams] = useSearchParams()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [items, setItems] = useState<UsageLog[]>([])
   const [providers, setProviders] = useState<Provider[]>([])
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
@@ -70,7 +77,7 @@ export default function Usage() {
   const [pageSize, setPageSize] = useState(20)
   const [total, setTotal] = useState(0)
   const [model, setModel] = useState(() => searchParams.get('model') || '')
-  const [requestId, setRequestId] = useState('')
+  const [requestId, setRequestId] = useState(() => searchParams.get('request_id') || '')
   const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') || '')
   const [providerId, setProviderId] = useState<number | undefined>(
     () => positiveIntegerParam(searchParams.get('provider_id')),
@@ -84,8 +91,14 @@ export default function Usage() {
   const [routeId, setRouteId] = useState<number | undefined>(
     () => positiveIntegerParam(searchParams.get('route_id')),
   )
-  const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>('all')
-  const [dates, setDates] = useState<[Dayjs, Dayjs]>()
+  const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>(
+    () => statusParam(searchParams),
+  )
+  const [dates, setDates] = useState<[Dayjs, Dayjs] | undefined>(() => {
+    const from = searchParams.get('from')
+    const to = searchParams.get('to')
+    return from && to ? [dayjs(from), dayjs(to)] : undefined
+  })
   const [newRequests, setNewRequests] = useState(0)
   const [autoScroll, setAutoScroll] = useState(true)
   const [detail, setDetail] = useState<UsageLog>()
@@ -115,6 +128,37 @@ export default function Usage() {
     // baseline would manufacture phantom "new requests".
     setNewRequests(0)
   }, [filterKey])
+
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (model) next.set('model', model)
+    if (requestId) next.set('request_id', requestId)
+    if (endpoint) next.set('endpoint', endpoint)
+    if (providerId) next.set('provider_id', String(providerId))
+    if (providerApiKeyId) next.set('provider_api_key_id', String(providerApiKeyId))
+    if (apiKeyId) next.set('api_key_id', String(apiKeyId))
+    if (routeId) next.set('route_id', String(routeId))
+    if (statusFilter === 'success') next.set('success', 'true')
+    if (statusFilter === 'failed') next.set('success', 'false')
+    if (statusFilter === 'pending') next.set('in_flight', 'true')
+    if (dates?.[0]) next.set('from', dates[0].toISOString())
+    if (dates?.[1]) next.set('to', dates[1].toISOString())
+    if (next.toString() !== searchParams.toString()) {
+      setSearchParams(next, { replace: true })
+    }
+  }, [
+    apiKeyId,
+    dates,
+    endpoint,
+    model,
+    providerApiKeyId,
+    providerId,
+    requestId,
+    routeId,
+    searchParams,
+    setSearchParams,
+    statusFilter,
+  ])
 
   const load = useCallback(async (
     nextPage = page,
