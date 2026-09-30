@@ -2750,6 +2750,9 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             last_used_at: value.last_used_at,
             last_error_at: value.last_error_at,
             last_error: value.last_error,
+            requests: 0,
+            success_rate: 0.0,
+            avg_latency_ms: 0.0,
             created_at: value.created_at,
         }
     }
@@ -2789,6 +2792,30 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
         .into_iter()
         .map(Into::into)
         .collect();
+    let stats = sqlx::query_as::<_, (i64, i64, f64, f64)>(
+        "SELECT provider_api_key_id, COUNT(*), \
+                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0), \
+                COALESCE(AVG(latency_ms), 0.0) \
+         FROM usage_logs \
+         WHERE provider_id = ? AND provider_api_key_id IS NOT NULL AND in_flight = 0 \
+         GROUP BY provider_api_key_id",
+    )
+    .bind(view.id)
+    .fetch_all(&state.pool)
+    .await?;
+    let stats = stats
+        .into_iter()
+        .map(|(id, requests, success_rate, avg_latency_ms)| {
+            (id, (requests, success_rate, avg_latency_ms))
+        })
+        .collect::<HashMap<_, _>>();
+    for key in &mut view.api_keys {
+        if let Some((requests, success_rate, avg_latency_ms)) = stats.get(&key.id) {
+            key.requests = *requests;
+            key.success_rate = *success_rate;
+            key.avg_latency_ms = *avg_latency_ms;
+        }
+    }
     view.api_key_set = !view.api_keys.is_empty();
     Ok(())
 }
@@ -3585,10 +3612,10 @@ mod tests {
             "INSERT INTO usage_logs (
                 request_id, provider_id, provider_api_key_id, provider_api_key_name,
                 requested_model,
-                endpoint, prompt_tokens, total_tokens, status_code, success
+                endpoint, prompt_tokens, total_tokens, latency_ms, status_code, success
              ) VALUES (
                 'request-with-provider-key', 1, 11, 'Primary', 'gpt-test',
-                '/v1/chat/completions', 10, 10, 200, 1
+                '/v1/chat/completions', 10, 10, 123, 200, 1
              )",
         )
         .execute(&state.pool)
@@ -3606,12 +3633,19 @@ mod tests {
             Some("Primary")
         );
 
-        let Json(detail) =
-            get_usage_detail(State(state), Path("request-with-provider-key".to_string()))
-                .await
-                .unwrap();
+        let Json(detail) = get_usage_detail(
+            State(state.clone()),
+            Path("request-with-provider-key".to_string()),
+        )
+        .await
+        .unwrap();
         assert_eq!(detail.provider_api_key_id, Some(11));
         assert_eq!(detail.provider_api_key_name.as_deref(), Some("Primary"));
+
+        let provider = get_provider(&state, 1).await.unwrap();
+        assert_eq!(provider.api_keys[0].requests, 1);
+        assert_eq!(provider.api_keys[0].success_rate, 100.0);
+        assert_eq!(provider.api_keys[0].avg_latency_ms, 123.0);
     }
 
     #[tokio::test]

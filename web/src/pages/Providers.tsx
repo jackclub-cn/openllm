@@ -492,6 +492,9 @@ export default function Providers() {
                   <div key={key.id}>
                     {key.name || `Key ${key.id}`} · {key.api_key_suffix || '****'} ·{' '}
                     {key.enabled ? '启用' : '停用'}
+                    {key.requests > 0
+                      ? ` · ${key.requests} 次 · ${key.success_rate.toFixed(1)}% · ${Math.round(key.avg_latency_ms)} ms`
+                      : ' · 暂无请求'}
                     {key.last_error ? ` · ${key.last_error}` : ''}
                   </div>
                 ))

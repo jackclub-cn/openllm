@@ -76,6 +76,9 @@ export type ProviderApiKey = {
   last_used_at?: string
   last_error_at?: string
   last_error?: string
+  requests: number
+  success_rate: number
+  avg_latency_ms: number
   created_at: string
 }
 

@@ -142,6 +142,9 @@ pub struct ProviderApiKeyView {
     pub last_used_at: Option<String>,
     pub last_error_at: Option<String>,
     pub last_error: Option<String>,
+    pub requests: i64,
+    pub success_rate: f64,
+    pub avg_latency_ms: f64,
     pub created_at: String,
 }
 
