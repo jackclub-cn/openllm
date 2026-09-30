@@ -33,7 +33,7 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   api,
   formatError,
@@ -90,15 +90,28 @@ type ModelSyncPreview = {
 export default function Providers() {
   const { message } = App.useApp()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [items, setItems] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [testingAll, setTestingAll] = useState(false)
-  const [providerSearch, setProviderSearch] = useState('')
-  const [providerStatus, setProviderStatus] = useState<'all' | 'enabled' | 'disabled'>('all')
+  const [providerSearch, setProviderSearch] = useState(() => searchParams.get('q') || '')
+  const [providerStatus, setProviderStatus] = useState<'all' | 'enabled' | 'disabled'>(() => {
+    const status = searchParams.get('status')
+    return status === 'enabled' || status === 'disabled' ? status : 'all'
+  })
   const [providerHealth, setProviderHealth] = useState<
-    'all' | 'healthy' | 'failed' | 'untested' | 'key_error'
-  >('all')
+    'all' | 'healthy' | 'failed' | 'untested' | 'key_error' | 'key_untested'
+  >(() => {
+    const health = searchParams.get('health')
+    return health === 'healthy' ||
+      health === 'failed' ||
+      health === 'untested' ||
+      health === 'key_error' ||
+      health === 'key_untested'
+      ? health
+      : 'all'
+  })
   const [providerPage, setProviderPage] = useState(1)
   const [keyTestOpen, setKeyTestOpen] = useState(false)
   const [keyTestLoading, setKeyTestLoading] = useState(false)
@@ -121,6 +134,14 @@ export default function Providers() {
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
   const apiKeyRows = Form.useWatch('api_keys', form) || []
+
+  useEffect(() => {
+    const next = new URLSearchParams()
+    if (providerSearch.trim()) next.set('q', providerSearch.trim())
+    if (providerStatus !== 'all') next.set('status', providerStatus)
+    if (providerHealth !== 'all') next.set('health', providerHealth)
+    setSearchParams(next, { replace: true })
+  }, [providerHealth, providerSearch, providerStatus, setSearchParams])
 
   const load = async () => {
     setLoading(true)
@@ -503,6 +524,12 @@ export default function Providers() {
     ) {
       return false
     }
+    if (
+      providerHealth === 'key_untested' &&
+      !provider.api_keys.some((key) => key.enabled && key.last_test_ok == null)
+    ) {
+      return false
+    }
     return true
   })
 
@@ -550,6 +577,7 @@ export default function Providers() {
                 { value: 'failed', label: '提供商异常' },
                 { value: 'untested', label: '提供商未检测' },
                 { value: 'key_error', label: '密钥异常' },
+                { value: 'key_untested', label: '密钥未检测' },
               ]}
             />
             <Tag>

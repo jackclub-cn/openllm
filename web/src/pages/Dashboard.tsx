@@ -29,6 +29,7 @@ import {
 } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
 import { Area } from '@ant-design/plots'
+import { useNavigate } from 'react-router-dom'
 import { api, formatError, type Overview } from '../api'
 import PageHeader from '../components/PageHeader'
 import MetricCard from '../components/MetricCard'
@@ -37,6 +38,7 @@ import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
 
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [data, setData] = useState<Overview>()
   const [error, setError] = useState('')
   const [dates, setDates] = useState<[Dayjs, Dayjs]>(() => [
@@ -411,9 +413,18 @@ export default function Dashboard() {
               <div>
                 <Typography.Text type="secondary">提供商健康</Typography.Text>
                 <div className="stat-line">
-                  正常 <strong>{data.healthy_providers}</strong> · 异常{' '}
-                  <strong>{data.failed_providers}</strong> · 未检测{' '}
-                  <strong>{data.untested_providers}</strong>
+                  正常{' '}
+                  <Typography.Link onClick={() => navigate('/providers?health=healthy')}>
+                    <strong>{data.healthy_providers}</strong>
+                  </Typography.Link>{' '}
+                  · 异常{' '}
+                  <Typography.Link onClick={() => navigate('/providers?health=failed')}>
+                    <strong>{data.failed_providers}</strong>
+                  </Typography.Link>{' '}
+                  · 未检测{' '}
+                  <Typography.Link onClick={() => navigate('/providers?health=untested')}>
+                    <strong>{data.untested_providers}</strong>
+                  </Typography.Link>
                 </div>
               </div>
               <div>
@@ -422,12 +433,21 @@ export default function Dashboard() {
                   {data.provider_keys_total > 0 ? (
                     <>
                       正常 <strong>{data.healthy_provider_keys}</strong> · 异常{' '}
-                      <strong>{data.failed_provider_keys}</strong> · 未检测{' '}
-                      <strong>{data.untested_provider_keys}</strong>
+                      <Typography.Link onClick={() => navigate('/providers?health=key_error')}>
+                        <strong>{data.failed_provider_keys}</strong>
+                      </Typography.Link>{' '}
+                      · 未检测{' '}
+                      <Typography.Link onClick={() => navigate('/providers?health=key_untested')}>
+                        <strong>{data.untested_provider_keys}</strong>
+                      </Typography.Link>
                       {data.runtime_error_provider_keys > 0 && (
                         <>
                           {' '}· 运行错误{' '}
-                          <strong>{data.runtime_error_provider_keys}</strong>
+                          <Typography.Link
+                            onClick={() => navigate('/providers?health=key_error')}
+                          >
+                            <strong>{data.runtime_error_provider_keys}</strong>
+                          </Typography.Link>
                         </>
                       )}
                     </>
