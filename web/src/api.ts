@@ -227,6 +227,8 @@ export type ApiKey = {
   created_at: string
   requests: number
   tokens: number
+  prompt_tokens: number
+  completion_tokens: number
   cost_micros?: number | null
   unpriced_requests: number
   daily_token_limit?: number | null
@@ -235,6 +237,8 @@ export type ApiKey = {
   max_concurrency?: number | null
   today_requests: number
   today_tokens: number
+  today_prompt_tokens: number
+  today_completion_tokens: number
   today_cost_micros?: number | null
   requests_this_minute: number
   current_in_flight: number

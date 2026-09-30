@@ -200,7 +200,7 @@ export default function ApiKeys() {
           loading={loading}
           dataSource={items}
           pagination={false}
-          scroll={{ x: 1620 }}
+          scroll={{ x: 1920 }}
           columns={[
             {
               title: '名称',
@@ -230,9 +230,17 @@ export default function ApiKeys() {
               width: 80,
             },
             {
-              title: '令牌',
-              dataIndex: 'tokens',
-              width: 110,
+              title: '输入 tokens',
+              dataIndex: 'prompt_tokens',
+              width: 120,
+              render: (value: number) => (
+                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+              ),
+            },
+            {
+              title: '输出 tokens',
+              dataIndex: 'completion_tokens',
+              width: 120,
               render: (value: number) => (
                 <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
               ),
@@ -254,7 +262,7 @@ export default function ApiKeys() {
             },
             {
               title: '今日用量 / 限额',
-              width: 190,
+              width: 270,
               render: (_, record) => {
                 const limits: string[] = []
                 if (record.today_requests > 0) {
@@ -262,10 +270,12 @@ export default function ApiKeys() {
                 }
                 if (record.daily_token_limit != null) {
                   limits.push(
-                    `token ${formatCompact(record.today_tokens)} / ${formatCompact(record.daily_token_limit)}`,
+                    `总 token ${formatCompact(record.today_tokens)} / ${formatCompact(record.daily_token_limit)} · 输入 ${formatCompact(record.today_prompt_tokens)} / 输出 ${formatCompact(record.today_completion_tokens)}`,
                   )
                 } else if (record.today_tokens > 0) {
-                  limits.push(`token ${formatCompact(record.today_tokens)}`)
+                  limits.push(
+                    `总 token ${formatCompact(record.today_tokens)} · 输入 ${formatCompact(record.today_prompt_tokens)} / 输出 ${formatCompact(record.today_completion_tokens)}`,
+                  )
                 }
                 if (record.daily_cost_limit_micros != null) {
                   limits.push(

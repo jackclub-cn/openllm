@@ -1588,12 +1588,22 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
                 CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
                      THEN u.total_tokens ELSE 0 END
             ), 0) AS today_tokens,
+            COALESCE(SUM(
+                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
+                     THEN u.prompt_tokens ELSE 0 END
+            ), 0) AS today_prompt_tokens,
+            COALESCE(SUM(
+                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
+                     THEN u.completion_tokens ELSE 0 END
+            ), 0) AS today_completion_tokens,
             SUM(
                 CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
                      THEN u.estimated_cost_micros END
             ) AS today_cost_micros,
             COUNT(u.id) AS requests,
             COALESCE(SUM(u.total_tokens), 0) AS tokens,
+            COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
+            COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
             SUM(u.estimated_cost_micros) AS cost_micros,
             COALESCE(SUM(
                 CASE WHEN u.id IS NOT NULL AND u.estimated_cost_micros IS NULL
@@ -1609,6 +1619,8 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
         "#,
     )
     .bind(&minute_start)
+    .bind(&day_start)
+    .bind(&day_start)
     .bind(&day_start)
     .bind(&day_start)
     .bind(&day_start)
@@ -3214,6 +3226,8 @@ impl From<ApiKeyRecord> for ApiKeyView {
             created_at: value.created_at,
             requests: 0,
             tokens: 0,
+            prompt_tokens: 0,
+            completion_tokens: 0,
             cost_micros: None,
             unpriced_requests: 0,
             daily_token_limit: value.daily_token_limit,
@@ -3222,6 +3236,8 @@ impl From<ApiKeyRecord> for ApiKeyView {
             max_concurrency: value.max_concurrency,
             today_requests: 0,
             today_tokens: 0,
+            today_prompt_tokens: 0,
+            today_completion_tokens: 0,
             today_cost_micros: None,
             requests_this_minute: 0,
             current_in_flight: 0,
@@ -3243,6 +3259,8 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             created_at: value.created_at,
             requests: value.requests,
             tokens: value.tokens,
+            prompt_tokens: value.prompt_tokens,
+            completion_tokens: value.completion_tokens,
             cost_micros: value.cost_micros,
             unpriced_requests: value.unpriced_requests,
             daily_token_limit: value.daily_token_limit,
@@ -3251,6 +3269,8 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             max_concurrency: value.max_concurrency,
             today_requests: value.today_requests,
             today_tokens: value.today_tokens,
+            today_prompt_tokens: value.today_prompt_tokens,
+            today_completion_tokens: value.today_completion_tokens,
             today_cost_micros: value.today_cost_micros,
             requests_this_minute: value.requests_this_minute,
             current_in_flight: value.current_in_flight,
@@ -3522,11 +3542,30 @@ mod tests {
         .await
         .unwrap();
 
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, api_key_id, requested_model, endpoint,
+                prompt_tokens, completion_tokens, total_tokens,
+                status_code, in_flight, success, created_at
+             ) VALUES (
+                'completed', ?, 'model', '/v1/chat/completions',
+                100, 25, 125, 200, 0, 1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             )",
+        )
+        .bind(created.item.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
         assert_eq!(items[0].requests_per_minute, Some(120));
         assert_eq!(items[0].max_concurrency, Some(5));
-        assert_eq!(items[0].requests_this_minute, 1);
+        assert_eq!(items[0].requests_this_minute, 2);
         assert_eq!(items[0].current_in_flight, 1);
+        assert_eq!(items[0].prompt_tokens, 100);
+        assert_eq!(items[0].completion_tokens, 25);
+        assert_eq!(items[0].today_prompt_tokens, 100);
+        assert_eq!(items[0].today_completion_tokens, 25);
 
         let Json(updated) = update_api_key(
             State(state),
