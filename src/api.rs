@@ -90,7 +90,8 @@ async fn load_database_stats(state: &AppState) -> AppResult<DatabaseStats> {
             (SELECT COUNT(*) FROM provider_api_keys), \
             (SELECT COUNT(*) FROM routes), \
             (SELECT COUNT(*) FROM api_keys), \
-            (SELECT COUNT(*) FROM usage_logs), \
+            (SELECT requests FROM usage_lifetime_stats WHERE id = 1) \
+                + (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1), \
             (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1)",
     )
     .fetch_one(&state.pool)
@@ -2506,19 +2507,25 @@ pub async fn overview(
     let totals = sqlx::query(
         r#"
         SELECT
-            COUNT(*) AS requests_total,
-            COALESCE(SUM(total_tokens), 0) AS tokens_total,
-            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens_total,
-            COALESCE(SUM(completion_tokens), 0) AS completion_tokens_total,
-            COALESCE(SUM(prompt_tokens), 0) AS prompt_total,
-            COALESCE(SUM(cache_read_tokens), 0) AS cache_read_total,
-            COALESCE(SUM(cache_write_tokens), 0) AS cache_write_total,
-            COALESCE(SUM(estimated_cost_micros), 0) AS cost_total_micros,
-            COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced_total,
-            COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
-            COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
-        FROM usage_logs
-        WHERE in_flight = 0
+            requests AS requests_total,
+            tokens AS tokens_total,
+            prompt_tokens AS prompt_tokens_total,
+            completion_tokens AS completion_tokens_total,
+            prompt_tokens AS prompt_total,
+            cache_read_tokens AS cache_read_total,
+            cache_write_tokens AS cache_write_total,
+            cost_micros AS cost_total_micros,
+            unpriced_requests AS unpriced_total,
+            CASE
+                WHEN requests = 0 THEN 0.0
+                ELSE successful_requests * 100.0 / requests
+            END AS success_rate,
+            CASE
+                WHEN requests = 0 THEN 0.0
+                ELSE latency_ms_sum * 1.0 / requests
+            END AS avg_latency_ms
+        FROM usage_lifetime_stats
+        WHERE id = 1
         "#,
     )
     .fetch_one(&state.pool)
@@ -5347,6 +5354,69 @@ mod tests {
         assert_eq!(view.model_usage[0].tokens, 150);
         assert_eq!(view.model_usage[0].prompt_tokens, 110);
         assert_eq!(view.model_usage[0].completion_tokens, 40);
+    }
+
+    #[tokio::test]
+    async fn usage_lifetime_stats_tracks_completion_and_cleanup() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, prompt_tokens,
+                completion_tokens, total_tokens, cache_read_tokens,
+                cache_write_tokens, latency_ms, status_code, in_flight, success
+             ) VALUES (
+                'pending', 'test-model', '/v1/chat/completions', 10,
+                20, 30, 5, 7, 100, 0, 1, 1
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let pending: i64 =
+            sqlx::query_scalar("SELECT requests FROM usage_lifetime_stats WHERE id = 1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
+
+        sqlx::query(
+            "UPDATE usage_logs
+             SET in_flight = 0, status_code = 200, success = 1,
+                 estimated_cost_micros = 42
+             WHERE request_id = 'pending'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let completed: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT requests, tokens, prompt_tokens, completion_tokens,
+                    cache_read_tokens, cache_write_tokens, cost_micros,
+                    successful_requests, latency_ms_sum
+             FROM usage_lifetime_stats WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(completed, (1, 30, 10, 20, 5, 7, 42, 1, 100));
+
+        sqlx::query("DELETE FROM usage_logs WHERE request_id = 'pending'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cleaned: (i64, i64, i64) = sqlx::query_as(
+            "SELECT requests, tokens, cost_micros
+             FROM usage_lifetime_stats WHERE id = 1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cleaned, (0, 0, 0));
     }
 
     #[tokio::test]

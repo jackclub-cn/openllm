@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
 use crate::Config;
 
@@ -35,6 +35,9 @@ impl Database {
             .create_if_missing(true)
             .foreign_keys(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("cache_size", "-16384")
+            .pragma("temp_store", "MEMORY")
             .busy_timeout(Duration::from_secs(10));
 
         let pool = SqlitePoolOptions::new()
