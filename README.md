@@ -52,11 +52,13 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 ## 核心能力
 
 - 聚合 OpenAI 兼容、Anthropic、Ollama 和自定义上游，支持提供商多密钥、优先级、加权随机、轮询和故障切换。
+- 添加提供商时先选择模板卡片，内置 Command Code、Kimi Code、GLM Token Plan、火山引擎 Token Plan、OpenCode Zen、OpenCode Go 和自定义协议模板。
 - 从上游同步模型，并结合 models.dev 保存上下文、输出上限、接口、模态和价格等能力信息；支持手动覆盖并保留重新同步结果。
 - 通过显式路由或 `vendor/model` 前缀对外提供稳定的模型列表，多目标路由会按最严格的公共能力限制输入和输出预算。
 - 兼容 OpenAI `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings` 和 Anthropic Messages 协议。
 - 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
 - 记录请求、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出。
+- 支持额度接口的提供商可直接查看额度窗口和价格，例如 Command Code 的 5 小时、周、月额度，OpenCode Go 的滚动、周、月窗口，以及 DeepSeek 余额和模型价格。
 
 ## 使用说明
 
@@ -64,7 +66,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 
 ### 配置流程
 
-1. 在“提供商”页面添加上游并填写 API Key，完成后可立即测试连接。
+1. 在“提供商”页面先选择模板卡片，再添加上游并填写 API Key，完成后可立即测试连接。
 2. 同步模型或手动维护模型列表，在“模型管理”中检查上下文、输出上限、支持接口和价格。
 3. 创建路由，或为提供商填写 `vendor/` 前缀后直接通过 `vendor/model` 调用。
 4. 在“访问密钥”页面创建网关 API Key，按需设置模型权限、到期时间和调用限额。

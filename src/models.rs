@@ -116,10 +116,50 @@ pub struct ProviderView {
     pub last_test_message: Option<String>,
     pub health_check_interval_minutes: Option<i64>,
     pub health_check_model: Option<String>,
+    pub quota_kind: Option<String>,
     pub models_sync_interval_minutes: Option<i64>,
     pub models_sync_attempted_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderQuotaView {
+    pub kind: String,
+    pub title: String,
+    pub plan_name: Option<String>,
+    pub source_url: Option<String>,
+    pub items: Vec<ProviderQuotaItem>,
+    pub details: Vec<ProviderQuotaDetail>,
+    pub prices: Vec<ProviderPriceView>,
+    pub fetched_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderQuotaItem {
+    pub key: String,
+    pub label: String,
+    pub used: Option<f64>,
+    pub limit: Option<f64>,
+    pub remaining: Option<f64>,
+    pub unit: String,
+    pub percent: Option<f64>,
+    pub reset_at: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderQuotaDetail {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderPriceView {
+    pub model_name: String,
+    pub input: Option<f64>,
+    pub output: Option<f64>,
+    pub cache_read: Option<f64>,
+    pub cache_write: Option<f64>,
 }
 
 #[derive(Debug, Clone, FromRow)]
@@ -1425,6 +1465,7 @@ impl From<Provider> for ProviderView {
     fn from(value: Provider) -> Self {
         let headers =
             serde_json::from_str(&value.headers).unwrap_or_else(|_| serde_json::json!({}));
+        let quota_kind = crate::api::provider_quota_kind(&value.base_url).map(ToOwned::to_owned);
         Self {
             id: value.id,
             name: value.name,
@@ -1447,6 +1488,7 @@ impl From<Provider> for ProviderView {
             last_test_message: value.last_test_message,
             health_check_interval_minutes: value.health_check_interval_minutes,
             health_check_model: value.health_check_model,
+            quota_kind,
             models_sync_interval_minutes: value.models_sync_interval_minutes,
             models_sync_attempted_at: value.models_sync_attempted_at,
             created_at: value.created_at,

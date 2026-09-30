@@ -1,18 +1,21 @@
 import { useEffect, useState } from 'react'
 import {
   ApiOutlined,
+  AppstoreOutlined,
   CheckCircleOutlined,
   ClearOutlined,
   DeleteOutlined,
   EditOutlined,
   HistoryOutlined,
   KeyOutlined,
+  LinkOutlined,
   PlusOutlined,
   SearchOutlined,
   SettingOutlined,
   StopOutlined,
   SyncOutlined,
   ThunderboltOutlined,
+  WalletOutlined,
 } from '@ant-design/icons'
 import {
   App,
@@ -24,6 +27,7 @@ import {
   InputNumber,
   Modal,
   Popconfirm,
+  Progress,
   Segmented,
   Select,
   Space,
@@ -45,6 +49,7 @@ import {
   type ProviderKeyTestResult,
   type ProviderModelLimit,
   type ProviderModelLimitInput,
+  type ProviderQuota,
 } from '../api'
 import PageHeader from '../components/PageHeader'
 import { formatCompact, formatExact } from '../format'
@@ -72,6 +77,11 @@ const syncFieldLabels: Record<string, string> = {
   supported_endpoints: '支持接口',
   cost: '价格',
   display_name: '显示名',
+}
+
+function formatUnitPrice(value?: number | null) {
+  if (value == null) return '-'
+  return `$${value.toLocaleString('en-US', { maximumFractionDigits: 6 })}`
 }
 
 type ProviderForm = Omit<ProviderInput, 'api_keys'> & {
@@ -126,6 +136,11 @@ export default function Providers() {
   const [syncPreview, setSyncPreview] = useState<ModelSyncPreview>()
   const [editing, setEditing] = useState<Provider>()
   const [open, setOpen] = useState(false)
+  const [templateOpen, setTemplateOpen] = useState(false)
+  const [quotaOpen, setQuotaOpen] = useState(false)
+  const [quotaLoading, setQuotaLoading] = useState(false)
+  const [quotaProvider, setQuotaProvider] = useState<Provider>()
+  const [quota, setQuota] = useState<ProviderQuota>()
   const [limitsOpen, setLimitsOpen] = useState(false)
   const [limitsLoading, setLimitsLoading] = useState(false)
   const [limitsSaving, setLimitsSaving] = useState(false)
@@ -159,9 +174,34 @@ export default function Providers() {
 
   useEffect(() => { void load() }, [])
 
+  const resetNewProviderForm = () => {
+    form.setFieldsValue({
+      name: '',
+      provider_type: 'openai',
+      base_url: '',
+      model_prefix: '',
+      api_keys: [],
+      enabled: true,
+      tool_search_supported: true,
+      auto_sync_models: true,
+      health_check_interval_minutes: 0,
+      health_check_model: '',
+      models_sync_interval_minutes: 0,
+      headersText: '{}',
+      modelsText: '',
+    } as never)
+  }
+
   const openEditor = (item?: Provider) => {
+    if (!item) {
+      setEditing(undefined)
+      setPresetKey(undefined)
+      resetNewProviderForm()
+      setTemplateOpen(true)
+      return
+    }
     setEditing(item)
-    form.setFieldsValue(item ? {
+    form.setFieldsValue({
       ...item,
       api_keys: item.api_keys.map((key) => ({
         id: key.id,
@@ -176,35 +216,34 @@ export default function Providers() {
       health_check_model: item.health_check_model || '',
       headersText: JSON.stringify(item.headers || {}, null, 2),
       modelsText: item.models.join('\n'),
-    } as never : {
-      name: '',
-      provider_type: 'openai',
-      base_url: 'https://api.openai.com/v1',
-      model_prefix: '',
-      api_keys: [],
-      enabled: true,
-      tool_search_supported: true,
-      auto_sync_models: true,
-      health_check_interval_minutes: 0,
-      health_check_model: '',
-      models_sync_interval_minutes: 0,
-      headersText: '{}',
-      modelsText: '',
     } as never)
     setPresetKey(undefined)
     setOpen(true)
   }
 
-  /**
-   * Fills the form from a common provider preset. Only connection details are
-   * written, so anything the user already typed (keys, headers, model list)
-   * survives a preset change.
-   */
-  const applyPreset = (key: string) => {
+  const selectTemplate = (key: string, initial = false) => {
     setPresetKey(key)
     const preset = providerPresets.find((item) => item.key === key)
     if (!preset) return
+    if (initial) resetNewProviderForm()
     form.setFieldsValue(preset.values as never)
+    setTemplateOpen(false)
+    setOpen(true)
+  }
+
+  const openQuota = async (provider: Provider) => {
+    setQuotaProvider(provider)
+    setQuota(undefined)
+    setQuotaOpen(true)
+    setQuotaLoading(true)
+    try {
+      setQuota(await api.get<ProviderQuota>(`/api/providers/${provider.id}/quota`))
+    } catch (error) {
+      message.error(formatError(error))
+      setQuotaOpen(false)
+    } finally {
+      setQuotaLoading(false)
+    }
   }
 
   const save = async () => {
@@ -556,6 +595,7 @@ export default function Providers() {
     }
     return true
   })
+  const selectedPreset = providerPresets.find((preset) => preset.key === presetKey)
 
   return (
     <>
@@ -816,7 +856,7 @@ export default function Providers() {
             },
             {
               title: '操作',
-              width: 320,
+              width: 360,
               fixed: 'right',
               render: (_, record) => (
                 <Space>
@@ -847,6 +887,15 @@ export default function Providers() {
                       />
                     </Tooltip>
                   )}
+                  {record.quota_kind && (
+                    <Tooltip title="查看额度、余额和价格">
+                      <Button
+                        type="text"
+                        icon={<WalletOutlined />}
+                        onClick={() => void openQuota(record)}
+                      />
+                    </Tooltip>
+                  )}
                   <Tooltip title="模型管理">
                     <Button
                       type="text"
@@ -868,6 +917,51 @@ export default function Providers() {
       </Card>
 
       <Modal
+        title="选择提供商模板"
+        open={templateOpen}
+        onCancel={() => setTemplateOpen(false)}
+        footer={null}
+        width={980}
+        destroyOnHidden
+      >
+        <Typography.Paragraph type="secondary">
+          先选择接近的模板，再填写 API Key。模板只预填协议、地址、前缀和推荐检测模型，所有字段仍可修改。
+        </Typography.Paragraph>
+        <div className="provider-template-groups">
+          {Array.from(new Set(providerPresets.map((item) => item.group))).map((group) => (
+            <section key={group}>
+              <Typography.Title level={5}>{group}</Typography.Title>
+              <div className="provider-template-grid">
+                {providerPresets
+                  .filter((item) => item.group === group)
+                  .map((preset) => (
+                    <Card
+                      key={preset.key}
+                      size="small"
+                      hoverable
+                      className="provider-template-card"
+                      onClick={() => selectTemplate(preset.key, true)}
+                    >
+                      <Space align="start">
+                        <div className="provider-template-icon">
+                          <ApiOutlined />
+                        </div>
+                        <div>
+                          <Typography.Text strong>{preset.label}</Typography.Text>
+                          <Typography.Paragraph type="secondary" ellipsis={{ rows: 2 }}>
+                            {preset.hint}
+                          </Typography.Paragraph>
+                        </div>
+                      </Space>
+                    </Card>
+                  ))}
+              </div>
+            </section>
+          ))}
+        </div>
+      </Modal>
+
+      <Modal
         title={editing ? '编辑提供商' : '添加提供商'}
         open={open}
         onCancel={() => setOpen(false)}
@@ -877,23 +971,26 @@ export default function Providers() {
         destroyOnHidden
       >
         <Form form={form} layout="vertical" className="modal-form">
-          {!editing && (
-            <Form.Item label="常用提供商" extra="选择后自动填入协议、地址和模型前缀，仍可手动修改。">
-              <Select
-                showSearch
-                allowClear
-                value={presetKey}
-                onChange={(value) => (value ? applyPreset(value) : setPresetKey(undefined))}
-                placeholder="选择预设快速填充"
-                optionFilterProp="label"
-                options={Array.from(new Set(providerPresets.map((item) => item.group))).map((group) => ({
-                  label: group,
-                  options: providerPresets
-                    .filter((item) => item.group === group)
-                    .map((item) => ({ value: item.key, label: item.label })),
-                }))}
-              />
-            </Form.Item>
+          {!editing && selectedPreset && (
+            <div className="provider-template-selected">
+              <Space>
+                <AppstoreOutlined />
+                <div>
+                  <Typography.Text strong>{selectedPreset.label}</Typography.Text>
+                  <div>
+                    <Typography.Text type="secondary">{selectedPreset.hint}</Typography.Text>
+                  </div>
+                </div>
+              </Space>
+              <Button
+                onClick={() => {
+                  setOpen(false)
+                  setTemplateOpen(true)
+                }}
+              >
+                更换模板
+              </Button>
+            </div>
           )}
           <div className="form-grid">
             <Form.Item name="name" label="名称" rules={[{ required: true, message: '请输入名称' }]}>
@@ -1495,6 +1592,133 @@ export default function Providers() {
             ]}
           />
         </Space>
+      </Modal>
+
+      <Modal
+        title={quotaProvider ? `额度与价格 · ${quotaProvider.name}` : '额度与价格'}
+        open={quotaOpen}
+        onCancel={() => setQuotaOpen(false)}
+        footer={null}
+        width={860}
+        destroyOnHidden
+      >
+        {quotaLoading && (
+          <Typography.Text type="secondary">正在向上游查询额度...</Typography.Text>
+        )}
+        {quota && (
+          <Space direction="vertical" size={18} style={{ width: '100%' }}>
+            <Space wrap>
+              <Typography.Text strong>{quota.title}</Typography.Text>
+              {quota.plan_name && <Tag color="blue">{quota.plan_name}</Tag>}
+              <Typography.Text type="secondary">
+                查询于 {dayjs(quota.fetched_at).format('YYYY-MM-DD HH:mm:ss')}
+              </Typography.Text>
+              {quota.source_url && (
+                <Typography.Link href={quota.source_url} target="_blank">
+                  <Space size={4}>
+                    <LinkOutlined />
+                    官方页
+                  </Space>
+                </Typography.Link>
+              )}
+            </Space>
+
+            {quota.items.length > 0 && (
+              <div className="provider-quota-grid">
+                {quota.items.map((item) => (
+                  <Card key={item.key} size="small" className="provider-quota-card">
+                    <Typography.Text type="secondary">{item.label}</Typography.Text>
+                    {item.percent != null ? (
+                      <>
+                        <Progress
+                          percent={Math.round(item.percent)}
+                          status={item.percent >= 100 ? 'exception' : 'normal'}
+                          strokeColor={item.percent >= 80 ? '#d46b08' : '#1677ff'}
+                        />
+                        {item.used != null && item.limit != null && (
+                          <Typography.Text type="secondary">
+                            {item.unit === 'USD' ? '$' : ''}
+                            {item.used.toFixed(2)} / {item.unit === 'USD' ? '$' : ''}
+                            {item.limit.toFixed(2)} {item.unit !== 'USD' ? item.unit : ''}
+                          </Typography.Text>
+                        )}
+                      </>
+                    ) : item.remaining != null ? (
+                      <div className="provider-quota-value">
+                        <Typography.Title level={3}>
+                          {item.unit === 'USD' ? '$' : item.unit === 'CNY' ? '¥' : ''}
+                          {item.remaining.toFixed(2)}
+                          <span>
+                            {item.unit !== 'CNY' && item.unit !== 'USD' ? ` ${item.unit}` : ''}
+                          </span>
+                        </Typography.Title>
+                      </div>
+                    ) : (
+                      <Typography.Text type="secondary">暂无数据</Typography.Text>
+                    )}
+                    {item.reset_at && (
+                      <Typography.Text type="secondary" className="provider-quota-reset">
+                        重置于 {dayjs(item.reset_at).format('MM-DD HH:mm')}
+                      </Typography.Text>
+                    )}
+                  </Card>
+                ))}
+              </div>
+            )}
+
+            {quota.details.length > 0 && (
+              <Space wrap>
+                {quota.details.map((detail) => (
+                  <Tag key={`${detail.label}-${detail.value}`}>
+                    {detail.label}：{detail.value}
+                  </Tag>
+                ))}
+              </Space>
+            )}
+
+            <div>
+              <Typography.Title level={5}>模型价格</Typography.Title>
+              <Table
+                rowKey="model_name"
+                size="small"
+                pagination={false}
+                dataSource={quota.prices}
+                locale={{ emptyText: '暂无已同步价格' }}
+                columns={[
+                  {
+                    title: '模型',
+                    dataIndex: 'model_name',
+                    render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+                  },
+                  {
+                    title: '输入 / 1M',
+                    dataIndex: 'input',
+                    width: 120,
+                    render: (value?: number | null) => formatUnitPrice(value),
+                  },
+                  {
+                    title: '输出 / 1M',
+                    dataIndex: 'output',
+                    width: 120,
+                    render: (value?: number | null) => formatUnitPrice(value),
+                  },
+                  {
+                    title: '缓存读 / 1M',
+                    dataIndex: 'cache_read',
+                    width: 130,
+                    render: (value?: number | null) => formatUnitPrice(value),
+                  },
+                  {
+                    title: '缓存写 / 1M',
+                    dataIndex: 'cache_write',
+                    width: 130,
+                    render: (value?: number | null) => formatUnitPrice(value),
+                  },
+                ]}
+              />
+            </div>
+          </Space>
+        )}
       </Modal>
     </>
   )

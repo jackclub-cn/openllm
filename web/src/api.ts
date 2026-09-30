@@ -119,10 +119,46 @@ export type Provider = {
   last_test_message?: string | null
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
+  quota_kind?: string | null
   models_sync_interval_minutes?: number | null
   models_sync_attempted_at?: string
   created_at: string
   updated_at: string
+}
+
+export type ProviderQuotaItem = {
+  key: string
+  label: string
+  used?: number | null
+  limit?: number | null
+  remaining?: number | null
+  unit: string
+  percent?: number | null
+  reset_at?: string | null
+}
+
+export type ProviderQuotaDetail = {
+  label: string
+  value: string
+}
+
+export type ProviderPrice = {
+  model_name: string
+  input?: number | null
+  output?: number | null
+  cache_read?: number | null
+  cache_write?: number | null
+}
+
+export type ProviderQuota = {
+  kind: string
+  title: string
+  plan_name?: string | null
+  source_url?: string | null
+  items: ProviderQuotaItem[]
+  details: ProviderQuotaDetail[]
+  prices: ProviderPrice[]
+  fetched_at: string
 }
 
 export type ProviderKeyTestItem = {
