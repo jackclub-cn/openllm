@@ -3015,6 +3015,30 @@ pub async fn overview(
     .fetch_one(&state.pool)
     .await?;
 
+    let session_totals = sqlx::query(
+        r#"
+        SELECT
+            COUNT(*) AS sessions,
+            COALESCE(SUM(requests), 0) AS session_requests,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+            COALESCE(SUM(cache_read), 0) AS cache_read
+        FROM (
+            SELECT session_id,
+                   COUNT(*) AS requests,
+                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read
+            FROM usage_logs
+            WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+              AND session_id IS NOT NULL AND TRIM(session_id) <> ''
+            GROUP BY session_id
+        )
+        "#,
+    )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .fetch_one(&state.pool)
+    .await?;
+
     let today = sqlx::query(
         r#"
         SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
@@ -3197,6 +3221,20 @@ pub async fn overview(
     .fetch_all(&state.pool)
     .await?;
 
+    let range_requests: i64 = range_totals.get("requests");
+    let range_sessions: i64 = session_totals.get("sessions");
+    let range_session_requests: i64 = session_totals.get("session_requests");
+    let range_session_coverage = if range_requests > 0 {
+        (range_session_requests as f64 / range_requests as f64 * 100.0).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+    let range_avg_requests_per_session = if range_sessions > 0 {
+        range_session_requests as f64 / range_sessions as f64
+    } else {
+        0.0
+    };
+
     Ok(Json(Overview {
         requests_today: today.get("requests"),
         tokens_today: today.get("tokens"),
@@ -3224,6 +3262,13 @@ pub async fn overview(
         range_cache_hit_rate: cache_hit_rate(
             range_totals.get("prompt"),
             range_totals.get("cache_read"),
+        ),
+        range_sessions,
+        range_session_coverage,
+        range_avg_requests_per_session,
+        range_session_cache_hit_rate: cache_hit_rate(
+            session_totals.get("prompt_tokens"),
+            session_totals.get("cache_read"),
         ),
         range_cost_micros: range_totals.get("cost_micros"),
         range_unpriced: range_totals.get("unpriced"),
@@ -5826,19 +5871,57 @@ mod tests {
         let old = (Utc::now() - Duration::days(20)).to_rfc3339();
         let recent = (Utc::now() - Duration::days(1)).to_rfc3339();
         let today = Utc::now().to_rfc3339();
-        for (request_id, prompt, completion, cache_read, latency_ms, success, created_at) in [
-            ("old", 700_i64, 200_i64, 0_i64, 500_i64, 1_i64, old),
-            ("recent", 60, 40, 20, 100, 1, recent),
-            ("today", 50, 0, 0, 300, 0, today),
+        for (
+            request_id,
+            session_id,
+            prompt,
+            completion,
+            cache_read,
+            latency_ms,
+            success,
+            created_at,
+        ) in [
+            (
+                "old",
+                Some("old-session"),
+                700_i64,
+                200_i64,
+                0_i64,
+                500_i64,
+                1_i64,
+                old,
+            ),
+            (
+                "recent",
+                Some("shared-session"),
+                60,
+                40,
+                20,
+                100,
+                1,
+                recent.clone(),
+            ),
+            (
+                "recent-2",
+                Some("shared-session"),
+                30,
+                10,
+                5,
+                200,
+                1,
+                recent,
+            ),
+            ("today", None, 50, 0, 0, 300, 0, today),
         ] {
             sqlx::query(
                 "INSERT INTO usage_logs (
-                    request_id, requested_model, endpoint, prompt_tokens,
+                    request_id, session_id, requested_model, endpoint, prompt_tokens,
                     completion_tokens, total_tokens, cache_read_tokens, latency_ms,
                     status_code, success, created_at
-                 ) VALUES (?, 'test-model', '/v1/chat/completions', ?, ?, ?, ?, ?, 200, ?, ?)",
+                 ) VALUES (?, ?, 'test-model', '/v1/chat/completions', ?, ?, ?, ?, ?, 200, ?, ?)",
             )
             .bind(request_id)
+            .bind(session_id)
             .bind(prompt)
             .bind(completion)
             .bind(prompt + completion)
@@ -5905,17 +5988,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(view.requests_today, 1);
-        assert_eq!(view.requests_total, 3);
+        assert_eq!(view.requests_total, 4);
         assert_eq!(view.prompt_tokens_today, 50);
         assert_eq!(view.completion_tokens_today, 0);
-        assert_eq!(view.prompt_tokens_total, 810);
-        assert_eq!(view.completion_tokens_total, 240);
-        assert_eq!(view.range_requests, 2);
-        assert_eq!(view.range_tokens, 150);
-        assert_eq!(view.range_prompt_tokens, 110);
-        assert_eq!(view.range_completion_tokens, 40);
-        assert_eq!(view.range_cache_read, 20);
-        assert_eq!(view.range_success_rate, 50.0);
+        assert_eq!(view.prompt_tokens_total, 840);
+        assert_eq!(view.completion_tokens_total, 250);
+        assert_eq!(view.range_requests, 3);
+        assert_eq!(view.range_tokens, 190);
+        assert_eq!(view.range_prompt_tokens, 140);
+        assert_eq!(view.range_completion_tokens, 50);
+        assert_eq!(view.range_cache_read, 25);
+        assert_eq!(view.range_sessions, 1);
+        assert!((view.range_session_coverage - 66.666_666).abs() < 0.001);
+        assert_eq!(view.range_avg_requests_per_session, 2.0);
+        assert!((view.range_session_cache_hit_rate - 27.777_777).abs() < 0.001);
+        assert!((view.range_success_rate - 66.666_666).abs() < 0.001);
         assert_eq!(view.range_avg_latency_ms, 200.0);
         assert_eq!(view.active_providers, 3);
         assert_eq!(view.healthy_providers, 1);
@@ -5942,17 +6029,17 @@ mod tests {
                 .sum::<i64>(),
             view.range_completion_tokens
         );
-        assert_eq!(view.recent_requests.len(), 3);
+        assert_eq!(view.recent_requests.len(), 4);
         assert!(view.recent_requests.iter().any(|row| row.in_flight));
         assert!(
             view.recent_requests
                 .iter()
                 .all(|row| row.request_id != "old")
         );
-        assert_eq!(view.model_usage[0].requests, 2);
-        assert_eq!(view.model_usage[0].tokens, 150);
-        assert_eq!(view.model_usage[0].prompt_tokens, 110);
-        assert_eq!(view.model_usage[0].completion_tokens, 40);
+        assert_eq!(view.model_usage[0].requests, 3);
+        assert_eq!(view.model_usage[0].tokens, 190);
+        assert_eq!(view.model_usage[0].prompt_tokens, 140);
+        assert_eq!(view.model_usage[0].completion_tokens, 50);
     }
 
     #[tokio::test]

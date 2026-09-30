@@ -413,6 +413,10 @@ export type Overview = {
   range_cache_read: number
   range_cache_write: number
   range_cache_hit_rate: number
+  range_sessions: number
+  range_session_coverage: number
+  range_avg_requests_per_session: number
+  range_session_cache_hit_rate: number
   range_cost_micros: number
   range_unpriced: number
   range_success_rate: number
