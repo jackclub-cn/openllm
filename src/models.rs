@@ -103,6 +103,7 @@ pub struct ProviderView {
     pub headers: serde_json::Value,
     pub enabled: bool,
     pub api_key_set: bool,
+    pub api_keys: Vec<ProviderApiKeyView>,
     pub tool_search_supported: bool,
     pub models: Vec<String>,
     pub models_synced_at: Option<String>,
@@ -119,6 +120,43 @@ pub struct ProviderView {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, FromRow)]
+pub struct ProviderApiKeyRecord {
+    pub id: i64,
+    pub name: String,
+    pub secret: String,
+    pub enabled: i64,
+    pub last_used_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderApiKeyView {
+    pub id: i64,
+    pub name: String,
+    pub api_key_set: bool,
+    pub api_key_suffix: String,
+    pub enabled: bool,
+    pub last_used_at: Option<String>,
+    pub last_error_at: Option<String>,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProviderApiKeyInput {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProviderInput {
     pub name: String,
@@ -128,6 +166,8 @@ pub struct ProviderInput {
     pub model_prefix: String,
     #[serde(default)]
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_keys: Vec<ProviderApiKeyInput>,
     #[serde(default)]
     pub headers: serde_json::Value,
     #[serde(default = "default_true")]
@@ -154,6 +194,8 @@ pub struct ProviderUpdate {
     pub api_key: Option<String>,
     #[serde(default)]
     pub clear_api_key: Option<bool>,
+    #[serde(default)]
+    pub api_keys: Option<Vec<ProviderApiKeyInput>>,
     pub headers: Option<serde_json::Value>,
     pub enabled: Option<bool>,
     pub tool_search_supported: Option<bool>,
@@ -252,6 +294,14 @@ pub struct RouteTarget {
     pub weight: i64,
     pub priority: i64,
     pub enabled: i64,
+    /// Provider credential selected for this runtime candidate. This is not a
+    /// route_targets column and defaults to `None` for database-loaded rows.
+    #[sqlx(default)]
+    pub provider_api_key_id: Option<i64>,
+    /// Whether an authentication failure should fall through to a later
+    /// candidate instead of being returned to the caller.
+    #[sqlx(default)]
+    pub auth_retryable: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1254,6 +1304,7 @@ impl From<Provider> for ProviderView {
             headers,
             enabled: value.enabled != 0,
             api_key_set: value.api_key.as_deref().is_some_and(|key| !key.is_empty()),
+            api_keys: Vec::new(),
             tool_search_supported: value.tool_search_supported != 0,
             models: Vec::new(),
             models_synced_at: value.models_synced_at,

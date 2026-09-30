@@ -67,6 +67,25 @@ export const api = {
   download: (path: string) => requestBlob(path),
 }
 
+export type ProviderApiKey = {
+  id: number
+  name: string
+  api_key_set: boolean
+  api_key_suffix: string
+  enabled: boolean
+  last_used_at?: string
+  last_error_at?: string
+  last_error?: string
+  created_at: string
+}
+
+export type ProviderApiKeyInput = {
+  id?: number
+  name: string
+  api_key?: string
+  enabled: boolean
+}
+
 export type Provider = {
   id: number
   name: string
@@ -77,6 +96,7 @@ export type Provider = {
   headers: Record<string, string>
   enabled: boolean
   api_key_set: boolean
+  api_keys: ProviderApiKey[]
   tool_search_supported: boolean
   models: string[]
   models_synced_at?: string
@@ -99,6 +119,7 @@ export type ProviderInput = {
   base_url: string
   model_prefix: string
   api_key?: string
+  api_keys?: ProviderApiKeyInput[]
   headers: Record<string, string>
   enabled: boolean
   tool_search_supported: boolean

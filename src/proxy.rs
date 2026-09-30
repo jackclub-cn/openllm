@@ -1,6 +1,7 @@
+use std::collections::HashMap;
 use std::io;
 use std::str::FromStr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -1336,6 +1337,7 @@ async fn proxy_anthropic_inner(
     let mut last_target = None;
     for target in ordered_targets {
         let target_provider_id = target.provider_id;
+        let target_provider_key_id = target.provider_api_key_id;
         let target_upstream_model = target.upstream_model.clone();
         log_usage_target(
             state,
@@ -1344,6 +1346,7 @@ async fn proxy_anthropic_inner(
             &target_upstream_model,
         )
         .await;
+        mark_provider_api_key_used(state, target_provider_key_id).await;
         last_target = Some((target_provider_id, target_upstream_model));
         let result = if target.provider_type == "anthropic" {
             // Native target: forward the caller's Anthropic payload unchanged,
@@ -1464,7 +1467,15 @@ async fn forward_anthropic_native(
             .chars()
             .take(600)
             .collect::<String>();
-        if retryable_status(status) {
+        if provider_key_failure(status) {
+            mark_provider_api_key_error(
+                state,
+                target.provider_api_key_id,
+                &format!("{} returned {}: {}", target.provider_name, status, message),
+            )
+            .await;
+        }
+        if should_try_next_target(&target, status) {
             return Err(AppError::Upstream(format!(
                 "{} returned {}: {}",
                 target.provider_name, status, message
@@ -1599,7 +1610,15 @@ async fn forward_openai_as_anthropic(
             .chars()
             .take(600)
             .collect::<String>();
-        if retryable_status(status) {
+        if provider_key_failure(status) {
+            mark_provider_api_key_error(
+                state,
+                target.provider_api_key_id,
+                &format!("{} returned {}: {}", target.provider_name, status, message),
+            )
+            .await;
+        }
+        if should_try_next_target(&target, status) {
             return Err(AppError::Upstream(format!(
                 "{} returned {}: {}",
                 target.provider_name, status, message
@@ -1806,6 +1825,7 @@ async fn proxy_openai_inner(
     let mut last_target = None;
     for target in ordered_targets {
         let target_provider_id = target.provider_id;
+        let target_provider_key_id = target.provider_api_key_id;
         let target_upstream_model = target.upstream_model.clone();
         last_target = Some((target_provider_id, target_upstream_model.clone()));
         if target.provider_type == "anthropic" && endpoint != OPENAI_CHAT_COMPLETIONS {
@@ -1823,6 +1843,7 @@ async fn proxy_openai_inner(
             &target_upstream_model,
         )
         .await;
+        mark_provider_api_key_used(state, target_provider_key_id).await;
         match forward_to_target(
             state,
             request_id,
@@ -1964,7 +1985,16 @@ async fn upstream_error_response(
         .take(600)
         .collect::<String>();
 
-    if retryable_status(status) {
+    if provider_key_failure(status) {
+        mark_provider_api_key_error(
+            state,
+            target.provider_api_key_id,
+            &format!("{} returned {}: {}", target.provider_name, status, message),
+        )
+        .await;
+    }
+
+    if should_try_next_target(target, status) {
         tracing::warn!(
             provider = %target.provider_name,
             model = %target.upstream_model,
@@ -4012,6 +4042,119 @@ fn provider_health_rank(health: Option<i64>) -> u8 {
     }
 }
 
+const PROVIDER_KEY_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+
+async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Option<i64>) {
+    let Some(provider_api_key_id) = provider_api_key_id else {
+        return;
+    };
+    {
+        let mut touched = state.provider_key_touched.lock().await;
+        if touched
+            .get(&provider_api_key_id)
+            .is_some_and(|last| last.elapsed() < PROVIDER_KEY_TOUCH_INTERVAL)
+        {
+            return;
+        }
+        touched.insert(provider_api_key_id, Instant::now());
+    }
+
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+             WHERE id = ?",
+        )
+        .bind(provider_api_key_id)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!(%error, provider_api_key_id, "failed to update provider key usage");
+        }
+    });
+}
+
+async fn mark_provider_api_key_error(
+    state: &AppState,
+    provider_api_key_id: Option<i64>,
+    message: &str,
+) {
+    let Some(provider_api_key_id) = provider_api_key_id else {
+        return;
+    };
+    let message = message.chars().take(1000).collect::<String>();
+    let state = state.clone();
+    tokio::spawn(async move {
+        if let Err(error) = sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                 last_error_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), \
+                 last_error = ? \
+             WHERE id = ?",
+        )
+        .bind(message)
+        .bind(provider_api_key_id)
+        .execute(&state.pool)
+        .await
+        {
+            tracing::warn!(%error, provider_api_key_id, "failed to record provider key error");
+        }
+    });
+}
+
+async fn expand_target_provider_keys(
+    state: &AppState,
+    targets: Vec<RouteTarget>,
+) -> AppResult<Vec<RouteTarget>> {
+    let mut keys_by_provider = HashMap::new();
+    for target in &targets {
+        if keys_by_provider.contains_key(&target.provider_id) {
+            continue;
+        }
+        let keys = sqlx::query_as::<_, (i64, String)>(
+            "SELECT id, secret FROM provider_api_keys \
+             WHERE provider_id = ? AND enabled = 1 \
+             ORDER BY id",
+        )
+        .bind(target.provider_id)
+        .fetch_all(&state.pool)
+        .await?;
+        keys_by_provider.insert(target.provider_id, keys);
+    }
+
+    let mut cursors = state.provider_key_cursor.lock().await;
+    let mut expanded = Vec::new();
+    for target in targets {
+        let mut keys = keys_by_provider
+            .get(&target.provider_id)
+            .cloned()
+            .unwrap_or_default();
+        if keys.is_empty() {
+            expanded.push(target);
+            continue;
+        }
+
+        let cursor = cursors.entry(target.provider_id).or_default();
+        let offset = *cursor % keys.len();
+        keys.rotate_left(offset);
+        *cursor = cursor.wrapping_add(1);
+
+        for (key_id, secret) in keys {
+            let mut candidate = target.clone();
+            candidate.api_key = Some(secret);
+            candidate.provider_api_key_id = Some(key_id);
+            expanded.push(candidate);
+        }
+    }
+
+    let last_index = expanded.len().saturating_sub(1);
+    for (index, target) in expanded.iter_mut().enumerate() {
+        target.auth_retryable = index < last_index;
+    }
+    Ok(expanded)
+}
+
 async fn order_targets(
     state: &AppState,
     route_id: i64,
@@ -4050,7 +4193,7 @@ async fn order_targets(
     // providers last. Unknown health stays ahead of failed providers so a
     // previously-tested outage does not permanently suppress a recovery.
     targets.sort_by_key(|target| provider_health_rank(target.provider_health));
-    Ok(targets)
+    expand_target_provider_keys(state, targets).await
 }
 
 struct UsageParser {
@@ -4446,6 +4589,16 @@ fn hash_secret(value: &str) -> String {
 
 fn retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
+}
+
+fn should_try_next_target(target: &RouteTarget, status: StatusCode) -> bool {
+    retryable_status(status)
+        || (target.auth_retryable
+            && matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN))
+}
+
+fn provider_key_failure(status: StatusCode) -> bool {
+    retryable_status(status) || matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
 }
 
 /// Downward compatibility for multi-target routes.
@@ -5163,6 +5316,8 @@ mod tests {
             weight: 100,
             priority: 0,
             enabled: 1,
+            provider_api_key_id: None,
+            auth_retryable: false,
         }
     }
 
@@ -6504,6 +6659,73 @@ mod tests {
         assert_eq!(provider_health_rank(Some(7)), 0);
     }
 
+    #[tokio::test]
+    async fn provider_keys_rotate_and_expand_a_route_target() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                name, provider_type, base_url, model_prefix, enabled
+             ) VALUES ('Rotating', 'openai', 'https://example.com/v1', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (provider_id, name, secret, enabled)
+             VALUES (1, 'First', 'sk-first', 1), (1, 'Second', 'sk-second', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let mut target = endpoint_test_target("openai", None);
+        target.id = 1;
+
+        let first = order_targets(&state, 1, "priority", vec![target.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|target| target.api_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("sk-first"), Some("sk-second")]
+        );
+        assert!(first[0].auth_retryable);
+        assert!(!first[1].auth_retryable);
+        assert!(
+            first
+                .iter()
+                .all(|target| target.provider_api_key_id.is_some())
+        );
+
+        let second = order_targets(&state, 1, "priority", vec![target])
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|target| target.api_key.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("sk-second"), Some("sk-first")]
+        );
+    }
+
+    #[test]
+    fn auth_failures_only_fall_through_when_another_candidate_exists() {
+        let mut target = endpoint_test_target("openai", None);
+        assert!(!should_try_next_target(&target, StatusCode::UNAUTHORIZED));
+        target.auth_retryable = true;
+        assert!(should_try_next_target(&target, StatusCode::UNAUTHORIZED));
+        assert!(should_try_next_target(&target, StatusCode::FORBIDDEN));
+        assert!(!should_try_next_target(&target, StatusCode::BAD_REQUEST));
+    }
+
     #[test]
     fn rejects_estimated_input_above_route_context_limit() {
         let barrel = BarrelEnvelope {
@@ -6737,6 +6959,8 @@ mod tests {
                 weight: 100,
                 priority: 0,
                 enabled: 1,
+                provider_api_key_id: None,
+                auth_retryable: false,
             };
 
             let response = forward_to_target(

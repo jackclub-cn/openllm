@@ -17,7 +17,6 @@ import {
   App,
   Button,
   Card,
-  Checkbox,
   Form,
   Input,
   InputNumber,
@@ -37,6 +36,7 @@ import {
   api,
   formatError,
   type Provider,
+  type ProviderApiKeyInput,
   type ProviderInput,
   type ProviderModelLimit,
   type ProviderModelLimitInput,
@@ -69,10 +69,10 @@ const syncFieldLabels: Record<string, string> = {
   display_name: '显示名',
 }
 
-type ProviderForm = ProviderInput & {
+type ProviderForm = Omit<ProviderInput, 'api_keys'> & {
   headersText: string
   modelsText: string
-  clear_api_key?: boolean
+  api_keys?: Array<ProviderApiKeyInput & { api_key_suffix?: string }>
 }
 
 type ModelSyncPreview = {
@@ -107,7 +107,7 @@ export default function Providers() {
   const [limitPage, setLimitPage] = useState(1)
   const [presetKey, setPresetKey] = useState<string>()
   const [form] = Form.useForm<ProviderForm>()
-  const clearApiKey = Form.useWatch('clear_api_key', form)
+  const apiKeyRows = Form.useWatch('api_keys', form) || []
 
   const load = async () => {
     setLoading(true)
@@ -126,8 +126,13 @@ export default function Providers() {
     setEditing(item)
     form.setFieldsValue(item ? {
       ...item,
-      api_key: '',
-      clear_api_key: false,
+      api_keys: item.api_keys.map((key) => ({
+        id: key.id,
+        name: key.name,
+        api_key: '',
+        api_key_suffix: key.api_key_suffix,
+        enabled: key.enabled,
+      })),
       // Never re-sync implicitly while editing: doing so would overwrite a
       // manually curated model list. The user must opt in explicitly.
       auto_sync_models: false,
@@ -138,8 +143,7 @@ export default function Providers() {
       provider_type: 'openai',
       base_url: 'https://api.openai.com/v1',
       model_prefix: '',
-      api_key: '',
-      clear_api_key: false,
+      api_keys: [],
       enabled: true,
       tool_search_supported: true,
       auto_sync_models: true,
@@ -173,13 +177,23 @@ export default function Providers() {
       message.error('请求头必须是有效的 JSON 对象')
       return
     }
-    const payload: ProviderInput & { clear_api_key?: boolean } = {
+    const apiKeys: ProviderApiKeyInput[] = (values.api_keys || []).map((key) => ({
+      id: key.id,
+      name: key.name?.trim() || '',
+      api_key: key.api_key?.trim() || undefined,
+      enabled: key.enabled,
+    }))
+    const missingSecret = apiKeys.findIndex((key) => !key.id && !key.api_key)
+    if (missingSecret >= 0) {
+      message.error(`第 ${missingSecret + 1} 个密钥还没有填写内容`)
+      return
+    }
+    const payload: ProviderInput = {
       name: values.name,
       provider_type: values.provider_type,
       base_url: values.base_url,
       model_prefix: values.model_prefix,
-      api_key: values.api_key,
-      clear_api_key: editing?.api_key_set ? Boolean(values.clear_api_key) : undefined,
+      api_keys: apiKeys,
       headers,
       enabled: values.enabled,
       tool_search_supported: values.tool_search_supported,
@@ -467,9 +481,28 @@ export default function Providers() {
             },
             {
               title: '凭证',
-              dataIndex: 'api_key_set',
-              width: 100,
-              render: (value: boolean) => <Tag color={value ? 'green' : 'default'}>{value ? '已配置' : '无需密钥'}</Tag>,
+              dataIndex: 'api_keys',
+              width: 130,
+              render: (keys: Provider['api_keys']) => {
+                if (!keys?.length) {
+                  return <Tag color="default">无需密钥</Tag>
+                }
+                const enabled = keys.filter((key) => key.enabled).length
+                const detail = keys.map((key) => (
+                  <div key={key.id}>
+                    {key.name || `Key ${key.id}`} · {key.api_key_suffix || '****'} ·{' '}
+                    {key.enabled ? '启用' : '停用'}
+                    {key.last_error ? ` · ${key.last_error}` : ''}
+                  </div>
+                ))
+                return (
+                  <Tooltip title={<div>{detail}</div>}>
+                    <Tag color={enabled ? 'green' : 'default'}>
+                      {enabled}/{keys.length} 个可用
+                    </Tag>
+                  </Tooltip>
+                )
+              },
             },
             {
               title: '健康',
@@ -648,31 +681,70 @@ export default function Providers() {
             <Input placeholder="openai/" />
           </Form.Item>
           <Form.Item
-            name="api_key"
-            label="API Key"
-            extra={editing?.api_key_set ? '留空将保留当前密钥；输入新值会覆盖。' : '本地模型可以留空。'}
+            label="API Keys"
+            extra="支持配置多个上游密钥；请求会轮转使用，遇到 401/403 时自动尝试下一把。已有密钥留空即保留原值。"
           >
-            <Input.Password
-              placeholder={editing?.api_key_set ? '留空保留，输入新值覆盖' : 'sk-...'}
-              autoComplete="new-password"
-              disabled={Boolean(editing?.api_key_set && clearApiKey)}
-            />
+            <Form.List name="api_keys">
+              {(fields, { add, remove }) => (
+                <Space direction="vertical" size={8} style={{ width: '100%' }}>
+                  {fields.map((field, index) => (
+                    <Space key={field.key} align="start" style={{ width: '100%' }}>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'id']}
+                        hidden
+                      >
+                        <Input />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'name']}
+                        style={{ marginBottom: 0, width: 150 }}
+                      >
+                        <Input placeholder={`Key ${index + 1}`} />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'api_key']}
+                        style={{ marginBottom: 0, width: 260 }}
+                      >
+                        <Input.Password
+                          placeholder={
+                            apiKeyRows[index]?.id
+                              ? `留空保留${apiKeyRows[index]?.api_key_suffix ? ` (****${apiKeyRows[index].api_key_suffix})` : ''}`
+                              : 'sk-...'
+                          }
+                          autoComplete="new-password"
+                        />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'enabled']}
+                        valuePropName="checked"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <Switch checkedChildren="启用" unCheckedChildren="停用" />
+                      </Form.Item>
+                      <Button
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => remove(field.name)}
+                      />
+                    </Space>
+                  ))}
+                  <Button
+                    type="dashed"
+                    icon={<PlusOutlined />}
+                    onClick={() => add({ name: `Key ${fields.length + 1}`, enabled: true })}
+                    block
+                  >
+                    添加密钥
+                  </Button>
+                </Space>
+              )}
+            </Form.List>
           </Form.Item>
-          {editing?.api_key_set && (
-            <Form.Item
-              name="clear_api_key"
-              valuePropName="checked"
-              extra="保存后立即移除已存密钥。需要鉴权的提供商将无法继续调用，直到重新填写密钥。"
-            >
-              <Checkbox
-                onChange={(event) => {
-                  if (event.target.checked) form.setFieldValue('api_key', '')
-                }}
-              >
-                清除已保存的 API Key
-              </Checkbox>
-            </Form.Item>
-          )}
           <Form.Item
             name="tool_search_supported"
             label="上游支持 tool_search"

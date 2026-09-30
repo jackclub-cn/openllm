@@ -171,6 +171,7 @@ pub async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec
         .await?;
         let mut view = ProviderView::from(provider);
         view.models = models;
+        hydrate_provider_view(&state, &mut view).await?;
         views.push(view);
     }
     Ok(Json(views))
@@ -183,7 +184,13 @@ pub async fn create_provider(
     validate_provider_input(&input)?;
     let headers = serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
     let model_prefix = normalize_model_prefix(&input.model_prefix)?;
-    let api_key = normalize_optional(input.api_key);
+    let api_key = normalize_optional(input.api_key.clone());
+    let mut api_keys = input.api_keys.clone();
+    if api_keys.is_empty()
+        && let Some(secret) = api_key.clone()
+    {
+        api_keys.push(provider_api_key_input(None, "Default", Some(secret), true));
+    }
     let base_url = normalize_base_url(&input.base_url);
     let health_check_interval_minutes =
         normalize_health_interval(input.health_check_interval_minutes)?;
@@ -221,6 +228,7 @@ pub async fn create_provider(
     .map_err(map_sqlite_conflict)?;
 
     let id = result.last_insert_rowid();
+    replace_provider_api_keys(&mut tx, id, &api_keys).await?;
     let entries = names_to_entries(&input.models);
     replace_provider_models(
         &mut tx,
@@ -279,11 +287,15 @@ pub async fn update_provider(
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.models_sync_interval_minutes,
     };
-    let api_key = merge_provider_api_key(
-        current.api_key,
-        input.api_key,
-        input.clear_api_key.unwrap_or(false),
-    );
+    let api_key_update = normalize_optional(input.api_key.clone());
+    let api_keys_update = if let Some(api_keys) = input.api_keys.clone() {
+        Some(api_keys)
+    } else if input.clear_api_key.unwrap_or(false) {
+        Some(Vec::new())
+    } else {
+        api_key_update
+            .map(|secret| vec![provider_api_key_input(None, "Default", Some(secret), true)])
+    };
     let headers = match input.headers {
         Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
         None => current.headers,
@@ -303,14 +315,13 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, api_key = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
     .bind(base_url)
     .bind(model_prefix)
     .bind(models_dev_id.as_deref())
-    .bind(api_key)
     .bind(headers)
     .bind(enabled as i64)
     .bind(tool_search_supported as i64)
@@ -320,6 +331,10 @@ pub async fn update_provider(
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
+
+    if let Some(api_keys) = api_keys_update {
+        replace_provider_api_keys(&mut tx, id, &api_keys).await?;
+    }
 
     if let Some(models) = input.models {
         let entries = names_to_entries(&models);
@@ -397,7 +412,48 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     .fetch_optional(&state.pool)
     .await?;
 
-    if let Some(model) = model {
+    // A provider may have several credentials. Test every enabled key and
+    // consider the provider healthy when any one of them succeeds.
+    let mut result = None;
+    for (_, key) in provider_key_candidates(state, &provider).await? {
+        let checked = if model.is_some() {
+            "inference"
+        } else {
+            "models"
+        };
+        let request = build_provider_probe_request(
+            state,
+            &provider,
+            provider_type,
+            model.as_deref(),
+            key.as_deref(),
+        )?;
+        let attempt =
+            probe_provider(request, started, checked, model.as_deref().unwrap_or("")).await;
+        if attempt.ok {
+            result = Some(attempt);
+            break;
+        }
+        result = Some(attempt);
+    }
+    let result = result.unwrap_or(ProviderTestResult {
+        ok: false,
+        latency_ms: started.elapsed().as_millis() as i64,
+        message: "provider has no credentials to test".to_string(),
+        checked: "none".to_string(),
+    });
+    persist_provider_test(state, id, &result).await?;
+    Ok(result)
+}
+
+fn build_provider_probe_request(
+    state: &AppState,
+    provider: &Provider,
+    provider_type: ProviderType,
+    model: Option<&str>,
+    key: Option<&str>,
+) -> AppResult<reqwest::RequestBuilder> {
+    let mut request = if let Some(model) = model {
         let (url, body) = match provider_type {
             ProviderType::Anthropic => (
                 join_upstream_url(&provider.base_url, "/v1/messages"),
@@ -418,40 +474,25 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
                 }),
             ),
         };
-        let mut request = state
+        state
             .client
             .post(url)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .json(&body);
-        request = match provider_type {
+            .json(&body)
+    } else {
+        // No model synced yet, so fall back to listing. This only proves the
+        // host is reachable, which the result message says explicitly.
+        let url = match provider_type {
             ProviderType::Anthropic => {
-                let request = request.header("anthropic-version", "2023-06-01");
-                match &provider.api_key {
-                    Some(key) => request.header("x-api-key", key),
-                    None => request,
-                }
+                format!("{}/v1/models", provider.base_url.trim_end_matches('/'))
             }
-            _ => match &provider.api_key {
-                Some(key) => request.bearer_auth(key),
-                None => request,
-            },
+            ProviderType::Ollama => format!("{}/api/tags", ollama_root(&provider.base_url)),
+            _ => format!("{}/models", provider.base_url.trim_end_matches('/')),
         };
-        request = apply_custom_headers(request, &provider.headers)?;
-        let result = probe_provider(request, started, "inference", &model).await;
-        persist_provider_test(state, id, &result).await?;
-        return Ok(result);
-    }
-
-    // No model synced yet, so fall back to listing. This only proves the host
-    // is reachable, which the message says explicitly.
-    let url = match provider_type {
-        ProviderType::Anthropic => format!("{}/v1/models", provider.base_url.trim_end_matches('/')),
-        ProviderType::Ollama => format!("{}/api/tags", ollama_root(&provider.base_url)),
-        _ => format!("{}/models", provider.base_url.trim_end_matches('/')),
+        state.client.get(url)
     };
 
-    let mut request = state.client.get(url);
-    if let Some(key) = &provider.api_key {
+    if let Some(key) = key {
         request = match provider_type {
             ProviderType::Anthropic => request
                 .header("x-api-key", key)
@@ -459,11 +500,7 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
             _ => request.bearer_auth(key),
         };
     }
-    request = apply_custom_headers(request, &provider.headers)?;
-
-    let result = probe_provider(request, started, "models", "").await;
-    persist_provider_test(state, id, &result).await?;
-    Ok(result)
+    apply_custom_headers(request, &provider.headers)
 }
 
 pub async fn test_all_providers(
@@ -1179,52 +1216,69 @@ async fn fetch_provider_entries(
         ),
     };
 
-    let mut request = state.client.get(url);
-    if let Some(key) = &provider.api_key {
-        request = match provider_type {
-            ProviderType::Anthropic => request
-                .header("x-api-key", key)
-                .header("anthropic-version", "2023-06-01"),
-            _ => request.bearer_auth(key),
+    let mut last_error = None;
+    for (_, key) in provider_key_candidates(state, provider).await? {
+        let mut request = state.client.get(&url);
+        if let Some(key) = key {
+            request = match provider_type {
+                ProviderType::Anthropic => request
+                    .header("x-api-key", key)
+                    .header("anthropic-version", "2023-06-01"),
+                _ => request.bearer_auth(key),
+            };
+        }
+        request = apply_custom_headers(request, &provider.headers)?;
+
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                last_error = Some(format!(
+                    "failed to fetch models from {}: {error}",
+                    provider.name
+                ));
+                continue;
+            }
         };
-    }
-    request = apply_custom_headers(request, &provider.headers)?;
+        let status = response.status();
+        let bytes = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                last_error = Some(error.to_string());
+                continue;
+            }
+        };
+        if !status.is_success() {
+            let body = String::from_utf8_lossy(&bytes)
+                .chars()
+                .take(400)
+                .collect::<String>();
+            last_error = Some(format!("{} returned {}: {}", provider.name, status, body));
+            if matches!(status.as_u16(), 401 | 403 | 408 | 409 | 425 | 429)
+                || status.is_server_error()
+            {
+                continue;
+            }
+            break;
+        }
 
-    let response = request.send().await.map_err(|error| {
-        AppError::Upstream(format!(
-            "failed to fetch models from {}: {error}",
-            provider.name
-        ))
-    })?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| AppError::Upstream(error.to_string()))?;
-    if !status.is_success() {
-        let body = String::from_utf8_lossy(&bytes)
-            .chars()
-            .take(400)
-            .collect::<String>();
-        return Err(AppError::Upstream(format!(
-            "{} returned {}: {}",
-            provider.name, status, body
-        )));
+        let value: Value = serde_json::from_slice(&bytes)
+            .map_err(|error| AppError::Upstream(format!("invalid model list response: {error}")))?;
+        let entries = if ollama_style {
+            names_to_entries(&parse_ollama_models(&value))
+        } else {
+            parse_openai_model_entries(&value)
+        };
+        if entries.is_empty() {
+            return Err(AppError::Upstream(
+                "upstream model list did not contain any recognizable models".to_string(),
+            ));
+        }
+        return Ok(entries);
     }
 
-    let value: Value = serde_json::from_slice(&bytes)
-        .map_err(|error| AppError::Upstream(format!("invalid model list response: {error}")))?;
-    let entries = if ollama_style {
-        names_to_entries(&parse_ollama_models(&value))
-    } else {
-        parse_openai_model_entries(&value)
-    };
-    if entries.is_empty() {
-        return Err(AppError::Upstream(
-            "upstream model list did not contain any recognizable models".to_string(),
-        ));
-    }
-    Ok(entries)
+    Err(AppError::Upstream(last_error.unwrap_or_else(|| {
+        format!("no credentials available for {}", provider.name)
+    })))
 }
 
 async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
@@ -2317,6 +2371,7 @@ async fn get_provider(state: &AppState, id: i64) -> AppResult<ProviderView> {
     .await?;
     let mut view = ProviderView::from(provider);
     view.models = models;
+    hydrate_provider_view(state, &mut view).await?;
     Ok(view)
 }
 
@@ -2672,19 +2727,186 @@ fn validate_provider_input(input: &ProviderInput) -> AppResult<()> {
     Ok(())
 }
 
-fn merge_provider_api_key(
-    current: Option<String>,
-    requested: Option<String>,
-    clear: bool,
-) -> Option<String> {
-    if clear {
-        return None;
+impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
+    fn from(value: ProviderApiKeyRecord) -> Self {
+        let api_key_suffix = value.secret.chars().rev().take(4).collect::<String>();
+        let api_key_suffix = api_key_suffix.chars().rev().collect::<String>();
+        Self {
+            id: value.id,
+            name: value.name,
+            api_key_set: !value.secret.is_empty(),
+            api_key_suffix,
+            enabled: value.enabled != 0,
+            last_used_at: value.last_used_at,
+            last_error_at: value.last_error_at,
+            last_error: value.last_error,
+            created_at: value.created_at,
+        }
     }
-    match requested {
-        Some(key) if key.trim().is_empty() => current,
-        Some(key) => Some(key.trim().to_string()),
-        None => current,
+}
+
+async fn provider_api_key_records(
+    pool: &sqlx::SqlitePool,
+    provider_id: i64,
+) -> AppResult<Vec<ProviderApiKeyRecord>> {
+    Ok(sqlx::query_as::<_, ProviderApiKeyRecord>(
+        "SELECT * FROM provider_api_keys WHERE provider_id = ? ORDER BY id",
+    )
+    .bind(provider_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+async fn provider_key_candidates(
+    state: &AppState,
+    provider: &Provider,
+) -> AppResult<Vec<(Option<i64>, Option<String>)>> {
+    let mut candidates = provider_api_key_records(&state.pool, provider.id)
+        .await?
+        .into_iter()
+        .filter(|record| record.enabled != 0)
+        .map(|record| (Some(record.id), Some(record.secret)))
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        candidates.push((None, provider.api_key.clone()));
     }
+    Ok(candidates)
+}
+
+async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> AppResult<()> {
+    view.api_keys = provider_api_key_records(&state.pool, view.id)
+        .await?
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    view.api_key_set = !view.api_keys.is_empty();
+    Ok(())
+}
+
+fn provider_api_key_input(
+    id: Option<i64>,
+    name: impl Into<String>,
+    api_key: Option<String>,
+    enabled: bool,
+) -> ProviderApiKeyInput {
+    ProviderApiKeyInput {
+        id,
+        name: name.into(),
+        api_key,
+        enabled,
+    }
+}
+
+async fn replace_provider_api_keys(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    provider_id: i64,
+    inputs: &[ProviderApiKeyInput],
+) -> AppResult<()> {
+    let existing = sqlx::query_as::<_, ProviderApiKeyRecord>(
+        "SELECT * FROM provider_api_keys WHERE provider_id = ? ORDER BY id",
+    )
+    .bind(provider_id)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|record| (record.id, record))
+    .collect::<HashMap<_, _>>();
+    let mut retained = HashSet::new();
+    let mut secrets = HashSet::new();
+
+    for (index, input) in inputs.iter().enumerate() {
+        let current = match input.id {
+            Some(id) => Some(
+                existing
+                    .get(&id)
+                    .ok_or_else(|| {
+                        AppError::BadRequest("API key does not belong to this provider".to_string())
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
+        let requested_secret = normalize_optional(input.api_key.clone());
+        let secret = match (requested_secret, current.as_ref()) {
+            (Some(secret), _) => secret,
+            (None, Some(current)) => current.secret.clone(),
+            (None, None) => {
+                return Err(AppError::BadRequest(
+                    "new provider API keys must include a secret".to_string(),
+                ));
+            }
+        };
+        if !secrets.insert(secret.clone()) {
+            return Err(AppError::BadRequest(
+                "provider API keys must be unique".to_string(),
+            ));
+        }
+        let name = match input.name.trim() {
+            "" => current
+                .as_ref()
+                .map(|current| current.name.clone())
+                .unwrap_or_else(|| format!("Key {}", index + 1)),
+            name => name.to_string(),
+        };
+        if name.chars().count() > 80 {
+            return Err(AppError::BadRequest(
+                "provider API key name must be at most 80 characters".to_string(),
+            ));
+        }
+
+        if let Some(current) = current {
+            retained.insert(current.id);
+            sqlx::query(
+                "UPDATE provider_api_keys \
+                 SET name = ?, secret = ?, enabled = ?, \
+                     updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+                 WHERE id = ? AND provider_id = ?",
+            )
+            .bind(name)
+            .bind(secret)
+            .bind(input.enabled as i64)
+            .bind(current.id)
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_sqlite_conflict)?;
+        } else {
+            let result = sqlx::query(
+                "INSERT INTO provider_api_keys (provider_id, name, secret, enabled) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(provider_id)
+            .bind(name)
+            .bind(secret)
+            .bind(input.enabled as i64)
+            .execute(&mut **tx)
+            .await
+            .map_err(map_sqlite_conflict)?;
+            retained.insert(result.last_insert_rowid());
+        }
+    }
+
+    for id in existing.keys().filter(|id| !retained.contains(id)) {
+        sqlx::query("DELETE FROM provider_api_keys WHERE id = ? AND provider_id = ?")
+            .bind(id)
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    let first_secret = sqlx::query_scalar::<_, String>(
+        "SELECT secret FROM provider_api_keys \
+         WHERE provider_id = ? AND enabled = 1 ORDER BY id LIMIT 1",
+    )
+    .bind(provider_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    sqlx::query("UPDATE providers SET api_key = ? WHERE id = ?")
+        .bind(first_secret)
+        .bind(provider_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 fn validate_route_input(input: &RouteInput) -> AppResult<()> {
@@ -2936,6 +3158,67 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
 mod tests {
     use super::*;
 
+    async fn provider_key_test_state() -> AppState {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        AppState::new(pool, None)
+    }
+
+    fn provider_input(api_key: Option<&str>, api_keys: Vec<ProviderApiKeyInput>) -> ProviderInput {
+        ProviderInput {
+            name: "key-pool-test".to_string(),
+            provider_type: ProviderType::Openai,
+            base_url: "https://example.com/v1".to_string(),
+            model_prefix: String::new(),
+            api_key: api_key.map(ToOwned::to_owned),
+            api_keys,
+            headers: json!({}),
+            enabled: true,
+            tool_search_supported: true,
+            auto_sync_models: false,
+            models: Vec::new(),
+            health_check_interval_minutes: None,
+            models_sync_interval_minutes: None,
+        }
+    }
+
+    fn provider_key_input(
+        id: Option<i64>,
+        name: &str,
+        api_key: Option<&str>,
+        enabled: bool,
+    ) -> ProviderApiKeyInput {
+        ProviderApiKeyInput {
+            id,
+            name: name.to_string(),
+            api_key: api_key.map(ToOwned::to_owned),
+            enabled,
+        }
+    }
+
+    fn provider_update_with_keys(api_keys: Option<Vec<ProviderApiKeyInput>>) -> ProviderUpdate {
+        ProviderUpdate {
+            name: None,
+            provider_type: None,
+            base_url: None,
+            model_prefix: None,
+            api_key: None,
+            clear_api_key: None,
+            api_keys,
+            headers: None,
+            enabled: None,
+            tool_search_supported: None,
+            auto_sync_models: None,
+            models: None,
+            health_check_interval_minutes: None,
+            models_sync_interval_minutes: None,
+        }
+    }
+
     #[test]
     fn normalizes_model_prefix_with_trailing_slash() {
         assert_eq!(normalize_model_prefix("openai").unwrap(), "openai/");
@@ -3166,23 +3449,104 @@ mod tests {
         assert!(normalize_health_interval(Some(-1)).is_err());
     }
 
-    #[test]
-    fn provider_api_key_update_supports_clear_retain_and_replace() {
-        let current = || Some("sk-existing".to_string());
+    #[tokio::test]
+    async fn provider_api_key_pool_supports_create_update_and_clear() {
+        let state = provider_key_test_state().await;
+        let (_, Json(created)) = create_provider(
+            State(state.clone()),
+            Json(provider_input(
+                None,
+                vec![
+                    provider_key_input(None, "Primary", Some("sk-one"), true),
+                    provider_key_input(None, "Backup", Some("sk-two"), true),
+                ],
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.api_keys.len(), 2);
+        assert_eq!(created.api_keys[0].name, "Primary");
+        assert_eq!(created.api_keys[0].api_key_suffix, "-one");
+        assert_eq!(created.api_keys[1].api_key_suffix, "-two");
 
-        assert_eq!(
-            merge_provider_api_key(current(), Some("sk-new".to_string()), false),
-            Some("sk-new".to_string())
-        );
-        assert_eq!(
-            merge_provider_api_key(current(), Some("   ".to_string()), false),
-            current()
-        );
-        assert_eq!(merge_provider_api_key(current(), None, false), current());
-        assert_eq!(
-            merge_provider_api_key(current(), Some("sk-ignored".to_string()), true),
-            None
-        );
+        let first_id = created.api_keys[0].id;
+        let Json(updated) = update_provider(
+            State(state.clone()),
+            Path(created.id),
+            Json(provider_update_with_keys(Some(vec![
+                provider_key_input(Some(first_id), "Primary", None, false),
+                provider_key_input(None, "Replacement", Some("sk-three"), true),
+            ]))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.api_keys.len(), 2);
+        assert!(!updated.api_keys[0].enabled);
+        assert_eq!(updated.api_keys[1].name, "Replacement");
+
+        let retained_secret: String =
+            sqlx::query_scalar("SELECT secret FROM provider_api_keys WHERE id = ?")
+                .bind(first_id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(retained_secret, "sk-one");
+        let mirrored: Option<String> =
+            sqlx::query_scalar("SELECT api_key FROM providers WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mirrored.as_deref(), Some("sk-three"));
+
+        let Json(cleared) = update_provider(
+            State(state.clone()),
+            Path(created.id),
+            Json(provider_update_with_keys(Some(Vec::new()))),
+        )
+        .await
+        .unwrap();
+        assert!(cleared.api_keys.is_empty());
+        assert!(!cleared.api_key_set);
+        let mirrored: Option<String> =
+            sqlx::query_scalar("SELECT api_key FROM providers WHERE id = ?")
+                .bind(created.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(mirrored, None);
+    }
+
+    #[tokio::test]
+    async fn provider_api_key_pool_rejects_duplicate_secrets() {
+        let state = provider_key_test_state().await;
+        let error = create_provider(
+            State(state),
+            Json(provider_input(
+                None,
+                vec![
+                    provider_key_input(None, "One", Some("sk-same"), true),
+                    provider_key_input(None, "Two", Some("sk-same"), true),
+                ],
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("must be unique"));
+    }
+
+    #[tokio::test]
+    async fn provider_api_key_pool_accepts_legacy_single_key_input() {
+        let state = provider_key_test_state().await;
+        let (_, Json(created)) = create_provider(
+            State(state),
+            Json(provider_input(Some("sk-legacy"), Vec::new())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(created.api_keys.len(), 1);
+        assert_eq!(created.api_keys[0].name, "Default");
+        assert_eq!(created.api_keys[0].api_key_suffix, "gacy");
     }
 
     #[test]
