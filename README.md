@@ -158,7 +158,7 @@ Vite 会把 `/api` 和 `/v1` 代理到 `127.0.0.1:8080`。
 
 ## 发布流程
 
-GitHub Actions 会在分支推送和 Pull Request 中执行测试与构建。推送 `v*` 格式的标签时，会额外创建 GitHub Release，并上传 Linux、Windows 和 macOS 二进制及校验文件。
+GitHub Actions 不会在普通分支推送时构建。Pull Request 和手动触发会执行测试与构建；推送 `v*` 格式的标签时会创建 GitHub Release，并上传 Linux、Windows 和 macOS 二进制及校验文件。
 
 ```bash
 git tag v0.1.0
