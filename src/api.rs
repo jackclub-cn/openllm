@@ -417,6 +417,12 @@ pub async fn test_provider(
     Ok(Json(test_provider_inner(&state, id).await?))
 }
 
+#[derive(Debug)]
+struct ProviderProbeModel {
+    name: String,
+    supported_endpoints: Vec<String>,
+}
+
 async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTestResult> {
     let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
         .bind(id)
@@ -433,16 +439,35 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
     // known, probe the inference endpoint instead: it is the one that actually
     // enforces auth, so a bad key fails the test instead of looking healthy.
     let model = match normalize_health_check_model(provider.health_check_model.as_deref()) {
-        Some(model) => Some(model),
-        None => {
-            sqlx::query_scalar::<_, String>(
-                "SELECT model_name FROM provider_models WHERE provider_id = ? AND enabled = 1 \
-                 ORDER BY model_name LIMIT 1",
+        Some(name) => {
+            let endpoints = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT COALESCE(supported_endpoints_override, supported_endpoints) \
+                 FROM provider_models \
+                 WHERE provider_id = ? AND model_name = ? AND enabled = 1",
             )
             .bind(id)
+            .bind(&name)
             .fetch_optional(&state.pool)
             .await?
+            .flatten();
+            Some(ProviderProbeModel {
+                name,
+                supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
+            })
         }
+        None => sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT model_name, \
+                        COALESCE(supported_endpoints_override, supported_endpoints) \
+                 FROM provider_models WHERE provider_id = ? AND enabled = 1 \
+                 ORDER BY model_name LIMIT 1",
+        )
+        .bind(id)
+        .fetch_optional(&state.pool)
+        .await?
+        .map(|(name, endpoints)| ProviderProbeModel {
+            name,
+            supported_endpoints: parse_provider_probe_endpoints(endpoints.as_deref()),
+        }),
     };
 
     // A provider may have several credentials. Test every enabled key and
@@ -458,11 +483,19 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
             state,
             &provider,
             provider_type,
-            model.as_deref(),
+            model.as_ref(),
             key.as_deref(),
         )?;
-        let attempt =
-            probe_provider(request, started, checked, model.as_deref().unwrap_or("")).await;
+        let attempt = probe_provider(
+            request,
+            started,
+            checked,
+            model
+                .as_ref()
+                .map(|model| model.name.as_str())
+                .unwrap_or(""),
+        )
+        .await;
         if attempt.ok {
             if let Some(key_id) = key_id {
                 state.provider_key_cooldown.lock().await.remove(&key_id);
@@ -486,7 +519,7 @@ fn build_provider_probe_request(
     state: &AppState,
     provider: &Provider,
     provider_type: ProviderType,
-    model: Option<&str>,
+    model: Option<&ProviderProbeModel>,
     key: Option<&str>,
 ) -> AppResult<reqwest::RequestBuilder> {
     let mut request = if let Some(model) = model {
@@ -494,17 +527,30 @@ fn build_provider_probe_request(
             ProviderType::Anthropic => (
                 join_upstream_url(&provider.base_url, "/v1/messages"),
                 json!({
-                    "model": model,
+                    "model": model.name.as_str(),
                     "max_tokens": 1,
                     "messages": [{"role": "user", "content": "ping"}]
                 }),
             ),
+            ProviderType::Openai | ProviderType::Custom
+                if !provider_probe_supports(&model.supported_endpoints, "/v1/chat/completions")
+                    && provider_probe_supports(&model.supported_endpoints, "/v1/responses") =>
+            {
+                (
+                    join_upstream_url(&provider.base_url, "/v1/responses"),
+                    json!({
+                        "model": model.name.as_str(),
+                        "input": "ping",
+                        "max_output_tokens": 1
+                    }),
+                )
+            }
             // Ollama's native tags endpoint needs no auth either, so probe its
             // chat endpoint for the same reason.
             _ => (
                 join_upstream_url(&provider.base_url, "/v1/chat/completions"),
                 json!({
-                    "model": model,
+                    "model": model.name.as_str(),
                     "messages": [{"role": "user", "content": "ping"}],
                     "max_tokens": 1
                 }),
@@ -3172,6 +3218,20 @@ fn normalize_health_check_model(value: Option<&str>) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn parse_provider_probe_endpoints(value: Option<&str>) -> Vec<String> {
+    value
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn provider_probe_supports(endpoints: &[String], expected: &str) -> bool {
+    let expected = expected.trim_end_matches('/');
+    endpoints.iter().any(|endpoint| {
+        let endpoint = endpoint.trim_end_matches('/');
+        !endpoint.is_empty() && (expected == endpoint || expected.ends_with(endpoint))
+    })
+}
+
 fn normalize_health_interval(value: Option<i64>) -> AppResult<Option<i64>> {
     match value {
         Some(value) if value < 0 => Err(AppError::BadRequest(
@@ -3863,6 +3923,68 @@ mod tests {
                 .and_then(Value::as_str),
             Some("configured-model")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_check_uses_responses_for_responses_only_model() {
+        let seen = std::sync::Arc::new(tokio::sync::Mutex::new(None));
+        let app = axum::Router::new().route(
+            "/v1/responses",
+            axum::routing::post({
+                let seen = seen.clone();
+                move |Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().await = Some(body);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp_health",
+                                "object": "response",
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 0,
+                                    "total_tokens": 1
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'mock', 'openai', ?)",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (
+                provider_id, model_name, enabled, supported_endpoints
+             ) VALUES (1, 'responses-model', 1, '[\"/responses\"]')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = test_provider_inner(&state, 1).await.unwrap();
+        assert!(result.ok);
+        assert_eq!(result.checked, "inference");
+        let body = seen.lock().await;
+        let body = body.as_ref().unwrap();
+        assert_eq!(body["model"], "responses-model");
+        assert_eq!(body["input"], "ping");
+        assert_eq!(body["max_output_tokens"], 1);
         server.abort();
     }
 
