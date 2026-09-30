@@ -28,6 +28,7 @@ use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 #[cfg(test)]
 const OPENAI_RESPONSES: &str = "/v1/responses";
 
@@ -194,6 +195,79 @@ fn anthropic_beta_of(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+/// Resolves a stable conversation identifier for OpenCode Go.
+///
+/// OpenCode clients send `x-opencode-session` directly. Codex sends its native
+/// `session-id` and `thread-id` headers, while some proxies and Responses
+/// clients only preserve the stable prompt cache key in the JSON body.
+fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<String> {
+    for name in [
+        OPENCODE_SESSION_HEADER,
+        "session-id",
+        "thread-id",
+        "x-session-id",
+        "x-claude-code-session-id",
+    ] {
+        if let Some(value) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    for pointer in [
+        "/prompt_cache_key",
+        "/client_metadata/session_id",
+        "/metadata/session_id",
+    ] {
+        if let Some(value) = body
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            return Some(value.to_string());
+        }
+    }
+
+    None
+}
+
+fn is_opencode_go_target(target: &RouteTarget) -> bool {
+    let provider_name = target.provider_name.to_ascii_lowercase();
+    let model_prefix = target.model_prefix.trim().trim_end_matches('/');
+    let base_url = target.base_url.to_ascii_lowercase();
+    provider_name.contains("opencode go")
+        || model_prefix.eq_ignore_ascii_case("opencode-go")
+        || base_url.contains("opencode.ai/zen/go")
+}
+
+fn custom_headers_contain(name: &str, headers: &str) -> bool {
+    serde_json::from_str::<Value>(headers)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|headers| headers.keys().any(|key| key.eq_ignore_ascii_case(name)))
+}
+
+fn apply_opencode_session_header(
+    request: RequestBuilder,
+    target: &RouteTarget,
+    session_id: Option<&str>,
+) -> RequestBuilder {
+    let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
+        return request;
+    };
+    if !is_opencode_go_target(target)
+        || custom_headers_contain(OPENCODE_SESSION_HEADER, &target.provider_headers)
+    {
+        return request;
+    }
+    request.header(OPENCODE_SESSION_HEADER, session_id)
 }
 
 /// Renders the model registry in Anthropic's `/v1/models` shape.
@@ -1276,6 +1350,7 @@ async fn proxy_anthropic_inner(
     // Convert once up front: routing, barrel clamping and token estimation all
     // operate on the OpenAI shape.
     let mut request_json = anthropic_request_to_openai(&inbound, &requested_model);
+    let session_id = upstream_session_id(headers, &inbound);
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
@@ -1382,6 +1457,7 @@ async fn proxy_anthropic_inner(
                 started,
                 receipt.clone(),
                 anthropic_beta_of(headers),
+                session_id.as_deref(),
             )
             .await
         } else {
@@ -1396,6 +1472,7 @@ async fn proxy_anthropic_inner(
                 api_key.as_ref(),
                 started,
                 receipt.clone(),
+                session_id.as_deref(),
             )
             .await
         };
@@ -1455,6 +1532,7 @@ async fn forward_anthropic_native(
     started: Instant,
     receipt: Option<Value>,
     anthropic_beta: Option<String>,
+    session_id: Option<&str>,
 ) -> AppResult<Response> {
     let url = join_upstream_url(&target.base_url, ANTHROPIC_MESSAGES);
     let mut request = state
@@ -1474,6 +1552,7 @@ async fn forward_anthropic_native(
     if let Some(key) = &target.api_key {
         request = request.header("x-api-key", key);
     }
+    request = apply_opencode_session_header(request, &target, session_id);
     request = apply_custom_headers(request, &target.provider_headers)?;
 
     let response = request.send().await.map_err(|error| {
@@ -1607,6 +1686,7 @@ async fn forward_openai_as_anthropic(
     api_key: Option<&ApiKeyRecord>,
     started: Instant,
     receipt: Option<Value>,
+    session_id: Option<&str>,
 ) -> AppResult<Response> {
     let mut body = request_json.clone();
     body["model"] = json!(target.upstream_model);
@@ -1619,6 +1699,7 @@ async fn forward_openai_as_anthropic(
     if let Some(key) = &target.api_key {
         request = request.bearer_auth(key);
     }
+    request = apply_opencode_session_header(request, &target, session_id);
     request = apply_custom_headers(request, &target.provider_headers)?;
 
     let response = request.send().await.map_err(|error| {
@@ -1764,6 +1845,7 @@ async fn proxy_openai_inner(
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
     })?;
     let requested_model = requested_model_of(&request_json)?;
+    let session_id = upstream_session_id(headers, &request_json);
     let streamed = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -1878,6 +1960,7 @@ async fn proxy_openai_inner(
             &requested_model,
             &request_json,
             body,
+            session_id.as_deref(),
             target,
             streamed,
             request_tokens,
@@ -1938,6 +2021,7 @@ fn build_upstream_request(
     provider_type: ProviderType,
     target: &RouteTarget,
     request_body: &Value,
+    session_id: Option<&str>,
 ) -> AppResult<RequestBuilder> {
     let mut request = state
         .client
@@ -1961,6 +2045,7 @@ fn build_upstream_request(
             request
         }
     };
+    request = apply_opencode_session_header(request, target, session_id);
     apply_custom_headers(request, &target.provider_headers)
 }
 
@@ -2083,6 +2168,7 @@ async fn forward_to_target(
     requested_model: &str,
     request_json: &Value,
     _raw_body: &Bytes,
+    session_id: Option<&str>,
     target: RouteTarget,
     streamed: bool,
     request_tokens: i64,
@@ -2111,12 +2197,19 @@ async fn forward_to_target(
         request_body = compat_body;
     }
 
-    let mut response = build_upstream_request(state, &url, provider_type, &target, &request_body)?
-        .send()
-        .await
-        .map_err(|error| {
-            AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-        })?;
+    let mut response = build_upstream_request(
+        state,
+        &url,
+        provider_type,
+        &target,
+        &request_body,
+        session_id,
+    )?
+    .send()
+    .await
+    .map_err(|error| {
+        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+    })?;
     let mut status = response.status();
 
     if !status.is_success() {
@@ -2138,16 +2231,19 @@ async fn forward_to_target(
                 );
                 mark_provider_tool_search_unsupported(state, target.provider_id).await;
                 request_body = compat_body;
-                response =
-                    build_upstream_request(state, &url, provider_type, &target, &request_body)?
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            AppError::Upstream(format!(
-                                "{} request failed: {error}",
-                                target.provider_name
-                            ))
-                        })?;
+                response = build_upstream_request(
+                    state,
+                    &url,
+                    provider_type,
+                    &target,
+                    &request_body,
+                    session_id,
+                )?
+                .send()
+                .await
+                .map_err(|error| {
+                    AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
+                })?;
                 status = response.status();
                 if !status.is_success() {
                     let response_headers = response.headers().clone();
@@ -5351,6 +5447,107 @@ mod tests {
         assert_eq!(anthropic_beta_of(&blank), None);
     }
 
+    #[test]
+    fn resolves_stable_session_ids_from_headers_and_responses_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            OPENCODE_SESSION_HEADER,
+            HeaderValue::from_static("opencode-session"),
+        );
+        headers.insert("session-id", HeaderValue::from_static("codex-session"));
+        assert_eq!(
+            upstream_session_id(&headers, &json!({})).as_deref(),
+            Some("opencode-session")
+        );
+
+        let mut codex = HeaderMap::new();
+        codex.insert("session-id", HeaderValue::from_static("codex-session"));
+        assert_eq!(
+            upstream_session_id(&codex, &json!({})).as_deref(),
+            Some("codex-session")
+        );
+        assert_eq!(
+            upstream_session_id(
+                &HeaderMap::new(),
+                &json!({"prompt_cache_key": "cache-session"})
+            )
+            .as_deref(),
+            Some("cache-session")
+        );
+    }
+
+    #[test]
+    fn adds_opencode_session_only_for_opencode_go_targets() {
+        let mut opencode = endpoint_test_target("openai", None);
+        opencode.provider_name = "OpenCode Go".to_string();
+        let request = apply_opencode_session_header(
+            reqwest::Client::new().post("http://upstream"),
+            &opencode,
+            Some("session-123"),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            request.headers().get(OPENCODE_SESSION_HEADER).unwrap(),
+            "session-123"
+        );
+
+        let other = endpoint_test_target("openai", None);
+        let request = apply_opencode_session_header(
+            reqwest::Client::new().post("http://upstream"),
+            &other,
+            Some("session-123"),
+        )
+        .build()
+        .unwrap();
+        assert!(request.headers().get(OPENCODE_SESSION_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn upstream_request_includes_the_resolved_session() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = AppState::new(pool, None);
+        let mut opencode = endpoint_test_target("openai", None);
+        opencode.provider_name = "OpenCode Go".to_string();
+
+        let request = build_upstream_request(
+            &state,
+            "http://upstream/v1/chat/completions",
+            ProviderType::Openai,
+            &opencode,
+            &json!({"model": "test"}),
+            Some("session-123"),
+        )
+        .unwrap()
+        .build()
+        .unwrap();
+
+        assert_eq!(
+            request.headers().get(OPENCODE_SESSION_HEADER).unwrap(),
+            "session-123"
+        );
+    }
+
+    #[test]
+    fn configured_opencode_session_header_takes_precedence() {
+        let mut opencode = endpoint_test_target("openai", None);
+        opencode.base_url = "https://opencode.ai/zen/go/v1".to_string();
+        opencode.provider_headers = r#"{"x-opencode-session":"configured-session"}"#.to_string();
+
+        let request = apply_opencode_session_header(
+            reqwest::Client::new().post("http://upstream"),
+            &opencode,
+            Some("request-session"),
+        )
+        .build()
+        .unwrap();
+        assert!(request.headers().get(OPENCODE_SESSION_HEADER).is_none());
+    }
+
     /// Builds a page of model entries with the given ids, matching the shape
     /// `anthropic_models` produces.
     fn model_page(ids: &[&str]) -> Vec<Value> {
@@ -7333,6 +7530,7 @@ mod tests {
                 "requested-model",
                 &request_json,
                 &Bytes::new(),
+                None,
                 target.clone(),
                 false,
                 10,
@@ -7359,6 +7557,7 @@ mod tests {
                 "requested-model",
                 &request_json,
                 &Bytes::new(),
+                None,
                 target,
                 false,
                 10,
