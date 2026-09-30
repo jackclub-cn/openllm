@@ -481,6 +481,15 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
                 .unwrap_or(""),
         )
         .await;
+        persist_provider_key_result(
+            state,
+            key_id,
+            attempt.ok,
+            attempt.latency_ms,
+            &attempt.checked,
+            &attempt.message,
+        )
+        .await?;
         if attempt.ok {
             if let Some(key_id) = key_id {
                 state.provider_key_cooldown.lock().await.remove(&key_id);
@@ -538,7 +547,15 @@ async fn test_provider_keys_inner(state: &AppState, id: i64) -> AppResult<Provid
             message: attempt.message,
             checked: attempt.checked,
         };
-        persist_provider_key_test(state, &result).await?;
+        persist_provider_key_result(
+            state,
+            result.key_id,
+            result.ok,
+            result.latency_ms,
+            &result.checked,
+            &result.message,
+        )
+        .await?;
         results.push(result);
     }
     let ok = results.iter().filter(|result| result.ok).count();
@@ -914,14 +931,18 @@ async fn persist_provider_test(
     Ok(())
 }
 
-async fn persist_provider_key_test(
+async fn persist_provider_key_result(
     state: &AppState,
-    result: &ProviderKeyTestItem,
+    key_id: Option<i64>,
+    ok: bool,
+    latency_ms: i64,
+    checked: &str,
+    message: &str,
 ) -> AppResult<()> {
-    let Some(key_id) = result.key_id else {
+    let Some(key_id) = key_id else {
         return Ok(());
     };
-    if result.ok {
+    if ok {
         state.provider_key_error_state.lock().await.remove(&key_id);
         sqlx::query(
             "UPDATE provider_api_keys \
@@ -931,9 +952,9 @@ async fn persist_provider_key_test(
              WHERE id = ?",
         )
         .bind(Utc::now().to_rfc3339())
-        .bind(result.latency_ms)
-        .bind(&result.checked)
-        .bind(&result.message)
+        .bind(latency_ms)
+        .bind(checked)
+        .bind(message)
         .bind(key_id)
         .execute(&state.pool)
         .await?;
@@ -945,9 +966,9 @@ async fn persist_provider_key_test(
              WHERE id = ?",
         )
         .bind(Utc::now().to_rfc3339())
-        .bind(result.latency_ms)
-        .bind(&result.checked)
-        .bind(&result.message)
+        .bind(latency_ms)
+        .bind(checked)
+        .bind(message)
         .bind(key_id)
         .execute(&state.pool)
         .await?;
@@ -4391,6 +4412,44 @@ mod tests {
         assert_eq!(provider.api_keys[0].last_test_ok, Some(false));
         assert_eq!(provider.api_keys[1].last_test_ok, Some(true));
         assert!(provider.api_keys[1].last_test_at.is_some());
+
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_test_at = NULL, last_test_ok = NULL, last_test_latency_ms = NULL, \
+                 last_test_checked = NULL, last_test_message = NULL, \
+                 last_error_at = NULL, last_error = NULL \
+             WHERE id IN (11, 12)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE provider_api_keys \
+             SET last_error_at = '2026-01-01T00:00:00Z', last_error = 'stale unauthorized' \
+             WHERE id = 12",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let aggregate = test_provider_inner(&state, 1).await.unwrap();
+        assert!(aggregate.ok);
+        let persisted: (Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT \
+                COALESCE(SUM(CASE WHEN id IN (11, 12) AND last_test_ok = 0 THEN 1 ELSE 0 END), 0), \
+                COALESCE(SUM(CASE WHEN id IN (11, 12) AND last_test_ok = 1 THEN 1 ELSE 0 END), 0) \
+             FROM provider_api_keys",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted, (Some(1), Some(1)));
+        let recovered_error: Option<String> =
+            sqlx::query_scalar("SELECT last_error FROM provider_api_keys WHERE id = 12")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(recovered_error, None);
         server.abort();
     }
 
