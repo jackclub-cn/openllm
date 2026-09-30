@@ -53,11 +53,59 @@ pub async fn admin_auth(
     Ok(next.run(request).await)
 }
 
-pub async fn get_settings(State(state): State<AppState>) -> Json<SettingsView> {
-    Json(SettingsView {
+pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<SettingsView>> {
+    Ok(Json(SettingsView {
         admin_auth_enabled: state.admin_token.is_some(),
         database: "sqlite",
         version: env!("CARGO_PKG_VERSION"),
+        database_stats: load_database_stats(&state).await?,
+    }))
+}
+
+async fn load_database_stats(state: &AppState) -> AppResult<DatabaseStats> {
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&state.pool)
+        .await?;
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(&state.pool)
+        .await?;
+    let free_pages: i64 = sqlx::query_scalar("PRAGMA freelist_count")
+        .fetch_one(&state.pool)
+        .await?;
+    let (_, _, path) = sqlx::query_as::<_, (i64, String, String)>("PRAGMA database_list")
+        .fetch_one(&state.pool)
+        .await?;
+    let (
+        providers,
+        provider_models,
+        provider_api_keys,
+        routes,
+        access_keys,
+        usage_logs,
+        in_flight_requests,
+    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        "SELECT \
+            (SELECT COUNT(*) FROM providers), \
+            (SELECT COUNT(*) FROM provider_models), \
+            (SELECT COUNT(*) FROM provider_api_keys), \
+            (SELECT COUNT(*) FROM routes), \
+            (SELECT COUNT(*) FROM api_keys), \
+            (SELECT COUNT(*) FROM usage_logs), \
+            (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1)",
+    )
+    .fetch_one(&state.pool)
+    .await?;
+    Ok(DatabaseStats {
+        path: (!path.is_empty()).then_some(path),
+        size_bytes: page_count.saturating_mul(page_size),
+        free_bytes: free_pages.saturating_mul(page_size),
+        providers,
+        provider_models,
+        provider_api_keys,
+        routes,
+        access_keys,
+        usage_logs,
+        in_flight_requests,
     })
 }
 
@@ -4643,6 +4691,33 @@ mod tests {
         assert_eq!(normalize_retention_days(Some(3650)).unwrap(), Some(3650));
         assert!(normalize_retention_days(Some(-1)).is_err());
         assert!(normalize_retention_days(Some(3651)).is_err());
+    }
+
+    #[tokio::test]
+    async fn settings_expose_database_stats() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'Provider', 'openai', 'https://example.com/v1')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+             VALUES (11, 1, 'Primary', 'sk-primary', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let Json(settings) = get_settings(State(state)).await.unwrap();
+
+        assert_eq!(settings.database, "sqlite");
+        assert!(settings.database_stats.size_bytes > 0);
+        assert_eq!(settings.database_stats.providers, 1);
+        assert_eq!(settings.database_stats.provider_api_keys, 1);
+        assert_eq!(settings.database_stats.in_flight_requests, 0);
     }
 
     #[test]

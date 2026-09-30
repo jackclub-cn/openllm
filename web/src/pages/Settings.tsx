@@ -17,6 +17,7 @@ import {
   InputNumber,
   Space,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd'
 import {
@@ -27,6 +28,7 @@ import {
   type Settings,
 } from '../api'
 import PageHeader from '../components/PageHeader'
+import { formatBytes, formatCompact, formatExact } from '../format'
 
 export default function SettingsPage({ onSave }: { onSave: (value: string) => void }) {
   const { message } = App.useApp()
@@ -140,6 +142,50 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
           </Descriptions>
         </Card>
       </div>
+      <Card
+        className="settings-retention"
+        title={<Space><DatabaseOutlined />数据库状态</Space>}
+        bordered={false}
+      >
+        {settings?.database_stats ? (
+          <>
+            <Descriptions column={2} size="small">
+              <Descriptions.Item label="数据库文件" span={2}>
+                {settings.database_stats.path ? (
+                  <Typography.Text copyable={{ text: settings.database_stats.path }}>
+                    {settings.database_stats.path}
+                  </Typography.Text>
+                ) : (
+                  '内存数据库'
+                )}
+              </Descriptions.Item>
+              <Descriptions.Item label="占用空间">
+                <Tooltip title={`${formatExact(settings.database_stats.size_bytes)} bytes`}>
+                  {formatBytes(settings.database_stats.size_bytes)}
+                </Tooltip>
+              </Descriptions.Item>
+              <Descriptions.Item label="可回收空间">
+                <Tooltip title={`${formatExact(settings.database_stats.free_bytes)} bytes`}>
+                  {formatBytes(settings.database_stats.free_bytes)}
+                </Tooltip>
+              </Descriptions.Item>
+            </Descriptions>
+            <Space wrap style={{ marginTop: 16 }}>
+              <Tag>提供商 {formatCompact(settings.database_stats.providers)}</Tag>
+              <Tag>模型 {formatCompact(settings.database_stats.provider_models)}</Tag>
+              <Tag>上游密钥 {formatCompact(settings.database_stats.provider_api_keys)}</Tag>
+              <Tag>路由 {formatCompact(settings.database_stats.routes)}</Tag>
+              <Tag>访问密钥 {formatCompact(settings.database_stats.access_keys)}</Tag>
+              <Tag>请求日志 {formatCompact(settings.database_stats.usage_logs)}</Tag>
+              <Tag color={settings.database_stats.in_flight_requests ? 'processing' : 'default'}>
+                请求中 {formatCompact(settings.database_stats.in_flight_requests)}
+              </Tag>
+            </Space>
+          </>
+        ) : (
+          <Typography.Text type="secondary">加载中</Typography.Text>
+        )}
+      </Card>
       <Card
         className="settings-retention"
         title={<Space><ClockCircleOutlined />日志保留</Space>}

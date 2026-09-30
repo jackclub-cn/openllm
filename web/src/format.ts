@@ -47,6 +47,19 @@ export function formatExact(value: number): string {
   return value.toLocaleString('en-US')
 }
 
+export function formatBytes(value: number): string {
+  if (!Number.isFinite(value) || value < 0) return '-'
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let scaled = value
+  let unit = 0
+  while (scaled >= 1024 && unit < units.length - 1) {
+    scaled /= 1024
+    unit += 1
+  }
+  const precision = unit === 0 || scaled >= 100 ? 0 : scaled >= 10 ? 1 : 2
+  return `${scaled.toFixed(precision).replace(/\.0+$/, '')} ${units[unit]}`
+}
+
 /**
  * A compact figure for display, plus the exact value for a tooltip.
  * Returns the pair so callers cannot show one without the other.
