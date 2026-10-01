@@ -212,19 +212,11 @@ pub async fn list_providers(State(state): State<AppState>) -> AppResult<Json<Vec
     .fetch_all(&state.pool)
     .await?;
 
-    let mut views = Vec::with_capacity(providers.len());
-    for provider in providers {
-        let models: Vec<String> = sqlx::query_scalar(
-            "SELECT model_name FROM provider_models WHERE provider_id = ? AND enabled = 1 ORDER BY model_name COLLATE NOCASE",
-        )
-        .bind(provider.id)
-        .fetch_all(&state.pool)
-        .await?;
-        let mut view = ProviderView::from(provider);
-        view.models = models;
-        hydrate_provider_view(&state, &mut view).await?;
-        views.push(view);
-    }
+    let mut views = providers
+        .into_iter()
+        .map(ProviderView::from)
+        .collect::<Vec<_>>();
+    hydrate_provider_views(&state, &mut views).await?;
     Ok(Json(views))
 }
 
@@ -3935,6 +3927,108 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
     Ok(())
 }
 
+async fn hydrate_provider_views(state: &AppState, views: &mut [ProviderView]) -> AppResult<()> {
+    if views.is_empty() {
+        return Ok(());
+    }
+
+    let mut models_by_provider = HashMap::<i64, Vec<String>>::new();
+    for (provider_id, model_name) in sqlx::query_as::<_, (i64, String)>(
+        "SELECT provider_id, model_name \
+         FROM provider_models \
+         WHERE enabled = 1 \
+         ORDER BY provider_id, model_name COLLATE NOCASE",
+    )
+    .fetch_all(&state.pool)
+    .await?
+    {
+        models_by_provider
+            .entry(provider_id)
+            .or_default()
+            .push(model_name);
+    }
+
+    let mut keys_by_provider = HashMap::<i64, Vec<ProviderApiKeyView>>::new();
+    for record in sqlx::query_as::<_, ProviderApiKeyRecord>(
+        "SELECT * FROM provider_api_keys ORDER BY provider_id, id",
+    )
+    .fetch_all(&state.pool)
+    .await?
+    {
+        if let Some(provider_id) = record.provider_id {
+            keys_by_provider
+                .entry(provider_id)
+                .or_default()
+                .push(record.into());
+        }
+    }
+
+    let mut stats_by_key = HashMap::<(i64, i64), (i64, f64, f64, i64, i64)>::new();
+    for (
+        provider_id,
+        provider_api_key_id,
+        requests,
+        success_rate,
+        avg_latency_ms,
+        prompt_tokens,
+        completion_tokens,
+    ) in sqlx::query_as::<_, (i64, i64, i64, f64, f64, i64, i64)>(
+        "SELECT provider_id, provider_api_key_id, COUNT(*), \
+                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0), \
+                COALESCE(AVG(latency_ms), 0.0), \
+                COALESCE(SUM(prompt_tokens), 0), \
+                COALESCE(SUM(completion_tokens), 0) \
+         FROM usage_logs \
+         WHERE provider_api_key_id IS NOT NULL AND in_flight = 0 \
+         GROUP BY provider_id, provider_api_key_id",
+    )
+    .fetch_all(&state.pool)
+    .await?
+    {
+        stats_by_key.insert(
+            (provider_id, provider_api_key_id),
+            (
+                requests,
+                success_rate,
+                avg_latency_ms,
+                prompt_tokens,
+                completion_tokens,
+            ),
+        );
+    }
+
+    let now = std::time::Instant::now();
+    let cooldowns = state.provider_key_cooldown.lock().await;
+    for view in views {
+        view.models = models_by_provider.remove(&view.id).unwrap_or_default();
+        view.api_keys = keys_by_provider.remove(&view.id).unwrap_or_default();
+        for key in &mut view.api_keys {
+            if let Some((
+                requests,
+                success_rate,
+                avg_latency_ms,
+                prompt_tokens,
+                completion_tokens,
+            )) = stats_by_key.get(&(view.id, key.id))
+            {
+                key.requests = *requests;
+                key.success_rate = *success_rate;
+                key.avg_latency_ms = *avg_latency_ms;
+                key.prompt_tokens = *prompt_tokens;
+                key.completion_tokens = *completion_tokens;
+            }
+            if let Some(until) = cooldowns.get(&key.id) {
+                let remaining = until.saturating_duration_since(now);
+                if !remaining.is_zero() {
+                    key.cooldown_seconds = Some((remaining.as_secs_f64().ceil() as i64).max(1));
+                }
+            }
+        }
+        view.api_key_set = !view.api_keys.is_empty();
+    }
+    Ok(())
+}
+
 fn provider_api_key_input(
     id: Option<i64>,
     name: impl Into<String>,
@@ -5535,6 +5629,75 @@ mod tests {
         assert_eq!(settings.database_stats.providers, 1);
         assert_eq!(settings.database_stats.provider_api_keys, 1);
         assert_eq!(settings.database_stats.in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_list_batches_models_and_key_statistics() {
+        let state = provider_key_test_state().await;
+        for (id, name) in [(1, "First"), (2, "Second")] {
+            sqlx::query(
+                "INSERT INTO providers (id, name, provider_type, base_url)
+                 VALUES (?, ?, 'openai', 'https://example.com/v1')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        for (provider_id, model_name) in [(1, "alpha"), (1, "beta"), (2, "gamma")] {
+            sqlx::query(
+                "INSERT INTO provider_models (provider_id, model_name, enabled)
+                 VALUES (?, ?, 1)",
+            )
+            .bind(provider_id)
+            .bind(model_name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        for (id, provider_id, name) in [(11, 1, "Primary"), (12, 1, "Backup"), (21, 2, "Only")] {
+            sqlx::query(
+                "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+                 VALUES (?, ?, ?, ?, 1)",
+            )
+            .bind(id)
+            .bind(provider_id)
+            .bind(name)
+            .bind(format!("sk-{id}"))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, provider_id, provider_api_key_id, requested_model,
+                endpoint, prompt_tokens, completion_tokens, total_tokens,
+                latency_ms, status_code, success, in_flight
+             ) VALUES (
+                'batched-provider-list', 1, 11, 'alpha',
+                '/v1/chat/completions', 10, 5, 15,
+                100, 200, 1, 0
+             )",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let Json(providers) = list_providers(State(state)).await.unwrap();
+        assert_eq!(providers.len(), 2);
+        let first = providers.iter().find(|provider| provider.id == 1).unwrap();
+        assert_eq!(first.models, vec!["alpha", "beta"]);
+        assert_eq!(first.api_keys.len(), 2);
+        let primary = first.api_keys.iter().find(|key| key.id == 11).unwrap();
+        assert_eq!(primary.requests, 1);
+        assert_eq!(primary.success_rate, 100.0);
+        assert_eq!(primary.avg_latency_ms, 100.0);
+        assert_eq!(primary.prompt_tokens, 10);
+        assert_eq!(primary.completion_tokens, 5);
+        let second = providers.iter().find(|provider| provider.id == 2).unwrap();
+        assert_eq!(second.models, vec!["gamma"]);
+        assert_eq!(second.api_keys[0].requests, 0);
     }
 
     #[tokio::test]

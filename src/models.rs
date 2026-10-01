@@ -175,6 +175,8 @@ pub struct ProviderPriceView {
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ProviderApiKeyRecord {
+    #[sqlx(default)]
+    pub provider_id: Option<i64>,
     pub id: i64,
     pub name: String,
     pub secret: String,
