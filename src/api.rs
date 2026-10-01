@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use axum::Json;
@@ -12,6 +13,7 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite};
+use tokio::io::AsyncReadExt;
 
 use crate::error::{AppError, AppResult};
 use crate::models::*;
@@ -2933,37 +2935,61 @@ pub async fn cleanup_usage(
 }
 
 pub async fn backup_database(State(state): State<AppState>) -> AppResult<Response> {
+    struct TemporaryFile(PathBuf);
+
+    impl Drop for TemporaryFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
     let filename = format!("openllm-backup-{}.db", Utc::now().format("%Y%m%d-%H%M%S"));
     let path = std::env::temp_dir().join(format!(
         "openllm-backup-{}.db",
         uuid::Uuid::new_v4().simple()
     ));
-    let path_string = path.to_string_lossy().to_string();
-    if let Err(error) = sqlx::query("VACUUM INTO ?")
-        .bind(&path_string)
-        .execute(&state.pool)
-        .await
-    {
-        let _ = tokio::fs::remove_file(&path).await;
+    let temporary_file = TemporaryFile(path.clone());
+    let path_string = path.to_string_lossy().replace('\\', "/");
+    let vacuum_sql = format!("VACUUM INTO '{}'", path_string.replace('\'', "''"));
+    if let Err(error) = sqlx::raw_sql(&vacuum_sql).execute(&state.pool).await {
         return Err(AppError::Database(error));
     }
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
+    let file = match tokio::fs::File::open(&path).await {
+        Ok(file) => file,
         Err(error) => {
-            let _ = tokio::fs::remove_file(&path).await;
             return Err(AppError::Internal(error.into()));
         }
     };
-    let _ = tokio::fs::remove_file(&path).await;
+    let content_length = file.metadata().await.ok().map(|metadata| metadata.len());
+    let stream = async_stream::stream! {
+        let _temporary_file = temporary_file;
+        let mut file = file;
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            match file.read(&mut buffer).await {
+                Ok(0) => break,
+                Ok(read) => yield Ok::<Bytes, std::io::Error>(Bytes::copy_from_slice(&buffer[..read])),
+                Err(error) => {
+                    yield Err(error);
+                    break;
+                }
+            }
+        }
+    };
 
-    Ok(Response::builder()
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/vnd.sqlite3")
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{filename}\""),
         )
-        .body(Body::from(bytes))
+        .header(header::CACHE_CONTROL, "no-store");
+    if let Some(content_length) = content_length {
+        response = response.header(header::CONTENT_LENGTH, content_length.to_string());
+    }
+    Ok(response
+        .body(Body::from_stream(stream))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
@@ -5527,6 +5553,34 @@ mod tests {
         assert!(result.reclaimed_bytes >= 0);
         assert_eq!(result.database_stats.providers, 1);
         assert_eq!(result.database_stats.in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn backup_database_streams_a_sqlite_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("source.db");
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&source_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool, None);
+        let response = backup_database(State(state)).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/vnd.sqlite3"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.starts_with(b"SQLite format 3\0"));
     }
 
     #[tokio::test]
