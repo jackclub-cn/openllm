@@ -354,7 +354,7 @@ export default function Dashboard() {
 
       <Row gutter={[16, 16]} className="section-row">
         <Col xs={24} xl={16}>
-          <Card title="最近请求" bordered={false}>
+          <Card title="最近请求" bordered={false} className="full-height-card">
             <Table
               rowKey="id"
               size="middle"
