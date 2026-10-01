@@ -465,22 +465,29 @@ export type Overview = {
   }>
 }
 
+export type DatabaseStats = {
+  path?: string | null
+  size_bytes: number
+  free_bytes: number
+  providers: number
+  provider_models: number
+  provider_api_keys: number
+  routes: number
+  access_keys: number
+  usage_logs: number
+  in_flight_requests: number
+}
+
+export type DatabaseVacuumResult = {
+  reclaimed_bytes: number
+  database_stats: DatabaseStats
+}
+
 export type Settings = {
   admin_auth_enabled: boolean
   database: string
   version: string
-  database_stats: {
-    path?: string | null
-    size_bytes: number
-    free_bytes: number
-    providers: number
-    provider_models: number
-    provider_api_keys: number
-    routes: number
-    access_keys: number
-    usage_logs: number
-    in_flight_requests: number
-  }
+  database_stats: DatabaseStats
 }
 
 export type RuntimeSettings = {

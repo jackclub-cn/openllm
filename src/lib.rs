@@ -27,7 +27,7 @@ use crate::api::{
     list_usage, overview, preview_provider_model_sync, provider_quota, rotate_api_key,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, update_api_key, update_provider, update_provider_model_limits,
-    update_route, update_runtime_settings,
+    update_route, update_runtime_settings, vacuum_database,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -85,6 +85,7 @@ pub fn build_router(state: AppState) -> Router {
     let admin = Router::new()
         .route("/overview", get(overview))
         .route("/database/backup", get(backup_database))
+        .route("/database/vacuum", post(vacuum_database))
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/test-all", post(test_all_providers))
         .route("/providers/test-all-keys", post(test_all_provider_keys))

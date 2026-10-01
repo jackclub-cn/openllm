@@ -2959,6 +2959,18 @@ pub async fn backup_database(State(state): State<AppState>) -> AppResult<Respons
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
 }
 
+pub async fn vacuum_database(
+    State(state): State<AppState>,
+) -> AppResult<Json<DatabaseVacuumResult>> {
+    let before = load_database_stats(&state).await?;
+    sqlx::query("VACUUM").execute(&state.pool).await?;
+    let database_stats = load_database_stats(&state).await?;
+    Ok(Json(DatabaseVacuumResult {
+        reclaimed_bytes: before.size_bytes.saturating_sub(database_stats.size_bytes),
+        database_stats,
+    }))
+}
+
 /// Share of prompt tokens served from cache, as a percentage.
 ///
 /// `prompt_tokens` must be the total input count (fresh + cached), so the ratio
@@ -5489,6 +5501,24 @@ mod tests {
         assert_eq!(settings.database_stats.providers, 1);
         assert_eq!(settings.database_stats.provider_api_keys, 1);
         assert_eq!(settings.database_stats.in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn vacuum_reports_reclaimed_space() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'Provider', 'openai', 'https://example.com/v1')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let Json(result) = vacuum_database(State(state)).await.unwrap();
+
+        assert!(result.reclaimed_bytes >= 0);
+        assert_eq!(result.database_stats.providers, 1);
+        assert_eq!(result.database_stats.in_flight_requests, 0);
     }
 
     #[test]

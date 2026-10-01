@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import {
   CheckCircleOutlined,
   ClockCircleOutlined,
+  CompressOutlined,
   DatabaseOutlined,
   DownloadOutlined,
   SafetyCertificateOutlined,
@@ -15,6 +16,7 @@ import {
   Form,
   Input,
   InputNumber,
+  Popconfirm,
   Space,
   Tag,
   Tooltip,
@@ -24,6 +26,7 @@ import {
   api,
   formatError,
   getAdminToken,
+  type DatabaseVacuumResult,
   type RuntimeSettings,
   type Settings,
 } from '../api'
@@ -36,6 +39,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [saved, setSaved] = useState(false)
   const [token, setToken] = useState(getAdminToken())
   const [backingUp, setBackingUp] = useState(false)
+  const [vacuuming, setVacuuming] = useState(false)
   const [retentionDays, setRetentionDays] = useState<number | null>(null)
   const [savingRetention, setSavingRetention] = useState(false)
 
@@ -77,6 +81,25 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setSavingRetention(false)
+    }
+  }
+
+  const vacuum = async () => {
+    setVacuuming(true)
+    try {
+      const result = await api.post<DatabaseVacuumResult>('/api/database/vacuum')
+      setSettings((current) =>
+        current ? { ...current, database_stats: result.database_stats } : current,
+      )
+      message.success(
+        result.reclaimed_bytes > 0
+          ? `数据库已整理，释放 ${formatBytes(result.reclaimed_bytes)}`
+          : '数据库已整理，无需释放空间',
+      )
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setVacuuming(false)
     }
   }
 
@@ -180,6 +203,23 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
               <Tag color={settings.database_stats.in_flight_requests ? 'processing' : 'default'}>
                 请求中 {formatCompact(settings.database_stats.in_flight_requests)}
               </Tag>
+            </Space>
+            <Space wrap style={{ marginTop: 16 }}>
+              <Popconfirm
+                title="整理数据库并回收空间？"
+                description="操作期间会短暂锁定数据库写入；数据量较大时可能耗时，建议先下载备份。"
+                okText="开始整理"
+                cancelText="取消"
+                onConfirm={() => void vacuum()}
+              >
+                <Button
+                  icon={<CompressOutlined />}
+                  loading={vacuuming}
+                  disabled={!settings.database_stats.free_bytes}
+                >
+                  整理数据库
+                </Button>
+              </Popconfirm>
             </Space>
           </>
         ) : (

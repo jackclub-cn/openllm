@@ -1280,6 +1280,12 @@ pub struct DatabaseStats {
 }
 
 #[derive(Debug, Serialize)]
+pub struct DatabaseVacuumResult {
+    pub reclaimed_bytes: i64,
+    pub database_stats: DatabaseStats,
+}
+
+#[derive(Debug, Serialize)]
 pub struct RuntimeSettingsView {
     pub usage_retention_days: Option<i64>,
 }
