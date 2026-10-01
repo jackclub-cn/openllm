@@ -190,6 +190,16 @@ pub struct ProviderApiKeyRecord {
     pub last_test_checked: Option<String>,
     pub last_test_message: Option<String>,
     pub created_at: String,
+    #[sqlx(default)]
+    pub lifetime_requests: i64,
+    #[sqlx(default)]
+    pub lifetime_successes: i64,
+    #[sqlx(default)]
+    pub lifetime_latency_ms: i64,
+    #[sqlx(default)]
+    pub lifetime_prompt_tokens: i64,
+    #[sqlx(default)]
+    pub lifetime_completion_tokens: i64,
 }
 
 #[derive(Debug, Serialize)]

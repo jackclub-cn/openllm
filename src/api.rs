@@ -3795,11 +3795,19 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             last_test_latency_ms: value.last_test_latency_ms,
             last_test_checked: value.last_test_checked,
             last_test_message: value.last_test_message,
-            requests: 0,
-            success_rate: 0.0,
-            avg_latency_ms: 0.0,
-            prompt_tokens: 0,
-            completion_tokens: 0,
+            requests: value.lifetime_requests,
+            success_rate: if value.lifetime_requests > 0 {
+                value.lifetime_successes as f64 / value.lifetime_requests as f64 * 100.0
+            } else {
+                0.0
+            },
+            avg_latency_ms: if value.lifetime_requests > 0 {
+                value.lifetime_latency_ms as f64 / value.lifetime_requests as f64
+            } else {
+                0.0
+            },
+            prompt_tokens: value.lifetime_prompt_tokens,
+            completion_tokens: value.lifetime_completion_tokens,
             cooldown_seconds: None,
             created_at: value.created_at,
         }
@@ -3883,47 +3891,6 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
         .into_iter()
         .map(Into::into)
         .collect();
-    let stats = sqlx::query_as::<_, (i64, i64, f64, f64, i64, i64)>(
-        "SELECT provider_api_key_id, COUNT(*), \
-                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0), \
-                COALESCE(AVG(latency_ms), 0.0), \
-                COALESCE(SUM(prompt_tokens), 0), \
-                COALESCE(SUM(completion_tokens), 0) \
-         FROM usage_logs \
-         WHERE provider_id = ? AND provider_api_key_id IS NOT NULL AND in_flight = 0 \
-         GROUP BY provider_api_key_id",
-    )
-    .bind(view.id)
-    .fetch_all(&state.pool)
-    .await?;
-    let stats = stats
-        .into_iter()
-        .map(
-            |(id, requests, success_rate, avg_latency_ms, prompt_tokens, completion_tokens)| {
-                (
-                    id,
-                    (
-                        requests,
-                        success_rate,
-                        avg_latency_ms,
-                        prompt_tokens,
-                        completion_tokens,
-                    ),
-                )
-            },
-        )
-        .collect::<HashMap<_, _>>();
-    for key in &mut view.api_keys {
-        if let Some((requests, success_rate, avg_latency_ms, prompt_tokens, completion_tokens)) =
-            stats.get(&key.id)
-        {
-            key.requests = *requests;
-            key.success_rate = *success_rate;
-            key.avg_latency_ms = *avg_latency_ms;
-            key.prompt_tokens = *prompt_tokens;
-            key.completion_tokens = *completion_tokens;
-        }
-    }
     let now = std::time::Instant::now();
     let cooldowns = state.provider_key_cooldown.lock().await;
     for key in &mut view.api_keys {
@@ -3974,60 +3941,12 @@ async fn hydrate_provider_views(state: &AppState, views: &mut [ProviderView]) ->
         }
     }
 
-    let mut stats_by_key = HashMap::<(i64, i64), (i64, f64, f64, i64, i64)>::new();
-    for (
-        provider_id,
-        provider_api_key_id,
-        requests,
-        success_rate,
-        avg_latency_ms,
-        prompt_tokens,
-        completion_tokens,
-    ) in sqlx::query_as::<_, (i64, i64, i64, f64, f64, i64, i64)>(
-        "SELECT provider_id, provider_api_key_id, COUNT(*), \
-                COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0), \
-                COALESCE(AVG(latency_ms), 0.0), \
-                COALESCE(SUM(prompt_tokens), 0), \
-                COALESCE(SUM(completion_tokens), 0) \
-         FROM usage_logs \
-         WHERE provider_api_key_id IS NOT NULL AND in_flight = 0 \
-         GROUP BY provider_id, provider_api_key_id",
-    )
-    .fetch_all(&state.pool)
-    .await?
-    {
-        stats_by_key.insert(
-            (provider_id, provider_api_key_id),
-            (
-                requests,
-                success_rate,
-                avg_latency_ms,
-                prompt_tokens,
-                completion_tokens,
-            ),
-        );
-    }
-
     let now = std::time::Instant::now();
     let cooldowns = state.provider_key_cooldown.lock().await;
     for view in views {
         view.models = models_by_provider.remove(&view.id).unwrap_or_default();
         view.api_keys = keys_by_provider.remove(&view.id).unwrap_or_default();
         for key in &mut view.api_keys {
-            if let Some((
-                requests,
-                success_rate,
-                avg_latency_ms,
-                prompt_tokens,
-                completion_tokens,
-            )) = stats_by_key.get(&(view.id, key.id))
-            {
-                key.requests = *requests;
-                key.success_rate = *success_rate;
-                key.avg_latency_ms = *avg_latency_ms;
-                key.prompt_tokens = *prompt_tokens;
-                key.completion_tokens = *completion_tokens;
-            }
             if let Some(until) = cooldowns.get(&key.id) {
                 let remaining = until.saturating_duration_since(now);
                 if !remaining.is_zero() {
@@ -5723,7 +5642,7 @@ mod tests {
         .await
         .unwrap();
 
-        let Json(providers) = list_providers(State(state)).await.unwrap();
+        let Json(providers) = list_providers(State(state.clone())).await.unwrap();
         assert_eq!(providers.len(), 2);
         let first = providers.iter().find(|provider| provider.id == 1).unwrap();
         assert_eq!(first.models, vec!["alpha", "beta"]);
@@ -5734,6 +5653,36 @@ mod tests {
         assert_eq!(primary.avg_latency_ms, 100.0);
         assert_eq!(primary.prompt_tokens, 10);
         assert_eq!(primary.completion_tokens, 5);
+
+        sqlx::query(
+            "UPDATE usage_logs
+             SET success = 0, latency_ms = 250,
+                 prompt_tokens = 20, completion_tokens = 10, total_tokens = 30
+             WHERE request_id = 'batched-provider-list'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let Json(providers) = list_providers(State(state.clone())).await.unwrap();
+        let first = providers.iter().find(|provider| provider.id == 1).unwrap();
+        let primary = first.api_keys.iter().find(|key| key.id == 11).unwrap();
+        assert_eq!(primary.requests, 1);
+        assert_eq!(primary.success_rate, 0.0);
+        assert_eq!(primary.avg_latency_ms, 250.0);
+        assert_eq!(primary.prompt_tokens, 20);
+        assert_eq!(primary.completion_tokens, 10);
+
+        sqlx::query("DELETE FROM usage_logs WHERE request_id = 'batched-provider-list'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let Json(providers) = list_providers(State(state)).await.unwrap();
+        let first = providers.iter().find(|provider| provider.id == 1).unwrap();
+        let primary = first.api_keys.iter().find(|key| key.id == 11).unwrap();
+        assert_eq!(primary.requests, 0);
+        assert_eq!(primary.prompt_tokens, 0);
+        assert_eq!(primary.completion_tokens, 0);
+
         let second = providers.iter().find(|provider| provider.id == 2).unwrap();
         assert_eq!(second.models, vec!["gamma"]);
         assert_eq!(second.api_keys[0].requests, 0);
