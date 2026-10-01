@@ -3045,7 +3045,10 @@ pub async fn vacuum_database(
     sqlx::query("VACUUM").execute(&state.pool).await?;
     let database_stats = load_database_stats(&state).await?;
     Ok(Json(DatabaseVacuumResult {
-        reclaimed_bytes: before.size_bytes.saturating_sub(database_stats.size_bytes),
+        reclaimed_bytes: before
+            .size_bytes
+            .saturating_sub(database_stats.size_bytes)
+            .max(0),
         database_stats,
     }))
 }
@@ -6625,6 +6628,30 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(request_ids, vec!["recent"]);
+    }
+
+    #[tokio::test]
+    async fn usage_completed_indexes_are_migrated() {
+        let state = provider_key_test_state().await;
+        let indexes = sqlx::query_scalar::<_, String>(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'index' AND name LIKE 'idx_usage_completed_%' \
+             ORDER BY name",
+        )
+        .fetch_all(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            indexes,
+            vec![
+                "idx_usage_completed_created",
+                "idx_usage_completed_model_created",
+                "idx_usage_completed_provider_created",
+                "idx_usage_completed_provider_key_created",
+                "idx_usage_completed_route_created",
+            ]
+        );
     }
 
     #[tokio::test]
