@@ -38,6 +38,7 @@ import {
   type RouteTarget,
 } from '../api'
 import PageHeader from '../components/PageHeader'
+import { formatCompact, formatExact } from '../format'
 
 type FormValues = {
   name: string
@@ -322,7 +323,7 @@ export default function RoutesPage() {
             onChange: (nextPage) => setPage(nextPage),
           }}
           locale={{ emptyText: items.length ? '没有符合筛选条件的路由' : '暂无路由' }}
-          scroll={{ x: 900 }}
+          scroll={{ x: 1100 }}
           columns={[
             {
               title: '路由',
@@ -339,6 +340,52 @@ export default function RoutesPage() {
               dataIndex: 'strategy',
               width: 120,
               render: (value: GatewayRoute['strategy']) => <Tag color="blue">{strategyLabels[value]}</Tag>,
+            },
+            {
+              title: '能力桶',
+              width: 190,
+              render: (_, record) => {
+                const limits = [
+                  record.input_limit != null ? `输入 ${formatCompact(record.input_limit)}` : '',
+                  record.output_limit != null ? `输出 ${formatCompact(record.output_limit)}` : '',
+                ].filter(Boolean)
+                return (
+                  <div>
+                    {limits.length ? (
+                      <Tooltip
+                        title={[
+                          record.context_limit != null
+                            ? `公共上下文 ${formatExact(record.context_limit)}`
+                            : '',
+                          record.input_limit != null
+                            ? `公共输入 ${formatExact(record.input_limit)}`
+                            : '',
+                          record.output_limit != null
+                            ? `公共输出 ${formatExact(record.output_limit)}`
+                            : '',
+                        ]
+                          .filter(Boolean)
+                          .join(' / ')}
+                      >
+                        <Space wrap size={[4, 4]}>
+                          {limits.map((limit) => (
+                            <Tag key={limit}>{limit}</Tag>
+                          ))}
+                        </Space>
+                      </Tooltip>
+                    ) : (
+                      <Typography.Text type="secondary">未声明</Typography.Text>
+                    )}
+                    {!record.limits_verified && (
+                      <div>
+                        <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                          部分目标缺少能力元数据
+                        </Typography.Text>
+                      </div>
+                    )}
+                  </div>
+                )
+              },
             },
             {
               title: '上游目标',

@@ -3455,6 +3455,9 @@ async fn route_targets(state: &AppState, route_id: Option<i64>) -> AppResult<Vec
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
                COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
                    AS supported_endpoints,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               COALESCE(pm.input_override, pm.input_limit) AS input_limit,
+               COALESCE(pm.output_override, pm.output_limit) AS output_limit,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
@@ -3476,12 +3479,39 @@ async fn route_targets(state: &AppState, route_id: Option<i64>) -> AppResult<Vec
 }
 
 fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> RouteView {
+    let enabled_targets = targets
+        .iter()
+        .filter(|target| target.enabled != 0)
+        .collect::<Vec<_>>();
+    let mut incomplete = enabled_targets.is_empty();
+    let capabilities = enabled_targets
+        .iter()
+        .map(|target| {
+            let capabilities = ModelCapabilities {
+                context_limit: target.context_limit,
+                input_limit: target.input_limit,
+                output_limit: target.output_limit,
+                ..Default::default()
+            }
+            .with_effective_input_limit();
+            if capabilities.input_limit.is_none() || capabilities.output_limit.is_none() {
+                incomplete = true;
+            }
+            capabilities
+        })
+        .collect::<Vec<_>>();
+    let barrel = ModelCapabilities::intersect(capabilities.iter()).unwrap_or_default();
+
     RouteView {
         id: route.id,
         name: route.name,
         model_pattern: route.model_pattern,
         strategy: route.strategy,
         enabled: route.enabled != 0,
+        context_limit: barrel.total_context_tokens.or(barrel.context_limit),
+        input_limit: barrel.input_limit,
+        output_limit: barrel.output_limit,
+        limits_verified: !incomplete,
         targets: targets
             .into_iter()
             .map(|target| RouteTargetView {
@@ -3495,6 +3525,9 @@ fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> RouteView {
                     .as_deref()
                     .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
                     .unwrap_or_default(),
+                context_limit: target.context_limit,
+                input_limit: target.input_limit,
+                output_limit: target.output_limit,
                 model_prefix: target.model_prefix,
                 weight: target.weight,
                 priority: target.priority,
@@ -5816,10 +5849,32 @@ mod tests {
             .await
             .unwrap();
         }
+        for (provider_id, model_name, context, input, output) in [
+            (1, "alpha", 100_000, 80_000, 40_000),
+            (2, "alpha-backup", 128_000, 100_000, 20_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO provider_models (
+                    provider_id, model_name, enabled, context_limit, input_limit, output_limit
+                 ) VALUES (?, ?, 1, ?, ?, ?)",
+            )
+            .bind(provider_id)
+            .bind(model_name)
+            .bind(context)
+            .bind(input)
+            .bind(output)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
 
         let Json(routes) = list_routes(State(state)).await.unwrap();
         assert_eq!(routes.len(), 2);
         let first = routes.iter().find(|route| route.id == 1).unwrap();
+        assert_eq!(first.context_limit, Some(100_000));
+        assert_eq!(first.input_limit, Some(80_000));
+        assert_eq!(first.output_limit, Some(20_000));
+        assert!(first.limits_verified);
         assert_eq!(first.targets.len(), 2);
         assert_eq!(first.targets[0].upstream_model, "alpha");
         assert_eq!(first.targets[1].upstream_model, "alpha-backup");

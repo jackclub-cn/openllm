@@ -268,6 +268,9 @@ export type RouteTarget = {
   provider_type?: string
   upstream_model: string
   supported_endpoints?: string[]
+  context_limit?: number | null
+  input_limit?: number | null
+  output_limit?: number | null
   model_prefix?: string
   weight: number
   priority: number
@@ -280,6 +283,10 @@ export type GatewayRoute = {
   model_pattern: string
   strategy: 'priority' | 'weighted' | 'round_robin'
   enabled: boolean
+  context_limit?: number | null
+  input_limit?: number | null
+  output_limit?: number | null
+  limits_verified: boolean
   targets: RouteTarget[]
   created_at: string
   updated_at: string

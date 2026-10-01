@@ -20,9 +20,9 @@ use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
-    ApiKeyRecord, ModelList, ProviderType, PublicModel, Route, RouteDiagnoseRuntimeTarget,
-    RouteDiagnoseTarget, RouteDiagnoseView, RouteStrategy, RouteTarget, Usage,
-    effective_cost_value, estimate_cost_micros,
+    ApiKeyRecord, ModelCapabilities, ModelList, ProviderType, PublicModel, Route,
+    RouteDiagnoseRuntimeTarget, RouteDiagnoseTarget, RouteDiagnoseView, RouteStrategy, RouteTarget,
+    Usage, effective_cost_value, estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -3700,10 +3700,9 @@ async fn log_request_rejection(
 }
 
 fn enforce_context_capacity(request_tokens: i64, barrel: Option<&BarrelEnvelope>) -> AppResult<()> {
-    let capabilities = barrel.and_then(|barrel| barrel.capabilities.as_ref());
-    let limit = capabilities
-        .and_then(|capabilities| capabilities.input_limit)
-        .or_else(|| capabilities.and_then(|capabilities| capabilities.context_limit));
+    let limit = barrel
+        .and_then(|barrel| barrel.capabilities.as_ref())
+        .and_then(effective_input_limit);
     if let Some(limit) = limit
         && request_tokens > limit
     {
@@ -3712,6 +3711,17 @@ fn enforce_context_capacity(request_tokens: i64, barrel: Option<&BarrelEnvelope>
         )));
     }
     Ok(())
+}
+
+/// Returns the strictest input capacity when a provider publishes both a
+/// context window and a separate input ceiling.
+fn effective_input_limit(capabilities: &ModelCapabilities) -> Option<i64> {
+    match (capabilities.input_limit, capabilities.context_limit) {
+        (Some(input), Some(context)) => Some(input.min(context)),
+        (Some(input), None) => Some(input),
+        (None, Some(context)) => Some(context),
+        (None, None) => None,
+    }
 }
 
 struct ResolvedRoute {
@@ -4232,6 +4242,9 @@ async fn diagnostic_runtime_targets(
             api_key: None,
             provider_headers: "{}".to_string(),
             supported_endpoints: row.supported_endpoints.clone(),
+            context_limit: None,
+            input_limit: None,
+            output_limit: None,
             tool_search_supported: 1,
             provider_health: row.provider_health,
             upstream_model: row.upstream_model.clone(),
@@ -5332,10 +5345,16 @@ fn apply_capability_headers(response: &mut Response, receipt: &Option<Value>) {
             .headers_mut()
             .insert("x-openllm-max-context-tokens", value);
     }
-    if let Some(input) = receipt
-        .get("input_limit")
-        .and_then(Value::as_i64)
-        .or_else(|| receipt.get("context_limit").and_then(Value::as_i64))
+    let input = match (
+        receipt.get("input_limit").and_then(Value::as_i64),
+        receipt.get("context_limit").and_then(Value::as_i64),
+    ) {
+        (Some(input), Some(context)) => Some(input.min(context)),
+        (Some(input), None) => Some(input),
+        (None, Some(context)) => Some(context),
+        (None, None) => None,
+    };
+    if let Some(input) = input
         && let Ok(value) = HeaderValue::from_str(&input.to_string())
     {
         response
@@ -6133,6 +6152,9 @@ mod tests {
             api_key: None,
             provider_headers: "{}".to_string(),
             supported_endpoints: supported_endpoints.map(ToOwned::to_owned),
+            context_limit: None,
+            input_limit: None,
+            output_limit: None,
             tool_search_supported: 1,
             provider_health: None,
             upstream_model: "model".to_string(),
@@ -7977,6 +7999,16 @@ mod tests {
     }
 
     #[test]
+    fn effective_input_limit_prefers_the_stricter_value() {
+        let capabilities = ModelCapabilities {
+            context_limit: Some(100),
+            input_limit: Some(200),
+            ..Default::default()
+        };
+        assert_eq!(effective_input_limit(&capabilities), Some(100));
+    }
+
+    #[test]
     fn capability_headers_include_input_and_context_without_output_limit() {
         let mut response = Response::new(Body::empty());
         let receipt = Some(json!({
@@ -8224,6 +8256,9 @@ mod tests {
                 api_key: None,
                 provider_headers: "{}".to_string(),
                 supported_endpoints: None,
+                context_limit: None,
+                input_limit: None,
+                output_limit: None,
                 tool_search_supported: 1,
                 provider_health: None,
                 upstream_model: "upstream".to_string(),

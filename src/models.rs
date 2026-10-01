@@ -450,6 +450,12 @@ pub struct RouteTarget {
     pub provider_headers: String,
     /// JSON array reported by the provider's models endpoint.
     pub supported_endpoints: Option<String>,
+    #[sqlx(default)]
+    pub context_limit: Option<i64>,
+    #[sqlx(default)]
+    pub input_limit: Option<i64>,
+    #[sqlx(default)]
+    pub output_limit: Option<i64>,
     pub tool_search_supported: i64,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
@@ -477,6 +483,10 @@ pub struct RouteView {
     pub model_pattern: String,
     pub strategy: String,
     pub enabled: bool,
+    pub context_limit: Option<i64>,
+    pub input_limit: Option<i64>,
+    pub output_limit: Option<i64>,
+    pub limits_verified: bool,
     pub targets: Vec<RouteTargetView>,
     pub created_at: String,
     pub updated_at: String,
@@ -492,6 +502,9 @@ pub struct RouteTargetView {
     /// Effective endpoint paths used when deciding whether this target can
     /// serve a request. Empty means the target did not declare a restriction.
     pub supported_endpoints: Vec<String>,
+    pub context_limit: Option<i64>,
+    pub input_limit: Option<i64>,
+    pub output_limit: Option<i64>,
     pub model_prefix: String,
     pub weight: i64,
     pub priority: i64,
