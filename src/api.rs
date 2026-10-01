@@ -2429,46 +2429,37 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
                 SELECT COUNT(*) FROM usage_logs active
                 WHERE active.api_key_id = k.id AND active.in_flight = 1
             ) AS current_in_flight,
-            COUNT(CASE WHEN u.id IS NOT NULL AND u.created_at >= ? THEN 1 END) AS today_requests,
-            COALESCE(SUM(
-                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
-                     THEN u.total_tokens ELSE 0 END
-            ), 0) AS today_tokens,
-            COALESCE(SUM(
-                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
-                     THEN u.prompt_tokens ELSE 0 END
-            ), 0) AS today_prompt_tokens,
-            COALESCE(SUM(
-                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
-                     THEN u.completion_tokens ELSE 0 END
-            ), 0) AS today_completion_tokens,
-            SUM(
-                CASE WHEN u.id IS NOT NULL AND u.created_at >= ?
-                     THEN u.estimated_cost_micros END
-            ) AS today_cost_micros,
-            COUNT(u.id) AS requests,
-            COALESCE(SUM(u.total_tokens), 0) AS tokens,
-            COALESCE(SUM(u.prompt_tokens), 0) AS prompt_tokens,
-            COALESCE(SUM(u.completion_tokens), 0) AS completion_tokens,
-            SUM(u.estimated_cost_micros) AS cost_micros,
-            COALESCE(SUM(
-                CASE WHEN u.id IS NOT NULL AND u.estimated_cost_micros IS NULL
-                     THEN 1 ELSE 0 END
-            ), 0) AS unpriced_requests
+            COALESCE(today.today_requests, 0) AS today_requests,
+            COALESCE(today.today_tokens, 0) AS today_tokens,
+            COALESCE(today.today_prompt_tokens, 0) AS today_prompt_tokens,
+            COALESCE(today.today_completion_tokens, 0) AS today_completion_tokens,
+            today.today_cost_micros,
+            k.lifetime_requests AS requests,
+            k.lifetime_tokens AS tokens,
+            k.lifetime_prompt_tokens AS prompt_tokens,
+            k.lifetime_completion_tokens AS completion_tokens,
+            CASE
+                WHEN k.lifetime_requests > k.lifetime_unpriced_requests
+                THEN k.lifetime_cost_micros
+                ELSE NULL
+            END AS cost_micros,
+            k.lifetime_unpriced_requests AS unpriced_requests
         FROM api_keys k
-        LEFT JOIN usage_logs u ON u.api_key_id = k.id AND u.in_flight = 0
-        GROUP BY k.id, k.name, k.key_prefix, k.key_suffix, k.enabled,
-                 k.last_used_at, k.created_at, k.daily_token_limit,
-                 k.daily_cost_limit_micros, k.requests_per_minute,
-                 k.max_concurrency, k.allowed_models, k.expires_at
+        LEFT JOIN (
+            SELECT api_key_id,
+                   COUNT(*) AS today_requests,
+                   COALESCE(SUM(total_tokens), 0) AS today_tokens,
+                   COALESCE(SUM(prompt_tokens), 0) AS today_prompt_tokens,
+                   COALESCE(SUM(completion_tokens), 0) AS today_completion_tokens,
+                   SUM(estimated_cost_micros) AS today_cost_micros
+            FROM usage_logs
+            WHERE created_at >= ? AND in_flight = 0
+            GROUP BY api_key_id
+        ) today ON today.api_key_id = k.id
         ORDER BY k.enabled DESC, k.created_at DESC
         "#,
     )
     .bind(&minute_start)
-    .bind(&day_start)
-    .bind(&day_start)
-    .bind(&day_start)
-    .bind(&day_start)
     .bind(&day_start)
     .fetch_all(&state.pool)
     .await?;
@@ -4798,10 +4789,38 @@ mod tests {
         assert_eq!(items[0].max_concurrency, Some(5));
         assert_eq!(items[0].requests_this_minute, 2);
         assert_eq!(items[0].current_in_flight, 1);
+        assert_eq!(items[0].requests, 1);
+        assert_eq!(items[0].tokens, 125);
         assert_eq!(items[0].prompt_tokens, 100);
         assert_eq!(items[0].completion_tokens, 25);
+        assert_eq!(items[0].cost_micros, None);
+        assert_eq!(items[0].unpriced_requests, 1);
         assert_eq!(items[0].today_prompt_tokens, 100);
         assert_eq!(items[0].today_completion_tokens, 25);
+
+        sqlx::query(
+            "UPDATE usage_logs
+             SET prompt_tokens = 120, completion_tokens = 30, total_tokens = 150,
+                 estimated_cost_micros = 1234
+             WHERE request_id = 'completed'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
+        assert_eq!(items[0].requests, 1);
+        assert_eq!(items[0].tokens, 150);
+        assert_eq!(items[0].cost_micros, Some(1234));
+        assert_eq!(items[0].unpriced_requests, 0);
+
+        sqlx::query("DELETE FROM usage_logs WHERE request_id = 'completed'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
+        assert_eq!(items[0].requests, 0);
+        assert_eq!(items[0].tokens, 0);
+        assert_eq!(items[0].cost_micros, None);
 
         let Json(updated) = update_api_key(
             State(state),
