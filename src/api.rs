@@ -2215,10 +2215,20 @@ pub async fn list_routes(State(state): State<AppState>) -> AppResult<Json<Vec<Ro
     )
     .fetch_all(&state.pool)
     .await?;
-    let mut views = Vec::with_capacity(routes.len());
-    for route in routes {
-        views.push(route_view(&state, route).await?);
+
+    let mut targets_by_route = HashMap::<i64, Vec<RouteTarget>>::new();
+    for target in route_targets(&state, None).await? {
+        if let Some(route_id) = target.route_id {
+            targets_by_route.entry(route_id).or_default().push(target);
+        }
     }
+    let views = routes
+        .into_iter()
+        .map(|route| {
+            let targets = targets_by_route.remove(&route.id).unwrap_or_default();
+            build_route_view(route, targets)
+        })
+        .collect();
     Ok(Json(views))
 }
 
@@ -3424,7 +3434,12 @@ async fn get_route(state: &AppState, id: i64) -> AppResult<RouteView> {
 }
 
 async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
-    let targets = sqlx::query_as::<_, RouteTarget>(
+    let targets = route_targets(state, Some(route.id)).await?;
+    Ok(build_route_view(route, targets))
+}
+
+async fn route_targets(state: &AppState, route_id: Option<i64>) -> AppResult<Vec<RouteTarget>> {
+    let mut query = QueryBuilder::<Sqlite>::new(
         r#"
         SELECT rt.*, p.name AS provider_name, p.provider_type,
                p.base_url, p.model_prefix, p.api_key, p.headers AS provider_headers,
@@ -3438,15 +3453,20 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
         LEFT JOIN provider_models pm
           ON pm.provider_id = rt.provider_id
          AND pm.model_name = rt.upstream_model
-        WHERE rt.route_id = ?
-        ORDER BY rt.priority ASC, rt.id
         "#,
-    )
-    .bind(route.id)
-    .fetch_all(&state.pool)
-    .await?;
+    );
+    if let Some(route_id) = route_id {
+        query.push(" WHERE rt.route_id = ").push_bind(route_id);
+    }
+    query.push(" ORDER BY rt.route_id, rt.priority ASC, rt.id");
+    Ok(query
+        .build_query_as::<RouteTarget>()
+        .fetch_all(&state.pool)
+        .await?)
+}
 
-    Ok(RouteView {
+fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> RouteView {
+    RouteView {
         id: route.id,
         name: route.name,
         model_pattern: route.model_pattern,
@@ -3473,7 +3493,7 @@ async fn route_view(state: &AppState, route: Route) -> AppResult<RouteView> {
             .collect(),
         created_at: route.created_at,
         updated_at: route.updated_at,
-    })
+    }
 }
 
 /// Wraps plain model names (manually curated lists, Ollama) with empty upstream
@@ -5698,6 +5718,62 @@ mod tests {
         let second = providers.iter().find(|provider| provider.id == 2).unwrap();
         assert_eq!(second.models, vec!["gamma"]);
         assert_eq!(second.api_keys[0].requests, 0);
+    }
+
+    #[tokio::test]
+    async fn route_list_batches_targets() {
+        let state = provider_key_test_state().await;
+        for (id, name) in [(1, "First"), (2, "Second")] {
+            sqlx::query(
+                "INSERT INTO providers (id, name, provider_type, base_url)
+                 VALUES (?, ?, 'openai', 'https://example.com/v1')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        for (id, pattern) in [(1, "route-one"), (2, "route-two")] {
+            sqlx::query(
+                "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+                 VALUES (?, ?, ?, 'priority', 1)",
+            )
+            .bind(id)
+            .bind(format!("Route {id}"))
+            .bind(pattern)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+        for (route_id, provider_id, upstream_model, priority) in [
+            (1, 1, "alpha", 0),
+            (1, 2, "alpha-backup", 1),
+            (2, 2, "beta", 0),
+        ] {
+            sqlx::query(
+                "INSERT INTO route_targets (
+                    route_id, provider_id, upstream_model, weight, priority, enabled
+                 ) VALUES (?, ?, ?, 100, ?, 1)",
+            )
+            .bind(route_id)
+            .bind(provider_id)
+            .bind(upstream_model)
+            .bind(priority)
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        }
+
+        let Json(routes) = list_routes(State(state)).await.unwrap();
+        assert_eq!(routes.len(), 2);
+        let first = routes.iter().find(|route| route.id == 1).unwrap();
+        assert_eq!(first.targets.len(), 2);
+        assert_eq!(first.targets[0].upstream_model, "alpha");
+        assert_eq!(first.targets[1].upstream_model, "alpha-backup");
+        let second = routes.iter().find(|route| route.id == 2).unwrap();
+        assert_eq!(second.targets.len(), 1);
+        assert_eq!(second.targets[0].upstream_model, "beta");
     }
 
     #[tokio::test]
