@@ -1200,6 +1200,11 @@ pub struct OverviewQuery {
     pub from: Option<String>,
     /// Exclusive end of the dashboard range as an RFC3339 timestamp.
     pub to: Option<String>,
+    /// Keep the legacy session metrics available to API callers, while the
+    /// dashboard can skip their grouping scan because it no longer displays
+    /// them.
+    #[serde(default = "default_true")]
+    pub include_session_metrics: bool,
 }
 
 #[derive(Debug, Serialize)]

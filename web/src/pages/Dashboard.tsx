@@ -58,6 +58,7 @@ export default function Dashboard() {
         tz_offset_minutes: String(offset),
         from: dates[0].startOf('day').toISOString(),
         to: dates[1].add(1, 'day').startOf('day').toISOString(),
+        include_session_metrics: 'false',
       })
       setData(await api.get<Overview>(`/api/overview?${params}`))
       setError('')

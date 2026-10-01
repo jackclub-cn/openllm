@@ -3127,28 +3127,36 @@ pub async fn overview(
     .bind(range_end.to_rfc3339())
     .fetch_one(&state.pool);
 
-    let session_totals_fut = sqlx::query(
-        r#"
-        SELECT
-            COUNT(*) AS sessions,
-            COALESCE(SUM(requests), 0) AS session_requests,
-            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-            COALESCE(SUM(cache_read), 0) AS cache_read
-        FROM (
-            SELECT session_id,
-                   COUNT(*) AS requests,
-                   COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-                   COALESCE(SUM(cache_read_tokens), 0) AS cache_read
-            FROM usage_logs
-            WHERE created_at >= ? AND created_at < ? AND in_flight = 0
-              AND session_id IS NOT NULL AND TRIM(session_id) <> ''
-            GROUP BY session_id
+    let session_totals_fut = if query.include_session_metrics {
+        sqlx::query(
+            r#"
+            SELECT
+                COUNT(*) AS sessions,
+                COALESCE(SUM(requests), 0) AS session_requests,
+                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                COALESCE(SUM(cache_read), 0) AS cache_read
+            FROM (
+                SELECT session_id,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                       COALESCE(SUM(cache_read_tokens), 0) AS cache_read
+                FROM usage_logs
+                WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+                  AND session_id IS NOT NULL AND TRIM(session_id) <> ''
+                GROUP BY session_id
+            )
+            "#,
         )
-        "#,
-    )
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .fetch_one(&state.pool);
+        .bind(range_start.to_rfc3339())
+        .bind(range_end.to_rfc3339())
+        .fetch_one(&state.pool)
+    } else {
+        sqlx::query(
+            "SELECT 0 AS sessions, 0 AS session_requests, \
+                    0 AS prompt_tokens, 0 AS cache_read",
+        )
+        .fetch_one(&state.pool)
+    };
 
     let today_fut = sqlx::query(
         r#"
@@ -6642,11 +6650,12 @@ mod tests {
         let range_start = Utc::now() - Duration::days(2);
         let range_end = Utc::now() + Duration::days(1);
         let Json(view) = overview(
-            State(state),
+            State(state.clone()),
             Query(OverviewQuery {
                 tz_offset_minutes: 0,
                 from: Some(range_start.to_rfc3339()),
                 to: Some(range_end.to_rfc3339()),
+                include_session_metrics: true,
             }),
         )
         .await
@@ -6705,6 +6714,21 @@ mod tests {
         assert_eq!(view.model_usage[0].tokens, 190);
         assert_eq!(view.model_usage[0].prompt_tokens, 140);
         assert_eq!(view.model_usage[0].completion_tokens, 50);
+
+        let Json(view_without_sessions) = overview(
+            State(state),
+            Query(OverviewQuery {
+                tz_offset_minutes: 0,
+                from: Some(range_start.to_rfc3339()),
+                to: Some(range_end.to_rfc3339()),
+                include_session_metrics: false,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(view_without_sessions.range_requests, view.range_requests);
+        assert_eq!(view_without_sessions.range_sessions, 0);
+        assert_eq!(view_without_sessions.range_session_coverage, 0.0);
     }
 
     #[tokio::test]
