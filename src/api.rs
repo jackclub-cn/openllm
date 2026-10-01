@@ -750,7 +750,7 @@ pub async fn update_provider(
     };
     let health_check_model = match input.health_check_model.as_deref() {
         Some(value) => normalize_health_check_model(Some(value)),
-        None => current.health_check_model,
+        None => current.health_check_model.clone(),
     };
     let models_sync_interval_minutes = match input.models_sync_interval_minutes {
         Some(value) => normalize_health_interval(Some(value))?,
@@ -777,7 +777,7 @@ pub async fn update_provider(
     };
     let headers = match input.headers {
         Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
-        None => current.headers,
+        None => current.headers.clone(),
     };
 
     if name.is_empty() || base_url.is_empty() {
@@ -789,6 +789,12 @@ pub async fn update_provider(
     // Name or base URL may have changed, which can change the models.dev match.
     // A status-only update must not wait on catalog refreshes.
     let identity_changed = name != current.name || base_url != current.base_url;
+    let tool_search_context_changed = provider_type.as_str() != current.provider_type
+        || base_url != current.base_url
+        || headers != current.headers
+        || api_keys_changed
+        || health_check_model != current.health_check_model
+        || input.models.is_some();
     let catalog = if identity_changed || input.models.is_some() {
         models_dev::try_load(&state).await
     } else {
@@ -804,7 +810,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -816,6 +822,8 @@ pub async fn update_provider(
     .bind(health_check_interval_minutes)
     .bind(health_check_model)
     .bind(models_sync_interval_minutes)
+    .bind(tool_search_context_changed as i64)
+    .bind(tool_search_context_changed as i64)
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -5519,6 +5527,48 @@ mod tests {
         assert!(result.reclaimed_bytes >= 0);
         assert_eq!(result.database_stats.providers, 1);
         assert_eq!(result.database_stats.in_flight_requests, 0);
+    }
+
+    #[tokio::test]
+    async fn provider_update_resets_tool_search_probe_only_when_context_changes() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url,
+                tool_search_supported, tool_search_checked_at
+             ) VALUES (1, 'Provider', 'openai', 'https://example.com/v1', 0, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let mut status_update = provider_update_with_keys(None);
+        status_update.enabled = Some(false);
+        let _ = update_provider(State(state.clone()), Path(1), Json(status_update))
+            .await
+            .unwrap();
+        let (supported, checked_at): (i64, Option<String>) = sqlx::query_as(
+            "SELECT tool_search_supported, tool_search_checked_at FROM providers WHERE id = 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(supported, 0);
+        assert_eq!(checked_at.as_deref(), Some("2026-01-01T00:00:00Z"));
+
+        let mut context_update = provider_update_with_keys(None);
+        context_update.headers = Some(json!({"X-Test": "changed"}));
+        let _ = update_provider(State(state.clone()), Path(1), Json(context_update))
+            .await
+            .unwrap();
+        let (supported, checked_at): (i64, Option<String>) = sqlx::query_as(
+            "SELECT tool_search_supported, tool_search_checked_at FROM providers WHERE id = 1",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(supported, 1);
+        assert_eq!(checked_at, None);
     }
 
     #[test]
