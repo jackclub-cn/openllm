@@ -59,7 +59,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - 兼容 OpenAI `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings` 和 Anthropic Messages 协议。
 - 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
 - 记录请求、会话 ID、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出；仪表盘可下钻到带筛选条件的请求日志，日志筛选条件会同步到 URL。
-- 仪表盘按所选日期范围展示会话数、会话请求覆盖、平均会话请求数和会话缓存命中率，便于评估客户端会话识别与亲和路由效果。
+- 会话 ID 用于请求详情追溯和同会话亲和路由；仪表盘聚焦请求、Token、缓存、成功率和总用时等核心指标。
 - 支持额度接口的提供商可直接查看额度窗口和价格，多密钥时可切换具体 Key 查询；例如 Command Code 的 5 小时、周、月额度，OpenCode Go 的滚动、周、月窗口，以及 DeepSeek 余额和模型价格。
 
 ## 使用说明
@@ -92,7 +92,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 只要创建过任意网关访问密钥，所有 `/v1` 请求都必须携带 `Authorization: Bearer sk-openllm-...`。没有创建任何密钥时，网关允许匿名调用，便于本地快速验证。停用密钥后它会立即失效，但不会重新打开匿名访问。
 
-控制台“模型调试”页可以直接选择模型并发起流式对话，实时显示生成内容、总用时和输入/输出 Token。若已创建访问密钥，在该页填写网关 API Key 即可。
+控制台“模型调试”页可以直接选择模型和网关 API Key，并发起流式对话，实时显示生成内容、总用时和输入/输出 Token。
 
 ### 模型前缀与路由
 
@@ -112,8 +112,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ### 协议兼容
 
 - OpenAI 与 Anthropic 请求都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可与请求日志关联。
+- 非流式与流式响应都会按可用能力返回 `x-openllm-max-input-tokens`、`x-openllm-max-context-tokens` 和 `x-openllm-max-output-tokens`，便于客户端在发起后续请求前读取实际上限。
 - Anthropic 上游目前用于转换 `/v1/chat/completions` 和 Anthropic Messages 请求，其他 OpenAI 兼容端点不向 Anthropic 目标转发。
-- 连接测试和定时健康检查会自动探测 `tool_search` 兼容性；界面会区分待探测、原生支持和自动兼容状态，上游拒绝该工具时，网关会记录兼容状态、移除该工具并自动重试。
+- 连接测试和定时健康检查会自动探测 `tool_search` 兼容性，不需要手动设置；上游拒绝该工具时，网关会记录兼容状态、移除该工具并自动重试。
 - 上游模型只支持 `/responses` 时，健康检查会自动走 Responses 接口。
 - 多目标路由会计算公共能力上限，并将超过共同输出上限的请求向下兼容到最严格目标允许的值。
 

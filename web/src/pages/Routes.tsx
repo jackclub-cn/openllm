@@ -90,6 +90,7 @@ export default function RoutesPage() {
   const [strategy, setStrategy] = useState<'all' | GatewayRoute['strategy']>('all')
   const [page, setPage] = useState(1)
   const [saving, setSaving] = useState(false)
+  const [togglingId, setTogglingId] = useState<number>()
   const [editing, setEditing] = useState<GatewayRoute>()
   const [open, setOpen] = useState(false)
   const [diagnoseOpen, setDiagnoseOpen] = useState(false)
@@ -162,6 +163,19 @@ export default function RoutesPage() {
       await load()
     } catch (error) {
       message.error(formatError(error))
+    }
+  }
+
+  const toggleEnabled = async (record: GatewayRoute, enabled: boolean) => {
+    setTogglingId(record.id)
+    try {
+      await api.put(`/api/routes/${record.id}`, { enabled })
+      message.success(enabled ? '路由已启用' : '路由已停用')
+      await load()
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setTogglingId(undefined)
     }
   }
 
@@ -358,8 +372,16 @@ export default function RoutesPage() {
             {
               title: '状态',
               dataIndex: 'enabled',
-              width: 90,
-              render: (value: boolean) => <Tag color={value ? 'success' : 'default'}>{value ? '启用' : '停用'}</Tag>,
+              width: 100,
+              render: (value: boolean, record) => (
+                <Switch
+                  checked={value}
+                  loading={togglingId === record.id}
+                  checkedChildren="启用"
+                  unCheckedChildren="停用"
+                  onChange={(checked) => void toggleEnabled(record, checked)}
+                />
+              ),
             },
             {
               title: '操作',

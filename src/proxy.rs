@@ -3700,14 +3700,15 @@ async fn log_request_rejection(
 }
 
 fn enforce_context_capacity(request_tokens: i64, barrel: Option<&BarrelEnvelope>) -> AppResult<()> {
-    let limit = barrel
-        .and_then(|barrel| barrel.capabilities.as_ref())
-        .and_then(|capabilities| capabilities.context_limit);
+    let capabilities = barrel.and_then(|barrel| barrel.capabilities.as_ref());
+    let limit = capabilities
+        .and_then(|capabilities| capabilities.input_limit)
+        .or_else(|| capabilities.and_then(|capabilities| capabilities.context_limit));
     if let Some(limit) = limit
         && request_tokens > limit
     {
         return Err(AppError::BadRequest(format!(
-            "estimated input tokens ({request_tokens}) exceed the route context limit ({limit})"
+            "estimated input tokens ({request_tokens}) exceed the route input limit ({limit})"
         )));
     }
     Ok(())
@@ -5317,10 +5318,9 @@ fn apply_capability_headers(response: &mut Response, receipt: &Option<Value>) {
     let Some(receipt) = receipt.as_ref() else {
         return;
     };
-    let Some(output) = receipt.get("output_limit").and_then(Value::as_i64) else {
-        return;
-    };
-    if let Ok(value) = HeaderValue::from_str(&output.to_string()) {
+    if let Some(output) = receipt.get("output_limit").and_then(Value::as_i64)
+        && let Ok(value) = HeaderValue::from_str(&output.to_string())
+    {
         response
             .headers_mut()
             .insert("x-openllm-max-output-tokens", value);
@@ -5331,6 +5331,16 @@ fn apply_capability_headers(response: &mut Response, receipt: &Option<Value>) {
         response
             .headers_mut()
             .insert("x-openllm-max-context-tokens", value);
+    }
+    if let Some(input) = receipt
+        .get("input_limit")
+        .and_then(Value::as_i64)
+        .or_else(|| receipt.get("context_limit").and_then(Value::as_i64))
+        && let Ok(value) = HeaderValue::from_str(&input.to_string())
+    {
+        response
+            .headers_mut()
+            .insert("x-openllm-max-input-tokens", value);
     }
 }
 
@@ -7947,6 +7957,53 @@ mod tests {
             Err(AppError::BadRequest(_))
         ));
         assert!(enforce_context_capacity(101, None).is_ok());
+    }
+
+    #[test]
+    fn rejects_estimated_input_above_model_input_limit_without_context_limit() {
+        let barrel = BarrelEnvelope {
+            capabilities: Some(crate::models::ModelCapabilities {
+                input_limit: Some(100),
+                ..Default::default()
+            }),
+            incomplete: false,
+            target_count: 1,
+        };
+        assert!(enforce_context_capacity(100, Some(&barrel)).is_ok());
+        assert!(matches!(
+            enforce_context_capacity(101, Some(&barrel)),
+            Err(AppError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn capability_headers_include_input_and_context_without_output_limit() {
+        let mut response = Response::new(Body::empty());
+        let receipt = Some(json!({
+            "context_limit": 100,
+            "input_limit": 80
+        }));
+        apply_capability_headers(&mut response, &receipt);
+        assert_eq!(
+            response
+                .headers()
+                .get("x-openllm-max-context-tokens")
+                .and_then(|value| value.to_str().ok()),
+            Some("100")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get("x-openllm-max-input-tokens")
+                .and_then(|value| value.to_str().ok()),
+            Some("80")
+        );
+        assert!(
+            response
+                .headers()
+                .get("x-openllm-max-output-tokens")
+                .is_none()
+        );
     }
 
     fn barrel_with_output_limit(output_limit: Option<i64>) -> BarrelEnvelope {

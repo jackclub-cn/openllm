@@ -3175,17 +3175,15 @@ pub async fn overview(
         sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE enabled = 1")
             .fetch_one(&state.pool);
     let active_routes_fut =
-        sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE enabled = 1")
-            .fetch_one(&state.pool);
-    let provider_health_fut =
-        sqlx::query_as::<_, (i64, i64, i64)>(
-            "SELECT \
+        sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE enabled = 1").fetch_one(&state.pool);
+    let provider_health_fut = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT \
                 COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok = 1 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok = 0 THEN 1 ELSE 0 END), 0), \
                 COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok IS NULL THEN 1 ELSE 0 END), 0) \
              FROM providers",
-        )
-        .fetch_one(&state.pool);
+    )
+    .fetch_one(&state.pool);
     let provider_key_health_fut = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
         "SELECT \
             COUNT(*), \
@@ -3317,8 +3315,12 @@ pub async fn overview(
     .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool);
 
-    let (recent, provider_usage, daily_rows, model_usage) =
-        tokio::try_join!(recent_fut, provider_usage_fut, daily_rows_fut, model_usage_fut)?;
+    let (recent, provider_usage, daily_rows, model_usage) = tokio::try_join!(
+        recent_fut,
+        provider_usage_fut,
+        daily_rows_fut,
+        model_usage_fut
+    )?;
 
     // Fill in days with no traffic so the chart has a continuous axis
     // instead of collapsing to only the days that happened to have requests.
