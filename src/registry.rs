@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use serde_json::Value;
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::error::AppResult;
 use crate::models::ModelCapabilities;
@@ -167,6 +167,14 @@ struct RouteTargetRow {
     capabilities: CapabilityRow,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct TargetCapabilityRow {
+    provider_id: i64,
+    model_name: String,
+    #[sqlx(flatten)]
+    capabilities: CapabilityRow,
+}
+
 pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
     let query = format!(
         r#"
@@ -201,27 +209,6 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
         .collect())
 }
 
-/// Capability metadata for one provider/model pair, if it was synced.
-pub async fn capabilities_for_target(
-    pool: &SqlitePool,
-    provider_id: i64,
-    model_name: &str,
-) -> AppResult<Option<ModelCapabilities>> {
-    let query = format!(
-        r#"
-        SELECT {CAPABILITY_COLUMNS}
-        FROM provider_models pm
-        WHERE pm.provider_id = ? AND pm.model_name = ? AND pm.enabled = 1
-        "#
-    );
-    let row = sqlx::query_as::<_, CapabilityRow>(&query)
-        .bind(provider_id)
-        .bind(model_name)
-        .fetch_optional(pool)
-        .await?;
-    Ok(row.and_then(CapabilityRow::into_capabilities))
-}
-
 /// Barrel envelope for a set of concrete targets: the strictest common
 /// capability across all of them, plus whether every target reported metadata.
 #[derive(Debug, Clone)]
@@ -237,11 +224,40 @@ pub async fn barrel_for_targets(
     pool: &SqlitePool,
     targets: &[(i64, String)],
 ) -> AppResult<BarrelEnvelope> {
+    let mut found = HashMap::<(i64, String), ModelCapabilities>::new();
+    for chunk in targets.chunks(256) {
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT pm.provider_id, pm.model_name, {CAPABILITY_COLUMNS} \
+             FROM provider_models pm WHERE pm.enabled = 1 AND ("
+        ));
+        for (index, (provider_id, model_name)) in chunk.iter().enumerate() {
+            if index > 0 {
+                query.push(" OR ");
+            }
+            query
+                .push("(pm.provider_id = ")
+                .push_bind(*provider_id)
+                .push(" AND pm.model_name = ")
+                .push_bind(model_name.clone())
+                .push(")");
+        }
+        query.push(")");
+        for row in query
+            .build_query_as::<TargetCapabilityRow>()
+            .fetch_all(pool)
+            .await?
+        {
+            if let Some(capabilities) = row.capabilities.into_capabilities() {
+                found.insert((row.provider_id, row.model_name), capabilities);
+            }
+        }
+    }
+
     let mut known = Vec::with_capacity(targets.len());
     let mut incomplete = false;
-    for (provider_id, model_name) in targets {
-        match capabilities_for_target(pool, *provider_id, model_name).await? {
-            Some(capabilities) => known.push(capabilities),
+    for target in targets {
+        match found.get(target) {
+            Some(capabilities) => known.push(capabilities.clone()),
             None => incomplete = true,
         }
     }
@@ -488,6 +504,38 @@ mod tests {
         assert_eq!(single.target_count, 1);
         assert_eq!(
             single.capabilities.as_ref().unwrap().context_limit,
+            Some(100_000)
+        );
+
+        let direct = barrel_for_targets(
+            &pool,
+            &[
+                (1, "primary-model".to_string()),
+                (2, "backup-model".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(!direct.incomplete);
+        assert_eq!(direct.target_count, 2);
+        assert_eq!(
+            direct.capabilities.as_ref().unwrap().context_limit,
+            Some(80_000)
+        );
+
+        let incomplete = barrel_for_targets(
+            &pool,
+            &[
+                (1, "primary-model".to_string()),
+                (99, "missing-model".to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+        assert!(incomplete.incomplete);
+        assert_eq!(incomplete.target_count, 2);
+        assert_eq!(
+            incomplete.capabilities.as_ref().unwrap().context_limit,
             Some(100_000)
         );
     }
