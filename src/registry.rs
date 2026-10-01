@@ -4,6 +4,8 @@
 //! console need the same view: every reachable model plus its capability
 //! envelope. Keeping the queries here guarantees the two never drift apart.
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use sqlx::SqlitePool;
 
@@ -159,6 +161,7 @@ struct SyncedRow {
 /// One enabled target of a route, joined to its synced capability metadata.
 #[derive(Debug, sqlx::FromRow)]
 struct RouteTargetRow {
+    route_id: i64,
     supported_endpoints: Option<String>,
     #[sqlx(flatten)]
     capabilities: CapabilityRow,
@@ -258,32 +261,43 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
     .fetch_all(pool)
     .await?;
 
+    let query = format!(
+        r#"
+        SELECT rt.route_id,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               {CAPABILITY_COLUMNS}
+        FROM route_targets rt
+        JOIN routes r ON r.id = rt.route_id AND r.enabled = 1
+        JOIN providers p ON p.id = rt.provider_id AND p.enabled = 1
+        LEFT JOIN provider_models pm
+               ON pm.provider_id = rt.provider_id
+              AND pm.model_name = rt.upstream_model
+              AND pm.enabled = 1
+        WHERE rt.enabled = 1
+          AND NOT EXISTS (
+              SELECT 1 FROM provider_models disabled
+              WHERE disabled.provider_id = rt.provider_id
+                AND disabled.model_name = rt.upstream_model
+                AND disabled.enabled = 0
+          )
+        ORDER BY rt.route_id, rt.id
+        "#
+    );
+    let mut targets_by_route = HashMap::<i64, Vec<RouteTargetRow>>::new();
+    for target in sqlx::query_as::<_, RouteTargetRow>(&query)
+        .fetch_all(pool)
+        .await?
+    {
+        targets_by_route
+            .entry(target.route_id)
+            .or_default()
+            .push(target);
+    }
+
     let mut models = Vec::with_capacity(routes.len());
     for (route_id, pattern, route_name, route_created_at) in routes {
-        let query = format!(
-            r#"
-            SELECT COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
-                       AS supported_endpoints,
-                   {CAPABILITY_COLUMNS}
-            FROM route_targets rt
-            JOIN providers p ON p.id = rt.provider_id AND p.enabled = 1
-            LEFT JOIN provider_models pm
-                   ON pm.provider_id = rt.provider_id
-                  AND pm.model_name = rt.upstream_model
-                  AND pm.enabled = 1
-            WHERE rt.route_id = ? AND rt.enabled = 1
-              AND NOT EXISTS (
-                  SELECT 1 FROM provider_models disabled
-                  WHERE disabled.provider_id = rt.provider_id
-                    AND disabled.model_name = rt.upstream_model
-                    AND disabled.enabled = 0
-              )
-            "#
-        );
-        let targets = sqlx::query_as::<_, RouteTargetRow>(&query)
-            .bind(route_id)
-            .fetch_all(pool)
-            .await?;
+        let targets = targets_by_route.remove(&route_id).unwrap_or_default();
         let target_count = targets.len();
         if target_count == 0 {
             continue;
@@ -380,4 +394,101 @@ fn intersect_endpoints(
         result = result.intersection(&endpoints).cloned().collect();
     }
     (!result.is_empty()).then(|| result.into_iter().collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn route_models_batches_targets_and_keeps_barrel_limits() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        for (id, name) in [(1, "Primary"), (2, "Backup")] {
+            sqlx::query(
+                "INSERT INTO providers (id, name, provider_type, base_url)
+                 VALUES (?, ?, 'openai', 'https://example.com/v1')",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (provider_id, model_name, context_limit, output_limit) in [
+            (1, "primary-model", 100_000, 50_000),
+            (2, "backup-model", 80_000, 40_000),
+        ] {
+            sqlx::query(
+                "INSERT INTO provider_models (
+                    provider_id, model_name, enabled, context_limit, output_limit
+                 ) VALUES (?, ?, 1, ?, ?)",
+            )
+            .bind(provider_id)
+            .bind(model_name)
+            .bind(context_limit)
+            .bind(output_limit)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (id, pattern) in [(1, "barrel-model"), (2, "single-model")] {
+            sqlx::query(
+                "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+                 VALUES (?, ?, ?, 'priority', 1)",
+            )
+            .bind(id)
+            .bind(pattern)
+            .bind(pattern)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        for (route_id, provider_id, upstream_model) in [
+            (1, 1, "primary-model"),
+            (1, 2, "backup-model"),
+            (2, 1, "primary-model"),
+        ] {
+            sqlx::query(
+                "INSERT INTO route_targets (
+                    route_id, provider_id, upstream_model, weight, priority, enabled
+                 ) VALUES (?, ?, ?, 100, 0, 1)",
+            )
+            .bind(route_id)
+            .bind(provider_id)
+            .bind(upstream_model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let models = route_models(&pool).await.unwrap();
+        let barrel = models
+            .iter()
+            .find(|model| model.id == "barrel-model")
+            .unwrap();
+        let single = models
+            .iter()
+            .find(|model| model.id == "single-model")
+            .unwrap();
+        assert_eq!(barrel.target_count, 2);
+        assert_eq!(
+            barrel.capabilities.as_ref().unwrap().context_limit,
+            Some(80_000)
+        );
+        assert_eq!(
+            barrel.capabilities.as_ref().unwrap().output_limit,
+            Some(40_000)
+        );
+        assert_eq!(single.target_count, 1);
+        assert_eq!(
+            single.capabilities.as_ref().unwrap().context_limit,
+            Some(100_000)
+        );
+    }
 }
