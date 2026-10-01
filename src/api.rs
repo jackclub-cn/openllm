@@ -2731,9 +2731,19 @@ pub async fn list_usage(
     let page_size = query.page_size.clamp(1, 200);
     let offset = (page - 1) * page_size;
 
-    let mut count = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM usage_logs u WHERE 1 = 1");
-    apply_usage_filters(&mut count, &query);
-    let total: i64 = count.build_query_scalar().fetch_one(&state.pool).await?;
+    let total = if usage_query_is_unfiltered(&query) {
+        sqlx::query_scalar(
+            "SELECT requests + (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1) \
+             FROM usage_lifetime_stats WHERE id = 1",
+        )
+        .fetch_one(&state.pool)
+        .await?
+    } else {
+        let mut count =
+            QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM usage_logs u WHERE 1 = 1");
+        apply_usage_filters(&mut count, &query);
+        count.build_query_scalar().fetch_one(&state.pool).await?
+    };
 
     let mut items = QueryBuilder::<Sqlite>::new(
         r#"
@@ -4326,6 +4336,33 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
     }
 }
 
+fn usage_query_is_unfiltered(query: &UsageQuery) -> bool {
+    query.provider_id.is_none()
+        && query.provider_api_key_id.is_none()
+        && query.api_key_id.is_none()
+        && query.route_id.is_none()
+        && query
+            .model
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && query
+            .request_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && query
+            .session_id
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && query
+            .endpoint
+            .as_deref()
+            .is_none_or(|value| value.trim().is_empty())
+        && query.success.is_none()
+        && query.in_flight.is_none()
+        && query.from.is_none()
+        && query.to.is_none()
+}
+
 impl From<ApiKeyRecord> for ApiKeyView {
     fn from(value: ApiKeyRecord) -> Self {
         Self {
@@ -5507,6 +5544,44 @@ mod tests {
         let provider = get_provider(&state, 1).await.unwrap();
         assert!(provider.api_keys[0].cooldown_seconds.is_some());
         assert!(provider.api_keys[0].cooldown_seconds.unwrap() > 0);
+    }
+
+    #[tokio::test]
+    async fn unfiltered_usage_total_combines_lifetime_and_in_flight_counts() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code,
+                in_flight, success
+             ) VALUES
+                ('pending', 'm', '/v1/chat/completions', 0, 1, 0),
+                ('finished', 'm', '/v1/chat/completions', 200, 0, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let query: UsageQuery = serde_json::from_value(json!({})).unwrap();
+
+        let Json(page) = list_usage(State(state.clone()), Query(query))
+            .await
+            .unwrap();
+        assert_eq!(page.total, 2);
+        assert_eq!(page.items.len(), 2);
+
+        sqlx::query("DELETE FROM usage_logs WHERE request_id = 'finished'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let query: UsageQuery = serde_json::from_value(json!({})).unwrap();
+        let Json(page) = list_usage(State(state), Query(query)).await.unwrap();
+        assert_eq!(page.total, 1);
+        assert_eq!(page.items[0].request_id, "pending");
     }
 
     #[tokio::test]
