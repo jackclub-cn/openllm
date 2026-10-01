@@ -3079,7 +3079,7 @@ pub async fn overview(
         day_start + Duration::days(1),
     )?;
 
-    let totals = sqlx::query(
+    let totals_fut = sqlx::query(
         r#"
         SELECT
             requests AS requests_total,
@@ -3103,10 +3103,9 @@ pub async fn overview(
         WHERE id = 1
         "#,
     )
-    .fetch_one(&state.pool)
-    .await?;
+    .fetch_one(&state.pool);
 
-    let range_totals = sqlx::query(
+    let range_totals_fut = sqlx::query(
         r#"
         SELECT
             COUNT(*) AS requests,
@@ -3126,10 +3125,9 @@ pub async fn overview(
     )
     .bind(range_start.to_rfc3339())
     .bind(range_end.to_rfc3339())
-    .fetch_one(&state.pool)
-    .await?;
+    .fetch_one(&state.pool);
 
-    let session_totals = sqlx::query(
+    let session_totals_fut = sqlx::query(
         r#"
         SELECT
             COUNT(*) AS sessions,
@@ -3150,10 +3148,9 @@ pub async fn overview(
     )
     .bind(range_start.to_rfc3339())
     .bind(range_end.to_rfc3339())
-    .fetch_one(&state.pool)
-    .await?;
+    .fetch_one(&state.pool);
 
-    let today = sqlx::query(
+    let today_fut = sqlx::query(
         r#"
         SELECT COUNT(*) AS requests, COALESCE(SUM(total_tokens), 0) AS tokens,
                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
@@ -3169,17 +3166,18 @@ pub async fn overview(
     )
     .bind(day_start.to_rfc3339())
     .bind((day_start + Duration::days(1)).to_rfc3339())
-    .fetch_one(&state.pool)
-    .await?;
+    .fetch_one(&state.pool);
 
-    let active_providers: i64 =
+    let (totals, range_totals, session_totals, today) =
+        tokio::try_join!(totals_fut, range_totals_fut, session_totals_fut, today_fut)?;
+
+    let active_providers_fut =
         sqlx::query_scalar("SELECT COUNT(*) FROM providers WHERE enabled = 1")
-            .fetch_one(&state.pool)
-            .await?;
-    let active_routes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE enabled = 1")
-        .fetch_one(&state.pool)
-        .await?;
-    let (healthy_providers, failed_providers, untested_providers) =
+            .fetch_one(&state.pool);
+    let active_routes_fut =
+        sqlx::query_scalar("SELECT COUNT(*) FROM routes WHERE enabled = 1")
+            .fetch_one(&state.pool);
+    let provider_health_fut =
         sqlx::query_as::<_, (i64, i64, i64)>(
             "SELECT \
                 COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok = 1 THEN 1 ELSE 0 END), 0), \
@@ -3187,15 +3185,8 @@ pub async fn overview(
                 COALESCE(SUM(CASE WHEN enabled = 1 AND last_test_ok IS NULL THEN 1 ELSE 0 END), 0) \
              FROM providers",
         )
-        .fetch_one(&state.pool)
-        .await?;
-    let (
-        provider_keys_total,
-        healthy_provider_keys,
-        failed_provider_keys,
-        untested_provider_keys,
-        runtime_error_provider_keys,
-    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
+        .fetch_one(&state.pool);
+    let provider_key_health_fut = sqlx::query_as::<_, (i64, i64, i64, i64, i64)>(
         "SELECT \
             COUNT(*), \
             COALESCE(SUM(CASE WHEN k.last_test_ok = 1 THEN 1 ELSE 0 END), 0), \
@@ -3206,12 +3197,29 @@ pub async fn overview(
          JOIN providers p ON p.id = k.provider_id \
          WHERE p.enabled = 1 AND k.enabled = 1",
     )
-    .fetch_one(&state.pool)
-    .await?;
-    let in_flight_requests: i64 =
+    .fetch_one(&state.pool);
+    let in_flight_requests_fut =
         sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
-            .fetch_one(&state.pool)
-            .await?;
+            .fetch_one(&state.pool);
+    let (
+        active_providers,
+        active_routes,
+        (healthy_providers, failed_providers, untested_providers),
+        (
+            provider_keys_total,
+            healthy_provider_keys,
+            failed_provider_keys,
+            untested_provider_keys,
+            runtime_error_provider_keys,
+        ),
+        in_flight_requests,
+    ) = tokio::try_join!(
+        active_providers_fut,
+        active_routes_fut,
+        provider_health_fut,
+        provider_key_health_fut,
+        in_flight_requests_fut,
+    )?;
     let now = std::time::Instant::now();
     let cooling_provider_keys = state
         .provider_key_cooldown
@@ -3221,7 +3229,7 @@ pub async fn overview(
         .filter(|until| **until > now)
         .count() as i64;
 
-    let recent = sqlx::query_as::<_, UsageLogDetailRow>(
+    let recent_fut = sqlx::query_as::<_, UsageLogDetailRow>(
         r#"
         SELECT u.id, u.request_id, u.api_key_id, u.route_id, u.provider_id,
                u.provider_api_key_id,
@@ -3245,10 +3253,9 @@ pub async fn overview(
     )
     .bind(range_start.to_rfc3339())
     .bind(range_end.to_rfc3339())
-    .fetch_all(&state.pool)
-    .await?;
+    .fetch_all(&state.pool);
 
-    let provider_usage = sqlx::query_as::<_, ProviderUsage>(
+    let provider_usage_fut = sqlx::query_as::<_, ProviderUsage>(
         r#"
         SELECT p.id AS provider_id, p.name AS provider_name,
                COUNT(u.id) AS requests,
@@ -3268,10 +3275,9 @@ pub async fn overview(
     )
     .bind(range_start.to_rfc3339())
     .bind(range_end.to_rfc3339())
-    .fetch_all(&state.pool)
-    .await?;
+    .fetch_all(&state.pool);
 
-    let daily_rows = sqlx::query_as::<_, DailyUsage>(
+    let daily_rows_fut = sqlx::query_as::<_, DailyUsage>(
         r#"
         SELECT date(datetime(created_at), ? || ' minutes') AS day,
                COUNT(*) AS requests,
@@ -3288,8 +3294,31 @@ pub async fn overview(
     .bind(range_start.to_rfc3339())
     .bind(range_end.to_rfc3339())
     .bind(tz_offset)
-    .fetch_all(&state.pool)
-    .await?;
+    .fetch_all(&state.pool);
+
+    let model_usage_fut = sqlx::query_as::<_, ModelUsage>(
+        r#"
+        SELECT requested_model AS model,
+               COUNT(*) AS requests,
+               COALESCE(SUM(total_tokens), 0) AS tokens,
+               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+               SUM(estimated_cost_micros) AS cost_micros,
+               COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
+               COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
+        FROM usage_logs
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+        GROUP BY requested_model
+        ORDER BY tokens DESC, requests DESC
+        LIMIT 8
+        "#,
+    )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .fetch_all(&state.pool);
+
+    let (recent, provider_usage, daily_rows, model_usage) =
+        tokio::try_join!(recent_fut, provider_usage_fut, daily_rows_fut, model_usage_fut)?;
 
     // Fill in days with no traffic so the chart has a continuous axis
     // instead of collapsing to only the days that happened to have requests.
@@ -3312,28 +3341,6 @@ pub async fn overview(
             completion_tokens: existing.map_or(0, |row| row.completion_tokens),
         });
     }
-
-    let model_usage = sqlx::query_as::<_, ModelUsage>(
-        r#"
-        SELECT requested_model AS model,
-               COUNT(*) AS requests,
-               COALESCE(SUM(total_tokens), 0) AS tokens,
-               COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
-               COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
-               SUM(estimated_cost_micros) AS cost_micros,
-               COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
-               COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
-        FROM usage_logs
-        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
-        GROUP BY requested_model
-        ORDER BY tokens DESC, requests DESC
-        LIMIT 8
-        "#,
-    )
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .fetch_all(&state.pool)
-    .await?;
 
     let range_requests: i64 = range_totals.get("requests");
     let range_sessions: i64 = session_totals.get("sessions");
