@@ -107,6 +107,7 @@ export default function Providers() {
   const [items, setItems] = useState<Provider[]>([])
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
+  const [togglingProviderId, setTogglingProviderId] = useState<number>()
   const [testingAll, setTestingAll] = useState(false)
   const [testingAllKeys, setTestingAllKeys] = useState(false)
   const [providerSearch, setProviderSearch] = useState(() => searchParams.get('q') || '')
@@ -185,8 +186,6 @@ export default function Providers() {
       base_url: '',
       model_prefix: '',
       api_keys: [],
-      enabled: true,
-      tool_search_supported: true,
       auto_sync_models: true,
       health_check_interval_minutes: 0,
       health_check_model: '',
@@ -290,8 +289,6 @@ export default function Providers() {
       model_prefix: values.model_prefix,
       api_keys: apiKeys,
       headers,
-      enabled: values.enabled,
-      tool_search_supported: values.tool_search_supported,
       auto_sync_models: values.auto_sync_models,
       models: values.modelsText.split('\n').map((item) => item.trim()).filter(Boolean),
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
@@ -319,6 +316,21 @@ export default function Providers() {
       await load()
     } catch (error) {
       message.error(formatError(error))
+    }
+  }
+
+  const toggleEnabled = async (provider: Provider, enabled: boolean) => {
+    setTogglingProviderId(provider.id)
+    try {
+      const updated = await api.put<Provider>(`/api/providers/${provider.id}`, { enabled })
+      setItems((current) =>
+        current.map((item) => (item.id === provider.id ? updated : item)),
+      )
+      message.success(enabled ? '提供商已启用' : '提供商已停用')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setTogglingProviderId(undefined)
     }
   }
 
@@ -848,28 +860,31 @@ export default function Providers() {
               render: (value: string) => value ? <Typography.Text code>{value}</Typography.Text> : <Typography.Text type="secondary">无</Typography.Text>,
             },
             {
-              title: '工具搜索兼容',
-              dataIndex: 'tool_search_supported',
-              width: 150,
-              render: (value: boolean) => (
-                <Tooltip
-                  title={
-                    value
-                      ? '直接转发 tool_search'
-                      : '转发前自动移除 tool_search，避免不支持该工具的上游返回 400'
-                  }
-                >
-                  <Tag color={value ? 'blue' : 'orange'}>
-                    {value ? '原生支持' : '自动兼容'}
-                  </Tag>
-                </Tooltip>
-              ),
-            },
-            {
               title: '状态',
               dataIndex: 'enabled',
-              width: 90,
-              render: (value: boolean) => <Tag color={value ? 'success' : 'default'}>{value ? '启用' : '停用'}</Tag>,
+              width: 190,
+              render: (value: boolean, record) => (
+                <Space direction="vertical" size={6}>
+                  <Switch
+                    checked={value}
+                    loading={togglingProviderId === record.id}
+                    checkedChildren="启用"
+                    unCheckedChildren="停用"
+                    onChange={(checked) => void toggleEnabled(record, checked)}
+                  />
+                  <Tooltip
+                    title={
+                      record.tool_search_supported
+                        ? '连接测试时会自动探测；当前直接转发 tool_search'
+                        : '连接测试时会自动探测；上游拒绝时会在转发前移除 tool_search'
+                    }
+                  >
+                    <Tag color={record.tool_search_supported ? 'blue' : 'orange'}>
+                      工具搜索{record.tool_search_supported ? '原生支持' : '自动兼容'}
+                    </Tag>
+                  </Tooltip>
+                </Space>
+              ),
             },
             {
               title: '操作',
@@ -1093,14 +1108,6 @@ export default function Providers() {
             </Form.List>
           </Form.Item>
           <Form.Item
-            name="tool_search_supported"
-            label="上游支持 tool_search"
-            valuePropName="checked"
-            extra="上游明确拒绝该工具时会自动关闭；上游升级后可在编辑页重新打开。"
-          >
-            <Switch />
-          </Form.Item>
-          <Form.Item
             name="auto_sync_models"
             label="保存后自动从上游同步模型"
             valuePropName="checked"
@@ -1141,9 +1148,6 @@ export default function Providers() {
           </Form.Item>
           <Form.Item name="headersText" label="附加请求头（JSON）">
             <Input.TextArea rows={4} className="code-input" placeholder={'{"X-Organization": "team-a"}'} />
-          </Form.Item>
-          <Form.Item name="enabled" label="启用" valuePropName="checked">
-            <Switch />
           </Form.Item>
         </Form>
       </Modal>

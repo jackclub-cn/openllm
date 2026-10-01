@@ -16,7 +16,7 @@ use sqlx::{QueryBuilder, Row, Sqlite};
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::models_dev;
-use crate::proxy::{apply_custom_headers, join_upstream_url};
+use crate::proxy::{apply_custom_headers, join_upstream_url, upstream_rejects_tool_search};
 use crate::state::AppState;
 
 const SETTING_USAGE_RETENTION_DAYS: &str = "usage_retention_days";
@@ -674,7 +674,7 @@ pub async fn create_provider(
             api_key, headers, enabled, tool_search_supported,
             health_check_interval_minutes, health_check_model,
             models_sync_interval_minutes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -684,7 +684,6 @@ pub async fn create_provider(
     .bind(api_key)
     .bind(headers)
     .bind(input.enabled as i64)
-    .bind(input.tool_search_supported as i64)
     .bind(health_check_interval_minutes)
     .bind(health_check_model)
     .bind(models_sync_interval_minutes)
@@ -724,7 +723,11 @@ pub async fn update_provider(
         .await?
         .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
 
-    let name = input.name.unwrap_or(current.name).trim().to_string();
+    let name = input
+        .name
+        .unwrap_or_else(|| current.name.clone())
+        .trim()
+        .to_string();
     let provider_type = input
         .provider_type
         .unwrap_or(ProviderType::from_str(&current.provider_type).map_err(AppError::BadRequest)?);
@@ -741,9 +744,6 @@ pub async fn update_provider(
             .unwrap_or(current.model_prefix.as_str()),
     )?;
     let enabled = input.enabled.unwrap_or(current.enabled != 0);
-    let tool_search_supported = input
-        .tool_search_supported
-        .unwrap_or(current.tool_search_supported != 0);
     let health_check_interval_minutes = match input.health_check_interval_minutes {
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.health_check_interval_minutes,
@@ -787,14 +787,24 @@ pub async fn update_provider(
     }
 
     // Name or base URL may have changed, which can change the models.dev match.
-    let catalog = models_dev::try_load(&state).await;
-    let models_dev_id = catalog
-        .as_ref()
-        .and_then(|catalog| catalog.match_provider(&name, &base_url));
+    // A status-only update must not wait on catalog refreshes.
+    let identity_changed = name != current.name || base_url != current.base_url;
+    let catalog = if identity_changed || input.models.is_some() {
+        models_dev::try_load(&state).await
+    } else {
+        None
+    };
+    let models_dev_id = if identity_changed {
+        catalog
+            .as_ref()
+            .and_then(|catalog| catalog.match_provider(&name, &base_url))
+    } else {
+        current.models_dev_id.clone()
+    };
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, tool_search_supported = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name)
     .bind(provider_type.as_str())
@@ -803,7 +813,6 @@ pub async fn update_provider(
     .bind(models_dev_id.as_deref())
     .bind(headers)
     .bind(enabled as i64)
-    .bind(tool_search_supported as i64)
     .bind(health_check_interval_minutes)
     .bind(health_check_model)
     .bind(models_sync_interval_minutes)
@@ -995,6 +1004,7 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
             provider_type,
             model.as_ref(),
             key.as_deref(),
+            false,
         )?;
         let attempt = probe_provider(
             request,
@@ -1016,6 +1026,17 @@ async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTes
         )
         .await?;
         if attempt.ok {
+            if let Some(supported) = probe_tool_search_support(
+                state,
+                &provider,
+                provider_type,
+                model.as_ref(),
+                key.as_deref(),
+            )
+            .await?
+            {
+                persist_tool_search_support(state, provider.id, supported).await?;
+            }
             if let Some(key_id) = key_id {
                 state.provider_key_cooldown.lock().await.remove(&key_id);
             }
@@ -1061,6 +1082,7 @@ async fn test_provider_keys_inner(state: &AppState, id: i64) -> AppResult<Provid
             provider_type,
             model.as_ref(),
             key.secret.as_deref(),
+            false,
         )?;
         let attempt = probe_provider(request, std::time::Instant::now(), checked, model_name).await;
         let result = ProviderKeyTestItem {
@@ -1139,9 +1161,10 @@ fn build_provider_probe_request(
     provider_type: ProviderType,
     model: Option<&ProviderProbeModel>,
     key: Option<&str>,
+    include_tool_search: bool,
 ) -> AppResult<reqwest::RequestBuilder> {
     let mut request = if let Some(model) = model {
-        let (url, body) = match provider_type {
+        let (url, mut body) = match provider_type {
             ProviderType::Anthropic => (
                 join_upstream_url(&provider.base_url, "/v1/messages"),
                 json!({
@@ -1176,6 +1199,9 @@ fn build_provider_probe_request(
                 }),
             ),
         };
+        if include_tool_search {
+            body["tools"] = json!([{"type": "tool_search", "execution": "client"}]);
+        }
         state
             .client
             .post(url)
@@ -1203,6 +1229,40 @@ fn build_provider_probe_request(
         };
     }
     apply_custom_headers(request, &provider.headers)
+}
+
+async fn probe_tool_search_support(
+    state: &AppState,
+    provider: &Provider,
+    provider_type: ProviderType,
+    model: Option<&ProviderProbeModel>,
+    key: Option<&str>,
+) -> AppResult<Option<bool>> {
+    if model.is_none() || !matches!(provider_type, ProviderType::Openai | ProviderType::Custom) {
+        return Ok(None);
+    }
+    let request = build_provider_probe_request(state, provider, provider_type, model, key, true)?;
+    let Ok(response) = request.send().await else {
+        return Ok(None);
+    };
+    if response.status().is_success() {
+        return Ok(Some(true));
+    }
+    let body = response.bytes().await.unwrap_or_default();
+    Ok(upstream_rejects_tool_search(&body).then_some(false))
+}
+
+async fn persist_tool_search_support(
+    state: &AppState,
+    provider_id: i64,
+    supported: bool,
+) -> AppResult<()> {
+    sqlx::query("UPDATE providers SET tool_search_supported = ? WHERE id = ?")
+        .bind(supported as i64)
+        .bind(provider_id)
+        .execute(&state.pool)
+        .await?;
+    Ok(())
 }
 
 pub async fn test_all_providers(
@@ -3126,7 +3186,7 @@ pub async fn overview(
         LEFT JOIN provider_api_keys pk ON pk.id = u.provider_api_key_id
         WHERE u.created_at >= ? AND u.created_at < ?
         ORDER BY u.created_at DESC, u.id DESC
-        LIMIT 8
+        LIMIT 12
         "#,
     )
     .bind(range_start.to_rfc3339())
@@ -4281,7 +4341,6 @@ mod tests {
             api_keys,
             headers: json!({}),
             enabled: true,
-            tool_search_supported: true,
             auto_sync_models: false,
             models: Vec::new(),
             health_check_interval_minutes: None,
@@ -4315,7 +4374,6 @@ mod tests {
             api_keys,
             headers: None,
             enabled: None,
-            tool_search_supported: None,
             auto_sync_models: None,
             models: None,
             health_check_interval_minutes: None,
@@ -4930,6 +4988,102 @@ mod tests {
                 .and_then(Value::as_str),
             Some("configured-model")
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_health_probe_learns_tool_search_compatibility() {
+        let reject_tool_search = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post({
+                let reject_tool_search = reject_tool_search.clone();
+                move |Json(body): Json<Value>| {
+                    let reject_tool_search = reject_tool_search.clone();
+                    async move {
+                        let includes_tool_search = body
+                            .get("tools")
+                            .and_then(Value::as_array)
+                            .is_some_and(|tools| {
+                                tools.iter().any(|tool| tool["type"] == "tool_search")
+                            });
+                        if includes_tool_search
+                            && reject_tool_search.load(std::sync::atomic::Ordering::SeqCst)
+                        {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "error": {
+                                        "message": "unknown tool type: tool_search"
+                                    }
+                                })),
+                            );
+                        }
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "health",
+                                "choices": [],
+                                "usage": {
+                                    "prompt_tokens": 1,
+                                    "completion_tokens": 0,
+                                    "total_tokens": 1
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, tool_search_supported
+             ) VALUES (1, 'mock', 'openai', ?, 1)",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_api_keys (provider_id, name, secret, enabled)
+             VALUES (1, 'Primary', 'sk-test', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'probe-model', 1)",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let result = test_provider_inner(&state, 1).await.unwrap();
+        assert!(result.ok);
+        let unsupported: i64 =
+            sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(unsupported, 0);
+
+        reject_tool_search.store(false, std::sync::atomic::Ordering::SeqCst);
+        let result = test_provider_inner(&state, 1).await.unwrap();
+        assert!(result.ok);
+        let supported: i64 =
+            sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(supported, 1);
         server.abort();
     }
 

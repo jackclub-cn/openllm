@@ -202,8 +202,6 @@ export type ProviderInput = {
   api_key?: string
   api_keys?: ProviderApiKeyInput[]
   headers: Record<string, string>
-  enabled: boolean
-  tool_search_supported: boolean
   auto_sync_models: boolean
   models: string[]
   health_check_interval_minutes?: number | null

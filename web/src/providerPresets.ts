@@ -19,7 +19,7 @@ export type ProviderPreset = {
     ProviderInput,
     'name' | 'provider_type' | 'base_url' | 'model_prefix'
   > &
-    Partial<Pick<ProviderInput, 'health_check_model' | 'tool_search_supported'>>
+    Partial<Pick<ProviderInput, 'health_check_model'>>
 }
 
 export const providerPresets: ProviderPreset[] = [

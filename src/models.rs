@@ -240,8 +240,6 @@ pub struct ProviderInput {
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_true")]
-    pub tool_search_supported: bool,
-    #[serde(default = "default_true")]
     pub auto_sync_models: bool,
     #[serde(default)]
     pub models: Vec<String>,
@@ -267,7 +265,6 @@ pub struct ProviderUpdate {
     pub api_keys: Option<Vec<ProviderApiKeyInput>>,
     pub headers: Option<serde_json::Value>,
     pub enabled: Option<bool>,
-    pub tool_search_supported: Option<bool>,
     pub auto_sync_models: Option<bool>,
     pub models: Option<Vec<String>>,
     #[serde(default)]

@@ -2086,7 +2086,7 @@ fn strip_tool_search_tools(body: &Value) -> Option<Value> {
     Some(compat)
 }
 
-fn upstream_rejects_tool_search(body: &[u8]) -> bool {
+pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     let message = String::from_utf8_lossy(body).to_ascii_lowercase();
     message.contains("tool_search")
         && (message.contains("unknown tool type") || message.contains("tool.type"))
