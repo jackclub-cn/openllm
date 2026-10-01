@@ -2955,10 +2955,7 @@ async fn process_anthropic_line(
 fn convert_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> Value {
     let mut output = json!({
         "model": model,
-        "max_tokens": input.get("max_tokens")
-            .or_else(|| input.get("max_completion_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or(4096),
+        "max_tokens": requested_output_tokens_of(input).unwrap_or(4096),
         "stream": streamed
     });
 
@@ -8936,6 +8933,19 @@ mod tests {
         assert_eq!(tool_result["type"], "tool_result");
         assert_eq!(tool_result["tool_use_id"], "call_1");
         assert_eq!(tool_result["content"], "18C");
+    }
+
+    #[test]
+    fn converts_max_output_tokens_to_anthropic_max_tokens() {
+        let converted = convert_request_to_anthropic(
+            &json!({
+                "max_output_tokens": 1200,
+                "messages": [{ "role": "user", "content": "hello" }]
+            }),
+            "claude-x",
+            false,
+        );
+        assert_eq!(converted["max_tokens"], 1200);
     }
 
     #[tokio::test]
