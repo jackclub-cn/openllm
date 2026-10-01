@@ -2094,8 +2094,10 @@ pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
 
 async fn mark_provider_tool_search_unsupported(state: &AppState, provider_id: i64) {
     if let Err(error) = sqlx::query(
-        "UPDATE providers SET tool_search_supported = 0 \
-         WHERE id = ? AND tool_search_supported <> 0",
+        "UPDATE providers \
+         SET tool_search_supported = 0, \
+             tool_search_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?",
     )
     .bind(provider_id)
     .execute(&state.pool)
@@ -8048,6 +8050,12 @@ mod tests {
                     .await
                     .unwrap();
             assert_eq!(tool_search_supported, 0);
+            let tool_search_checked_at: Option<String> =
+                sqlx::query_scalar("SELECT tool_search_checked_at FROM providers WHERE id = 1")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert!(tool_search_checked_at.is_some());
 
             target.tool_search_supported = 0;
             let response = forward_to_target(

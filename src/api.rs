@@ -1257,11 +1257,16 @@ async fn persist_tool_search_support(
     provider_id: i64,
     supported: bool,
 ) -> AppResult<()> {
-    sqlx::query("UPDATE providers SET tool_search_supported = ? WHERE id = ?")
-        .bind(supported as i64)
-        .bind(provider_id)
-        .execute(&state.pool)
-        .await?;
+    sqlx::query(
+        "UPDATE providers \
+         SET tool_search_supported = ?, \
+             tool_search_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?",
+    )
+    .bind(supported as i64)
+    .bind(provider_id)
+    .execute(&state.pool)
+    .await?;
     Ok(())
 }
 
@@ -5068,6 +5073,12 @@ mod tests {
 
         let result = test_provider_inner(&state, 1).await.unwrap();
         assert!(result.ok);
+        let checked_after_rejection: Option<String> =
+            sqlx::query_scalar("SELECT tool_search_checked_at FROM providers WHERE id = 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(checked_after_rejection.is_some());
         let unsupported: i64 =
             sqlx::query_scalar("SELECT tool_search_supported FROM providers WHERE id = 1")
                 .fetch_one(&state.pool)

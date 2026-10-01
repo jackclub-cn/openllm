@@ -109,6 +109,7 @@ export type Provider = {
   api_key_set: boolean
   api_keys: ProviderApiKey[]
   tool_search_supported: boolean
+  tool_search_checked_at?: string | null
   models: string[]
   models_synced_at?: string
   models_sync_error?: string
