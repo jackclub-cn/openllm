@@ -975,6 +975,20 @@ struct ProviderProbeKey {
 }
 
 async fn test_provider_inner(state: &AppState, id: i64) -> AppResult<ProviderTestResult> {
+    {
+        let mut running = state.provider_health_check.lock().await;
+        if !running.insert(id) {
+            return Err(AppError::Conflict(
+                "provider health check is already in progress".to_string(),
+            ));
+        }
+    }
+    let result = test_provider_inner_unlocked(state, id).await;
+    state.provider_health_check.lock().await.remove(&id);
+    result
+}
+
+async fn test_provider_inner_unlocked(state: &AppState, id: i64) -> AppResult<ProviderTestResult> {
     let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.pool)
@@ -6205,6 +6219,17 @@ mod tests {
         state.provider_model_sync.lock().await.insert(1);
 
         let error = sync_provider(state, 1).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Conflict(message) if message.contains("already in progress"))
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_health_check_rejects_duplicate_runs() {
+        let state = provider_key_test_state().await;
+        state.provider_health_check.lock().await.insert(1);
+
+        let error = test_provider_inner(&state, 1).await.unwrap_err();
         assert!(
             matches!(error, AppError::Conflict(message) if message.contains("already in progress"))
         );

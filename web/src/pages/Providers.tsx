@@ -110,6 +110,7 @@ export default function Providers() {
   const [togglingProviderId, setTogglingProviderId] = useState<number>()
   const [testingAll, setTestingAll] = useState(false)
   const [testingAllKeys, setTestingAllKeys] = useState(false)
+  const [testingProviderId, setTestingProviderId] = useState<number>()
   const [providerSearch, setProviderSearch] = useState(() => searchParams.get('q') || '')
   const [providerStatus, setProviderStatus] = useState<'all' | 'enabled' | 'disabled'>(() => {
     const status = searchParams.get('status')
@@ -337,6 +338,7 @@ export default function Providers() {
 
   const test = async (id: number) => {
     const key = `provider-test-${id}`
+    setTestingProviderId(id)
     message.loading({ content: '正在测试连接...', key })
     try {
       const result = await api.post<{
@@ -356,6 +358,8 @@ export default function Providers() {
       await load()
     } catch (error) {
       message.error({ content: formatError(error), key })
+    } finally {
+      setTestingProviderId(undefined)
     }
   }
 
@@ -923,7 +927,12 @@ export default function Providers() {
                     />
                   </Tooltip>
                   <Tooltip title="测试连接">
-                    <Button type="text" icon={<ThunderboltOutlined />} onClick={() => test(record.id)} />
+                    <Button
+                      type="text"
+                      icon={<ThunderboltOutlined />}
+                      loading={testingProviderId === record.id}
+                      onClick={() => void test(record.id)}
+                    />
                   </Tooltip>
                   {record.api_keys.length > 0 && (
                     <Tooltip title="逐个测试全部启用密钥">

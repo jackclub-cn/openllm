@@ -37,6 +37,9 @@ pub struct AppState {
     /// Prevents a manual sync and the scheduled sync worker from fetching the
     /// same provider concurrently.
     pub provider_model_sync: Arc<Mutex<HashSet<i64>>>,
+    /// Prevents overlapping provider health probes from overwriting each
+    /// other's persisted result.
+    pub provider_health_check: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// A fetched models.dev catalog and the instant it was retrieved.
@@ -80,6 +83,7 @@ impl AppState {
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
             provider_model_sync: Arc::new(Mutex::new(HashSet::new())),
+            provider_health_check: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
