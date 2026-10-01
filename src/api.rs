@@ -1469,6 +1469,30 @@ pub async fn reconcile_interrupted_usage_requests(state: &AppState) -> AppResult
     Ok(updated)
 }
 
+/// A process restart can leave a model sync with only its start timestamp.
+/// Mark it explicitly so the console does not present a permanent "syncing"
+/// state and the next scheduled run can recover normally.
+pub async fn reconcile_interrupted_provider_model_syncs(state: &AppState) -> AppResult<u64> {
+    let result = sqlx::query(
+        "UPDATE providers \
+         SET models_sync_error = 'gateway restarted before model synchronization completed', \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE models_sync_attempted_at IS NOT NULL \
+           AND models_sync_error IS NULL \
+           AND (models_synced_at IS NULL \
+                OR datetime(models_sync_attempted_at) > datetime(models_synced_at))",
+    )
+    .execute(&state.pool)
+    .await?;
+    if result.rows_affected() > 0 {
+        tracing::warn!(
+            updated = result.rows_affected(),
+            "reconciled interrupted provider model syncs after restart"
+        );
+    }
+    Ok(result.rows_affected())
+}
+
 async fn finish_interrupted_usage_requests(
     state: &AppState,
     cutoff: Option<&str>,
@@ -2136,27 +2160,45 @@ async fn fetch_provider_entries(
 }
 
 async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
-    let result = sync_provider_inner(&state, id).await;
+    {
+        let mut running = state.provider_model_sync.lock().await;
+        if !running.insert(id) {
+            return Err(AppError::Conflict(
+                "model synchronization is already in progress for this provider".to_string(),
+            ));
+        }
+    }
+
     let attempted_at = Utc::now().to_rfc3339();
+    if let Err(error) = sqlx::query(
+        "UPDATE providers \
+         SET models_sync_attempted_at = ?, models_sync_error = NULL, \
+             updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
+         WHERE id = ?",
+    )
+    .bind(&attempted_at)
+    .bind(id)
+    .execute(&state.pool)
+    .await
+    {
+        state.provider_model_sync.lock().await.remove(&id);
+        return Err(AppError::Database(error));
+    }
+
+    let result = sync_provider_inner(&state, id).await;
     if let Err(error) = &result {
         let _ = sqlx::query(
             "UPDATE providers \
-             SET models_sync_error = ?, models_sync_attempted_at = ?, \
+             SET models_sync_error = ?, \
                  updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
              WHERE id = ?",
         )
         .bind(error.to_string())
-        .bind(&attempted_at)
         .bind(id)
         .execute(&state.pool)
         .await;
-    } else {
-        let _ = sqlx::query("UPDATE providers SET models_sync_attempted_at = ? WHERE id = ?")
-            .bind(&attempted_at)
-            .bind(id)
-            .execute(&state.pool)
-            .await;
     }
+    state.provider_model_sync.lock().await.remove(&id);
     result
 }
 
@@ -6152,6 +6194,59 @@ mod tests {
         );
         assert!(changed[0].fields.contains(&"cost".to_string()));
         assert!(changed[0].fields.contains(&"display_name".to_string()));
+    }
+
+    #[tokio::test]
+    async fn provider_model_sync_rejects_duplicate_runs() {
+        let state = provider_key_test_state().await;
+        state.provider_model_sync.lock().await.insert(1);
+
+        let error = sync_provider(state, 1).await.unwrap_err();
+        assert!(
+            matches!(error, AppError::Conflict(message) if message.contains("already in progress"))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciles_interrupted_provider_model_syncs() {
+        let state = provider_key_test_state().await;
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url,
+                models_sync_attempted_at, models_synced_at, models_sync_error
+             ) VALUES
+                (1, 'interrupted', 'openai', 'https://example.com/v1',
+                 '2026-10-01T10:00:00Z', '2026-10-01T09:00:00Z', NULL),
+                (2, 'completed', 'openai', 'https://example.com/v1',
+                 '2026-10-01T09:00:00Z', '2026-10-01T10:00:00Z', NULL),
+                (3, 'failed', 'openai', 'https://example.com/v1',
+                 '2026-10-01T10:00:00Z', NULL, 'upstream failed')",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            reconcile_interrupted_provider_model_syncs(&state)
+                .await
+                .unwrap(),
+            1
+        );
+        let error: Option<String> =
+            sqlx::query_scalar("SELECT models_sync_error FROM providers WHERE id = 1")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            error.as_deref(),
+            Some("gateway restarted before model synchronization completed")
+        );
+        let completed_error: Option<String> =
+            sqlx::query_scalar("SELECT models_sync_error FROM providers WHERE id = 2")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(completed_error.is_none());
     }
 
     #[test]

@@ -134,6 +134,7 @@ export default function Providers() {
   const [keyTestResult, setKeyTestResult] = useState<ProviderKeyTestResult>()
   const [previewingSync, setPreviewingSync] = useState(false)
   const [applyingSync, setApplyingSync] = useState(false)
+  const [syncingProviderId, setSyncingProviderId] = useState<number>()
   const [syncTarget, setSyncTarget] = useState<Provider>()
   const [syncPreview, setSyncPreview] = useState<ModelSyncPreview>()
   const [editing, setEditing] = useState<Provider>()
@@ -426,6 +427,18 @@ export default function Providers() {
   const applySync = async (id: number) => {
     const key = `provider-sync-${id}`
     setApplyingSync(true)
+    setSyncingProviderId(id)
+    setItems((current) =>
+      current.map((provider) =>
+        provider.id === id
+          ? {
+              ...provider,
+              models_sync_attempted_at: new Date().toISOString(),
+              models_sync_error: undefined,
+            }
+          : provider,
+      ),
+    )
     message.loading({ content: '正在应用模型同步...', key })
     try {
       const result = await api.post<{ ok: boolean; count: number; message: string }>(`/api/providers/${id}/models/sync`)
@@ -435,8 +448,14 @@ export default function Providers() {
       await load()
     } catch (error) {
       message.error({ content: formatError(error), key, duration: 6 })
+      try {
+        await load()
+      } catch {
+        // Keep the original sync error visible when the refresh also fails.
+      }
     } finally {
       setApplyingSync(false)
+      setSyncingProviderId(undefined)
     }
   }
 
@@ -827,31 +846,40 @@ export default function Providers() {
               title: '模型',
               dataIndex: 'models',
               width: 190,
-              render: (models: string[], record) => (
-                <div>
-                  <div>{models.length ? `${models.length} 个` : '-'}</div>
-                  <Tooltip
-                    title={
-                      record.models_sync_error ||
-                      (record.models_synced_at
-                        ? `同步时间 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm:ss')}`
-                        : undefined)
-                    }
-                  >
-                    <Typography.Text
-                      type={record.models_sync_error ? 'danger' : 'secondary'}
-                      ellipsis
-                      style={{ maxWidth: 170 }}
-                    >
-                      {record.models_sync_error
-                        ? `同步失败：${record.models_sync_error}`
-                        : record.models_synced_at
-                          ? `同步于 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm')}`
-                          : '尚未同步'}
-                    </Typography.Text>
-                  </Tooltip>
-                </div>
-              ),
+              render: (models: string[], record) => {
+                const syncing =
+                  !record.models_sync_error &&
+                  Boolean(record.models_sync_attempted_at) &&
+                  (!record.models_synced_at ||
+                    dayjs(record.models_sync_attempted_at).isAfter(dayjs(record.models_synced_at)))
+                const syncDetail = record.models_sync_error
+                  ? record.models_sync_error
+                  : syncing
+                    ? `开始于 ${dayjs(record.models_sync_attempted_at).format('YYYY-MM-DD HH:mm:ss')}`
+                    : record.models_synced_at
+                      ? `完成于 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm:ss')}`
+                      : undefined
+                return (
+                  <div>
+                    <div>{models.length ? `${models.length} 个` : '-'}</div>
+                    <Tooltip title={syncDetail}>
+                      <Typography.Text
+                        type={record.models_sync_error ? 'danger' : syncing ? 'warning' : 'secondary'}
+                        ellipsis
+                        style={{ maxWidth: 170 }}
+                      >
+                        {record.models_sync_error
+                          ? `同步失败：${record.models_sync_error}`
+                          : syncing
+                            ? '同步中…'
+                            : record.models_synced_at
+                              ? `同步于 ${dayjs(record.models_synced_at).format('YYYY-MM-DD HH:mm')}`
+                              : '尚未同步'}
+                      </Typography.Text>
+                    </Tooltip>
+                  </div>
+                )
+              },
             },
             {
               title: '前缀',
@@ -890,6 +918,7 @@ export default function Providers() {
                     <Button
                       type="text"
                       icon={<SyncOutlined />}
+                      loading={syncingProviderId === record.id}
                       onClick={() => void previewSync(record)}
                     />
                   </Tooltip>

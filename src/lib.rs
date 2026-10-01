@@ -54,6 +54,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     if let Err(error) = crate::api::reconcile_interrupted_usage_requests(&state).await {
         tracing::warn!(%error, "failed to reconcile interrupted usage logs on startup");
     }
+    if let Err(error) = crate::api::reconcile_interrupted_provider_model_syncs(&state).await {
+        tracing::warn!(%error, "failed to reconcile interrupted provider model syncs on startup");
+    }
     let health_state = state.clone();
     tokio::spawn(async move {
         loop {

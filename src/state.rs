@@ -34,6 +34,9 @@ pub struct AppState {
     /// Held behind a read-mostly lock because provider sync refreshes it only
     /// once per TTL.
     pub models_dev: Arc<RwLock<Option<CatalogCache>>>,
+    /// Prevents a manual sync and the scheduled sync worker from fetching the
+    /// same provider concurrently.
+    pub provider_model_sync: Arc<Mutex<HashSet<i64>>>,
 }
 
 /// A fetched models.dev catalog and the instant it was retrieved.
@@ -76,6 +79,7 @@ impl AppState {
             key_touched: Arc::new(Mutex::new(HashMap::new())),
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
+            provider_model_sync: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
