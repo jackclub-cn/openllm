@@ -24,11 +24,11 @@ import {
   Tooltip,
   Typography,
 } from 'antd'
-import { api, formatError, type ModelInfo } from '../api'
+import { api, formatError, getAdminToken, type ApiKey, type ModelInfo } from '../api'
 import PageHeader from '../components/PageHeader'
 import { formatCompact, formatExact } from '../format'
 
-const GATEWAY_KEY = 'openllm-gateway-key'
+const GATEWAY_KEY_ID = 'openllm-gateway-key-id'
 const SETTINGS_KEY = 'openllm-playground-settings'
 
 type PersistedSettings = {
@@ -82,7 +82,11 @@ export default function Playground() {
   const initial = useRef(readSettings())
   const [models, setModels] = useState<ModelOption[]>([])
   const [model, setModel] = useState<string | undefined>(initial.current.model)
-  const [gatewayKey, setGatewayKey] = useState(() => localStorage.getItem(GATEWAY_KEY) || '')
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
+  const [gatewayKeyId, setGatewayKeyId] = useState<number | undefined>(() => {
+    const value = Number(localStorage.getItem(GATEWAY_KEY_ID))
+    return Number.isInteger(value) && value > 0 ? value : undefined
+  })
   const [input, setInput] = useState('')
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [running, setRunning] = useState(false)
@@ -95,17 +99,34 @@ export default function Playground() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const selected = models.find((item) => item.id === model)
   const capabilities = selected?.capabilities
+  const selectableApiKeys = apiKeys.filter(
+    (key) =>
+      key.enabled && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now()),
+  )
+  const selectedApiKey = selectableApiKeys.find((key) => key.id === gatewayKeyId)
   // Never let the form submit above what the model (or route barrel) accepts;
   // the gateway clamps too, but surfacing the real ceiling avoids a surprise.
   const outputLimit = capabilities?.output_limit
 
   const loadModels = useCallback(async () => {
     try {
-      const result = await api.get<ModelOption[]>('/api/models')
-      setModels(result)
+      const [modelResult, keyResult] = await Promise.all([
+        api.get<ModelOption[]>('/api/models'),
+        api.get<ApiKey[]>('/api/api-keys'),
+      ])
+      setModels(modelResult)
+      setApiKeys(keyResult)
       setModel((current) => {
-        if (current && result.some((item) => item.id === current)) return current
-        return result[0]?.id
+        if (current && modelResult.some((item) => item.id === current)) return current
+        return modelResult[0]?.id
+      })
+      setGatewayKeyId((current) => {
+        const selectable = keyResult.filter(
+          (key) =>
+            key.enabled && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now()),
+        )
+        if (current && selectable.some((key) => key.id === current)) return current
+        return selectable[0]?.id
       })
       setLoadError('')
     } catch (error) {
@@ -124,6 +145,11 @@ export default function Playground() {
       JSON.stringify({ model, temperature, maxTokens } satisfies PersistedSettings),
     )
   }, [maxTokens, model, temperature])
+
+  useEffect(() => {
+    if (gatewayKeyId) localStorage.setItem(GATEWAY_KEY_ID, String(gatewayKeyId))
+    else localStorage.removeItem(GATEWAY_KEY_ID)
+  }, [gatewayKeyId])
 
   const regenerate = async () => {
     if (running) return
@@ -170,8 +196,10 @@ export default function Playground() {
       message.warning('请先选择模型')
       return
     }
-    if (gatewayKey) localStorage.setItem(GATEWAY_KEY, gatewayKey)
-    else localStorage.removeItem(GATEWAY_KEY)
+    if (apiKeys.length > 0 && !selectedApiKey) {
+      message.warning('请选择网关 API Key')
+      return
+    }
 
     const userMessage: ChatMessage = { id: crypto.randomUUID(), role: 'user', content }
     const assistantMessage: ChatMessage = {
@@ -200,8 +228,10 @@ export default function Playground() {
 
     try {
       const headers = new Headers({ 'Content-Type': 'application/json' })
-      if (gatewayKey) headers.set('Authorization', `Bearer ${gatewayKey}`)
-      const response = await fetch('/v1/chat/completions', {
+      const adminToken = getAdminToken()
+      if (adminToken) headers.set('x-admin-token', adminToken)
+      if (selectedApiKey) headers.set('x-openllm-api-key-id', String(selectedApiKey.id))
+      const response = await fetch('/api/playground/chat/completions', {
         method: 'POST',
         headers,
         signal: controller.signal,
@@ -407,7 +437,12 @@ export default function Playground() {
               {running ? (
                 <Button danger icon={<StopOutlined />} onClick={stop}>停止</Button>
               ) : (
-                <Button type="primary" icon={<SendOutlined />} disabled={!input.trim() || !model} onClick={() => void send()}>
+                <Button
+                  type="primary"
+                  icon={<SendOutlined />}
+                  disabled={!input.trim() || !model || (apiKeys.length > 0 && !selectedApiKey)}
+                  onClick={() => void send()}
+                >
                   发送
                 </Button>
               )}
@@ -430,12 +465,24 @@ export default function Playground() {
             </div>
             <div>
               <Typography.Text strong>网关 API Key</Typography.Text>
-              <Input.Password
+              <Select
                 className="settings-control"
-                value={gatewayKey}
-                onChange={(event) => setGatewayKey(event.target.value)}
-                placeholder="未启用鉴权时可留空"
-                autoComplete="off"
+                showSearch
+                optionFilterProp="label"
+                value={gatewayKeyId}
+                onChange={setGatewayKeyId}
+                placeholder={apiKeys.length ? '选择网关 API Key' : '未启用网关鉴权'}
+                disabled={!apiKeys.length}
+                options={apiKeys.map((key) => {
+                  const expired =
+                    Boolean(key.expires_at) &&
+                    new Date(key.expires_at as string).getTime() <= Date.now()
+                  return {
+                    value: key.id,
+                    label: `${key.name} (${key.key_suffix})${key.enabled && !expired ? '' : ' · 不可用'}`,
+                    disabled: !key.enabled || expired,
+                  }
+                })}
               />
             </div>
             <div>

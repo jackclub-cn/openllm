@@ -28,6 +28,7 @@ use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const CONSOLE_API_KEY_ID_HEADER: &str = "x-openllm-api-key-id";
 const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 const SESSION_ID_MAX_CHARS: usize = 256;
 #[cfg(test)]
@@ -1836,12 +1837,37 @@ pub async fn proxy_openai(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let result = proxy_openai_inner(&state, &headers, &uri, &body, &request_id).await;
+    let result = proxy_openai_inner(&state, &headers, &uri, &body, &request_id, None).await;
     let response = match result {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
     with_gateway_request_id(response, &request_id)
+}
+
+pub async fn proxy_openai_console(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = proxy_openai_console_inner(&state, &headers, &body, &request_id).await;
+    let response = match result {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    };
+    with_gateway_request_id(response, &request_id)
+}
+
+async fn proxy_openai_console_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    request_id: &str,
+) -> AppResult<Response> {
+    let api_key = selected_console_api_key(state, headers).await?;
+    let uri = Uri::from_static(OPENAI_CHAT_COMPLETIONS);
+    proxy_openai_inner(state, headers, &uri, body, request_id, api_key).await
 }
 
 async fn proxy_openai_inner(
@@ -1850,6 +1876,7 @@ async fn proxy_openai_inner(
     uri: &Uri,
     body: &Bytes,
     request_id: &str,
+    api_key_override: Option<ApiKeyRecord>,
 ) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
@@ -1864,7 +1891,10 @@ async fn proxy_openai_inner(
         .unwrap_or(false);
     let request_tokens = estimate_request_tokens(&request_json);
 
-    let api_key = authenticate_gateway(state, headers).await?;
+    let api_key = match api_key_override {
+        Some(api_key) => Some(api_key),
+        None => authenticate_gateway(state, headers).await?,
+    };
     enforce_policy_or_log(
         state,
         api_key.as_ref(),
@@ -3216,6 +3246,46 @@ fn openai_stream_chunk(
         value["choices"] = json!([]);
     }
     value
+}
+
+async fn selected_console_api_key(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> AppResult<Option<ApiKeyRecord>> {
+    let key_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys")
+        .fetch_one(&state.pool)
+        .await?;
+    let selected_id = headers
+        .get(CONSOLE_API_KEY_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<i64>()
+                .map_err(|_| AppError::BadRequest("invalid gateway API key id".to_string()))
+        })
+        .transpose()?;
+
+    let Some(key_id) = selected_id else {
+        if key_count > 0 {
+            return Err(AppError::BadRequest(
+                "select a gateway API key for the playground".to_string(),
+            ));
+        }
+        return Ok(None);
+    };
+
+    sqlx::query_as::<_, ApiKeyRecord>(
+        "SELECT * FROM api_keys \
+         WHERE id = ? AND enabled = 1 \
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+    )
+    .bind(key_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .map(Some)
+    .ok_or_else(|| AppError::BadRequest("selected gateway API key is unavailable".to_string()))
 }
 
 async fn authenticate_gateway(
@@ -5713,6 +5783,63 @@ mod tests {
             .to_str()
             .unwrap();
         assert_eq!(response.headers().get("x-request-id").unwrap(), request_id);
+    }
+
+    #[tokio::test]
+    async fn console_api_key_selection_uses_id_without_exposing_secret() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE api_keys (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                key_prefix TEXT NOT NULL,
+                key_suffix TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                last_used_at TEXT,
+                created_at TEXT NOT NULL,
+                daily_token_limit INTEGER,
+                daily_cost_limit_micros INTEGER,
+                requests_per_minute INTEGER,
+                max_concurrency INTEGER,
+                allowed_models TEXT,
+                expires_at TEXT
+             )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO api_keys (
+                id, name, key_hash, key_prefix, key_suffix, enabled, created_at
+             ) VALUES (7, 'Console', 'hash', 'sk-con', 'sole', 1, '2026-10-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+
+        let error = selected_console_api_key(&state, &HeaderMap::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AppError::BadRequest(message) if message.contains("select a gateway API key")
+        ));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(CONSOLE_API_KEY_ID_HEADER, HeaderValue::from_static("7"));
+        let key = selected_console_api_key(&state, &headers)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(key.id, 7);
+        assert_eq!(key.name, "Console");
+        assert_eq!(key.key_suffix, "sole");
     }
 
     #[test]

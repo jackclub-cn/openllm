@@ -6,10 +6,8 @@ import {
   DollarOutlined,
   NodeIndexOutlined,
   PauseCircleOutlined,
-  PercentageOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
-  TeamOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import {
@@ -207,46 +205,6 @@ export default function Dashboard() {
             suffix="USD"
             icon={<DatabaseOutlined />}
             tone="blue"
-          />
-        </Col>
-      </Row>
-
-      <Row gutter={[16, 16]} className="section-row">
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="会话数"
-            value={data.range_sessions}
-            icon={<TeamOutlined />}
-            tone="blue"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="会话请求覆盖"
-            value={data.range_session_coverage}
-            precision={1}
-            suffix="%"
-            icon={<PercentageOutlined />}
-            tone="green"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="平均会话请求数"
-            value={data.range_avg_requests_per_session}
-            precision={1}
-            icon={<ApiOutlined />}
-            tone="cyan"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="会话缓存命中率"
-            value={data.range_session_cache_hit_rate}
-            precision={1}
-            suffix="%"
-            icon={<DatabaseOutlined />}
-            tone="purple"
           />
         </Col>
       </Row>

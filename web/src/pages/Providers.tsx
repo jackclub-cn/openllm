@@ -862,46 +862,15 @@ export default function Providers() {
             {
               title: '状态',
               dataIndex: 'enabled',
-              width: 190,
+              width: 100,
               render: (value: boolean, record) => (
-                <Space direction="vertical" size={6}>
-                  <Switch
-                    checked={value}
-                    loading={togglingProviderId === record.id}
-                    checkedChildren="启用"
-                    unCheckedChildren="停用"
-                    onChange={(checked) => void toggleEnabled(record, checked)}
-                  />
-                  <Tooltip
-                    title={(() => {
-                      const checked = record.tool_search_checked_at
-                        ? `上次探测 ${dayjs(record.tool_search_checked_at).format('YYYY-MM-DD HH:mm:ss')}；`
-                        : '尚未探测；'
-                      if (!record.tool_search_checked_at) {
-                        return `${checked}连接测试或健康检查后会自动更新`
-                      }
-                      return record.tool_search_supported
-                        ? `${checked}当前直接转发 tool_search`
-                        : `${checked}上游拒绝时会在转发前移除 tool_search`
-                    })()}
-                  >
-                    <Tag
-                      color={
-                        !record.tool_search_checked_at
-                          ? 'default'
-                          : record.tool_search_supported
-                            ? 'blue'
-                            : 'orange'
-                      }
-                    >
-                      {!record.tool_search_checked_at
-                        ? '工具搜索待探测'
-                        : record.tool_search_supported
-                          ? '工具搜索原生支持'
-                          : '工具搜索自动兼容'}
-                    </Tag>
-                  </Tooltip>
-                </Space>
+                <Switch
+                  checked={value}
+                  loading={togglingProviderId === record.id}
+                  checkedChildren="启用"
+                  unCheckedChildren="停用"
+                  onChange={(checked) => void toggleEnabled(record, checked)}
+                />
               ),
             },
             {

@@ -32,7 +32,8 @@ use crate::api::{
 use crate::assets::static_handler;
 use crate::db::Database;
 use crate::proxy::{
-    count_tokens_anthropic, proxy_anthropic, proxy_openai, public_model, public_models,
+    count_tokens_anthropic, proxy_anthropic, proxy_openai, proxy_openai_console, public_model,
+    public_models,
 };
 use crate::state::AppState;
 
@@ -113,6 +114,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api-keys/{id}/rotate", post(rotate_api_key))
         .route("/api-keys/{id}", put(update_api_key).delete(delete_api_key))
+        .route("/playground/chat/completions", post(proxy_openai_console))
         .route("/usage", get(list_usage))
         .route("/usage/export", get(export_usage))
         .route("/usage/cleanup", post(cleanup_usage))

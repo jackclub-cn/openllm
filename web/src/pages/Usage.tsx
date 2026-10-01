@@ -573,19 +573,6 @@ export default function Usage() {
               render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm:ss'),
             },
             {
-              title: '会话 ID',
-              dataIndex: 'session_id',
-              width: 150,
-              render: (value: string | undefined) =>
-                value ? (
-                  <Typography.Text copyable={{ text: value }} ellipsis style={{ maxWidth: 140 }}>
-                    {value}
-                  </Typography.Text>
-                ) : (
-                  '-'
-                ),
-            },
-            {
               title: '模型',
               dataIndex: 'requested_model',
               width: 170,
@@ -615,6 +602,19 @@ export default function Usage() {
                 </div>
               ),
             },
+            {
+              title: '访问密钥',
+              dataIndex: 'api_key_name',
+              width: 140,
+              render: (value: string | undefined, record) =>
+                value ? (
+                  <Tag color="geekblue">{value}</Tag>
+                ) : (
+                  <Typography.Text type="secondary">
+                    {record.api_key_id ? `#${record.api_key_id}` : '匿名调用'}
+                  </Typography.Text>
+                ),
+            },
             { title: '接口', dataIndex: 'endpoint', width: 180, render: (value: string) => <Typography.Text code>{value}</Typography.Text> },
             {
               title: '状态',
@@ -628,10 +628,10 @@ export default function Usage() {
                 ),
             },
             {
-              title: '输入 tokens',
-              dataIndex: 'prompt_tokens',
-              width: 120,
-              render: (value: number, record) => {
+              title: 'tokens',
+              key: 'tokens',
+              width: 150,
+              render: (_, record) => {
                 if (record.in_flight) {
                   return <Typography.Text type="secondary">-</Typography.Text>
                 }
@@ -639,9 +639,16 @@ export default function Usage() {
                 return (
                   <div>
                     <Tooltip
-                      title={`输入 ${formatExact(value)} / 总 tokens ${formatExact(record.total_tokens)}`}
+                      title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)} / 总 tokens ${formatExact(record.total_tokens)}`}
                     >
-                      <span>{formatCompact(value)}</span>
+                      <div>
+                        <Typography.Text type="secondary">输入 </Typography.Text>
+                        {formatCompact(record.prompt_tokens)}
+                      </div>
+                      <div>
+                        <Typography.Text type="secondary">输出 </Typography.Text>
+                        {formatCompact(record.completion_tokens)}
+                      </div>
                     </Tooltip>
                     {cached > 0 && (
                       <div>
@@ -657,17 +664,6 @@ export default function Usage() {
                   </div>
                 )
               },
-            },
-            {
-              title: '输出 tokens',
-              dataIndex: 'completion_tokens',
-              width: 110,
-              render: (value: number, record) =>
-                record.in_flight ? (
-                  <Typography.Text type="secondary">-</Typography.Text>
-                ) : (
-                  <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-                ),
             },
             {
               title: '总用时',
