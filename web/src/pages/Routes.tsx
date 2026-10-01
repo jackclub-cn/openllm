@@ -396,19 +396,36 @@ export default function RoutesPage() {
                     const endpoints = target.supported_endpoints?.map((endpoint) =>
                       endpoint.replace(/^\/v1/, ''),
                     )
+                    const available =
+                      target.enabled &&
+                      target.provider_enabled !== false &&
+                      target.model_enabled !== false
+                    const unavailableReason = !target.enabled
+                      ? '目标已停用'
+                      : target.provider_enabled === false
+                        ? '提供商已停用'
+                        : target.model_enabled === false
+                          ? '模型已停用'
+                          : ''
                     return (
                       <Tooltip
                         key={`${target.id ?? index}-${target.provider_id}`}
                         title={
-                          endpoints?.length
-                            ? `支持接口：${endpoints.join('、')}`
-                            : '未声明接口限制，所有兼容接口均可尝试'
+                          [
+                            unavailableReason,
+                            endpoints?.length
+                              ? `支持接口：${endpoints.join('、')}`
+                              : '未声明接口限制，所有兼容接口均可尝试',
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')
                         }
                       >
-                        <Tag color={target.enabled ? 'cyan' : 'default'}>
+                        <Tag color={available ? 'cyan' : 'default'}>
                           {target.provider_name} / {target.model_prefix || ''}
                           {target.upstream_model}
                           {endpoints?.length ? ` · ${endpoints.join(', ')}` : ''}
+                          {!available ? ' · 不可用' : ''}
                         </Tag>
                       </Tooltip>
                     )

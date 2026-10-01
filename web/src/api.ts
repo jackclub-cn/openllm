@@ -271,6 +271,8 @@ export type RouteTarget = {
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
+  provider_enabled?: boolean
+  model_enabled?: boolean
   model_prefix?: string
   weight: number
   priority: number

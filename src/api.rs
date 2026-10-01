@@ -3458,6 +3458,7 @@ async fn route_targets(state: &AppState, route_id: Option<i64>) -> AppResult<Vec
                COALESCE(pm.context_override, pm.context_limit) AS context_limit,
                COALESCE(pm.input_override, pm.input_limit) AS input_limit,
                COALESCE(pm.output_override, pm.output_limit) AS output_limit,
+               COALESCE(pm.enabled, 1) AS model_enabled,
                p.tool_search_supported,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
@@ -3481,7 +3482,11 @@ async fn route_targets(state: &AppState, route_id: Option<i64>) -> AppResult<Vec
 fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> RouteView {
     let enabled_targets = targets
         .iter()
-        .filter(|target| target.enabled != 0)
+        .filter(|target| {
+            target.enabled != 0
+                && target.provider_enabled.unwrap_or(1) != 0
+                && target.model_enabled.unwrap_or(1) != 0
+        })
         .collect::<Vec<_>>();
     let mut incomplete = enabled_targets.is_empty();
     let capabilities = enabled_targets
@@ -3528,6 +3533,8 @@ fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> RouteView {
                 context_limit: target.context_limit,
                 input_limit: target.input_limit,
                 output_limit: target.output_limit,
+                provider_enabled: target.provider_enabled.unwrap_or(1) != 0,
+                model_enabled: target.model_enabled.unwrap_or(1) != 0,
                 model_prefix: target.model_prefix,
                 weight: target.weight,
                 priority: target.priority,
@@ -5868,7 +5875,7 @@ mod tests {
             .unwrap();
         }
 
-        let Json(routes) = list_routes(State(state)).await.unwrap();
+        let Json(routes) = list_routes(State(state.clone())).await.unwrap();
         assert_eq!(routes.len(), 2);
         let first = routes.iter().find(|route| route.id == 1).unwrap();
         assert_eq!(first.context_limit, Some(100_000));
@@ -5878,9 +5885,22 @@ mod tests {
         assert_eq!(first.targets.len(), 2);
         assert_eq!(first.targets[0].upstream_model, "alpha");
         assert_eq!(first.targets[1].upstream_model, "alpha-backup");
+        assert!(first.targets[0].provider_enabled);
+        assert!(first.targets[0].model_enabled);
         let second = routes.iter().find(|route| route.id == 2).unwrap();
         assert_eq!(second.targets.len(), 1);
         assert_eq!(second.targets[0].upstream_model, "beta");
+
+        sqlx::query("UPDATE providers SET enabled = 0 WHERE id = 2")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let Json(routes) = list_routes(State(state.clone())).await.unwrap();
+        let first = routes.iter().find(|route| route.id == 1).unwrap();
+        assert_eq!(first.input_limit, Some(80_000));
+        assert_eq!(first.output_limit, Some(40_000));
+        assert!(first.limits_verified);
+        assert!(!first.targets[1].provider_enabled);
     }
 
     #[tokio::test]

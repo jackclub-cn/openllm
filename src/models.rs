@@ -456,6 +456,13 @@ pub struct RouteTarget {
     pub input_limit: Option<i64>,
     #[sqlx(default)]
     pub output_limit: Option<i64>,
+    /// Provider/model availability as loaded by management queries. Runtime
+    /// queries may omit these columns because they already filter disabled
+    /// targets.
+    #[sqlx(default)]
+    pub provider_enabled: Option<i64>,
+    #[sqlx(default)]
+    pub model_enabled: Option<i64>,
     pub tool_search_supported: i64,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
@@ -505,6 +512,8 @@ pub struct RouteTargetView {
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
     pub output_limit: Option<i64>,
+    pub provider_enabled: bool,
+    pub model_enabled: bool,
     pub model_prefix: String,
     pub weight: i64,
     pub priority: i64,
