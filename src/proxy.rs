@@ -1396,7 +1396,7 @@ async fn proxy_anthropic_inner(
         return Err(error);
     }
     let route_id = resolved.route_id;
-    let requested_output_tokens = request_json.get("max_tokens").and_then(Value::as_i64);
+    let requested_output_tokens = requested_output_tokens_of(&request_json);
     let clamped_output_tokens = clamp_output_request(&mut request_json, resolved.barrel.as_ref());
     let receipt = capability_receipt(
         resolved.barrel.as_ref(),
@@ -1938,10 +1938,7 @@ async fn proxy_openai_inner(
     // Barrel mode: clamp the requested output length to the strictest common
     // ceiling across every target, so no target is picked that would reject the
     // request as too large.
-    let requested_output_tokens = request_json
-        .get("max_tokens")
-        .or_else(|| request_json.get("max_completion_tokens"))
-        .and_then(Value::as_i64);
+    let requested_output_tokens = requested_output_tokens_of(&request_json);
     let clamped_output_tokens = clamp_output_request(&mut request_json, resolved.barrel.as_ref());
     let receipt = capability_receipt(
         resolved.barrel.as_ref(),
@@ -5278,7 +5275,7 @@ fn clamp_output_request(body: &mut Value, barrel: Option<&BarrelEnvelope>) -> Op
         .and_then(|barrel| barrel.capabilities.as_ref())
         .and_then(|capabilities| capabilities.output_limit)?;
     let mut clamped = None;
-    for key in ["max_tokens", "max_completion_tokens"] {
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
         if let Some(requested) = body.get(key).and_then(Value::as_i64)
             && requested > limit
         {
@@ -5287,6 +5284,12 @@ fn clamp_output_request(body: &mut Value, barrel: Option<&BarrelEnvelope>) -> Op
         }
     }
     clamped
+}
+
+fn requested_output_tokens_of(body: &Value) -> Option<i64> {
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .into_iter()
+        .find_map(|key| body.get(key).and_then(Value::as_i64))
 }
 
 /// Builds the capability receipt returned alongside a completion.
@@ -8081,6 +8084,18 @@ mod tests {
         let mut body = json!({"model": "m", "max_completion_tokens": 5000});
         assert_eq!(clamp_output_request(&mut body, Some(&barrel)), Some(1000));
         assert_eq!(body["max_completion_tokens"], 1000);
+    }
+
+    #[test]
+    fn clamps_responses_max_output_tokens_too() {
+        let barrel = barrel_with_output_limit(Some(1000));
+        let mut body = json!({"model": "m", "max_output_tokens": 5000});
+        assert_eq!(clamp_output_request(&mut body, Some(&barrel)), Some(1000));
+        assert_eq!(body["max_output_tokens"], 1000);
+        assert_eq!(
+            requested_output_tokens_of(&json!({"max_output_tokens": 5000})),
+            Some(5000)
+        );
     }
 
     #[test]
