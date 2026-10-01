@@ -2088,8 +2088,25 @@ fn strip_tool_search_tools(body: &Value) -> Option<Value> {
 
 pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     let message = String::from_utf8_lossy(body).to_ascii_lowercase();
-    message.contains("tool_search")
-        && (message.contains("unknown tool type") || message.contains("tool.type"))
+    if !message.contains("tool_search") {
+        return false;
+    }
+    [
+        "unknown tool type",
+        "unsupported tool type",
+        "invalid tool type",
+        "tool.type",
+        "tool_search is not supported",
+        "tool_search not supported",
+        "tool_search is unsupported",
+        "does not support tool_search",
+        "doesn't support tool_search",
+        "unsupported tool_search",
+        "unknown tool: tool_search",
+        "unsupported tool: tool_search",
+    ]
+    .iter()
+    .any(|pattern| message.contains(pattern))
 }
 
 async fn mark_provider_tool_search_unsupported(state: &AppState, provider_id: i64) {
@@ -7895,15 +7912,24 @@ mod tests {
 
     #[test]
     fn recognizes_unsupported_tool_search_error() {
-        let error = br#"{
-            "type": "BadRequest",
-            "code": "InvalidParameter",
-            "message": "The parameter `tool.type` specified in the request are not valid: The parameter `type` specified in the request are not valid: unknown tool type: tool_search."
-        }"#;
-        assert!(upstream_rejects_tool_search(error));
-        assert!(!upstream_rejects_tool_search(
-            br#"{"error":{"message":"rate limit exceeded"}}"#
-        ));
+        for error in [
+            r#"{
+                "type": "BadRequest",
+                "code": "InvalidParameter",
+                "message": "The parameter `tool.type` specified in the request are not valid: The parameter `type` specified in the request are not valid: unknown tool type: tool_search."
+            }"#,
+            r#"{"error":{"message":"unsupported tool type: tool_search"}}"#,
+            r#"{"error":{"message":"tool_search is not supported by this model"}}"#,
+            r#"{"error":{"message":"unknown tool: tool_search"}}"#,
+        ] {
+            assert!(upstream_rejects_tool_search(error.as_bytes()));
+        }
+        for error in [
+            r#"{"error":{"message":"rate limit exceeded"}}"#,
+            r#"{"error":{"message":"tool_search returned an invalid result"}}"#,
+        ] {
+            assert!(!upstream_rejects_tool_search(error.as_bytes()));
+        }
     }
 
     #[tokio::test]
