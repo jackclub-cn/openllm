@@ -277,13 +277,51 @@ body {
 
 .target-row {
   display: grid;
-  grid-template-columns: 1.1fr 1.5fr 100px 100px 92px 40px;
+  grid-template-columns: 32px 1.1fr 1.5fr 100px 100px 92px 40px;
   gap: 8px;
   align-items: start;
   padding: 12px;
   border: 1px solid #e6eaf0;
   border-radius: 8px;
   background: #fafcff;
+  transition:
+    border-color 0.2s,
+    box-shadow 0.2s,
+    opacity 0.2s;
+}
+
+.target-row-dragging {
+  opacity: 0.5;
+}
+
+.target-row-drag-over {
+  border-color: #1677ff;
+  box-shadow: 0 0 0 2px rgb(22 119 255 / 14%);
+}
+
+.target-drag-handle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  color: #8c8c8c;
+  border-radius: 6px;
+  cursor: grab;
+  transition:
+    color 0.2s,
+    background-color 0.2s;
+}
+
+.target-drag-handle:hover,
+.target-drag-handle:focus-visible {
+  color: #1677ff;
+  background: #e6f4ff;
+  outline: none;
+}
+
+.target-drag-handle:active {
+  cursor: grabbing;
 }
 
 .target-row .ant-form-item {

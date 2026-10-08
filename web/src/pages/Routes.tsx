@@ -4,6 +4,7 @@ import {
   EditOutlined,
   ExperimentOutlined,
   HistoryOutlined,
+  HolderOutlined,
   PlusOutlined,
   SearchOutlined,
 } from '@ant-design/icons'
@@ -100,6 +101,8 @@ export default function RoutesPage() {
   const [diagnoseSessionId, setDiagnoseSessionId] = useState('')
   const [diagnosing, setDiagnosing] = useState(false)
   const [diagnosis, setDiagnosis] = useState<RouteDiagnose>()
+  const [draggedTargetIndex, setDraggedTargetIndex] = useState<number>()
+  const [dragOverTargetIndex, setDragOverTargetIndex] = useState<number>()
   const [searchParams, setSearchParams] = useSearchParams()
   const handledDiagnosisQuery = useRef('')
   const [form] = Form.useForm<FormValues>()
@@ -155,6 +158,18 @@ export default function RoutesPage() {
     } finally {
       setSaving(false)
     }
+  }
+
+  const reorderTargets = (from: number, to: number) => {
+    if (from === to) return
+    const targets = [...(form.getFieldValue('targets') as RouteTarget[] | undefined ?? [])]
+    const [moved] = targets.splice(from, 1)
+    if (!moved) return
+    targets.splice(to, 0, moved)
+    form.setFieldValue(
+      'targets',
+      targets.map((target, index) => ({ ...target, priority: index })),
+    )
   }
 
   const remove = async (id: number) => {
@@ -507,7 +522,69 @@ export default function RoutesPage() {
             {(fields, { add, remove: removeTarget }) => (
               <Space direction="vertical" size={12} style={{ width: '100%' }}>
                 {fields.map((field) => (
-                  <div className="target-row" key={field.key}>
+                  <div
+                    className={[
+                      'target-row',
+                      draggedTargetIndex === field.name ? 'target-row-dragging' : '',
+                      dragOverTargetIndex === field.name ? 'target-row-drag-over' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ')}
+                    key={field.key}
+                    onDragOver={(event) => {
+                      if (draggedTargetIndex === undefined) return
+                      event.preventDefault()
+                      event.dataTransfer.dropEffect = 'move'
+                      setDragOverTargetIndex(field.name)
+                    }}
+                    onDragLeave={(event) => {
+                      const relatedTarget = event.relatedTarget
+                      if (
+                        !(relatedTarget instanceof Node) ||
+                        !event.currentTarget.contains(relatedTarget)
+                      ) {
+                        setDragOverTargetIndex((current) =>
+                          current === field.name ? undefined : current,
+                        )
+                      }
+                    }}
+                    onDrop={(event) => {
+                      event.preventDefault()
+                      if (draggedTargetIndex !== undefined) {
+                        reorderTargets(draggedTargetIndex, field.name)
+                      }
+                      setDraggedTargetIndex(undefined)
+                      setDragOverTargetIndex(undefined)
+                    }}
+                  >
+                    <Tooltip title="拖拽调整顺序，也可使用方向键">
+                      <span
+                        aria-label="拖拽调整顺序"
+                        className="target-drag-handle"
+                        draggable
+                        role="button"
+                        tabIndex={0}
+                        onDragStart={(event) => {
+                          setDraggedTargetIndex(field.name)
+                          event.dataTransfer.effectAllowed = 'move'
+                          event.dataTransfer.setData('text/plain', String(field.name))
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return
+                          event.preventDefault()
+                          const to = event.key === 'ArrowUp' ? field.name - 1 : field.name + 1
+                          if (to < 0 || to >= fields.length) return
+                          reorderTargets(field.name, to)
+                          setDragOverTargetIndex(to)
+                        }}
+                        onDragEnd={() => {
+                          setDraggedTargetIndex(undefined)
+                          setDragOverTargetIndex(undefined)
+                        }}
+                      >
+                        <HolderOutlined />
+                      </span>
+                    </Tooltip>
                     <Form.Item
                       {...field}
                       name={[field.name, 'provider_id']}
