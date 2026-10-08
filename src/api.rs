@@ -839,6 +839,7 @@ pub async fn update_provider(
         .await?;
     }
     tx.commit().await?;
+    state.provider_cooldown.lock().await.remove(&id);
 
     if api_keys_changed {
         let current_key_ids =
@@ -880,6 +881,7 @@ pub async fn delete_provider(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("provider not found".to_string()));
     }
+    state.provider_cooldown.lock().await.remove(&id);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1560,6 +1562,9 @@ async fn persist_provider_test(
     .bind(provider_id)
     .execute(&state.pool)
     .await?;
+    if result.ok {
+        state.provider_cooldown.lock().await.remove(&provider_id);
+    }
     Ok(())
 }
 

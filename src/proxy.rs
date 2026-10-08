@@ -1492,6 +1492,7 @@ async fn proxy_anthropic_inner(
         match result {
             Ok(response) => {
                 if response.status().is_success() {
+                    mark_provider_success(state, target_provider_id).await;
                     mark_provider_api_key_success(state, target_provider_key_id).await;
                 }
                 return Ok(response);
@@ -1568,9 +1569,7 @@ async fn forward_anthropic_native(
     request = apply_opencode_session_header(request, &target, session_id);
     request = apply_custom_headers(request, &target.provider_headers)?;
 
-    let response = request.send().await.map_err(|error| {
-        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-    })?;
+    let response = send_provider_request(state, &target, request).await?;
     let status = response.status();
     if !status.is_success() {
         let response_body = response
@@ -1581,6 +1580,9 @@ async fn forward_anthropic_native(
             .chars()
             .take(600)
             .collect::<String>();
+        if retryable_status(status) {
+            mark_provider_error(state, target.provider_id, Some(status)).await;
+        }
         if provider_key_failure(status) {
             mark_provider_api_key_error(
                 state,
@@ -1715,9 +1717,7 @@ async fn forward_openai_as_anthropic(
     request = apply_opencode_session_header(request, &target, session_id);
     request = apply_custom_headers(request, &target.provider_headers)?;
 
-    let response = request.send().await.map_err(|error| {
-        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-    })?;
+    let response = send_provider_request(state, &target, request).await?;
     let status = response.status();
     if !status.is_success() {
         let response_body = response
@@ -1728,6 +1728,9 @@ async fn forward_openai_as_anthropic(
             .chars()
             .take(600)
             .collect::<String>();
+        if retryable_status(status) {
+            mark_provider_error(state, target.provider_id, Some(status)).await;
+        }
         if provider_key_failure(status) {
             mark_provider_api_key_error(
                 state,
@@ -2022,6 +2025,7 @@ async fn proxy_openai_inner(
         {
             Ok(response) => {
                 if response.status().is_success() {
+                    mark_provider_success(state, target_provider_id).await;
                     mark_provider_api_key_success(state, target_provider_key_id).await;
                 }
                 return Ok(response);
@@ -2171,6 +2175,9 @@ async fn upstream_error_response(
         .take(600)
         .collect::<String>();
 
+    if retryable_status(status) {
+        mark_provider_error(state, target.provider_id, Some(status)).await;
+    }
     if provider_key_failure(status) {
         mark_provider_api_key_error(
             state,
@@ -2266,19 +2273,19 @@ async fn forward_to_target(
         request_body = compat_body;
     }
 
-    let mut response = build_upstream_request(
+    let mut response = send_provider_request(
         state,
-        &url,
-        provider_type,
         &target,
-        &request_body,
-        session_id,
-    )?
-    .send()
-    .await
-    .map_err(|error| {
-        AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-    })?;
+        build_upstream_request(
+            state,
+            &url,
+            provider_type,
+            &target,
+            &request_body,
+            session_id,
+        )?,
+    )
+    .await?;
     let mut status = response.status();
 
     if !status.is_success() {
@@ -2300,19 +2307,19 @@ async fn forward_to_target(
                 );
                 mark_provider_tool_search_unsupported(state, target.provider_id).await;
                 request_body = compat_body;
-                response = build_upstream_request(
+                response = send_provider_request(
                     state,
-                    &url,
-                    provider_type,
                     &target,
-                    &request_body,
-                    session_id,
-                )?
-                .send()
-                .await
-                .map_err(|error| {
-                    AppError::Upstream(format!("{} request failed: {error}", target.provider_name))
-                })?;
+                    build_upstream_request(
+                        state,
+                        &url,
+                        provider_type,
+                        &target,
+                        &request_body,
+                        session_id,
+                    )?,
+                )
+                .await?;
                 status = response.status();
                 if !status.is_success() {
                     let response_headers = response.headers().clone();
@@ -4460,6 +4467,13 @@ fn provider_health_rank(health: Option<i64>) -> u8 {
 
 const PROVIDER_KEY_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
+fn provider_cooldown(status: Option<StatusCode>) -> Duration {
+    match status {
+        Some(StatusCode::TOO_MANY_REQUESTS) => Duration::from_secs(30),
+        _ => Duration::from_secs(20),
+    }
+}
+
 fn provider_key_cooldown(status: StatusCode) -> Duration {
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => Duration::from_secs(300),
@@ -4497,6 +4511,35 @@ async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Optio
             tracing::warn!(%error, provider_api_key_id, "failed to update provider key usage");
         }
     });
+}
+
+async fn mark_provider_error(state: &AppState, provider_id: i64, status: Option<StatusCode>) {
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(provider_id, Instant::now() + provider_cooldown(status));
+}
+
+async fn mark_provider_success(state: &AppState, provider_id: i64) {
+    state.provider_cooldown.lock().await.remove(&provider_id);
+}
+
+async fn send_provider_request(
+    state: &AppState,
+    target: &RouteTarget,
+    request: RequestBuilder,
+) -> AppResult<reqwest::Response> {
+    match request.send().await {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            mark_provider_error(state, target.provider_id, None).await;
+            Err(AppError::Upstream(format!(
+                "{} request failed: {error}",
+                target.provider_name
+            )))
+        }
+    }
 }
 
 async fn mark_provider_api_key_error(
@@ -4788,6 +4831,20 @@ async fn order_targets(
             }
         }
     }
+    // Prefer providers outside their runtime cooldown window. If every
+    // candidate is cooling, keep them all so an all-cooling route still has a
+    // chance to recover instead of failing before it reaches the upstream.
+    let mut provider_cooldowns = state.provider_cooldown.lock().await;
+    let now = Instant::now();
+    provider_cooldowns.retain(|_, until| *until > now);
+    if targets
+        .iter()
+        .any(|target| !provider_cooldowns.contains_key(&target.provider_id))
+    {
+        targets.retain(|target| !provider_cooldowns.contains_key(&target.provider_id));
+    }
+    drop(provider_cooldowns);
+
     // Keep strategy order within each health group, but try explicitly failed
     // providers last. Unknown health stays ahead of failed providers so a
     // previously-tested outage does not permanently suppress a recovery.
@@ -7908,6 +7965,94 @@ mod tests {
                 .iter()
                 .all(|target| target.provider_api_key_id.is_some())
         );
+    }
+
+    #[tokio::test]
+    async fn provider_cooldowns_skip_cooling_providers_when_alternatives_exist() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (
+                id, name, provider_type, base_url, model_prefix, enabled
+             ) VALUES
+                (1, 'Cooling', 'openai', 'https://cooling.example/v1', '', 1),
+                (2, 'Healthy', 'openai', 'https://healthy.example/v1', '', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let mut cooling = endpoint_test_target("openai", None);
+        cooling.id = 1;
+        cooling.provider_id = 1;
+        let mut healthy = endpoint_test_target("openai", None);
+        healthy.id = 2;
+        healthy.provider_id = 2;
+
+        state
+            .provider_cooldown
+            .lock()
+            .await
+            .insert(1, Instant::now() + Duration::from_secs(60));
+        let available = order_targets(
+            &state,
+            1,
+            "priority",
+            vec![cooling.clone(), healthy.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            available
+                .iter()
+                .map(|target| target.provider_id)
+                .collect::<Vec<_>>(),
+            vec![2]
+        );
+
+        state
+            .provider_cooldown
+            .lock()
+            .await
+            .insert(2, Instant::now() + Duration::from_secs(60));
+        let fallback = order_targets(&state, 1, "priority", vec![cooling, healthy], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            fallback
+                .iter()
+                .map(|target| target.provider_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_cooldown_is_set_for_retryable_failures_and_cleared_on_success() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let state = AppState::new(pool, None);
+
+        mark_provider_error(&state, 7, Some(StatusCode::TOO_MANY_REQUESTS)).await;
+        let until = state
+            .provider_cooldown
+            .lock()
+            .await
+            .get(&7)
+            .copied()
+            .unwrap();
+        assert!(until > Instant::now() + Duration::from_secs(25));
+
+        mark_provider_success(&state, 7).await;
+        assert!(!state.provider_cooldown.lock().await.contains_key(&7));
     }
 
     #[tokio::test]
