@@ -3185,7 +3185,9 @@ pub async fn overview(
             COALESCE(SUM(estimated_cost_micros), 0) AS cost_micros,
             COALESCE(SUM(estimated_cost_micros IS NULL), 0) AS unpriced,
             COALESCE(AVG(CASE WHEN success = 1 THEN 1.0 ELSE 0.0 END) * 100.0, 0.0) AS success_rate,
-            COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms
+            COALESCE(AVG(latency_ms), 0.0) AS avg_latency_ms,
+            COALESCE(SUM(CASE WHEN warning_message IS NOT NULL
+                              AND TRIM(warning_message) <> '' THEN 1 ELSE 0 END), 0) AS gateway_adjusted
         FROM usage_logs
         WHERE created_at >= ? AND created_at < ? AND in_flight = 0
         "#,
@@ -3479,6 +3481,7 @@ pub async fn overview(
         range_unpriced: range_totals.get("unpriced"),
         range_success_rate: range_totals.get("success_rate"),
         range_avg_latency_ms: range_totals.get("avg_latency_ms"),
+        range_gateway_adjusted: range_totals.get("gateway_adjusted"),
         success_rate: totals.get("success_rate"),
         avg_latency_ms: totals.get("avg_latency_ms"),
         active_providers,
@@ -4474,6 +4477,13 @@ fn apply_usage_filters<'a>(builder: &mut QueryBuilder<'a, Sqlite>, query: &'a Us
             .push(" AND u.in_flight = ")
             .push_bind(in_flight as i64);
     }
+    if let Some(gateway_adjusted) = query.gateway_adjusted {
+        if gateway_adjusted {
+            builder.push(" AND u.warning_message IS NOT NULL AND TRIM(u.warning_message) <> ''");
+        } else {
+            builder.push(" AND (u.warning_message IS NULL OR TRIM(u.warning_message) = '')");
+        }
+    }
     if let Some(from) = &query.from {
         builder.push(" AND u.created_at >= ").push_bind(from);
     }
@@ -4505,6 +4515,7 @@ fn usage_query_is_unfiltered(query: &UsageQuery) -> bool {
             .is_none_or(|value| value.trim().is_empty())
         && query.success.is_none()
         && query.in_flight.is_none()
+        && query.gateway_adjusted.is_none()
         && query.from.is_none()
         && query.to.is_none()
 }
@@ -6820,6 +6831,13 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
+            "UPDATE usage_logs SET warning_message = 'repaired request'
+             WHERE request_id = 'recent-2'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
             "INSERT INTO providers (name, provider_type, base_url, enabled, last_test_ok)
              VALUES
                 ('healthy', 'openai', 'https://healthy.example/v1', 1, 1),
@@ -6883,6 +6901,7 @@ mod tests {
         assert!((view.range_session_cache_hit_rate - 27.777_777).abs() < 0.001);
         assert!((view.range_success_rate - 66.666_666).abs() < 0.001);
         assert_eq!(view.range_avg_latency_ms, 200.0);
+        assert_eq!(view.range_gateway_adjusted, 1);
         assert_eq!(view.active_providers, 3);
         assert_eq!(view.healthy_providers, 1);
         assert_eq!(view.failed_providers, 1);
@@ -7038,6 +7057,7 @@ mod tests {
                 endpoint: None,
                 success: None,
                 in_flight: Some(true),
+                gateway_adjusted: None,
                 from: None,
                 to: None,
             }),
@@ -7088,6 +7108,7 @@ mod tests {
                 endpoint: Some("/v1/responses".to_string()),
                 success: None,
                 in_flight: None,
+                gateway_adjusted: None,
                 from: None,
                 to: None,
             }),
@@ -7097,6 +7118,80 @@ mod tests {
 
         assert_eq!(page.total, 1);
         assert_eq!(page.items[0].request_id, "responses");
+    }
+
+    #[tokio::test]
+    async fn usage_filter_can_select_gateway_adjusted_requests() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                request_id, requested_model, endpoint, status_code,
+                in_flight, success, warning_message, created_at
+             ) VALUES
+                ('adjusted', 'm', '/v1/chat/completions', 200, 0, 1,
+                 'repaired request', strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                ('original', 'm', '/v1/chat/completions', 200, 0, 1,
+                 NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let state = AppState::new(pool, None);
+        let Json(adjusted) = list_usage(
+            State(state.clone()),
+            Query(UsageQuery {
+                page: 1,
+                page_size: 20,
+                provider_id: None,
+                provider_api_key_id: None,
+                api_key_id: None,
+                route_id: None,
+                model: None,
+                request_id: None,
+                session_id: None,
+                endpoint: None,
+                success: None,
+                in_flight: None,
+                gateway_adjusted: Some(true),
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(adjusted.total, 1);
+        assert_eq!(adjusted.items[0].request_id, "adjusted");
+
+        let Json(original) = list_usage(
+            State(state),
+            Query(UsageQuery {
+                page: 1,
+                page_size: 20,
+                provider_id: None,
+                provider_api_key_id: None,
+                api_key_id: None,
+                route_id: None,
+                model: None,
+                request_id: None,
+                session_id: None,
+                endpoint: None,
+                success: None,
+                in_flight: None,
+                gateway_adjusted: Some(false),
+                from: None,
+                to: None,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(original.total, 1);
+        assert_eq!(original.items[0].request_id, "original");
     }
 
     #[tokio::test]
@@ -7137,6 +7232,7 @@ mod tests {
                 endpoint: None,
                 success: None,
                 in_flight: None,
+                gateway_adjusted: None,
                 from: None,
                 to: None,
             }),

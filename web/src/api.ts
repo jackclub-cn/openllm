@@ -434,6 +434,7 @@ export type Overview = {
   range_unpriced: number
   range_success_rate: number
   range_avg_latency_ms: number
+  range_gateway_adjusted: number
   success_rate: number
   avg_latency_ms: number
   active_providers: number

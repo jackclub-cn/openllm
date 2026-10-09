@@ -156,7 +156,27 @@ export default function Dashboard() {
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="成功率" value={data.range_success_rate} precision={1} suffix="%" icon={<NodeIndexOutlined />} tone="green" />
+          <MetricCard
+            label="成功率"
+            value={data.range_success_rate}
+            precision={1}
+            suffix="%"
+            icon={<NodeIndexOutlined />}
+            tone="green"
+            hint={
+              data.range_gateway_adjusted > 0 ? (
+                <Tooltip title="兼容层自动修复工具历史或调整上游请求参数的次数">
+                  <Typography.Link
+                    onClick={() => navigate('/usage?gateway_adjusted=true')}
+                  >
+                    网关调整 {data.range_gateway_adjusted} 次
+                  </Typography.Link>
+                </Tooltip>
+              ) : (
+                '无兼容调整'
+              )
+            }
+          />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard

@@ -97,6 +97,9 @@ export default function Usage() {
   const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>(
     () => statusParam(searchParams),
   )
+  const [onlyAdjusted, setOnlyAdjusted] = useState(
+    () => searchParams.get('gateway_adjusted') === 'true',
+  )
   const [dates, setDates] = useState<[Dayjs, Dayjs] | undefined>(() => {
     const from = searchParams.get('from')
     const to = searchParams.get('to')
@@ -111,8 +114,8 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, dates, autoScroll }
+  const queryRef = useRef({ page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, onlyAdjusted, dates, autoScroll })
+  queryRef.current = { page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, onlyAdjusted, dates, autoScroll }
   const filterKey = JSON.stringify([
     model,
     requestId,
@@ -123,6 +126,7 @@ export default function Usage() {
     apiKeyId,
     routeId,
     statusFilter,
+    onlyAdjusted,
     dates?.[0]?.toISOString(),
     dates?.[1]?.toISOString(),
   ])
@@ -146,6 +150,7 @@ export default function Usage() {
     if (statusFilter === 'success') next.set('success', 'true')
     if (statusFilter === 'failed') next.set('success', 'false')
     if (statusFilter === 'pending') next.set('in_flight', 'true')
+    if (onlyAdjusted) next.set('gateway_adjusted', 'true')
     if (dates?.[0]) next.set('from', dates[0].toISOString())
     if (dates?.[1]) next.set('to', dates[1].toISOString())
     if (next.toString() !== searchParams.toString()) {
@@ -156,6 +161,7 @@ export default function Usage() {
     dates,
     endpoint,
     model,
+    onlyAdjusted,
     providerApiKeyId,
     providerId,
     requestId,
@@ -187,6 +193,7 @@ export default function Usage() {
     if (statusFilter === 'success') params.set('success', 'true')
     if (statusFilter === 'failed') params.set('success', 'false')
     if (statusFilter === 'pending') params.set('in_flight', 'true')
+    if (onlyAdjusted) params.set('gateway_adjusted', 'true')
     if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
     if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
     try {
@@ -201,6 +208,7 @@ export default function Usage() {
         apiKeyId,
         routeId,
         statusFilter,
+        onlyAdjusted,
         dates?.[0]?.toISOString(),
         dates?.[1]?.toISOString(),
       ])
@@ -236,7 +244,7 @@ export default function Usage() {
     } finally {
       if (mode === 'manual') setLoading(false)
     }
-  }, [apiKeyId, autoScroll, dates, endpoint, model, page, pageSize, providerApiKeyId, providerId, requestId, routeId, sessionId, statusFilter])
+  }, [apiKeyId, autoScroll, dates, endpoint, model, onlyAdjusted, page, pageSize, providerApiKeyId, providerId, requestId, routeId, sessionId, statusFilter])
 
   const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
     const current = queryRef.current
@@ -295,6 +303,7 @@ export default function Usage() {
     setApiKeyId(undefined)
     setRouteId(undefined)
     setStatusFilter('all')
+    setOnlyAdjusted(false)
     setDates(undefined)
   }
 
@@ -366,6 +375,7 @@ export default function Usage() {
       if (statusFilter === 'success') params.set('success', 'true')
       if (statusFilter === 'failed') params.set('success', 'false')
       if (statusFilter === 'pending') params.set('in_flight', 'true')
+      if (onlyAdjusted) params.set('gateway_adjusted', 'true')
       if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
       if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
       const blob = await api.download(`/api/usage/export?${params}`)
@@ -539,6 +549,10 @@ export default function Usage() {
             ]}
             style={{ width: 140 }}
           />
+          <Space size={6}>
+            <Switch checked={onlyAdjusted} onChange={setOnlyAdjusted} />
+            <Typography.Text>网关调整</Typography.Text>
+          </Space>
           <DatePicker.RangePicker
             value={dates}
             onChange={(value) => setDates(value as [Dayjs, Dayjs] | undefined)}

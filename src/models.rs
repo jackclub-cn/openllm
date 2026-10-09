@@ -1184,6 +1184,8 @@ pub struct UsageQuery {
     pub endpoint: Option<String>,
     pub success: Option<bool>,
     pub in_flight: Option<bool>,
+    /// When true, only requests whose outbound body the gateway adjusted.
+    pub gateway_adjusted: Option<bool>,
     pub from: Option<String>,
     pub to: Option<String>,
 }
@@ -1262,6 +1264,9 @@ pub struct Overview {
     pub range_unpriced: i64,
     pub range_success_rate: f64,
     pub range_avg_latency_ms: f64,
+    /// Requests in the range whose outbound body the gateway adjusted for
+    /// upstream compatibility (tool-history repair or CommandCode limits).
+    pub range_gateway_adjusted: i64,
     pub success_rate: f64,
     pub avg_latency_ms: f64,
     pub active_providers: i64,
