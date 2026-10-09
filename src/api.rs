@@ -6535,10 +6535,14 @@ mod tests {
         assert_eq!(capabilities.context_limit, Some(400_000));
         assert_eq!(capabilities.input_limit, Some(400_000));
         assert_eq!(capabilities.output_limit, Some(64_000));
+        // The model declares chat + responses, so every message protocol is
+        // reachable through translation.
         assert_eq!(
             model.supported_endpoints,
             Some(vec![
                 "/chat/completions".to_string(),
+                "/completions".to_string(),
+                "/messages".to_string(),
                 "/responses".to_string()
             ])
         );

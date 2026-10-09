@@ -118,6 +118,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - 非流式与流式响应都会按可用能力返回 `x-openllm-max-input-tokens`、`x-openllm-max-context-tokens` 和 `x-openllm-max-output-tokens`，便于客户端在发起后续请求前读取实际上限。
 - 只支持 Anthropic Messages 的上游可以承接 `/v1/chat/completions`、`/v1/completions` 和 `/v1/responses`，网关会在请求与流式/非流式响应之间做双向转换。
 - 只支持 `/chat/completions` 的 OpenAI 兼容上游也可以承接 `/v1/responses`；只支持 `/v1/responses` 的上游则能承接 `/v1/chat/completions` 和 Anthropic `/v1/messages`，网关会在这些形态之间双向转换请求与流式/非流式响应（含 Responses SSE 与 Anthropic 事件互转）。
+- `/v1/models` 返回的 `supported_endpoints` 是网关实际能承接的集合，而不是上游声明的原始集合：只要上游支持其中一种消息协议，其余消息协议都会标注为可用。
 - 推理内容会尽力透传：Anthropic `thinking` 和 chat `reasoning_content` 会转成 Responses `reasoning` 摘要，Responses 的 reasoning summary 也会转成 Anthropic `thinking` 块。跨提供商的签名与加密封字段无法重建，因此只用于展示，不参与回传校验。
 - 上游返回只带 trace id、没有明确参数的临时 4xx 时，网关会先重试一次，再决定是否切换到下一个路由目标。
 - 连接测试和定时健康检查会自动探测 `tool_search` 兼容性，不需要手动设置；上游拒绝该工具时，网关会记录兼容状态、移除该工具并自动重试。
