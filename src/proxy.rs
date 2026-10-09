@@ -2263,6 +2263,8 @@ async fn forward_to_target(
     // translation; everything else is a straight passthrough.
     let translate_responses_to_chat =
         endpoint == OPENAI_RESPONSES && upstream_endpoint == OPENAI_CHAT_COMPLETIONS;
+    let translate_chat_to_responses =
+        endpoint == OPENAI_CHAT_COMPLETIONS && upstream_endpoint == OPENAI_RESPONSES;
 
     let (url, mut request_body) = match provider_type {
         ProviderType::Anthropic => {
@@ -2280,6 +2282,8 @@ async fn forward_to_target(
         ProviderType::Openai | ProviderType::Ollama | ProviderType::Custom => {
             let body = if translate_responses_to_chat {
                 responses_request_to_chat(request_json, &target.upstream_model, streamed)
+            } else if translate_chat_to_responses {
+                chat_request_to_responses(request_json, &target.upstream_model, streamed)
             } else {
                 let mut body = request_json.clone();
                 body["model"] = json!(target.upstream_model);
@@ -2513,6 +2517,62 @@ async fn forward_to_target(
             AppError::Upstream(format!("invalid JSON from chat completions: {error}"))
         })?;
         let (converted, usage) = chat_response_to_responses(&upstream_json, requested_model);
+        let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
+        let converted_bytes =
+            inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
+        let preview = response_preview(&converted_bytes);
+        let latency_ms = started.elapsed().as_millis() as i64;
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint,
+                usage: fill_usage(usage, request_tokens, &converted),
+                latency_ms,
+                first_token_ms: Some(latency_ms),
+                status_code: status.as_u16() as i64,
+                success: true,
+                streamed: false,
+                error_message: None,
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+        let mut response = Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(converted_bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        apply_capability_headers(&mut response, &receipt);
+        return Ok(response);
+    }
+
+    if translate_chat_to_responses {
+        if streamed {
+            return Ok(responses_stream_to_chat(
+                state.clone(),
+                response,
+                request_id.to_string(),
+                requested_model.to_string(),
+                target,
+                request_tokens,
+                api_key.cloned(),
+                started,
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let upstream_json: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::Upstream(format!("invalid JSON from responses upstream: {error}"))
+        })?;
+        let (converted, usage) = responses_response_to_chat(&upstream_json, requested_model);
         let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
         let converted_bytes =
             inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
@@ -3690,6 +3750,305 @@ async fn process_chat_chunk_line(
     }
 }
 
+/// Streams a chat-completions response from a Responses-only upstream by
+/// translating the Responses SSE events back into chat chunks.
+#[allow(clippy::too_many_arguments)]
+fn responses_stream_to_chat(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut event_name = String::new();
+        let mut chat_state = ChatStreamState::default();
+        let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                process_responses_line_for_chat(
+                    &line,
+                    &mut event_name,
+                    &mut chat_state,
+                    &message_id,
+                    &requested_model,
+                    started,
+                    &tx,
+                )
+                .await;
+            }
+        }
+        if !buffer.is_empty() {
+            process_responses_line_for_chat(
+                &buffer,
+                &mut event_name,
+                &mut chat_state,
+                &message_id,
+                &requested_model,
+                started,
+                &tx,
+            )
+            .await;
+        }
+
+        if let Some(reason) = chat_state.finish_reason() {
+            let final_chunk =
+                openai_stream_chunk(&message_id, &requested_model, json!({}), Some(reason), None);
+            let usage_chunk = openai_stream_chunk(
+                &message_id,
+                &requested_model,
+                json!({}),
+                None,
+                Some(json!({
+                    "prompt_tokens": chat_state.prompt_tokens,
+                    "completion_tokens": chat_state.completion_tokens,
+                    "total_tokens": chat_state.prompt_tokens + chat_state.completion_tokens
+                })),
+            );
+            let _ = tx
+                .send(Ok(Bytes::from(format!(
+                    "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                    serde_json::to_string(&final_chunk).unwrap_or_default(),
+                    serde_json::to_string(&usage_chunk).unwrap_or_default()
+                ))))
+                .await;
+        }
+        drop(tx);
+
+        let prompt_tokens = if chat_state.prompt_tokens > 0 {
+            chat_state.prompt_tokens
+        } else {
+            request_tokens
+        };
+        let completion_tokens = if chat_state.completion_tokens > 0 {
+            chat_state.completion_tokens
+        } else {
+            (chat_state.text.chars().count() / 4) as i64
+        };
+        let usage = Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_read_tokens: chat_state.cache_read_tokens,
+            cache_write_tokens: chat_state.cache_write_tokens,
+        }
+        .normalized();
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let preview = response_preview(chat_state.text.as_bytes());
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: OPENAI_CHAT_COMPLETIONS,
+                usage,
+                latency_ms,
+                first_token_ms: chat_state.first_token_ms,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+#[derive(Default)]
+struct ChatStreamState {
+    text: String,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    first_token_ms: Option<i64>,
+    sent_role: bool,
+    saw_tool_call: bool,
+    stop_reason: Option<String>,
+    /// Maps a Responses function-call item id to its chat tool-call index.
+    tool_indices: std::collections::HashMap<String, usize>,
+}
+
+impl ChatStreamState {
+    fn finish_reason(&self) -> Option<&'static str> {
+        Some(if self.saw_tool_call {
+            "tool_calls"
+        } else if self.stop_reason.as_deref() == Some("max_tokens")
+            || self.stop_reason.as_deref() == Some("length")
+        {
+            "length"
+        } else {
+            "stop"
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_responses_line_for_chat(
+    line: &[u8],
+    event_name: &mut String,
+    state: &mut ChatStreamState,
+    message_id: &str,
+    model: &str,
+    started: Instant,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if let Some(event) = line.strip_prefix("event:") {
+        *event_name = event.trim().to_string();
+        return;
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+
+    let event = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(event_name.as_str());
+    match event {
+        "response.output_item.added" => {
+            let item = value.get("item").unwrap_or(&Value::Null);
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                let call_id = item
+                    .get("call_id")
+                    .or_else(|| item.get("id"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let name = item.get("name").cloned().unwrap_or(Value::Null);
+                let index = state.tool_indices.len();
+                if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                    state.tool_indices.insert(item_id.to_string(), index);
+                }
+                state.saw_tool_call = true;
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({"tool_calls": [{
+                        "index": index,
+                        "id": call_id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": ""}
+                    }]}),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "response.output_text.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                state.text.push_str(delta);
+                if state.first_token_ms.is_none() {
+                    state.first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
+                let delta_json = if state.sent_role {
+                    json!({"content": delta})
+                } else {
+                    state.sent_role = true;
+                    json!({"role": "assistant", "content": delta})
+                };
+                let chunk = openai_stream_chunk(message_id, model, delta_json, None, None);
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                let index = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .and_then(|item_id| state.tool_indices.get(item_id).copied())
+                    .unwrap_or(0);
+                let chunk = openai_stream_chunk(
+                    message_id,
+                    model,
+                    json!({"tool_calls": [{
+                        "index": index,
+                        "function": {"arguments": delta}
+                    }]}),
+                    None,
+                    None,
+                );
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            let response = value.get("response").unwrap_or(&Value::Null);
+            if let Some(usage) = usage_from_value(response) {
+                state.prompt_tokens = usage.prompt_tokens;
+                state.completion_tokens = usage.completion_tokens;
+                state.cache_read_tokens = usage.cache_read_tokens;
+                state.cache_write_tokens = usage.cache_write_tokens;
+            }
+            if let Some(details) = response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+            {
+                state.stop_reason = Some(details.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn anthropic_stream_to_responses(
     state: AppState,
@@ -4532,6 +4891,229 @@ fn responses_tool_to_chat(tool: &Value) -> Option<Value> {
 /// Converts a legacy OpenAI `/v1/completions` request into the Anthropic
 /// Messages shape by way of the chat shape that `convert_request_to_anthropic`
 /// already understands. The legacy `prompt` field replaces the message list.
+/// Converts an OpenAI chat-completions request into the Responses shape.
+///
+/// This is the inverse of [`responses_request_to_chat`] and lets a
+/// Responses-only upstream serve callers that speak `/v1/chat/completions`.
+fn chat_request_to_responses(input: &Value, model: &str, streamed: bool) -> Value {
+    let mut instructions = Vec::new();
+    let mut items = Vec::new();
+    if let Some(messages) = input.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("user");
+            let content = message.get("content").cloned().unwrap_or(Value::Null);
+            if role == "system" || role == "developer" {
+                if let Some(text) = content_text(&content)
+                    && !text.is_empty()
+                {
+                    instructions.push(text);
+                }
+                continue;
+            }
+            if role == "tool" {
+                items.push(json!({
+                    "type": "function_call_output",
+                    "call_id": message.get("tool_call_id").cloned().unwrap_or(Value::Null),
+                    "output": content_text(&content).unwrap_or_default()
+                }));
+                continue;
+            }
+            let text_type = if role == "assistant" {
+                "output_text"
+            } else {
+                "input_text"
+            };
+            let parts = chat_content_to_responses_parts(&content, text_type);
+            if !parts.is_empty() {
+                items.push(json!({"type": "message", "role": role, "content": parts}));
+            }
+            if role == "assistant"
+                && let Some(calls) = message.get("tool_calls").and_then(Value::as_array)
+            {
+                for call in calls {
+                    let function = call.get("function").unwrap_or(call);
+                    items.push(json!({
+                        "type": "function_call",
+                        "call_id": call
+                            .get("id")
+                            .or_else(|| call.get("call_id"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "name": function.get("name").cloned().unwrap_or(Value::Null),
+                        "arguments": match function.get("arguments") {
+                            Some(Value::String(text)) => json!(text),
+                            Some(other) => json!(other.to_string()),
+                            None => json!("{}"),
+                        }
+                    }));
+                }
+            }
+        }
+    }
+
+    let mut output = json!({"model": model, "input": items});
+    if !instructions.is_empty() {
+        output["instructions"] = json!(instructions.join("\n\n"));
+    }
+    if streamed {
+        output["stream"] = json!(true);
+    }
+    for (source, target) in [
+        ("max_tokens", "max_output_tokens"),
+        ("max_completion_tokens", "max_output_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+    ] {
+        if let Some(value) = input.get(source) {
+            output[target] = value.clone();
+        }
+    }
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        let tools = tools
+            .iter()
+            .filter_map(chat_tool_to_responses)
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            output["tools"] = json!(tools);
+        }
+    }
+    if let Some(choice) = input.get("tool_choice") {
+        output["tool_choice"] = match choice {
+            Value::Object(_) => {
+                let name = choice
+                    .get("name")
+                    .or_else(|| choice.pointer("/function/name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({"type": "function", "name": name})
+            }
+            _ => choice.clone(),
+        };
+    }
+    output
+}
+
+fn chat_content_to_responses_parts(content: &Value, text_type: &str) -> Vec<Value> {
+    match content {
+        Value::String(text) => {
+            if text.is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type": text_type, "text": text})]
+            }
+        }
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|item| match item.get("type").and_then(Value::as_str) {
+                Some("image_url") => item
+                    .pointer("/image_url/url")
+                    .and_then(Value::as_str)
+                    .map(|url| json!({"type": "input_image", "image_url": url})),
+                _ => item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .map(|text| json!({"type": text_type, "text": text})),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn chat_tool_to_responses(tool: &Value) -> Option<Value> {
+    let function = tool.get("function").unwrap_or(tool);
+    function.get("name")?;
+    Some(json!({
+        "type": "function",
+        "name": function.get("name")?.clone(),
+        "description": function.get("description").cloned().unwrap_or(Value::Null),
+        "parameters": function.get("parameters").cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+    }))
+}
+
+/// Converts a Responses object into a chat-completions response.
+fn responses_response_to_chat(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let mut text = String::new();
+    let mut tool_calls = Vec::new();
+    if let Some(items) = value.get("output").and_then(Value::as_array) {
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(part) = part.get("text").and_then(Value::as_str) {
+                                text.push_str(part);
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    tool_calls.push(json!({
+                        "id": item.get("call_id").or_else(|| item.get("id"))
+                            .cloned().unwrap_or_else(|| json!(format!("call_{}", uuid::Uuid::new_v4().simple()))),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name").cloned().unwrap_or(Value::Null),
+                            "arguments": item.get("arguments").cloned()
+                                .unwrap_or_else(|| json!("{}"))
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let incomplete = value.get("status").and_then(Value::as_str) == Some("incomplete");
+    let finish_reason = if !tool_calls.is_empty() {
+        "tool_calls"
+    } else if incomplete {
+        "length"
+    } else {
+        "stop"
+    };
+    let mut message = json!({
+        "role": "assistant",
+        "content": if text.is_empty() { Value::Null } else { json!(text) }
+    });
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = json!(tool_calls);
+    }
+
+    let usage = usage_from_value(value).unwrap_or_default().normalized();
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("chatcmpl-{}", id.trim_start_matches("resp_")))
+        .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()));
+    let created = value
+        .get("created_at")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    (
+        json!({
+            "id": id,
+            "object": "chat.completion",
+            "created": created,
+            "model": requested_model,
+            "choices": [{
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason
+            }],
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
+        }),
+        usage,
+    )
+}
+
 fn completions_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> Value {
     let mut messages = Vec::new();
     if let Some(prompt) = completions_prompt_text(input.get("prompt")) {
@@ -5407,6 +5989,18 @@ fn target_upstream_endpoint<'a>(
         )
     {
         return Some(OPENAI_CHAT_COMPLETIONS);
+    }
+    // The reverse: a Responses-only upstream can serve chat-completions
+    // callers through the same translation, in the other direction.
+    if matches!(provider_type, ProviderType::Openai | ProviderType::Custom)
+        && request_endpoint == OPENAI_CHAT_COMPLETIONS
+        && !endpoint_metadata_supports(
+            target.supported_endpoints.as_deref(),
+            OPENAI_CHAT_COMPLETIONS,
+        )
+        && endpoint_metadata_supports(target.supported_endpoints.as_deref(), OPENAI_RESPONSES)
+    {
+        return Some(OPENAI_RESPONSES);
     }
     provider_upstream_endpoint(provider_type, request_endpoint)
 }
@@ -7958,6 +8552,17 @@ mod tests {
             target_upstream_endpoint(&openai, OPENAI_RESPONSES),
             Some(OPENAI_RESPONSES)
         );
+
+        // Conversely, a Responses-only target can serve chat callers.
+        let responses_only = endpoint_test_target("openai", Some(r#"["/responses"]"#));
+        assert!(target_supports_endpoint(
+            &responses_only,
+            OPENAI_CHAT_COMPLETIONS
+        ));
+        assert_eq!(
+            target_upstream_endpoint(&responses_only, OPENAI_CHAT_COMPLETIONS),
+            Some(OPENAI_RESPONSES)
+        );
     }
 
     #[test]
@@ -8053,8 +8658,19 @@ mod tests {
         .unwrap();
 
         let state = AppState::new(pool, None);
-        assert!(
+        // The override drops native chat support, but chat callers are still
+        // served by translating to Responses.
+        assert_eq!(
             resolve_route(&state, "vendor/model", OPENAI_CHAT_COMPLETIONS)
+                .await
+                .unwrap()
+                .targets
+                .len(),
+            1
+        );
+        // Endpoints the override does not imply stay unroutable.
+        assert!(
+            resolve_route(&state, "vendor/model", "/v1/embeddings")
                 .await
                 .is_err()
         );
@@ -11307,4 +11923,124 @@ mod tests {
             "OpenAI tool indices must not include Anthropic text-block offsets: {joined}"
         );
     }
+}
+#[test]
+fn chat_request_converts_to_responses_shape() {
+    let converted = chat_request_to_responses(
+        &json!({
+            "model": "coding",
+            "max_tokens": 256,
+            "temperature": 0.2,
+            "messages": [
+                { "role": "system", "content": "be terse" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "guess 2+2" }
+                ] },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "calc", "arguments": "{\"expr\":\"2+2\"}" }
+                    }]
+                },
+                { "role": "tool", "tool_call_id": "call_1", "content": "4" }
+            ],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "calc", "parameters": { "type": "object" } }
+            }]
+        }),
+        "deepseek/x",
+        true,
+    );
+    assert_eq!(converted["model"], "deepseek/x");
+    assert_eq!(converted["stream"], true);
+    assert_eq!(converted["instructions"], "be terse");
+    assert_eq!(converted["max_output_tokens"], 256);
+    let input = converted["input"].as_array().expect("input array");
+    // user message, function_call, function_call_output (assistant text was empty)
+    assert_eq!(input.len(), 3);
+    assert_eq!(input[0]["type"], "message");
+    assert_eq!(input[0]["content"][0]["type"], "input_text");
+    assert_eq!(input[0]["content"][0]["text"], "guess 2+2");
+    assert_eq!(input[1]["type"], "function_call");
+    assert_eq!(input[1]["call_id"], "call_1");
+    assert_eq!(input[1]["name"], "calc");
+    assert_eq!(input[2]["type"], "function_call_output");
+    assert_eq!(input[2]["output"], "4");
+    assert_eq!(converted["tools"][0]["name"], "calc");
+}
+
+#[test]
+fn responses_result_converts_to_chat_completion() {
+    let (converted, usage) = responses_response_to_chat(
+        &json!({
+            "id": "resp_abc",
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "summary": [] },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "hi there" }]
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_9",
+                    "name": "calc",
+                    "arguments": "{\"expr\":\"2+2\"}"
+                }
+            ],
+            "usage": { "input_tokens": 11, "output_tokens": 5, "total_tokens": 16 }
+        }),
+        "coding",
+    );
+    assert_eq!(converted["object"], "chat.completion");
+    assert_eq!(converted["model"], "coding");
+    assert_eq!(converted["choices"][0]["message"]["content"], "hi there");
+    assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        converted["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_9"
+    );
+    assert_eq!(converted["usage"]["prompt_tokens"], 11);
+    assert_eq!(converted["usage"]["completion_tokens"], 5);
+    assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
+}
+
+#[tokio::test]
+async fn responses_stream_converts_to_chat_chunks() {
+    let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+    let mut event_name = String::new();
+    let mut state = ChatStreamState::default();
+    for line in [
+            b"event: response.output_text.delta\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\" there\"}\n".as_slice(),
+            b"event: response.completed\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":3},\"status\":\"completed\"}}\n".as_slice(),
+        ] {
+            process_responses_line_for_chat(
+                line,
+                &mut event_name,
+                &mut state,
+                "chatcmpl_test",
+                "coding",
+                Instant::now(),
+                &tx,
+            )
+            .await;
+        }
+    drop(tx);
+    let mut joined = String::new();
+    while let Some(chunk) = rx.recv().await {
+        joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+    }
+    assert!(joined.contains("\"content\":\"hi\""));
+    assert!(joined.contains("\"content\":\" there\""));
+    assert_eq!(state.text, "hi there");
+    assert_eq!(state.prompt_tokens, 7);
+    assert_eq!(state.completion_tokens, 3);
 }
