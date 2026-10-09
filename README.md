@@ -116,7 +116,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - OpenAI 与 Anthropic 请求都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可与请求日志关联。
 - 非流式与流式响应都会按可用能力返回 `x-openllm-max-input-tokens`、`x-openllm-max-context-tokens` 和 `x-openllm-max-output-tokens`，便于客户端在发起后续请求前读取实际上限。
-- Anthropic 上游目前用于转换 `/v1/chat/completions` 和 Anthropic Messages 请求，其他 OpenAI 兼容端点不向 Anthropic 目标转发。
+- 只支持 Anthropic Messages 的上游可以承接 `/v1/chat/completions`、`/v1/completions` 和 `/v1/responses`，网关会在请求与流式/非流式响应之间做双向转换。
+- 只支持 `/chat/completions` 的 OpenAI 兼容上游也可以承接 `/v1/responses`，网关会自动把 Responses 请求转换为 chat 请求并还原响应。
+- 上游返回只带 trace id、没有明确参数的临时 4xx 时，网关会先重试一次，再决定是否切换到下一个路由目标。
 - 连接测试和定时健康检查会自动探测 `tool_search` 兼容性，不需要手动设置；上游拒绝该工具时，网关会记录兼容状态、移除该工具并自动重试。
 - 上游模型只支持 `/responses` 时，健康检查会自动走 Responses 接口。
 - 多目标路由会计算公共能力上限，并将超过共同输出上限的请求向下兼容到最严格目标允许的值。

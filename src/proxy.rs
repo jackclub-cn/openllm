@@ -2258,6 +2258,11 @@ async fn forward_to_target(
 ) -> AppResult<Response> {
     let provider_type =
         ProviderType::from_str(&target.provider_type).map_err(AppError::BadRequest)?;
+    let upstream_endpoint = target_upstream_endpoint(&target, endpoint).unwrap_or(endpoint);
+    // Chat completions upstreams can serve a Responses client through
+    // translation; everything else is a straight passthrough.
+    let translate_responses_to_chat =
+        endpoint == OPENAI_RESPONSES && upstream_endpoint == OPENAI_CHAT_COMPLETIONS;
 
     let (url, mut request_body) = match provider_type {
         ProviderType::Anthropic => {
@@ -2273,9 +2278,14 @@ async fn forward_to_target(
             (join_upstream_url(&target.base_url, "/v1/messages"), body)
         }
         ProviderType::Openai | ProviderType::Ollama | ProviderType::Custom => {
-            let mut body = request_json.clone();
-            body["model"] = json!(target.upstream_model);
-            (join_upstream_url(&target.base_url, endpoint), body)
+            let body = if translate_responses_to_chat {
+                responses_request_to_chat(request_json, &target.upstream_model, streamed)
+            } else {
+                let mut body = request_json.clone();
+                body["model"] = json!(target.upstream_model);
+                body
+            };
+            (join_upstream_url(&target.base_url, upstream_endpoint), body)
         }
     };
 
@@ -2299,96 +2309,90 @@ async fn forward_to_target(
     )
     .await?;
     let mut status = response.status();
+    let mut transient_retry_used = false;
 
-    if !status.is_success() {
+    while !status.is_success() {
         let response_headers = response.headers().clone();
         let response_body = response
             .bytes()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))?;
+
+        // Aggregator gateways sometimes answer with an opaque
+        // "invalid request error" carrying only a trace id when one of their
+        // internal channels fails. That is a transient routing failure rather
+        // than a client error, so resend the same request once before giving
+        // up on the target.
+        if !transient_retry_used && transient_upstream_4xx(status, &response_body) {
+            transient_retry_used = true;
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                %status,
+                "upstream returned an opaque 4xx; retrying once"
+            );
+            response = send_provider_request(
+                state,
+                &target,
+                build_upstream_request(
+                    state,
+                    &url,
+                    provider_type,
+                    &target,
+                    &request_body,
+                    session_id,
+                )?,
+            )
+            .await?;
+            status = response.status();
+            continue;
+        }
+
         if matches!(
             status,
             StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
         ) && upstream_rejects_tool_search(&response_body)
+            && let Some(compat_body) = strip_tool_search_tools(&request_body)
         {
-            if let Some(compat_body) = strip_tool_search_tools(&request_body) {
-                tracing::warn!(
-                    provider = %target.provider_name,
-                    model = %target.upstream_model,
-                    "upstream rejected tool_search; retrying without it"
-                );
-                mark_provider_tool_search_unsupported(state, target.provider_id).await;
-                request_body = compat_body;
-                response = send_provider_request(
-                    state,
-                    &target,
-                    build_upstream_request(
-                        state,
-                        &url,
-                        provider_type,
-                        &target,
-                        &request_body,
-                        session_id,
-                    )?,
-                )
-                .await?;
-                status = response.status();
-                if !status.is_success() {
-                    let response_headers = response.headers().clone();
-                    let response_body = response
-                        .bytes()
-                        .await
-                        .map_err(|error| AppError::Upstream(error.to_string()))?;
-                    return upstream_error_response(
-                        state,
-                        request_id,
-                        endpoint,
-                        requested_model,
-                        &target,
-                        streamed,
-                        request_tokens,
-                        api_key,
-                        started,
-                        status,
-                        response_headers,
-                        response_body,
-                    )
-                    .await;
-                }
-            } else {
-                return upstream_error_response(
-                    state,
-                    request_id,
-                    endpoint,
-                    requested_model,
-                    &target,
-                    streamed,
-                    request_tokens,
-                    api_key,
-                    started,
-                    status,
-                    response_headers,
-                    response_body,
-                )
-                .await;
-            }
-        } else {
-            return upstream_error_response(
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                "upstream rejected tool_search; retrying without it"
+            );
+            mark_provider_tool_search_unsupported(state, target.provider_id).await;
+            request_body = compat_body;
+            response = send_provider_request(
                 state,
-                request_id,
-                endpoint,
-                requested_model,
                 &target,
-                streamed,
-                request_tokens,
-                api_key,
-                started,
-                status,
-                response_headers,
-                response_body,
+                build_upstream_request(
+                    state,
+                    &url,
+                    provider_type,
+                    &target,
+                    &request_body,
+                    session_id,
+                )?,
             )
-            .await;
+            .await?;
+            status = response.status();
+            continue;
         }
+
+        return upstream_error_response(
+            state,
+            request_id,
+            endpoint,
+            requested_model,
+            &target,
+            streamed,
+            request_tokens,
+            api_key,
+            started,
+            status,
+            response_headers,
+            response_body,
+        )
+        .await;
     }
 
     let response_content_type = response
@@ -2452,6 +2456,63 @@ async fn forward_to_target(
             }
             _ => convert_anthropic_response(&upstream_json),
         };
+        let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
+        let converted_bytes =
+            inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
+        let preview = response_preview(&converted_bytes);
+        let latency_ms = started.elapsed().as_millis() as i64;
+        log_usage(
+            state,
+            UsageLogEntry {
+                request_id,
+                api_key_id: api_key.map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint,
+                usage: fill_usage(usage, request_tokens, &converted),
+                latency_ms,
+                first_token_ms: Some(latency_ms),
+                status_code: status.as_u16() as i64,
+                success: true,
+                streamed: false,
+                error_message: None,
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+        let mut response = Response::builder()
+            .status(status)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(converted_bytes))
+            .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+        apply_capability_headers(&mut response, &receipt);
+        return Ok(response);
+    }
+
+    if translate_responses_to_chat {
+        if streamed {
+            return Ok(openai_chat_stream_to_responses(
+                state.clone(),
+                response,
+                request_id.to_string(),
+                requested_model.to_string(),
+                target,
+                request_tokens,
+                api_key.cloned(),
+                started,
+                receipt,
+            ));
+        }
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| AppError::Upstream(error.to_string()))?;
+        let upstream_json: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            AppError::Upstream(format!("invalid JSON from chat completions: {error}"))
+        })?;
+        let (converted, usage) = chat_response_to_responses(&upstream_json, requested_model);
         let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
         let converted_bytes =
             inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
@@ -3314,6 +3375,318 @@ impl ResponsesStreamState {
             json!({"type": "response.failed", "response": response}),
         )
         .await;
+    }
+}
+
+/// Streams a Responses API event stream from an OpenAI chat-completions chunk
+/// stream, so Responses clients can use chat-only upstreams.
+#[allow(clippy::too_many_arguments)]
+fn openai_chat_stream_to_responses(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+    receipt: Option<Value>,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut tool_index: Option<i64> = None;
+        let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                process_chat_chunk_line(&mut stream, &line, &mut tool_index, &tx).await;
+            }
+        }
+        if !buffer.is_empty() {
+            process_chat_chunk_line(&mut stream, &buffer, &mut tool_index, &tx).await;
+        }
+
+        if let Some(error) = stream_error.as_deref() {
+            stream.fail(&tx, error).await;
+        } else {
+            stream.ensure_created(&tx).await;
+            stream.complete(&tx).await;
+        }
+        drop(tx);
+
+        if stream.usage.prompt_tokens == 0 {
+            stream.usage.prompt_tokens = request_tokens;
+        }
+        if stream.usage.completion_tokens == 0 {
+            stream.usage.completion_tokens = (stream.output_chars / 4) as i64;
+        }
+        let usage = stream.usage.normalized();
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms = stream
+            .first_token_ms
+            .or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
+        let preview = response_preview(
+            stream
+                .output
+                .iter()
+                .filter_map(|item| {
+                    item.pointer("/content/0/text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                        .or_else(|| {
+                            item.get("arguments")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned)
+                        })
+                })
+                .collect::<Vec<_>>()
+                .join("")
+                .as_bytes(),
+        );
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: OPENAI_RESPONSES,
+                usage,
+                latency_ms,
+                first_token_ms,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    response
+}
+
+async fn process_chat_chunk_line(
+    stream: &mut ResponsesStreamState,
+    line: &[u8],
+    tool_index: &mut Option<i64>,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    stream.ensure_created(tx).await;
+
+    if value.get("usage").is_some_and(|usage| !usage.is_null())
+        && let Some(usage) = usage_from_value(&value)
+    {
+        stream.usage = usage;
+    }
+
+    let Some(choice) = value.pointer("/choices/0") else {
+        return;
+    };
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+
+    if let Some(content) = delta.get("content").and_then(Value::as_str)
+        && !content.is_empty()
+    {
+        if !matches!(stream.current, Some(ResponsesStreamBlock::Text { .. })) {
+            stream.finish_current(tx).await;
+            let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+            let output_index = stream.output.len();
+            stream.current = Some(ResponsesStreamBlock::Text {
+                item_id: item_id.clone(),
+                output_index,
+                text: String::new(),
+            });
+            stream
+                .send_event(
+                    tx,
+                    "response.output_item.added",
+                    json!({
+                        "type": "response.output_item.added",
+                        "output_index": output_index,
+                        "item": {
+                            "id": item_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": []
+                        }
+                    }),
+                )
+                .await;
+            stream
+                .send_event(
+                    tx,
+                    "response.content_part.added",
+                    json!({
+                        "type": "response.content_part.added",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": "",
+                            "annotations": [],
+                            "logprobs": []
+                        }
+                    }),
+                )
+                .await;
+        }
+        let (item_id, output_index) = match stream.current.as_ref() {
+            Some(ResponsesStreamBlock::Text {
+                item_id,
+                output_index,
+                ..
+            }) => (item_id.clone(), *output_index),
+            _ => return,
+        };
+        if let Some(ResponsesStreamBlock::Text { text, .. }) = stream.current.as_mut() {
+            text.push_str(content);
+        }
+        stream.output_chars += content.chars().count();
+        stream.mark_first_token();
+        stream
+            .send_event(
+                tx,
+                "response.output_text.delta",
+                json!({
+                    "type": "response.output_text.delta",
+                    "item_id": item_id,
+                    "output_index": output_index,
+                    "content_index": 0,
+                    "delta": content
+                }),
+            )
+            .await;
+    }
+
+    if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let index = call.get("index").and_then(Value::as_i64).unwrap_or(0);
+            let start_new = !matches!(
+                (&stream.current, *tool_index),
+                (Some(ResponsesStreamBlock::Tool { .. }), Some(current)) if current == index
+            );
+            if start_new {
+                stream.finish_current(tx).await;
+                let item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
+                let output_index = stream.output.len();
+                let call_id = call
+                    .get("id")
+                    .cloned()
+                    .unwrap_or_else(|| json!(format!("call_{}", uuid::Uuid::new_v4().simple())));
+                let name = call
+                    .pointer("/function/name")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                stream.current = Some(ResponsesStreamBlock::Tool {
+                    item_id: item_id.clone(),
+                    output_index,
+                    call_id: call_id.clone(),
+                    name: name.clone(),
+                    arguments: String::new(),
+                });
+                *tool_index = Some(index);
+                stream
+                    .send_event(
+                        tx,
+                        "response.output_item.added",
+                        json!({
+                            "type": "response.output_item.added",
+                            "output_index": output_index,
+                            "item": {
+                                "id": item_id,
+                                "type": "function_call",
+                                "status": "in_progress",
+                                "call_id": call_id,
+                                "name": name,
+                                "arguments": ""
+                            }
+                        }),
+                    )
+                    .await;
+            }
+            if let Some(arguments) = call.pointer("/function/arguments").and_then(Value::as_str)
+                && !arguments.is_empty()
+            {
+                let (item_id, output_index) = match stream.current.as_ref() {
+                    Some(ResponsesStreamBlock::Tool {
+                        item_id,
+                        output_index,
+                        ..
+                    }) => (item_id.clone(), *output_index),
+                    _ => continue,
+                };
+                if let Some(ResponsesStreamBlock::Tool { arguments: acc, .. }) =
+                    stream.current.as_mut()
+                {
+                    acc.push_str(arguments);
+                }
+                stream.output_chars += arguments.chars().count();
+                stream.mark_first_token();
+                stream
+                    .send_event(
+                        tx,
+                        "response.function_call_arguments.delta",
+                        json!({
+                            "type": "response.function_call_arguments.delta",
+                            "item_id": item_id,
+                            "output_index": output_index,
+                            "delta": arguments
+                        }),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+        stream.stop_reason = Some(if reason == "length" {
+            "max_tokens".to_string()
+        } else {
+            reason.to_string()
+        });
     }
 }
 
@@ -5020,6 +5393,21 @@ fn target_upstream_endpoint<'a>(
     request_endpoint: &'a str,
 ) -> Option<&'a str> {
     let provider_type = ProviderType::from_str(&target.provider_type).ok()?;
+    // An OpenAI-compatible upstream that only advertises chat completions can
+    // still serve a Responses client: the gateway translates the request and
+    // the streamed/non-streamed response. Only take that path when the metadata
+    // explicitly rules out `/responses`, so providers that do support it keep
+    // getting a straight passthrough.
+    if matches!(provider_type, ProviderType::Openai | ProviderType::Custom)
+        && request_endpoint == OPENAI_RESPONSES
+        && !endpoint_metadata_supports(target.supported_endpoints.as_deref(), OPENAI_RESPONSES)
+        && endpoint_metadata_supports(
+            target.supported_endpoints.as_deref(),
+            OPENAI_CHAT_COMPLETIONS,
+        )
+    {
+        return Some(OPENAI_CHAT_COMPLETIONS);
+    }
     provider_upstream_endpoint(provider_type, request_endpoint)
 }
 
@@ -6578,6 +6966,21 @@ fn retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
 }
 
+/// Detects the opaque 4xx that aggregator upstreams return when one of their
+/// internal channels fails: an "invalid request error" that carries only a
+/// trace id and no actionable `param`. These are transient routing failures, so
+/// retrying is worthwhile instead of surfacing them as client errors.
+fn transient_upstream_4xx(status: StatusCode, body: &[u8]) -> bool {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("trace_id") && text.contains("invalid request") && !text.contains("\"param\"")
+}
+
 fn should_try_next_target(target: &RouteTarget, status: StatusCode) -> bool {
     retryable_status(status)
         || (target.auth_retryable
@@ -7541,6 +7944,43 @@ mod tests {
         );
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].provider_type, "anthropic");
+
+        // A chat-only OpenAI-compatible target still advertises Responses
+        // support because the gateway translates the request on the way out.
+        let chat_only = endpoint_test_target("openai", Some(r#"["/chat/completions"]"#));
+        assert!(target_supports_endpoint(&chat_only, OPENAI_RESPONSES));
+        assert_eq!(
+            target_upstream_endpoint(&chat_only, OPENAI_RESPONSES),
+            Some(OPENAI_CHAT_COMPLETIONS)
+        );
+        // A target that genuinely supports Responses keeps the passthrough.
+        assert_eq!(
+            target_upstream_endpoint(&openai, OPENAI_RESPONSES),
+            Some(OPENAI_RESPONSES)
+        );
+    }
+
+    #[test]
+    fn transient_upstream_4xx_only_matches_opaque_aggregator_errors() {
+        // The trace-id-only aggregator error is transient and worth a retry.
+        assert!(transient_upstream_4xx(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"{\"type\":\"invalid_request_error\",\"code\":\"\",\"message\":\"invalid request error trace_id: 63eeeadddaa2d5224a4acf42a78dd1de\"}\n","type":"invalid_request_error"}}"#
+        ));
+        // Actionable client errors carry a `param` and must not be retried.
+        assert!(!transient_upstream_4xx(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"Too small: expected array to have >=1 items","type":"invalid_request_error","param":"input"}}"#
+        ));
+        // Success and other status classes are never treated as transient.
+        assert!(!transient_upstream_4xx(
+            StatusCode::OK,
+            br#"{"error":{"message":"invalid request error trace_id: abc"}}"#
+        ));
+        assert!(!transient_upstream_4xx(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"context length exceeded"}}"#
+        ));
     }
 
     #[tokio::test]
@@ -7553,7 +7993,7 @@ mod tests {
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO providers (id, name, provider_type, base_url) VALUES
-                (1, 'chat-only', 'openai', 'http://chat-only'),
+                (1, 'embeddings-only', 'openai', 'http://embeddings-only'),
                 (2, 'responses', 'openai', 'http://responses')",
         )
         .execute(&pool)
@@ -7561,7 +8001,7 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
-                (1, 'shared', '[\"/chat/completions\"]'),
+                (1, 'shared', '[\"/embeddings\"]'),
                 (2, 'shared', '[\"/chat/completions\",\"/responses\"]')",
         )
         .execute(&pool)
@@ -7575,11 +8015,13 @@ mod tests {
         assert_eq!(resolved.targets.len(), 1);
         assert_eq!(resolved.targets[0].provider_id, 2);
 
-        assert!(
-            resolve_route(&state, "shared", OPENAI_CHAT_COMPLETIONS)
-                .await
-                .is_err()
-        );
+        // The embeddings-only provider is excluded from chat completions even
+        // though it advertises a different OpenAI-compatible endpoint.
+        let resolved = resolve_route(&state, "shared", OPENAI_CHAT_COMPLETIONS)
+            .await
+            .unwrap();
+        assert_eq!(resolved.targets.len(), 1);
+        assert_eq!(resolved.targets[0].provider_id, 2);
     }
 
     #[tokio::test]
@@ -10525,6 +10967,37 @@ mod tests {
         assert!(joined.contains("event: response.completed"));
         assert_eq!(stream.usage.prompt_tokens, 7);
         assert_eq!(stream.usage.completion_tokens, 3);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_converts_to_responses_events() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut stream = ResponsesStreamState::new("coding".to_string(), Instant::now());
+        let mut tool_index = None;
+        for line in [
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hel\"},\"finish_reason\":null}]}\n".as_slice(),
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"lo\"},\"finish_reason\":null}]}\n".as_slice(),
+            b"data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n".as_slice(),
+            b"data: [DONE]\n".as_slice(),
+        ] {
+            process_chat_chunk_line(&mut stream, line, &mut tool_index, &tx).await;
+        }
+        stream.ensure_created(&tx).await;
+        stream.complete(&tx).await;
+        drop(tx);
+
+        let mut joined = String::new();
+        while let Some(chunk) = rx.recv().await {
+            joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+        }
+        assert!(joined.contains("event: response.created"));
+        assert!(joined.contains("event: response.output_text.delta"));
+        assert!(joined.contains("\"delta\":\"hel\""));
+        assert!(joined.contains("\"delta\":\"lo\""));
+        assert!(joined.contains("event: response.output_text.done"));
+        assert!(joined.contains("event: response.completed"));
+        assert_eq!(stream.usage.prompt_tokens, 5);
+        assert_eq!(stream.usage.completion_tokens, 2);
     }
 
     #[test]
