@@ -1847,7 +1847,7 @@ async fn forward_anthropic_native(
     state: &AppState,
     request_id: &str,
     requested_model: &str,
-    body: Value,
+    mut body: Value,
     target: RouteTarget,
     streamed: bool,
     request_tokens: i64,
@@ -1857,6 +1857,14 @@ async fn forward_anthropic_native(
     anthropic_beta: Option<String>,
     session_id: Option<&str>,
 ) -> AppResult<Response> {
+    apply_upstream_compat(
+        state,
+        request_id,
+        &target,
+        UpstreamShape::Anthropic,
+        &mut body,
+    )
+    .await;
     let build = || {
         let mut request = state
             .client
@@ -2017,13 +2025,19 @@ async fn forward_openai_as_anthropic(
     let upstream_endpoint =
         target_upstream_endpoint(&target, ANTHROPIC_MESSAGES).unwrap_or(OPENAI_CHAT_COMPLETIONS);
     let use_responses = upstream_endpoint == OPENAI_RESPONSES;
-    let body = if use_responses {
+    let mut body = if use_responses {
         chat_request_to_responses(request_json, &target.upstream_model, streamed)
     } else {
         let mut body = request_json.clone();
         body["model"] = json!(target.upstream_model);
         body
     };
+    let shape = if use_responses {
+        UpstreamShape::Responses
+    } else {
+        UpstreamShape::Chat
+    };
+    apply_upstream_compat(state, request_id, &target, shape, &mut body).await;
     let url = join_upstream_url(&target.base_url, upstream_endpoint);
     let build = || {
         let mut request = state
@@ -2677,6 +2691,96 @@ fn normalize_command_code_request(body: &mut Value) -> usize {
     command_code_max_output_tokens(body) + normalize_command_code_reasoning_effort(body)
 }
 
+/// Applies the compatibility repairs that must run on the exact body sent
+/// upstream, regardless of which inbound protocol produced it:
+///
+/// - drop unpaired tool calls and orphan tool results (aggregators and strict
+///   providers reject these with opaque 400s),
+/// - strip `tool_search` for providers known not to support it,
+/// - clamp/normalize CommandCode output limits and reasoning effort.
+///
+/// `shape` describes the wire format actually being sent, because OpenAI
+/// `messages` and Anthropic `messages` are different enough that the pairing
+/// rules must not be applied to the wrong one.
+async fn apply_upstream_compat(
+    state: &AppState,
+    request_id: &str,
+    target: &RouteTarget,
+    shape: UpstreamShape,
+    body: &mut Value,
+) {
+    let repaired_tool_items = match shape {
+        UpstreamShape::Responses => sanitize_responses_tool_history(body),
+        UpstreamShape::Chat => sanitize_chat_tool_history(body),
+        UpstreamShape::Anthropic => 0,
+    };
+    if repaired_tool_items > 0 {
+        tracing::warn!(
+            provider = %target.provider_name,
+            model = %target.upstream_model,
+            request_id,
+            repaired_tool_items,
+            "repaired incomplete tool history before upstream request"
+        );
+        log_usage_warning(
+            state,
+            request_id,
+            &format!(
+                "Removed {repaired_tool_items} incomplete tool-history item(s) before forwarding."
+            ),
+        )
+        .await;
+    }
+
+    if target.tool_search_supported == 0
+        && let Some(compat_body) = strip_tool_search_tools(body)
+    {
+        *body = compat_body;
+    }
+
+    if is_command_code_target(target) {
+        let changes = normalize_command_code_request(body);
+        if changes > 0 {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                changes,
+                "normalized CommandCode request before upstream send"
+            );
+            log_usage_warning(
+                state,
+                request_id,
+                "Applied CommandCode compatibility normalization to output limits or reasoning effort.",
+            )
+            .await;
+        }
+    }
+}
+
+/// Wire shape of the body that will be sent to the upstream.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum UpstreamShape {
+    Responses,
+    Chat,
+    Anthropic,
+}
+
+/// Classifies the body about to be sent to `provider_type` so the correct
+/// tool-history repair runs. A body with neither `input` nor the expected
+/// `messages` shape classifies as `Chat`; the chat repair then no-ops because
+/// there is no `messages` array to walk.
+fn classify_upstream_shape(provider_type: ProviderType, body: &Value) -> UpstreamShape {
+    if provider_type == ProviderType::Anthropic {
+        return UpstreamShape::Anthropic;
+    }
+    if body.get("input").is_some() && body.get("messages").is_none() {
+        UpstreamShape::Responses
+    } else {
+        UpstreamShape::Chat
+    }
+}
+
 pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     let message = String::from_utf8_lossy(body).to_ascii_lowercase();
     if !message.contains("tool_search") {
@@ -2828,32 +2932,6 @@ async fn forward_to_target(
     let translate_completions_to_responses =
         endpoint == OPENAI_COMPLETIONS && upstream_endpoint == OPENAI_RESPONSES;
 
-    let mut normalized_request = request_json.clone();
-    let repaired_tool_items = match endpoint {
-        OPENAI_RESPONSES => sanitize_responses_tool_history(&mut normalized_request),
-        OPENAI_CHAT_COMPLETIONS => sanitize_chat_tool_history(&mut normalized_request),
-        _ => 0,
-    };
-    if repaired_tool_items > 0 {
-        tracing::warn!(
-            provider = %target.provider_name,
-            model = %target.upstream_model,
-            request_id,
-            endpoint,
-            repaired_tool_items,
-            "repaired incomplete tool history before upstream request"
-        );
-        log_usage_warning(
-            state,
-            request_id,
-            &format!(
-                "Removed {repaired_tool_items} incomplete tool-history item(s) before forwarding."
-            ),
-        )
-        .await;
-    }
-    let request_json = &normalized_request;
-
     let (url, mut request_body) = match provider_type {
         ProviderType::Anthropic => {
             let body = match endpoint {
@@ -2887,30 +2965,8 @@ async fn forward_to_target(
         }
     };
 
-    if target.tool_search_supported == 0
-        && let Some(compat_body) = strip_tool_search_tools(&request_body)
-    {
-        request_body = compat_body;
-    }
-    if provider_type != ProviderType::Anthropic && is_command_code_target(&target) {
-        let changes = normalize_command_code_request(&mut request_body);
-        if changes > 0 {
-            tracing::warn!(
-                provider = %target.provider_name,
-                model = %target.upstream_model,
-                request_id,
-                endpoint,
-                changes,
-                "normalized CommandCode request before upstream send"
-            );
-            log_usage_warning(
-                state,
-                request_id,
-                "Applied CommandCode compatibility normalization to output limits or reasoning effort.",
-            )
-            .await;
-        }
-    }
+    let shape = classify_upstream_shape(provider_type, &request_body);
+    apply_upstream_compat(state, request_id, &target, shape, &mut request_body).await;
 
     let mut response = send_provider_request(
         state,
@@ -12385,6 +12441,161 @@ mod tests {
         assert_eq!(input[0]["call_id"], "call_pair");
         assert_eq!(input[1]["call_id"], "call_pair");
         assert_eq!(input[2]["role"], "user");
+
+        server.abort();
+    }
+
+    #[test]
+    fn classifies_upstream_shape_from_body_and_provider() {
+        assert_eq!(
+            classify_upstream_shape(ProviderType::Openai, &json!({"input": "hi"})),
+            UpstreamShape::Responses
+        );
+        assert_eq!(
+            classify_upstream_shape(
+                ProviderType::Openai,
+                &json!({"messages": [{"role": "user", "content": "hi"}]})
+            ),
+            UpstreamShape::Chat
+        );
+        // An Anthropic provider keeps the Anthropic repair rules even though
+        // the body also carries a `messages` array.
+        assert_eq!(
+            classify_upstream_shape(
+                ProviderType::Anthropic,
+                &json!({"messages": [{"role": "user", "content": []}]})
+            ),
+            UpstreamShape::Anthropic
+        );
+    }
+
+    #[tokio::test]
+    async fn anthropic_forward_repairs_orphan_tool_calls_for_openai_upstream() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None));
+        let app = axum::Router::new().route(
+            OPENAI_CHAT_COMPLETIONS,
+            axum::routing::post({
+                let captured = captured.clone();
+                move |Json(body): Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().await = Some(body);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "chatcmpl-1",
+                                "object": "chat.completion",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "done"},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 3,
+                                    "completion_tokens": 1,
+                                    "total_tokens": 4
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url)
+             VALUES (1, 'mock', 'openai', ?)",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let target = RouteTarget {
+            id: 1,
+            route_id: None,
+            provider_id: 1,
+            provider_name: "mock".to_string(),
+            provider_type: "openai".to_string(),
+            base_url: format!("http://{address}"),
+            model_prefix: String::new(),
+            api_key: None,
+            provider_headers: "{}".to_string(),
+            supported_endpoints: None,
+            context_limit: None,
+            input_limit: None,
+            output_limit: None,
+            provider_enabled: None,
+            model_enabled: None,
+            tool_search_supported: 1,
+            provider_health: None,
+            upstream_model: "upstream".to_string(),
+            weight: 100,
+            priority: 0,
+            enabled: 1,
+            provider_api_key_id: None,
+            provider_api_key_name: None,
+            auth_retryable: false,
+        };
+        // OpenAI chat shape, as produced from an Anthropic caller, carrying an
+        // assistant tool call whose result never came back.
+        let request_json = json!({
+            "model": "requested-model",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_missing",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                {"role": "user", "content": "continue"}
+            ]
+        });
+
+        let response = forward_openai_as_anthropic(
+            &state,
+            "anthropic-tool-repair",
+            "requested-model",
+            &request_json,
+            target,
+            false,
+            10,
+            None,
+            Instant::now(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = captured.lock().await.clone().unwrap();
+        let messages = captured["messages"].as_array().unwrap();
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.get("tool_calls").is_none()),
+            "orphan tool_calls must be removed before the upstream call: {captured}"
+        );
+        assert_eq!(messages.len(), 2);
 
         server.abort();
     }
