@@ -1814,6 +1814,7 @@ pub async fn list_model_inventory(
         r#"
         SELECT pm.provider_id,
                p.name AS provider_name,
+               p.provider_type AS provider_type,
                p.enabled AS provider_enabled,
                p.model_prefix,
                pm.model_name,
@@ -6589,6 +6590,17 @@ mod tests {
         assert_eq!(row.input_limit, Some(50_000));
         assert_eq!(row.output_limit, Some(4_000));
         assert_eq!(row.supported_endpoints, vec!["/chat/completions"]);
+        // The catalog also reports what the gateway serves, which includes the
+        // endpoints reachable through protocol translation.
+        assert_eq!(
+            row.served_endpoints,
+            vec![
+                "/chat/completions",
+                "/completions",
+                "/messages",
+                "/responses"
+            ]
+        );
         assert_eq!(row.cost_input, Some(1.5));
         assert_eq!(row.cost_output, Some(2.0));
     }

@@ -255,7 +255,10 @@ export type ModelInventory = {
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
+  /** Endpoints the upstream declares, after any manual override. */
   supported_endpoints: string[]
+  /** Endpoints the gateway accepts, including protocol translation. */
+  served_endpoints: string[]
   cost_input?: number | null
   cost_output?: number | null
   cost_cache_read?: number | null

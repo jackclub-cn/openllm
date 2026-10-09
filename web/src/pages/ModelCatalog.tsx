@@ -63,7 +63,7 @@ export default function ModelCatalog() {
   )
   const endpoints = useMemo(
     () =>
-      Array.from(new Set(items.flatMap((item) => item.supported_endpoints))).sort(),
+      Array.from(new Set(items.flatMap((item) => item.served_endpoints))).sort(),
     [items],
   )
   const filteredItems = items.filter((item) => {
@@ -78,7 +78,9 @@ export default function ModelCatalog() {
     if (providerId && item.provider_id !== providerId) return false
     if (status === 'enabled' && (!item.enabled || !item.provider_enabled)) return false
     if (status === 'disabled' && item.enabled && item.provider_enabled) return false
-    if (endpoint && !item.supported_endpoints.includes(endpoint)) return false
+    // Filter on what the gateway serves, not just what the upstream declares,
+    // so translated endpoints show up in the results.
+    if (endpoint && !item.served_endpoints.includes(endpoint)) return false
     return true
   })
   const enabledCount = items.filter((item) => item.enabled && item.provider_enabled).length
@@ -231,17 +233,27 @@ export default function ModelCatalog() {
               title: '支持接口',
               dataIndex: 'supported_endpoints',
               width: 220,
-              render: (values: string[]) =>
-                values.length ? (
-                  <Space wrap size={[4, 4]}>
-                    {values.slice(0, 2).map((value) => (
-                      <Tag key={value}>{value.replace(/^\/v1/, '')}</Tag>
-                    ))}
-                    {values.length > 2 && <Tag>+{values.length - 2}</Tag>}
-                  </Space>
-                ) : (
-                  <Typography.Text type="secondary">未声明</Typography.Text>
-                ),
+              render: (values: string[], record) => (
+                <Tooltip
+                  title={
+                    <div>
+                      <div>上游声明：{values.length ? values.join('、') : '未声明'}</div>
+                      <div>网关可承接：{record.served_endpoints.join('、') || '未验证'}</div>
+                    </div>
+                  }
+                >
+                  {values.length ? (
+                    <Space wrap size={[4, 4]}>
+                      {values.slice(0, 2).map((value) => (
+                        <Tag key={value}>{value.replace(/^\/v1/, '')}</Tag>
+                      ))}
+                      {values.length > 2 && <Tag>+{values.length - 2}</Tag>}
+                    </Space>
+                  ) : (
+                    <Typography.Text type="secondary">未声明</Typography.Text>
+                  )}
+                </Tooltip>
+              ),
             },
             {
               title: '操作',

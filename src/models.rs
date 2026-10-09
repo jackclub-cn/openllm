@@ -350,6 +350,7 @@ pub struct ProviderModelLimitsUpdate {
 pub struct ModelInventoryRow {
     pub provider_id: i64,
     pub provider_name: String,
+    pub provider_type: String,
     pub provider_enabled: bool,
     pub model_prefix: String,
     pub model_name: String,
@@ -376,7 +377,11 @@ pub struct ModelInventoryView {
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
     pub output_limit: Option<i64>,
+    /// Endpoints the upstream itself declares (after any manual override).
     pub supported_endpoints: Vec<String>,
+    /// Endpoints the gateway will actually accept, including protocol
+    /// translation. This is what routing and `/v1/models` enforce.
+    pub served_endpoints: Vec<String>,
     pub cost_input: Option<f64>,
     pub cost_output: Option<f64>,
     pub cost_cache_read: Option<f64>,
@@ -396,6 +401,15 @@ impl From<ModelInventoryRow> for ModelInventoryView {
             value.cost_cache_read_override,
             value.cost_cache_write_override,
         );
+        let declared: Vec<String> = value
+            .supported_endpoints
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+            .unwrap_or_default();
+        let served_endpoints = (!declared.is_empty())
+            .then(|| crate::registry::served_endpoints(&value.provider_type, Some(declared.clone())))
+            .flatten()
+            .unwrap_or_default();
         Self {
             provider_id: value.provider_id,
             provider_name: value.provider_name,
@@ -406,11 +420,8 @@ impl From<ModelInventoryRow> for ModelInventoryView {
             context_limit: value.context_limit,
             input_limit: value.input_limit,
             output_limit: value.output_limit,
-            supported_endpoints: value
-                .supported_endpoints
-                .as_deref()
-                .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
-                .unwrap_or_default(),
+            supported_endpoints: declared,
+            served_endpoints,
             cost_input: effective_cost
                 .as_ref()
                 .and_then(|cost| crate::models::cost_base_price(cost, "input")),
