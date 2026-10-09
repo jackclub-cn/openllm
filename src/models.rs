@@ -407,7 +407,9 @@ impl From<ModelInventoryRow> for ModelInventoryView {
             .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
             .unwrap_or_default();
         let served_endpoints = (!declared.is_empty())
-            .then(|| crate::registry::served_endpoints(&value.provider_type, Some(declared.clone())))
+            .then(|| {
+                crate::registry::served_endpoints(&value.provider_type, Some(declared.clone()))
+            })
             .flatten()
             .unwrap_or_default();
         Self {

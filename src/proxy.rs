@@ -660,21 +660,6 @@ fn anthropic_stop_reason(finish: Option<&str>, has_tool_use: bool) -> &'static s
 fn openai_response_to_anthropic(value: &Value, requested_model: &str) -> (Value, Usage) {
     let message = value.pointer("/choices/0/message");
     let mut content = Vec::new();
-    if let Some(reasoning) = message
-        .and_then(|message| {
-            message
-                .get("reasoning_content")
-                .or_else(|| message.get("reasoning"))
-        })
-        .and_then(Value::as_str)
-        .filter(|reasoning| !reasoning.is_empty())
-    {
-        content.push(json!({
-            "type": "thinking",
-            "thinking": reasoning,
-            "signature": ""
-        }));
-    }
     if let Some(text) = message
         .and_then(|message| message.get("content"))
         .and_then(Value::as_str)
@@ -753,7 +738,6 @@ fn anthropic_error_body(error_type: &str, message: &str) -> Value {
 #[derive(Default)]
 struct AnthropicStreamState {
     started: bool,
-    thinking_index: Option<usize>,
     text_index: Option<usize>,
     open_tools: Vec<usize>,
     tool_indices: std::collections::HashMap<i64, usize>,
@@ -766,6 +750,8 @@ struct AnthropicStreamState {
     cache_write_tokens: i64,
     text: String,
     first_token_ms: Option<i64>,
+    response_terminated: bool,
+    response_error: Option<String>,
 }
 
 async fn send_anthropic_event(
@@ -825,49 +811,8 @@ impl AnthropicStreamState {
         }
     }
 
-    /// Closes the open thinking block so a text or tool block can start.
-    async fn close_thinking_block(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
-        if let Some(index) = self.thinking_index.take() {
-            send_anthropic_event(
-                tx,
-                "content_block_stop",
-                json!({"type": "content_block_stop", "index": index}),
-            )
-            .await;
-        }
-    }
-
-    /// Opens a thinking block on first reasoning delta.
-    async fn ensure_thinking(
-        &mut self,
-        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
-        ctx: &StreamContext,
-    ) -> usize {
-        self.mark_first_token(ctx.started);
-        self.ensure_started(tx, ctx).await;
-        self.close_text_block(tx).await;
-        if let Some(index) = self.thinking_index {
-            return index;
-        }
-        let index = self.next_index;
-        self.next_index += 1;
-        self.thinking_index = Some(index);
-        send_anthropic_event(
-            tx,
-            "content_block_start",
-            json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-            }),
-        )
-        .await;
-        index
-    }
-
     /// Closes every still-open block at end of stream.
     async fn close_all_blocks(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
-        self.close_thinking_block(tx).await;
         self.close_text_block(tx).await;
         for index in self.open_tools.drain(..) {
             send_anthropic_event(
@@ -936,27 +881,6 @@ async fn process_openai_line_for_anthropic(
     }
 
     let delta = value.pointer("/choices/0/delta");
-    if let Some(reasoning) = delta
-        .and_then(|delta| {
-            delta
-                .get("reasoning_content")
-                .or_else(|| delta.get("reasoning"))
-        })
-        .and_then(Value::as_str)
-        && !reasoning.is_empty()
-    {
-        let index = state.ensure_thinking(tx, ctx).await;
-        send_anthropic_event(
-            tx,
-            "content_block_delta",
-            json!({
-                "type": "content_block_delta",
-                "index": index,
-                "delta": {"type": "thinking_delta", "thinking": reasoning}
-            }),
-        )
-        .await;
-    }
     if let Some(text) = delta
         .and_then(|delta| delta.get("content"))
         .and_then(Value::as_str)
@@ -967,7 +891,6 @@ async fn process_openai_line_for_anthropic(
         let index = match state.text_index {
             Some(index) => index,
             None => {
-                state.close_thinking_block(tx).await;
                 let index = state.next_index;
                 state.next_index += 1;
                 state.text_index = Some(index);
@@ -1301,7 +1224,17 @@ fn responses_stream_to_anthropic(
             )
             .await;
         }
-        finish_anthropic_stream(&mut stream_state, &context, &tx).await;
+        let stream_error = stream_error
+            .or_else(|| stream_state.response_error.clone())
+            .or_else(|| {
+                (!stream_state.response_terminated)
+                    .then(|| "upstream Responses stream ended without a terminal event".to_string())
+            });
+        if let Some(error) = stream_error.as_deref() {
+            send_anthropic_event(&tx, "error", anthropic_error_body("api_error", error)).await;
+        } else {
+            finish_anthropic_stream(&mut stream_state, &context, &tx).await;
+        }
         drop(tx);
 
         let prompt_tokens = if stream_state.input_tokens > 0 {
@@ -1362,6 +1295,15 @@ fn responses_stream_to_anthropic(
     response
 }
 
+fn responses_stream_error(value: &Value) -> String {
+    value
+        .pointer("/response/error/message")
+        .or_else(|| value.pointer("/error/message"))
+        .and_then(Value::as_str)
+        .unwrap_or("upstream response failed")
+        .to_string()
+}
+
 /// Handles one Responses SSE line, emitting the matching Anthropic events.
 #[allow(clippy::too_many_arguments)]
 async fn process_responses_line_for_anthropic(
@@ -1396,12 +1338,9 @@ async fn process_responses_line_for_anthropic(
     match event {
         "response.output_item.added" => {
             let item = value.get("item").unwrap_or(&Value::Null);
-            if item.get("type").and_then(Value::as_str) == Some("reasoning") {
-                state.ensure_thinking(tx, ctx).await;
-            } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
                 state.mark_first_token(ctx.started);
                 state.ensure_started(tx, ctx).await;
-                state.close_thinking_block(tx).await;
                 state.close_text_block(tx).await;
                 let index = state.next_index;
                 state.next_index += 1;
@@ -1437,7 +1376,6 @@ async fn process_responses_line_for_anthropic(
                 let index = match state.text_index {
                     Some(index) => index,
                     None => {
-                        state.close_thinking_block(tx).await;
                         let index = state.next_index;
                         state.next_index += 1;
                         state.text_index = Some(index);
@@ -1467,23 +1405,6 @@ async fn process_responses_line_for_anthropic(
                 .await;
             }
         }
-        "response.reasoning_summary_text.delta" => {
-            if let Some(delta) = value.get("delta").and_then(Value::as_str)
-                && !delta.is_empty()
-            {
-                let index = state.ensure_thinking(tx, ctx).await;
-                send_anthropic_event(
-                    tx,
-                    "content_block_delta",
-                    json!({
-                        "type": "content_block_delta",
-                        "index": index,
-                        "delta": {"type": "thinking_delta", "thinking": delta}
-                    }),
-                )
-                .await;
-            }
-        }
         "response.function_call_arguments.delta" => {
             if let Some(partial) = value.get("delta").and_then(Value::as_str)
                 && !partial.is_empty()
@@ -1507,6 +1428,10 @@ async fn process_responses_line_for_anthropic(
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
             let response = value.get("response").unwrap_or(&Value::Null);
+            state.response_terminated = true;
+            if event == "response.failed" {
+                state.response_error = Some(responses_stream_error(&value));
+            }
             if let Some(usage) = usage_from_value(response) {
                 if usage.prompt_tokens > 0 {
                     state.input_tokens = usage.prompt_tokens;
@@ -1517,7 +1442,9 @@ async fn process_responses_line_for_anthropic(
                 state.cache_read_tokens = usage.cache_read_tokens;
                 state.cache_write_tokens = usage.cache_write_tokens;
             }
-            if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+            if event == "response.incomplete"
+                || response.get("status").and_then(Value::as_str) == Some("incomplete")
+            {
                 state.finish_reason = Some("length".to_string());
             }
         }
@@ -4062,12 +3989,13 @@ impl ResponsesStreamState {
             "completed"
         };
         let response = self.response_object(status);
-        self.send_event(
-            tx,
-            "response.completed",
-            json!({"type": "response.completed", "response": response}),
-        )
-        .await;
+        let event = if status == "incomplete" {
+            "response.incomplete"
+        } else {
+            "response.completed"
+        };
+        self.send_event(tx, event, json!({"type": event, "response": response}))
+            .await;
     }
 
     async fn fail(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>, message: &str) {
@@ -4531,7 +4459,21 @@ fn responses_stream_to_chat(
             .await;
         }
 
-        if let Some(reason) = chat_state.finish_reason() {
+        let stream_error = stream_error
+            .or_else(|| chat_state.response_error.clone())
+            .or_else(|| {
+                (!chat_state.response_terminated)
+                    .then(|| "upstream Responses stream ended without a terminal event".to_string())
+            });
+        if let Some(error) = stream_error.as_deref() {
+            let _ = tx
+                .send(Ok(Bytes::from(format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    json!({"error": {"type": "api_error", "message": error}})
+                ))))
+                .await;
+        } else {
+            let reason = chat_state.finish_reason();
             let final_chunk =
                 openai_stream_chunk(&message_id, &requested_model, json!({}), Some(reason), None);
             let usage_chunk = openai_stream_chunk(
@@ -4621,13 +4563,15 @@ struct ChatStreamState {
     sent_role: bool,
     saw_tool_call: bool,
     stop_reason: Option<String>,
+    response_terminated: bool,
+    response_error: Option<String>,
     /// Maps a Responses function-call item id to its chat tool-call index.
     tool_indices: std::collections::HashMap<String, usize>,
 }
 
 impl ChatStreamState {
-    fn finish_reason(&self) -> Option<&'static str> {
-        Some(if self.saw_tool_call {
+    fn finish_reason(&self) -> &'static str {
+        if self.saw_tool_call {
             "tool_calls"
         } else if self.stop_reason.as_deref() == Some("max_tokens")
             || self.stop_reason.as_deref() == Some("length")
@@ -4635,7 +4579,7 @@ impl ChatStreamState {
             "length"
         } else {
             "stop"
-        })
+        }
     }
 }
 
@@ -4772,13 +4716,19 @@ async fn process_responses_line_for_chat(
         }
         "response.completed" | "response.incomplete" | "response.failed" => {
             let response = value.get("response").unwrap_or(&Value::Null);
+            state.response_terminated = true;
+            if event == "response.failed" {
+                state.response_error = Some(responses_stream_error(&value));
+            }
             if let Some(usage) = usage_from_value(response) {
                 state.prompt_tokens = usage.prompt_tokens;
                 state.completion_tokens = usage.completion_tokens;
                 state.cache_read_tokens = usage.cache_read_tokens;
                 state.cache_write_tokens = usage.cache_write_tokens;
             }
-            if let Some(details) = response
+            if event == "response.incomplete" {
+                state.stop_reason = Some("length".to_string());
+            } else if let Some(details) = response
                 .pointer("/incomplete_details/reason")
                 .and_then(Value::as_str)
             {
@@ -9680,7 +9630,10 @@ mod tests {
             upstream_trace_id(body).as_deref(),
             Some("b25620737c4014bef3c7d9d4b56e6854")
         );
-        assert_eq!(upstream_trace_id(br#"{"error":{"message":"bad input"}}"#), None);
+        assert_eq!(
+            upstream_trace_id(br#"{"error":{"message":"bad input"}}"#),
+            None
+        );
     }
 
     #[tokio::test]
@@ -13235,6 +13188,67 @@ mod tests {
         assert_eq!(state.text, "hi there");
         assert_eq!(state.prompt_tokens, 7);
         assert_eq!(state.completion_tokens, 3);
+        assert!(state.response_terminated);
+        assert!(state.response_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn responses_stream_failure_is_not_a_successful_chat_or_anthropic_turn() {
+        let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let failed = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"quota exhausted\"},\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n";
+        let mut chat = ChatStreamState::default();
+        process_responses_line_for_chat(
+            failed,
+            &mut String::new(),
+            &mut chat,
+            "chatcmpl_test",
+            "coding",
+            Instant::now(),
+            &tx,
+        )
+        .await;
+        assert!(chat.response_terminated);
+        assert_eq!(chat.response_error.as_deref(), Some("quota exhausted"));
+        assert_eq!(chat.prompt_tokens, 6);
+
+        let context = StreamContext {
+            message_id: "msg_test".to_string(),
+            model: "coding".to_string(),
+            input_tokens: 6,
+            started: Instant::now(),
+        };
+        let mut anthropic = AnthropicStreamState::default();
+        process_responses_line_for_anthropic(
+            failed,
+            &mut String::new(),
+            &mut anthropic,
+            &mut std::collections::HashMap::new(),
+            &context,
+            &tx,
+        )
+        .await;
+        assert!(anthropic.response_terminated);
+        assert_eq!(anthropic.response_error.as_deref(), Some("quota exhausted"));
+        assert_eq!(anthropic.input_tokens, 6);
+    }
+
+    #[tokio::test]
+    async fn incomplete_responses_stream_has_length_finish_reason() {
+        let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let incomplete = b"data: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n";
+        let mut chat = ChatStreamState::default();
+        process_responses_line_for_chat(
+            incomplete,
+            &mut String::new(),
+            &mut chat,
+            "chatcmpl_test",
+            "coding",
+            Instant::now(),
+            &tx,
+        )
+        .await;
+        assert_eq!(chat.finish_reason(), "length");
+        assert!(chat.response_error.is_none());
     }
 
     #[test]
@@ -13372,8 +13386,24 @@ mod tests {
         assert_eq!(stream.output[1]["type"], "message");
     }
 
+    #[tokio::test]
+    async fn anthropic_max_tokens_emits_incomplete_responses_event() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(8);
+        let mut stream = ResponsesStreamState::new("coding".to_string(), Instant::now());
+        stream.stop_reason = Some("max_tokens".to_string());
+        stream.complete(&tx).await;
+        drop(tx);
+        let mut events = String::new();
+        while let Some(chunk) = rx.recv().await {
+            events.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert!(events.contains("event: response.incomplete"));
+        assert!(events.contains("\"reason\":\"max_output_tokens\""));
+        assert!(!events.contains("event: response.completed"));
+    }
+
     #[test]
-    fn responses_reasoning_becomes_anthropic_thinking() {
+    fn responses_reasoning_does_not_forge_anthropic_signature() {
         let (converted, _) = responses_response_to_anthropic(
             &json!({
                 "id": "resp_1",
@@ -13393,10 +13423,26 @@ mod tests {
             }),
             "coding",
         );
-        assert_eq!(converted["content"][0]["type"], "thinking");
-        assert_eq!(converted["content"][0]["thinking"], "thought");
-        assert_eq!(converted["content"][1]["type"], "text");
-        assert_eq!(converted["content"][1]["text"], "answer");
+        assert_eq!(converted["content"].as_array().unwrap().len(), 1);
+        assert_eq!(converted["content"][0]["type"], "text");
+        assert_eq!(converted["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn chat_reasoning_does_not_forge_anthropic_signature() {
+        let (converted, _) = openai_response_to_anthropic(
+            &json!({
+                "choices": [{
+                    "message": {"role": "assistant", "reasoning_content": "private plan", "content": "answer"},
+                    "finish_reason": "stop"
+                }]
+            }),
+            "coding",
+        );
+        assert_eq!(
+            converted["content"],
+            json!([{"type": "text", "text": "answer"}])
+        );
     }
 
     #[test]
@@ -13484,7 +13530,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn responses_reasoning_stream_becomes_anthropic_thinking() {
+    async fn responses_reasoning_stream_does_not_emit_unsigned_anthropic_thinking() {
         let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
         let context = StreamContext {
             message_id: "msg_test".to_string(),
@@ -13521,8 +13567,9 @@ mod tests {
         while let Some(chunk) = rx.recv().await {
             joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
         }
-        assert!(joined.contains("\"thinking_delta\""));
-        assert!(joined.contains("\"thinking\":\"hmm\""));
+        assert!(!joined.contains("\"thinking_delta\""));
+        assert!(!joined.contains("\"signature\":\"\""));
+        assert!(joined.contains("\"text\":\"done\""));
         assert!(joined.contains("event: message_stop"));
     }
 }
