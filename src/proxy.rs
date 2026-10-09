@@ -2843,6 +2843,14 @@ async fn forward_to_target(
             repaired_tool_items,
             "repaired incomplete tool history before upstream request"
         );
+        log_usage_warning(
+            state,
+            request_id,
+            &format!(
+                "Removed {repaired_tool_items} incomplete tool-history item(s) before forwarding."
+            ),
+        )
+        .await;
     }
     let request_json = &normalized_request;
 
@@ -2895,6 +2903,12 @@ async fn forward_to_target(
                 changes,
                 "normalized CommandCode request before upstream send"
             );
+            log_usage_warning(
+                state,
+                request_id,
+                "Applied CommandCode compatibility normalization to output limits or reasoning effort.",
+            )
+            .await;
         }
     }
 
@@ -9155,6 +9169,28 @@ async fn log_usage_target(
     }
 }
 
+async fn log_usage_warning(state: &AppState, request_id: &str, warning: &str) {
+    let warning = warning.chars().take(500).collect::<String>();
+    if let Err(error) = sqlx::query(
+        "UPDATE usage_logs \
+         SET warning_message = CASE \
+             WHEN warning_message IS NULL OR warning_message = '' THEN ? \
+             WHEN instr(warning_message, ?) > 0 THEN warning_message \
+             ELSE warning_message || char(10) || ? \
+         END \
+         WHERE request_id = ?",
+    )
+    .bind(&warning)
+    .bind(&warning)
+    .bind(&warning)
+    .bind(request_id)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(%error, request_id, "failed to update usage warning");
+    }
+}
+
 async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
     let estimated_cost_micros =
@@ -12351,6 +12387,41 @@ mod tests {
         assert_eq!(input[2]["role"], "user");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn usage_warning_appends_once_per_unique_message() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let state = AppState::new(pool.clone(), None);
+
+        log_usage_started(
+            &state,
+            "warning-test",
+            None,
+            None,
+            None,
+            "requested-model",
+            OPENAI_RESPONSES,
+            10,
+            false,
+        )
+        .await;
+        log_usage_warning(&state, "warning-test", "first warning").await;
+        log_usage_warning(&state, "warning-test", "first warning").await;
+        log_usage_warning(&state, "warning-test", "second warning").await;
+
+        let warning: Option<String> =
+            sqlx::query_scalar("SELECT warning_message FROM usage_logs WHERE request_id = ?")
+                .bind("warning-test")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(warning.as_deref(), Some("first warning\nsecond warning"));
     }
 
     #[test]

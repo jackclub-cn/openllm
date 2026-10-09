@@ -397,6 +397,7 @@ export type UsageLog = {
   streamed: boolean
   error_message?: string
   response_preview?: string
+  warning_message?: string
   created_at: string
 }
 

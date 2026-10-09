@@ -10,6 +10,7 @@ import {
   PauseCircleOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
+  WarningOutlined,
 } from '@ant-design/icons'
 import {
   Alert,
@@ -620,12 +621,22 @@ export default function Usage() {
               title: '状态',
               dataIndex: 'success',
               width: 100,
-              render: (value: boolean, record) =>
-                record.in_flight ? (
-                  <Tag color="processing">请求中</Tag>
-                ) : (
-                  <Tag color={value ? 'success' : 'error'}>{value ? '成功' : record.status_code}</Tag>
-                ),
+              render: (value: boolean, record) => (
+                <Space size={4}>
+                  {record.in_flight ? (
+                    <Tag color="processing">请求中</Tag>
+                  ) : (
+                    <Tag color={value ? 'success' : 'error'}>
+                      {value ? '成功' : record.status_code}
+                    </Tag>
+                  )}
+                  {record.warning_message && (
+                    <Tooltip title={record.warning_message}>
+                      <WarningOutlined style={{ color: '#d48806' }} />
+                    </Tooltip>
+                  )}
+                </Space>
+              ),
             },
             {
               title: 'tokens',
@@ -900,6 +911,14 @@ export default function Usage() {
                 {formatCostMicros(detail.estimated_cost_micros)}
               </Descriptions.Item>
             </Descriptions>
+            {detail.warning_message && (
+              <Alert
+                type="warning"
+                showIcon
+                message="网关请求调整"
+                description={<pre className="response-block">{detail.warning_message}</pre>}
+              />
+            )}
             {detail.error_message && (
               <div>
                 <Typography.Text strong>错误信息</Typography.Text>

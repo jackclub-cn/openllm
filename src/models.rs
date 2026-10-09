@@ -996,6 +996,8 @@ pub struct UsageLog {
     pub streamed: i64,
     pub error_message: Option<String>,
     pub response_preview: Option<String>,
+    #[sqlx(default)]
+    pub warning_message: Option<String>,
     pub created_at: String,
 }
 
@@ -1038,6 +1040,7 @@ pub struct UsageLogView {
     pub streamed: bool,
     pub error_message: Option<String>,
     pub response_preview: Option<String>,
+    pub warning_message: Option<String>,
     pub created_at: String,
 }
 
@@ -1080,6 +1083,7 @@ impl From<UsageLog> for UsageLogView {
             streamed,
             error_message: value.error_message,
             response_preview: value.response_preview,
+            warning_message: value.warning_message,
             created_at: value.created_at,
         }
     }
@@ -1115,6 +1119,7 @@ pub struct UsageLogDetailRow {
     pub streamed: i64,
     pub error_message: Option<String>,
     pub response_preview: Option<String>,
+    pub warning_message: Option<String>,
     pub created_at: String,
 }
 
@@ -1157,6 +1162,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
             streamed,
             error_message: value.error_message,
             response_preview: value.response_preview,
+            warning_message: value.warning_message,
             created_at: value.created_at,
         }
     }

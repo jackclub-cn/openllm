@@ -2815,7 +2815,7 @@ pub async fn list_usage(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
-               u.first_token_ms, u.session_id,
+               u.first_token_ms, u.session_id, u.warning_message,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
@@ -2860,7 +2860,8 @@ pub async fn export_usage(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
                u.status_code, u.in_flight, u.success, u.streamed, u.error_message,
-               u.created_at, u.first_token_ms, u.session_id, NULL AS response_preview,
+               u.created_at, u.first_token_ms, u.session_id, u.warning_message,
+               NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
         FROM usage_logs u
@@ -2882,7 +2883,7 @@ pub async fn export_usage(
     let truncated = rows.len() as i64 == USAGE_EXPORT_LIMIT;
 
     let mut csv = String::from(
-        "\u{feff}created_at,request_id,session_id,api_key,provider,provider_api_key,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message\r\n",
+        "\u{feff}created_at,request_id,session_id,api_key,provider,provider_api_key,route,requested_model,upstream_model,endpoint,prompt_tokens,completion_tokens,total_tokens,cache_read_tokens,cache_write_tokens,estimated_cost_usd,latency_ms,first_token_ms,output_tps,status_code,in_flight,success,streamed,error_message,gateway_warning\r\n",
     );
     for row in rows {
         let item = UsageLogView::from(row);
@@ -2941,6 +2942,7 @@ fn usage_csv_row(item: &UsageLogView) -> String {
         if item.success { "true" } else { "false" }.to_string(),
         if item.streamed { "true" } else { "false" }.to_string(),
         text(item.error_message.as_deref()),
+        text(item.warning_message.as_deref()),
     ]
     .into_iter()
     .map(|value| csv_field(&value))
@@ -3315,7 +3317,7 @@ pub async fn overview(
                u.completion_tokens, u.total_tokens, u.cache_read_tokens,
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
-               u.first_token_ms, u.session_id,
+               u.first_token_ms, u.session_id, u.warning_message,
                NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
@@ -5645,10 +5647,10 @@ mod tests {
                 request_id, provider_id, provider_api_key_id, provider_api_key_name,
                 requested_model,
                 endpoint, prompt_tokens, completion_tokens, total_tokens,
-                latency_ms, status_code, success
+                latency_ms, status_code, success, warning_message
              ) VALUES (
                 'request-with-provider-key', 1, 11, 'Primary', 'gpt-test',
-                '/v1/chat/completions', 10, 4, 14, 123, 200, 1
+                '/v1/chat/completions', 10, 4, 14, 123, 200, 1, 'repaired request'
              )",
         )
         .execute(&state.pool)
@@ -5674,6 +5676,7 @@ mod tests {
         .unwrap();
         assert_eq!(detail.provider_api_key_id, Some(11));
         assert_eq!(detail.provider_api_key_name.as_deref(), Some("Primary"));
+        assert_eq!(detail.warning_message.as_deref(), Some("repaired request"));
 
         let provider = get_provider(&state, 1).await.unwrap();
         assert_eq!(provider.api_keys[0].requests, 1);
