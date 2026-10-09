@@ -2757,7 +2757,13 @@ async fn forward_to_target(
             tracing::warn!(
                 provider = %target.provider_name,
                 model = %target.upstream_model,
+                request_id,
+                endpoint,
                 %status,
+                trace_id = tracing::field::display(
+                    upstream_trace_id(&response_body).as_deref().unwrap_or("unknown")
+                ),
+                has_tool_search = strip_tool_search_tools(&request_body).is_some(),
                 "upstream returned an opaque 4xx; retrying once"
             );
             response = send_provider_request(
@@ -2775,6 +2781,20 @@ async fn forward_to_target(
             .await?;
             status = response.status();
             continue;
+        }
+
+        if transient_retry_used && transient_upstream_4xx(status, &response_body) {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                endpoint,
+                %status,
+                trace_id = tracing::field::display(
+                    upstream_trace_id(&response_body).as_deref().unwrap_or("unknown")
+                ),
+                "upstream still returned an opaque 4xx after retry"
+            );
         }
 
         if matches!(
@@ -7804,6 +7824,9 @@ where
             provider = %target.provider_name,
             model = %target.upstream_model,
             %status,
+            trace_id = tracing::field::display(
+                upstream_trace_id(&body).as_deref().unwrap_or("unknown")
+            ),
             "upstream returned an opaque 4xx; retrying once"
         );
         response = send_provider_request(state, target, build()?).await?;
@@ -7815,6 +7838,17 @@ where
             .bytes()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))?;
+        if transient_upstream_4xx(status, &body) {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                %status,
+                trace_id = tracing::field::display(
+                    upstream_trace_id(&body).as_deref().unwrap_or("unknown")
+                ),
+                "upstream still returned an opaque 4xx after retry"
+            );
+        }
     }
 
     Ok(UpstreamAttempt::Error { status, body })
@@ -8596,6 +8630,18 @@ fn transient_upstream_4xx(status: StatusCode, body: &[u8]) -> bool {
     }
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     text.contains("trace_id") && text.contains("invalid request") && !text.contains("\"param\"")
+}
+
+fn upstream_trace_id(body: &[u8]) -> Option<String> {
+    let value = serde_json::from_slice::<Value>(body).ok()?;
+    let message = value.pointer("/error/message")?.as_str()?;
+    let start = message.to_ascii_lowercase().find("trace_id:")? + "trace_id:".len();
+    let trace = message[start..]
+        .trim_start()
+        .chars()
+        .take_while(|ch| ch.is_ascii_hexdigit())
+        .collect::<String>();
+    (!trace.is_empty()).then_some(trace)
 }
 
 fn should_try_next_target(target: &RouteTarget, status: StatusCode) -> bool {
@@ -9625,6 +9671,16 @@ mod tests {
             StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"context length exceeded"}}"#
         ));
+    }
+
+    #[test]
+    fn extracts_trace_id_from_wrapped_upstream_error() {
+        let body = br#"{"error":{"message":"{\"type\":\"invalid_request_error\",\"message\":\"invalid request error trace_id: b25620737c4014bef3c7d9d4b56e6854\"}\n","type":"invalid_request_error"}}"#;
+        assert_eq!(
+            upstream_trace_id(body).as_deref(),
+            Some("b25620737c4014bef3c7d9d4b56e6854")
+        );
+        assert_eq!(upstream_trace_id(br#"{"error":{"message":"bad input"}}"#), None);
     }
 
     #[tokio::test]
