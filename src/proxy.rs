@@ -718,6 +718,16 @@ fn openai_response_to_anthropic(value: &Value, requested_model: &str) -> (Value,
     )
 }
 
+/// Converts a Responses object into an Anthropic message.
+///
+/// Responses-first OpenAI upstreams serve Anthropic clients by normalising the
+/// payload through the chat shape the Anthropic converter already understands.
+fn responses_response_to_anthropic(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let (chat, usage) = responses_response_to_chat(value, requested_model);
+    let (anthropic, _) = openai_response_to_anthropic(&chat, requested_model);
+    (anthropic, usage)
+}
+
 /// Wraps a message in Anthropic's error envelope so Anthropic clients can parse
 /// gateway-side failures the same way they parse upstream errors.
 fn anthropic_error_body(error_type: &str, message: &str) -> Value {
@@ -1141,6 +1151,272 @@ fn openai_stream_to_anthropic(
         .header("x-accel-buffering", "no")
         .body(Body::from_stream(ReceiverStream::new(rx)))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Rewrites a Responses SSE stream into the Anthropic event protocol so that
+/// Anthropic clients can be served by a Responses-only OpenAI upstream.
+#[allow(clippy::too_many_arguments)]
+fn responses_stream_to_anthropic(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let context = StreamContext {
+            message_id: format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            model: requested_model.clone(),
+            input_tokens: request_tokens,
+            started,
+        };
+        let mut stream_state = AnthropicStreamState::default();
+        let mut tool_indices = std::collections::HashMap::<String, usize>::new();
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut event_name = String::new();
+        let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                process_responses_line_for_anthropic(
+                    &line,
+                    &mut event_name,
+                    &mut stream_state,
+                    &mut tool_indices,
+                    &context,
+                    &tx,
+                )
+                .await;
+            }
+        }
+        if !buffer.is_empty() {
+            process_responses_line_for_anthropic(
+                &buffer,
+                &mut event_name,
+                &mut stream_state,
+                &mut tool_indices,
+                &context,
+                &tx,
+            )
+            .await;
+        }
+        finish_anthropic_stream(&mut stream_state, &context, &tx).await;
+        drop(tx);
+
+        let prompt_tokens = if stream_state.input_tokens > 0 {
+            stream_state.input_tokens
+        } else {
+            request_tokens
+        };
+        let completion_tokens = if stream_state.output_tokens > 0 {
+            stream_state.output_tokens
+        } else {
+            (stream_state.text.chars().count() / 4) as i64
+        };
+        let usage = Usage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+            cache_read_tokens: stream_state.cache_read_tokens,
+            cache_write_tokens: stream_state.cache_write_tokens,
+        }
+        .normalized();
+        let preview = response_preview(stream_state.text.as_bytes());
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms = stream_state
+            .first_token_ms
+            .or_else(|| (completion_tokens > 0).then_some(latency_ms));
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: ANTHROPIC_MESSAGES,
+                usage,
+                latency_ms,
+                first_token_ms,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+}
+
+/// Handles one Responses SSE line, emitting the matching Anthropic events.
+#[allow(clippy::too_many_arguments)]
+async fn process_responses_line_for_anthropic(
+    line: &[u8],
+    event_name: &mut String,
+    state: &mut AnthropicStreamState,
+    tool_indices: &mut std::collections::HashMap<String, usize>,
+    ctx: &StreamContext,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if let Some(event) = line.strip_prefix("event:") {
+        *event_name = event.trim().to_string();
+        return;
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+    let event = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or(event_name.as_str());
+
+    match event {
+        "response.output_item.added" => {
+            let item = value.get("item").unwrap_or(&Value::Null);
+            if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                state.mark_first_token(ctx.started);
+                state.ensure_started(tx, ctx).await;
+                state.close_text_block(tx).await;
+                let index = state.next_index;
+                state.next_index += 1;
+                state.open_tools.push(index);
+                state.has_tool_use = true;
+                if let Some(item_id) = item.get("id").and_then(Value::as_str) {
+                    tool_indices.insert(item_id.to_string(), index);
+                }
+                send_anthropic_event(
+                    tx,
+                    "content_block_start",
+                    json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": item.get("call_id").or_else(|| item.get("id")).cloned()
+                                .unwrap_or_else(|| json!(format!("toolu_{}", uuid::Uuid::new_v4().simple()))),
+                            "name": item.get("name").cloned().unwrap_or(Value::Null),
+                            "input": {}
+                        }
+                    }),
+                )
+                .await;
+            }
+        }
+        "response.output_text.delta" => {
+            if let Some(text) = value.get("delta").and_then(Value::as_str)
+                && !text.is_empty()
+            {
+                state.mark_first_token(ctx.started);
+                state.ensure_started(tx, ctx).await;
+                let index = match state.text_index {
+                    Some(index) => index,
+                    None => {
+                        let index = state.next_index;
+                        state.next_index += 1;
+                        state.text_index = Some(index);
+                        send_anthropic_event(
+                            tx,
+                            "content_block_start",
+                            json!({
+                                "type": "content_block_start",
+                                "index": index,
+                                "content_block": {"type": "text", "text": ""}
+                            }),
+                        )
+                        .await;
+                        index
+                    }
+                };
+                state.text.push_str(text);
+                send_anthropic_event(
+                    tx,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "text_delta", "text": text}
+                    }),
+                )
+                .await;
+            }
+        }
+        "response.function_call_arguments.delta" => {
+            if let Some(partial) = value.get("delta").and_then(Value::as_str)
+                && !partial.is_empty()
+                && let Some(index) = value
+                    .get("item_id")
+                    .and_then(Value::as_str)
+                    .and_then(|item_id| tool_indices.get(item_id).copied())
+            {
+                state.mark_first_token(ctx.started);
+                send_anthropic_event(
+                    tx,
+                    "content_block_delta",
+                    json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {"type": "input_json_delta", "partial_json": partial}
+                    }),
+                )
+                .await;
+            }
+        }
+        "response.completed" | "response.incomplete" | "response.failed" => {
+            let response = value.get("response").unwrap_or(&Value::Null);
+            if let Some(usage) = usage_from_value(response) {
+                if usage.prompt_tokens > 0 {
+                    state.input_tokens = usage.prompt_tokens;
+                }
+                if usage.completion_tokens > 0 {
+                    state.output_tokens = usage.completion_tokens;
+                }
+                state.cache_read_tokens = usage.cache_read_tokens;
+                state.cache_write_tokens = usage.cache_write_tokens;
+            }
+            if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+                state.finish_reason = Some("length".to_string());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Pagination parameters accepted by Anthropic's model list endpoint.
@@ -1703,9 +1979,17 @@ async fn forward_openai_as_anthropic(
     receipt: Option<Value>,
     session_id: Option<&str>,
 ) -> AppResult<Response> {
-    let mut body = request_json.clone();
-    body["model"] = json!(target.upstream_model);
-    let url = join_upstream_url(&target.base_url, OPENAI_CHAT_COMPLETIONS);
+    let upstream_endpoint =
+        target_upstream_endpoint(&target, ANTHROPIC_MESSAGES).unwrap_or(OPENAI_CHAT_COMPLETIONS);
+    let use_responses = upstream_endpoint == OPENAI_RESPONSES;
+    let body = if use_responses {
+        chat_request_to_responses(request_json, &target.upstream_model, streamed)
+    } else {
+        let mut body = request_json.clone();
+        body["model"] = json!(target.upstream_model);
+        body
+    };
+    let url = join_upstream_url(&target.base_url, upstream_endpoint);
     let mut request = state
         .client
         .post(url)
@@ -1781,6 +2065,18 @@ async fn forward_openai_as_anthropic(
     }
 
     if streamed {
+        if use_responses {
+            return Ok(responses_stream_to_anthropic(
+                state.clone(),
+                response,
+                request_id.to_string(),
+                requested_model.to_string(),
+                target,
+                request_tokens,
+                api_key.cloned(),
+                started,
+            ));
+        }
         return Ok(openai_stream_to_anthropic(
             state.clone(),
             response,
@@ -1799,7 +2095,11 @@ async fn forward_openai_as_anthropic(
         .map_err(|error| AppError::Upstream(error.to_string()))?;
     let upstream: Value = serde_json::from_slice(&bytes)
         .map_err(|error| AppError::Upstream(format!("invalid JSON from upstream: {error}")))?;
-    let (converted, usage) = openai_response_to_anthropic(&upstream, requested_model);
+    let (converted, usage) = if use_responses {
+        responses_response_to_anthropic(&upstream, requested_model)
+    } else {
+        openai_response_to_anthropic(&upstream, requested_model)
+    };
     let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
     let preview = response_preview(converted_bytes.as_slice());
     let latency_ms = started.elapsed().as_millis() as i64;
@@ -6002,6 +6302,18 @@ fn target_upstream_endpoint<'a>(
     {
         return Some(OPENAI_RESPONSES);
     }
+    // Anthropic callers normally reach an OpenAI provider through its chat
+    // endpoint, but a Responses-only upstream can serve them too.
+    if matches!(provider_type, ProviderType::Openai | ProviderType::Custom)
+        && request_endpoint == ANTHROPIC_MESSAGES
+        && !endpoint_metadata_supports(
+            target.supported_endpoints.as_deref(),
+            OPENAI_CHAT_COMPLETIONS,
+        )
+        && endpoint_metadata_supports(target.supported_endpoints.as_deref(), OPENAI_RESPONSES)
+    {
+        return Some(OPENAI_RESPONSES);
+    }
     provider_upstream_endpoint(provider_type, request_endpoint)
 }
 
@@ -8561,6 +8873,15 @@ mod tests {
         ));
         assert_eq!(
             target_upstream_endpoint(&responses_only, OPENAI_CHAT_COMPLETIONS),
+            Some(OPENAI_RESPONSES)
+        );
+        // Anthropic callers can also reach a Responses-only target.
+        assert!(target_supports_endpoint(
+            &responses_only,
+            ANTHROPIC_MESSAGES
+        ));
+        assert_eq!(
+            target_upstream_endpoint(&responses_only, ANTHROPIC_MESSAGES),
             Some(OPENAI_RESPONSES)
         );
     }
@@ -11923,99 +12244,99 @@ mod tests {
             "OpenAI tool indices must not include Anthropic text-block offsets: {joined}"
         );
     }
-}
-#[test]
-fn chat_request_converts_to_responses_shape() {
-    let converted = chat_request_to_responses(
-        &json!({
-            "model": "coding",
-            "max_tokens": 256,
-            "temperature": 0.2,
-            "messages": [
-                { "role": "system", "content": "be terse" },
-                { "role": "user", "content": [
-                    { "type": "text", "text": "guess 2+2" }
-                ] },
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": { "name": "calc", "arguments": "{\"expr\":\"2+2\"}" }
-                    }]
-                },
-                { "role": "tool", "tool_call_id": "call_1", "content": "4" }
-            ],
-            "tools": [{
-                "type": "function",
-                "function": { "name": "calc", "parameters": { "type": "object" } }
-            }]
-        }),
-        "deepseek/x",
-        true,
-    );
-    assert_eq!(converted["model"], "deepseek/x");
-    assert_eq!(converted["stream"], true);
-    assert_eq!(converted["instructions"], "be terse");
-    assert_eq!(converted["max_output_tokens"], 256);
-    let input = converted["input"].as_array().expect("input array");
-    // user message, function_call, function_call_output (assistant text was empty)
-    assert_eq!(input.len(), 3);
-    assert_eq!(input[0]["type"], "message");
-    assert_eq!(input[0]["content"][0]["type"], "input_text");
-    assert_eq!(input[0]["content"][0]["text"], "guess 2+2");
-    assert_eq!(input[1]["type"], "function_call");
-    assert_eq!(input[1]["call_id"], "call_1");
-    assert_eq!(input[1]["name"], "calc");
-    assert_eq!(input[2]["type"], "function_call_output");
-    assert_eq!(input[2]["output"], "4");
-    assert_eq!(converted["tools"][0]["name"], "calc");
-}
 
-#[test]
-fn responses_result_converts_to_chat_completion() {
-    let (converted, usage) = responses_response_to_chat(
-        &json!({
-            "id": "resp_abc",
-            "status": "completed",
-            "output": [
-                { "type": "reasoning", "summary": [] },
-                {
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "hi there" }]
-                },
-                {
-                    "type": "function_call",
-                    "call_id": "call_9",
-                    "name": "calc",
-                    "arguments": "{\"expr\":\"2+2\"}"
-                }
-            ],
-            "usage": { "input_tokens": 11, "output_tokens": 5, "total_tokens": 16 }
-        }),
-        "coding",
-    );
-    assert_eq!(converted["object"], "chat.completion");
-    assert_eq!(converted["model"], "coding");
-    assert_eq!(converted["choices"][0]["message"]["content"], "hi there");
-    assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
-    assert_eq!(
-        converted["choices"][0]["message"]["tool_calls"][0]["id"],
-        "call_9"
-    );
-    assert_eq!(converted["usage"]["prompt_tokens"], 11);
-    assert_eq!(converted["usage"]["completion_tokens"], 5);
-    assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
-}
+    #[test]
+    fn chat_request_converts_to_responses_shape() {
+        let converted = chat_request_to_responses(
+            &json!({
+                "model": "coding",
+                "max_tokens": 256,
+                "temperature": 0.2,
+                "messages": [
+                    { "role": "system", "content": "be terse" },
+                    { "role": "user", "content": [
+                        { "type": "text", "text": "guess 2+2" }
+                    ] },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_1",
+                            "type": "function",
+                            "function": { "name": "calc", "arguments": "{\"expr\":\"2+2\"}" }
+                        }]
+                    },
+                    { "role": "tool", "tool_call_id": "call_1", "content": "4" }
+                ],
+                "tools": [{
+                    "type": "function",
+                    "function": { "name": "calc", "parameters": { "type": "object" } }
+                }]
+            }),
+            "deepseek/x",
+            true,
+        );
+        assert_eq!(converted["model"], "deepseek/x");
+        assert_eq!(converted["stream"], true);
+        assert_eq!(converted["instructions"], "be terse");
+        assert_eq!(converted["max_output_tokens"], 256);
+        let input = converted["input"].as_array().expect("input array");
+        // user message, function_call, function_call_output (assistant text was empty)
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "guess 2+2");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert_eq!(input[1]["name"], "calc");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["output"], "4");
+        assert_eq!(converted["tools"][0]["name"], "calc");
+    }
 
-#[tokio::test]
-async fn responses_stream_converts_to_chat_chunks() {
-    let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
-    let mut event_name = String::new();
-    let mut state = ChatStreamState::default();
-    for line in [
+    #[test]
+    fn responses_result_converts_to_chat_completion() {
+        let (converted, usage) = responses_response_to_chat(
+            &json!({
+                "id": "resp_abc",
+                "status": "completed",
+                "output": [
+                    { "type": "reasoning", "summary": [] },
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "hi there" }]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_9",
+                        "name": "calc",
+                        "arguments": "{\"expr\":\"2+2\"}"
+                    }
+                ],
+                "usage": { "input_tokens": 11, "output_tokens": 5, "total_tokens": 16 }
+            }),
+            "coding",
+        );
+        assert_eq!(converted["object"], "chat.completion");
+        assert_eq!(converted["model"], "coding");
+        assert_eq!(converted["choices"][0]["message"]["content"], "hi there");
+        assert_eq!(converted["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            converted["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_9"
+        );
+        assert_eq!(converted["usage"]["prompt_tokens"], 11);
+        assert_eq!(converted["usage"]["completion_tokens"], 5);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (11, 5));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_converts_to_chat_chunks() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut event_name = String::new();
+        let mut state = ChatStreamState::default();
+        for line in [
             b"event: response.output_text.delta\n".as_slice(),
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n".as_slice(),
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\" there\"}\n".as_slice(),
@@ -12033,14 +12354,95 @@ async fn responses_stream_converts_to_chat_chunks() {
             )
             .await;
         }
-    drop(tx);
-    let mut joined = String::new();
-    while let Some(chunk) = rx.recv().await {
-        joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+        drop(tx);
+        let mut joined = String::new();
+        while let Some(chunk) = rx.recv().await {
+            joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+        }
+        assert!(joined.contains("\"content\":\"hi\""));
+        assert!(joined.contains("\"content\":\" there\""));
+        assert_eq!(state.text, "hi there");
+        assert_eq!(state.prompt_tokens, 7);
+        assert_eq!(state.completion_tokens, 3);
     }
-    assert!(joined.contains("\"content\":\"hi\""));
-    assert!(joined.contains("\"content\":\" there\""));
-    assert_eq!(state.text, "hi there");
-    assert_eq!(state.prompt_tokens, 7);
-    assert_eq!(state.completion_tokens, 3);
+
+    #[test]
+    fn responses_result_converts_to_anthropic_message() {
+        let (converted, usage) = responses_response_to_anthropic(
+            &json!({
+                "id": "resp_1",
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "hi" }]
+                    },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "calc",
+                        "arguments": "{\"x\":1}"
+                    }
+                ],
+                "usage": { "input_tokens": 4, "output_tokens": 2 }
+            }),
+            "coding",
+        );
+        assert_eq!(converted["type"], "message");
+        assert_eq!(converted["model"], "coding");
+        assert_eq!(converted["content"][0]["type"], "text");
+        assert_eq!(converted["content"][0]["text"], "hi");
+        assert_eq!(converted["content"][1]["type"], "tool_use");
+        assert_eq!(converted["content"][1]["name"], "calc");
+        assert_eq!(converted["content"][1]["input"]["x"], 1);
+        assert_eq!(converted["stop_reason"], "tool_use");
+        assert_eq!(converted["usage"]["output_tokens"], 2);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (4, 2));
+    }
+
+    #[tokio::test]
+    async fn responses_stream_converts_to_anthropic_events() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let context = StreamContext {
+            message_id: "msg_test".to_string(),
+            model: "coding".to_string(),
+            input_tokens: 5,
+            started: Instant::now(),
+        };
+        let mut state = AnthropicStreamState::default();
+        let mut tool_indices = std::collections::HashMap::new();
+        let mut event_name = String::new();
+        for line in [
+            b"event: response.output_text.delta\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n".as_slice(),
+            b"event: response.output_text.delta\n".as_slice(),
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"!\"}\n".as_slice(),
+            b"event: response.completed\n".as_slice(),
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"usage\":{\"input_tokens\":6,\"output_tokens\":2}}}\n".as_slice(),
+        ] {
+            process_responses_line_for_anthropic(
+                line,
+                &mut event_name,
+                &mut state,
+                &mut tool_indices,
+                &context,
+                &tx,
+            )
+            .await;
+        }
+        finish_anthropic_stream(&mut state, &context, &tx).await;
+        drop(tx);
+        let mut joined = String::new();
+        while let Some(chunk) = rx.recv().await {
+            joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+        }
+        assert!(joined.contains("event: message_start"));
+        assert!(joined.contains("event: content_block_start"));
+        assert!(joined.contains("\"text_delta\""));
+        assert!(joined.contains("\"text\":\"hi\""));
+        assert!(joined.contains("event: message_stop"));
+        assert_eq!(state.text, "hi!");
+        assert_eq!(state.output_tokens, 2);
+    }
 }
