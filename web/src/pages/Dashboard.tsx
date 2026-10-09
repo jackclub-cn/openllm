@@ -471,6 +471,12 @@ export default function Dashboard() {
                   <div className="stat-line"><strong>{data.cooling_provider_keys}</strong> 把</div>
                 </div>
               )}
+              {data.cooling_providers > 0 && (
+                <div>
+                  <Typography.Text type="secondary">冷却中的提供商</Typography.Text>
+                  <div className="stat-line"><strong>{data.cooling_providers}</strong> 个</div>
+                </div>
+              )}
               <div>
                 <Typography.Text type="secondary">累计请求</Typography.Text>
                 <div className="stat-line"><strong>{data.requests_total}</strong> 次</div>

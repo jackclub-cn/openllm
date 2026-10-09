@@ -120,6 +120,7 @@ export type Provider = {
   last_test_message?: string | null
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
+  cooldown_seconds?: number | null
   quota_kind?: string | null
   models_sync_interval_minutes?: number | null
   models_sync_attempted_at?: string
@@ -441,6 +442,7 @@ export type Overview = {
   failed_provider_keys: number
   untested_provider_keys: number
   runtime_error_provider_keys: number
+  cooling_providers: number
   cooling_provider_keys: number
   in_flight_requests: number
   recent_requests: UsageLog[]

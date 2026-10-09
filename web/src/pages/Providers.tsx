@@ -894,15 +894,20 @@ export default function Providers() {
             {
               title: '状态',
               dataIndex: 'enabled',
-              width: 100,
+              width: 120,
               render: (value: boolean, record) => (
-                <Switch
-                  checked={value}
-                  loading={togglingProviderId === record.id}
-                  checkedChildren="启用"
-                  unCheckedChildren="停用"
-                  onChange={(checked) => void toggleEnabled(record, checked)}
-                />
+                <Space direction="vertical" size={4}>
+                  <Switch
+                    checked={value}
+                    loading={togglingProviderId === record.id}
+                    checkedChildren="启用"
+                    unCheckedChildren="停用"
+                    onChange={(checked) => void toggleEnabled(record, checked)}
+                  />
+                  {record.cooldown_seconds ? (
+                    <Tag color="orange">冷却 {record.cooldown_seconds}s</Tag>
+                  ) : null}
+                </Space>
               ),
             },
             {

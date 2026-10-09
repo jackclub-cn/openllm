@@ -28,10 +28,10 @@ use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
 const OPENAI_CHAT_COMPLETIONS: &str = "/v1/chat/completions";
+const OPENAI_COMPLETIONS: &str = "/v1/completions";
 const CONSOLE_API_KEY_ID_HEADER: &str = "x-openllm-api-key-id";
 const OPENCODE_SESSION_HEADER: &str = "x-opencode-session";
 const SESSION_ID_MAX_CHARS: usize = 256;
-#[cfg(test)]
 const OPENAI_RESPONSES: &str = "/v1/responses";
 
 pub async fn public_models(
@@ -1989,7 +1989,11 @@ async fn proxy_openai_inner(
         let target_provider_key_id = target.provider_api_key_id;
         let target_upstream_model = target.upstream_model.clone();
         last_target = Some((target_provider_id, target_upstream_model.clone()));
-        if target.provider_type == "anthropic" && endpoint != OPENAI_CHAT_COMPLETIONS {
+        if target.provider_type == "anthropic"
+            && endpoint != OPENAI_CHAT_COMPLETIONS
+            && endpoint != OPENAI_COMPLETIONS
+            && endpoint != OPENAI_RESPONSES
+        {
             last_error = Some(format!(
                 "{} does not support the {} endpoint",
                 target.provider_name, endpoint
@@ -2256,10 +2260,18 @@ async fn forward_to_target(
         ProviderType::from_str(&target.provider_type).map_err(AppError::BadRequest)?;
 
     let (url, mut request_body) = match provider_type {
-        ProviderType::Anthropic => (
-            join_upstream_url(&target.base_url, "/v1/messages"),
-            convert_request_to_anthropic(request_json, &target.upstream_model, streamed),
-        ),
+        ProviderType::Anthropic => {
+            let body = match endpoint {
+                OPENAI_RESPONSES => {
+                    responses_request_to_anthropic(request_json, &target.upstream_model, streamed)
+                }
+                OPENAI_COMPLETIONS => {
+                    completions_request_to_anthropic(request_json, &target.upstream_model, streamed)
+                }
+                _ => convert_request_to_anthropic(request_json, &target.upstream_model, streamed),
+            };
+            (join_upstream_url(&target.base_url, "/v1/messages"), body)
+        }
         ProviderType::Openai | ProviderType::Ollama | ProviderType::Custom => {
             let mut body = request_json.clone();
             body["model"] = json!(target.upstream_model);
@@ -2388,6 +2400,32 @@ async fn forward_to_target(
 
     if provider_type == ProviderType::Anthropic {
         if streamed {
+            if endpoint == OPENAI_RESPONSES {
+                return Ok(anthropic_stream_to_responses(
+                    state.clone(),
+                    response,
+                    request_id.to_string(),
+                    requested_model.to_string(),
+                    target,
+                    request_tokens,
+                    api_key.cloned(),
+                    started,
+                    receipt,
+                ));
+            }
+            if endpoint == OPENAI_COMPLETIONS {
+                return Ok(anthropic_stream_to_completions(
+                    state.clone(),
+                    response,
+                    request_id.to_string(),
+                    requested_model.to_string(),
+                    target,
+                    request_tokens,
+                    api_key.cloned(),
+                    started,
+                    receipt,
+                ));
+            }
             return Ok(anthropic_stream_response(
                 state.clone(),
                 response,
@@ -2407,7 +2445,13 @@ async fn forward_to_target(
             .map_err(|error| AppError::Upstream(error.to_string()))?;
         let upstream_json: Value = serde_json::from_slice(&bytes)
             .map_err(|error| AppError::Upstream(format!("invalid JSON from Anthropic: {error}")))?;
-        let (converted, usage) = convert_anthropic_response(&upstream_json);
+        let (converted, usage) = match endpoint {
+            OPENAI_RESPONSES => anthropic_response_to_responses(&upstream_json, requested_model),
+            OPENAI_COMPLETIONS => {
+                anthropic_response_to_completions(&upstream_json, requested_model)
+            }
+            _ => convert_anthropic_response(&upstream_json),
+        };
         let converted_bytes = serde_json::to_vec(&converted).unwrap_or_default();
         let converted_bytes =
             inject_capability_receipt(&converted_bytes, &receipt).unwrap_or(converted_bytes);
@@ -2772,6 +2816,846 @@ fn anthropic_stream_response(
     response
 }
 
+#[derive(Debug)]
+enum ResponsesStreamBlock {
+    Text {
+        item_id: String,
+        output_index: usize,
+        text: String,
+    },
+    Tool {
+        item_id: String,
+        output_index: usize,
+        call_id: Value,
+        name: Value,
+        arguments: String,
+    },
+}
+
+struct ResponsesStreamState {
+    response_id: String,
+    model: String,
+    created_at: i64,
+    sequence_number: i64,
+    created: bool,
+    output: Vec<Value>,
+    current: Option<ResponsesStreamBlock>,
+    usage: Usage,
+    stop_reason: Option<String>,
+    first_token_ms: Option<i64>,
+    output_chars: usize,
+    started: Instant,
+}
+
+impl ResponsesStreamState {
+    fn new(model: String, started: Instant) -> Self {
+        Self {
+            response_id: format!("resp_{}", uuid::Uuid::new_v4().simple()),
+            model,
+            created_at: chrono::Utc::now().timestamp(),
+            sequence_number: 0,
+            created: false,
+            output: Vec::new(),
+            current: None,
+            usage: Usage::default(),
+            stop_reason: None,
+            first_token_ms: None,
+            output_chars: 0,
+            started,
+        }
+    }
+
+    fn response_object(&self, status: &str) -> Value {
+        let incomplete = status == "incomplete";
+        let usage = if status == "in_progress" {
+            Value::Null
+        } else {
+            responses_usage_json(&self.usage)
+        };
+        json!({
+            "id": self.response_id,
+            "object": "response",
+            "created_at": self.created_at,
+            "status": status,
+            "error": Value::Null,
+            "incomplete_details": if incomplete {
+                json!({"reason": "max_output_tokens"})
+            } else {
+                Value::Null
+            },
+            "instructions": Value::Null,
+            "max_output_tokens": Value::Null,
+            "model": self.model,
+            "output": self.output,
+            "parallel_tool_calls": true,
+            "previous_response_id": Value::Null,
+            "reasoning": Value::Null,
+            "store": false,
+            "temperature": Value::Null,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": Value::Null,
+            "truncation": "disabled",
+            "usage": usage
+        })
+    }
+
+    async fn send_event(
+        &mut self,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+        event: &str,
+        mut data: Value,
+    ) {
+        data["sequence_number"] = json!(self.sequence_number);
+        self.sequence_number += 1;
+        let _ = tx.send(Ok(Bytes::from(sse_line(event, data)))).await;
+    }
+
+    async fn ensure_created(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        if self.created {
+            return;
+        }
+        self.created = true;
+        let response = self.response_object("in_progress");
+        self.send_event(
+            tx,
+            "response.created",
+            json!({"type": "response.created", "response": response.clone()}),
+        )
+        .await;
+        self.send_event(
+            tx,
+            "response.in_progress",
+            json!({"type": "response.in_progress", "response": response}),
+        )
+        .await;
+    }
+
+    fn mark_first_token(&mut self) {
+        if self.first_token_ms.is_none() {
+            self.first_token_ms = Some(self.started.elapsed().as_millis() as i64);
+        }
+    }
+
+    async fn finish_current(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        let Some(current) = self.current.take() else {
+            return;
+        };
+        match current {
+            ResponsesStreamBlock::Text {
+                item_id,
+                output_index,
+                text,
+            } => {
+                self.send_event(
+                    tx,
+                    "response.output_text.done",
+                    json!({
+                        "type": "response.output_text.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "text": text
+                    }),
+                )
+                .await;
+                let part = json!({
+                    "type": "output_text",
+                    "text": text,
+                    "annotations": [],
+                    "logprobs": []
+                });
+                self.send_event(
+                    tx,
+                    "response.content_part.done",
+                    json!({
+                        "type": "response.content_part.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "content_index": 0,
+                        "part": part
+                    }),
+                )
+                .await;
+                let item = json!({
+                    "id": item_id,
+                    "type": "message",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [part]
+                });
+                self.send_event(
+                    tx,
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item
+                    }),
+                )
+                .await;
+                self.output.push(item);
+            }
+            ResponsesStreamBlock::Tool {
+                item_id,
+                output_index,
+                call_id,
+                name,
+                arguments,
+            } => {
+                let arguments = if arguments.is_empty() {
+                    "{}".to_string()
+                } else {
+                    arguments
+                };
+                self.send_event(
+                    tx,
+                    "response.function_call_arguments.done",
+                    json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": item_id,
+                        "output_index": output_index,
+                        "arguments": arguments
+                    }),
+                )
+                .await;
+                let item = json!({
+                    "id": item_id,
+                    "type": "function_call",
+                    "status": "completed",
+                    "call_id": call_id,
+                    "name": name,
+                    "arguments": arguments
+                });
+                self.send_event(
+                    tx,
+                    "response.output_item.done",
+                    json!({
+                        "type": "response.output_item.done",
+                        "output_index": output_index,
+                        "item": item
+                    }),
+                )
+                .await;
+                self.output.push(item);
+            }
+        }
+    }
+
+    async fn handle_line(
+        &mut self,
+        line: &[u8],
+        event_name: &mut String,
+        tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    ) {
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        if let Some(event) = line.strip_prefix("event:") {
+            *event_name = event.trim().to_string();
+            return;
+        }
+        let Some(data) = line.strip_prefix("data:") else {
+            return;
+        };
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        self.ensure_created(tx).await;
+
+        match event_name.as_str() {
+            "message_start" => {
+                if let Some(message_usage) = value.pointer("/message/usage") {
+                    if let Some(input_tokens) =
+                        message_usage.get("input_tokens").and_then(Value::as_i64)
+                    {
+                        self.usage.prompt_tokens = input_tokens;
+                    }
+                    self.usage.cache_read_tokens = cache_read_of(message_usage);
+                    self.usage.cache_write_tokens = cache_write_of(message_usage);
+                }
+            }
+            "content_block_start" => {
+                if self.current.is_some() {
+                    self.finish_current(tx).await;
+                }
+                let content_block = value.get("content_block").unwrap_or(&Value::Null);
+                match content_block.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let item_id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+                        let output_index = self.output.len();
+                        let initial = content_block
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        self.current = Some(ResponsesStreamBlock::Text {
+                            item_id: item_id.clone(),
+                            output_index,
+                            text: initial.clone(),
+                        });
+                        self.send_event(
+                            tx,
+                            "response.output_item.added",
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": {
+                                    "id": item_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": []
+                                }
+                            }),
+                        )
+                        .await;
+                        self.send_event(
+                            tx,
+                            "response.content_part.added",
+                            json!({
+                                "type": "response.content_part.added",
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "part": {
+                                    "type": "output_text",
+                                    "text": "",
+                                    "annotations": [],
+                                    "logprobs": []
+                                }
+                            }),
+                        )
+                        .await;
+                        if !initial.is_empty() {
+                            self.mark_first_token();
+                            self.output_chars += initial.chars().count();
+                            self.send_event(
+                                tx,
+                                "response.output_text.delta",
+                                json!({
+                                    "type": "response.output_text.delta",
+                                    "item_id": item_id,
+                                    "output_index": output_index,
+                                    "content_index": 0,
+                                    "delta": initial
+                                }),
+                            )
+                            .await;
+                        }
+                    }
+                    Some("tool_use") => {
+                        let item_id = format!("fc_{}", uuid::Uuid::new_v4().simple());
+                        let output_index = self.output.len();
+                        let call_id = content_block.get("id").cloned().unwrap_or_else(|| {
+                            json!(format!("call_{}", uuid::Uuid::new_v4().simple()))
+                        });
+                        let name = content_block.get("name").cloned().unwrap_or(Value::Null);
+                        self.current = Some(ResponsesStreamBlock::Tool {
+                            item_id: item_id.clone(),
+                            output_index,
+                            call_id: call_id.clone(),
+                            name: name.clone(),
+                            arguments: String::new(),
+                        });
+                        self.mark_first_token();
+                        self.send_event(
+                            tx,
+                            "response.output_item.added",
+                            json!({
+                                "type": "response.output_item.added",
+                                "output_index": output_index,
+                                "item": {
+                                    "id": item_id,
+                                    "type": "function_call",
+                                    "status": "in_progress",
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": ""
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_delta" => {
+                let delta = value.get("delta").unwrap_or(&Value::Null);
+                match delta.get("type").and_then(Value::as_str) {
+                    Some("text_delta") => {
+                        let Some(text) = delta
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            return;
+                        };
+                        let (item_id, output_index) = match self.current.as_ref() {
+                            Some(ResponsesStreamBlock::Text {
+                                item_id,
+                                output_index,
+                                ..
+                            }) => (item_id.clone(), *output_index),
+                            _ => return,
+                        };
+                        if let Some(ResponsesStreamBlock::Text {
+                            text: accumulated, ..
+                        }) = self.current.as_mut()
+                        {
+                            accumulated.push_str(&text);
+                        }
+                        self.output_chars += text.chars().count();
+                        self.mark_first_token();
+                        self.send_event(
+                            tx,
+                            "response.output_text.delta",
+                            json!({
+                                "type": "response.output_text.delta",
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "content_index": 0,
+                                "delta": text
+                            }),
+                        )
+                        .await;
+                    }
+                    Some("input_json_delta") => {
+                        let Some(partial) = delta
+                            .get("partial_json")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                        else {
+                            return;
+                        };
+                        let (item_id, output_index) = match self.current.as_ref() {
+                            Some(ResponsesStreamBlock::Tool {
+                                item_id,
+                                output_index,
+                                ..
+                            }) => (item_id.clone(), *output_index),
+                            _ => return,
+                        };
+                        if let Some(ResponsesStreamBlock::Tool { arguments, .. }) =
+                            self.current.as_mut()
+                        {
+                            arguments.push_str(&partial);
+                        }
+                        self.output_chars += partial.chars().count();
+                        self.mark_first_token();
+                        self.send_event(
+                            tx,
+                            "response.function_call_arguments.delta",
+                            json!({
+                                "type": "response.function_call_arguments.delta",
+                                "item_id": item_id,
+                                "output_index": output_index,
+                                "delta": partial
+                            }),
+                        )
+                        .await;
+                    }
+                    Some("thinking_delta") => {
+                        if let Some(thinking) = delta.get("thinking").and_then(Value::as_str) {
+                            self.output_chars += thinking.chars().count();
+                            self.mark_first_token();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "content_block_stop" => {
+                self.finish_current(tx).await;
+            }
+            "message_delta" => {
+                if let Some(output_tokens) = value
+                    .pointer("/usage/output_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    self.usage.completion_tokens = output_tokens;
+                }
+                if let Some(stop_reason) =
+                    value.pointer("/delta/stop_reason").and_then(Value::as_str)
+                {
+                    self.stop_reason = Some(stop_reason.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    async fn complete(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>) {
+        self.finish_current(tx).await;
+        let status = if self.stop_reason.as_deref() == Some("max_tokens") {
+            "incomplete"
+        } else {
+            "completed"
+        };
+        let response = self.response_object(status);
+        self.send_event(
+            tx,
+            "response.completed",
+            json!({"type": "response.completed", "response": response}),
+        )
+        .await;
+    }
+
+    async fn fail(&mut self, tx: &mpsc::Sender<Result<Bytes, io::Error>>, message: &str) {
+        self.finish_current(tx).await;
+        let mut response = self.response_object("failed");
+        response["error"] = json!({"code": "upstream_error", "message": message});
+        self.send_event(
+            tx,
+            "response.failed",
+            json!({"type": "response.failed", "response": response}),
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn anthropic_stream_to_responses(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+    receipt: Option<Value>,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut event_name = String::new();
+        let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                stream.handle_line(&line, &mut event_name, &tx).await;
+            }
+        }
+        if !buffer.is_empty() {
+            stream.handle_line(&buffer, &mut event_name, &tx).await;
+        }
+
+        if let Some(error) = stream_error.as_deref() {
+            stream.fail(&tx, error).await;
+        } else {
+            stream.complete(&tx).await;
+        }
+        drop(tx);
+
+        if stream.usage.prompt_tokens == 0 {
+            stream.usage.prompt_tokens = request_tokens;
+        }
+        if stream.usage.completion_tokens == 0 {
+            stream.usage.completion_tokens = (stream.output_chars / 4) as i64;
+        }
+        let usage = stream.usage.normalized();
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms = stream
+            .first_token_ms
+            .or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
+        let preview = response_preview(
+            stream
+                .output
+                .iter()
+                .filter_map(|item| {
+                    item.pointer("/content/0/text")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .collect::<Vec<_>>()
+                .join("")
+                .as_bytes(),
+        );
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: OPENAI_RESPONSES,
+                usage,
+                latency_ms,
+                first_token_ms,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    response
+}
+
+fn completions_stream_chunk(
+    id: &str,
+    model: &str,
+    text: &str,
+    finish_reason: Option<&str>,
+) -> Value {
+    json!({
+        "id": id,
+        "object": "text_completion",
+        "created": chrono::Utc::now().timestamp(),
+        "model": model,
+        "choices": [{
+            "text": text,
+            "index": 0,
+            "logprobs": Value::Null,
+            "finish_reason": finish_reason
+        }]
+    })
+}
+
+/// Streams a legacy `/v1/completions` response from an Anthropic Messages SSE
+/// stream. Only text deltas map across; tool use has no legacy equivalent and
+/// is dropped.
+#[allow(clippy::too_many_arguments)]
+fn anthropic_stream_to_completions(
+    state: AppState,
+    response: reqwest::Response,
+    request_id: String,
+    requested_model: String,
+    target: RouteTarget,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    started: Instant,
+    receipt: Option<Value>,
+) -> Response {
+    let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
+    tokio::spawn(async move {
+        let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
+        let mut upstream = response.bytes_stream();
+        let mut buffer = Vec::<u8>::new();
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut text = String::new();
+        let mut stop_reason: Option<String> = None;
+        let mut first_token_ms = None;
+        let mut stream_error = None;
+        let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
+
+        while let Some(chunk) = upstream.next().await {
+            let chunk = match chunk {
+                Ok(chunk) => {
+                    heartbeat.touch().await;
+                    chunk
+                }
+                Err(error) => {
+                    stream_error = Some(error.to_string());
+                    break;
+                }
+            };
+            buffer.extend_from_slice(&chunk);
+            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+                let line = buffer.drain(..=position).collect::<Vec<_>>();
+                process_completions_anthropic_line(
+                    &line,
+                    &mut event_name,
+                    &mut usage,
+                    &mut text,
+                    &mut stop_reason,
+                    &mut first_token_ms,
+                    started,
+                    &completion_id,
+                    &requested_model,
+                    &tx,
+                )
+                .await;
+            }
+        }
+        if !buffer.is_empty() {
+            process_completions_anthropic_line(
+                &buffer,
+                &mut event_name,
+                &mut usage,
+                &mut text,
+                &mut stop_reason,
+                &mut first_token_ms,
+                started,
+                &completion_id,
+                &requested_model,
+                &tx,
+            )
+            .await;
+        }
+
+        let finish_reason = if stop_reason.as_deref() == Some("max_tokens") {
+            "length"
+        } else {
+            "stop"
+        };
+        if stream_error.is_none() {
+            let final_chunk =
+                completions_stream_chunk(&completion_id, &requested_model, "", Some(finish_reason));
+            let _ = tx
+                .send(Ok(Bytes::from(format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    serde_json::to_string(&final_chunk).unwrap_or_default()
+                ))))
+                .await;
+        }
+        drop(tx);
+
+        if usage.prompt_tokens == 0 {
+            usage.prompt_tokens = request_tokens;
+        }
+        if usage.completion_tokens == 0 {
+            usage.completion_tokens = (text.chars().count() / 4) as i64;
+        }
+        let usage = usage.normalized();
+        let latency_ms = started.elapsed().as_millis() as i64;
+        let first_token_ms =
+            first_token_ms.or_else(|| (usage.completion_tokens > 0).then_some(latency_ms));
+        let preview = response_preview(text.as_bytes());
+        log_usage(
+            &state,
+            UsageLogEntry {
+                request_id: &request_id,
+                api_key_id: api_key.as_ref().map(|key| key.id),
+                route_id: target.route_id,
+                provider_id: Some(target.provider_id),
+                requested_model: &requested_model,
+                upstream_model: Some(&target.upstream_model),
+                endpoint: OPENAI_COMPLETIONS,
+                usage,
+                latency_ms,
+                first_token_ms,
+                status_code: if stream_error.is_some() { 502 } else { 200 },
+                success: stream_error.is_none(),
+                streamed: true,
+                error_message: stream_error.as_deref(),
+                response_preview: preview.as_deref(),
+            },
+        )
+        .await;
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+        .header(reqwest::header::CACHE_CONTROL, "no-cache")
+        .header(reqwest::header::CONNECTION, "keep-alive")
+        .header("x-accel-buffering", "no")
+        .body(Body::from_stream(ReceiverStream::new(rx)))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response());
+    apply_capability_headers(&mut response, &receipt);
+    response
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_completions_anthropic_line(
+    line: &[u8],
+    event_name: &mut String,
+    usage: &mut Usage,
+    text: &mut String,
+    stop_reason: &mut Option<String>,
+    first_token_ms: &mut Option<i64>,
+    started: Instant,
+    completion_id: &str,
+    model: &str,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) {
+    let line = String::from_utf8_lossy(line);
+    let line = line.trim();
+    if let Some(event) = line.strip_prefix("event:") {
+        *event_name = event.trim().to_string();
+        return;
+    }
+    let Some(data) = line.strip_prefix("data:") else {
+        return;
+    };
+    let data = data.trim();
+    if data.is_empty() || data == "[DONE]" {
+        return;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return;
+    };
+
+    match event_name.as_str() {
+        "message_start" => {
+            if let Some(message_usage) = value.pointer("/message/usage") {
+                if let Some(input_tokens) =
+                    message_usage.get("input_tokens").and_then(Value::as_i64)
+                {
+                    usage.prompt_tokens = input_tokens;
+                }
+                usage.cache_read_tokens = cache_read_of(message_usage);
+                usage.cache_write_tokens = cache_write_of(message_usage);
+            }
+        }
+        "content_block_delta" => {
+            let delta = value.get("delta").unwrap_or(&Value::Null);
+            if delta.get("type").and_then(Value::as_str) == Some("text_delta")
+                && let Some(part) = delta.get("text").and_then(Value::as_str)
+            {
+                text.push_str(part);
+                if first_token_ms.is_none() {
+                    *first_token_ms = Some(started.elapsed().as_millis() as i64);
+                }
+                let chunk = completions_stream_chunk(completion_id, model, part, None);
+                let _ = tx
+                    .send(Ok(Bytes::from(format!(
+                        "data: {}\n\n",
+                        serde_json::to_string(&chunk).unwrap_or_default()
+                    ))))
+                    .await;
+            }
+        }
+        "message_delta" => {
+            if let Some(output_tokens) = value
+                .pointer("/usage/output_tokens")
+                .and_then(Value::as_i64)
+            {
+                usage.completion_tokens = output_tokens;
+            }
+            if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                *stop_reason = Some(reason.to_string());
+            }
+        }
+        _ => {}
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn process_anthropic_line(
     line: &[u8],
@@ -3083,7 +3967,241 @@ fn convert_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> V
             output["tools"] = json!(anthropic_tools);
         }
     }
+    if let Some(choice) = input.get("tool_choice") {
+        output["tool_choice"] = match choice {
+            Value::String(value) if value == "required" => json!({"type": "any"}),
+            Value::String(value) if value == "auto" || value == "none" => {
+                json!({"type": value})
+            }
+            Value::Object(_) => {
+                let name = choice
+                    .get("name")
+                    .or_else(|| choice.pointer("/function/name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({"type": "tool", "name": name})
+            }
+            _ => choice.clone(),
+        };
+    }
     output
+}
+
+/// Converts an OpenAI Responses request into the Anthropic Messages shape.
+///
+/// Responses is item-oriented while Messages is message-oriented, so the
+/// conversion first normalizes the input into the chat shape that
+/// `convert_request_to_anthropic` already knows how to handle.
+fn responses_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> Value {
+    let chat = responses_request_to_chat(input, model, streamed);
+    convert_request_to_anthropic(&chat, model, streamed)
+}
+
+fn responses_request_to_chat(input: &Value, model: &str, streamed: bool) -> Value {
+    let mut messages = Vec::new();
+    if let Some(instructions) = input.get("instructions")
+        && let Some(text) = content_text(instructions)
+        && !text.is_empty()
+    {
+        messages.push(json!({"role": "system", "content": text}));
+    }
+    append_responses_input(&mut messages, input.get("input"));
+
+    let mut output = json!({"model": model, "messages": messages});
+    if streamed {
+        output["stream"] = json!(true);
+    }
+    for (source, target) in [
+        ("max_output_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+    ] {
+        if let Some(value) = input.get(source) {
+            output[target] = value.clone();
+        }
+    }
+    if let Some(tools) = input.get("tools").and_then(Value::as_array) {
+        let tools = tools
+            .iter()
+            .filter_map(responses_tool_to_chat)
+            .collect::<Vec<_>>();
+        if !tools.is_empty() {
+            output["tools"] = json!(tools);
+        }
+    }
+    if let Some(choice) = input.get("tool_choice") {
+        output["tool_choice"] = match choice {
+            Value::Object(_) => {
+                let name = choice
+                    .get("name")
+                    .or_else(|| choice.pointer("/function/name"))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                json!({"type": "function", "function": {"name": name}})
+            }
+            _ => choice.clone(),
+        };
+    }
+    output
+}
+
+fn append_responses_input(messages: &mut Vec<Value>, input: Option<&Value>) {
+    match input {
+        Some(Value::String(text)) => {
+            messages.push(json!({"role": "user", "content": text}));
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str) {
+                    Some("function_call") => {
+                        let call = json!({
+                            "id": item.get("call_id").or_else(|| item.get("id")).cloned()
+                                .unwrap_or(Value::Null),
+                            "type": "function",
+                            "function": {
+                                "name": item.get("name").cloned().unwrap_or(Value::Null),
+                                "arguments": item.get("arguments").cloned()
+                                    .unwrap_or_else(|| json!("{}"))
+                            }
+                        });
+                        if let Some(last) = messages.last_mut()
+                            && last.get("role").and_then(Value::as_str) == Some("assistant")
+                        {
+                            let calls = last
+                                .as_object_mut()
+                                .and_then(|object| object.get_mut("tool_calls"))
+                                .and_then(Value::as_array_mut);
+                            if let Some(calls) = calls {
+                                calls.push(call);
+                                continue;
+                            }
+                        }
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": Value::Null,
+                            "tool_calls": [call]
+                        }));
+                    }
+                    Some("function_call_output") => {
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
+                            "content": item.get("output").cloned().unwrap_or(Value::Null)
+                        }));
+                    }
+                    _ => {
+                        let Some(role) = item.get("role").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let content =
+                            responses_content_to_chat(item.get("content").unwrap_or(&Value::Null));
+                        messages.push(json!({"role": role, "content": content}));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn responses_content_to_chat(content: &Value) -> Value {
+    match content {
+        Value::String(_) | Value::Null => content.clone(),
+        Value::Array(items) => json!(
+            items
+                .iter()
+                .filter_map(responses_content_part_to_chat)
+                .collect::<Vec<_>>()
+        ),
+        _ => content.clone(),
+    }
+}
+
+fn responses_content_part_to_chat(item: &Value) -> Option<Value> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("input_text" | "output_text" | "text") => item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "text", "text": text})),
+        Some("input_image") => {
+            let url = item
+                .get("image_url")
+                .or_else(|| item.get("url"))
+                .and_then(Value::as_str)?;
+            Some(json!({"type": "image_url", "image_url": {"url": url}}))
+        }
+        Some("image_url") => Some(item.clone()),
+        _ => item
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| json!({"type": "text", "text": text})),
+    }
+}
+
+fn responses_tool_to_chat(tool: &Value) -> Option<Value> {
+    if tool.get("type").and_then(Value::as_str) != Some("function") {
+        return None;
+    }
+    if tool.get("function").is_some() {
+        return Some(tool.clone());
+    }
+    Some(json!({
+        "type": "function",
+        "function": {
+            "name": tool.get("name")?.clone(),
+            "description": tool.get("description").cloned().unwrap_or(Value::Null),
+            "parameters": tool.get("parameters").cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}}))
+        }
+    }))
+}
+
+/// Converts a legacy OpenAI `/v1/completions` request into the Anthropic
+/// Messages shape by way of the chat shape that `convert_request_to_anthropic`
+/// already understands. The legacy `prompt` field replaces the message list.
+fn completions_request_to_anthropic(input: &Value, model: &str, streamed: bool) -> Value {
+    let mut messages = Vec::new();
+    if let Some(prompt) = completions_prompt_text(input.get("prompt")) {
+        messages.push(json!({"role": "user", "content": prompt}));
+    }
+
+    let mut chat = json!({"model": model, "messages": messages});
+    if streamed {
+        chat["stream"] = json!(true);
+    }
+    for key in ["max_tokens", "temperature", "top_p", "stop"] {
+        if let Some(value) = input.get(key) {
+            chat[key] = value.clone();
+        }
+    }
+    convert_request_to_anthropic(&chat, model, streamed)
+}
+
+/// Flattens the legacy `prompt` field into a single string. OpenAI allows a
+/// plain string, an array of strings, or token arrays; token arrays cannot be
+/// decoded without the provider's tokenizer, so they are skipped.
+fn completions_prompt_text(prompt: Option<&Value>) -> Option<String> {
+    match prompt {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Array(items)) => {
+            let mut text = String::new();
+            for item in items {
+                match item {
+                    Value::String(part) => text.push_str(part),
+                    Value::Array(parts) => {
+                        for part in parts {
+                            if let Some(part) = part.as_str() {
+                                text.push_str(part);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Some(text)
+        }
+        _ => None,
+    }
 }
 
 fn convert_anthropic_content(content: &Value) -> Value {
@@ -3222,6 +4340,158 @@ fn convert_anthropic_response(value: &Value) -> (Value, Usage) {
         }),
         usage,
     )
+}
+
+fn anthropic_response_to_responses(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let (chat, usage) = convert_anthropic_response(value);
+    let (response, _) = chat_response_to_responses(&chat, requested_model);
+    (response, usage)
+}
+
+fn anthropic_response_to_completions(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let (chat, usage) = convert_anthropic_response(value);
+    let text = chat
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let finish_reason = match value.get("stop_reason").and_then(Value::as_str) {
+        Some("max_tokens") => "length",
+        _ => "stop",
+    };
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("cmpl-{}", id.trim_start_matches("msg_")))
+        .unwrap_or_else(|| format!("cmpl-{}", uuid::Uuid::new_v4().simple()));
+    (
+        json!({
+            "id": id,
+            "object": "text_completion",
+            "created": chrono::Utc::now().timestamp(),
+            "model": requested_model,
+            "choices": [{
+                "text": text,
+                "index": 0,
+                "logprobs": Value::Null,
+                "finish_reason": finish_reason
+            }],
+            "usage": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens
+            }
+        }),
+        usage,
+    )
+}
+
+fn chat_response_to_responses(value: &Value, requested_model: &str) -> (Value, Usage) {
+    let message = value.pointer("/choices/0/message");
+    let mut output = Vec::new();
+    if let Some(text) = message
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        output.push(json!({
+            "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
+            "type": "message",
+            "status": "completed",
+            "role": "assistant",
+            "content": [{
+                "type": "output_text",
+                "text": text,
+                "annotations": [],
+                "logprobs": []
+            }]
+        }));
+    }
+    if let Some(calls) = message
+        .and_then(|message| message.get("tool_calls"))
+        .and_then(Value::as_array)
+    {
+        for call in calls {
+            let function = call.get("function").unwrap_or(call);
+            let call_id = call
+                .get("id")
+                .cloned()
+                .unwrap_or_else(|| json!(format!("call_{}", uuid::Uuid::new_v4().simple())));
+            let arguments = function
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!("{}"));
+            output.push(json!({
+                "id": format!("fc_{}", uuid::Uuid::new_v4().simple()),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": call_id,
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "arguments": match arguments {
+                    Value::String(_) => arguments,
+                    other => json!(serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string()))
+                }
+            }));
+        }
+    }
+
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str);
+    let incomplete = finish_reason == Some("length");
+    let usage = usage_from_value(value).unwrap_or_default().normalized();
+    let id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(|id| format!("resp_{}", id.trim_start_matches("chatcmpl-")))
+        .unwrap_or_else(|| format!("resp_{}", uuid::Uuid::new_v4().simple()));
+    let created_at = value
+        .get("created")
+        .and_then(Value::as_i64)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    (
+        json!({
+            "id": id,
+            "object": "response",
+            "created_at": created_at,
+            "status": if incomplete { "incomplete" } else { "completed" },
+            "error": Value::Null,
+            "incomplete_details": if incomplete {
+                json!({"reason": "max_output_tokens"})
+            } else {
+                Value::Null
+            },
+            "instructions": Value::Null,
+            "max_output_tokens": Value::Null,
+            "model": requested_model,
+            "output": output,
+            "parallel_tool_calls": true,
+            "previous_response_id": Value::Null,
+            "reasoning": Value::Null,
+            "store": false,
+            "temperature": Value::Null,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "auto",
+            "tools": [],
+            "top_p": Value::Null,
+            "truncation": "disabled",
+            "usage": responses_usage_json(&usage)
+        }),
+        usage,
+    )
+}
+
+fn responses_usage_json(usage: &Usage) -> Value {
+    json!({
+        "input_tokens": usage.prompt_tokens,
+        "input_tokens_details": {
+            "cached_tokens": usage.cache_read_tokens
+        },
+        "output_tokens": usage.completion_tokens,
+        "output_tokens_details": {
+            "reasoning_tokens": 0
+        },
+        "total_tokens": usage.total_tokens
+    })
 }
 
 fn openai_stream_chunk(
@@ -3756,7 +5026,10 @@ fn target_upstream_endpoint<'a>(
 fn provider_upstream_endpoint(provider_type: ProviderType, request_endpoint: &str) -> Option<&str> {
     match provider_type {
         ProviderType::Anthropic => {
-            if request_endpoint == OPENAI_CHAT_COMPLETIONS || request_endpoint == ANTHROPIC_MESSAGES
+            if request_endpoint == OPENAI_CHAT_COMPLETIONS
+                || request_endpoint == OPENAI_COMPLETIONS
+                || request_endpoint == OPENAI_RESPONSES
+                || request_endpoint == ANTHROPIC_MESSAGES
             {
                 Some(ANTHROPIC_MESSAGES)
             } else {
@@ -6247,15 +7520,27 @@ mod tests {
             OPENAI_CHAT_COMPLETIONS
         ));
         assert!(target_supports_endpoint(&anthropic, ANTHROPIC_MESSAGES));
-        assert!(!target_supports_endpoint(&anthropic, OPENAI_RESPONSES));
+        // Anthropic targets serve Responses requests by translating them to
+        // the Messages API, so they advertise Responses support too.
+        assert!(target_supports_endpoint(&anthropic, OPENAI_RESPONSES));
 
         let unknown = endpoint_test_target("custom", None);
         assert!(target_supports_endpoint(&unknown, "/v1/embeddings"));
 
         let filtered =
             filter_targets_for_endpoint(vec![openai.clone(), anthropic.clone()], OPENAI_RESPONSES);
-        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.len(), 2);
         assert_eq!(filtered[0].provider_type, "openai");
+        assert_eq!(filtered[1].provider_type, "anthropic");
+
+        // Anthropic targets also serve the legacy completions endpoint.
+        assert!(target_supports_endpoint(&anthropic, OPENAI_COMPLETIONS));
+        let filtered = filter_targets_for_endpoint(
+            vec![openai.clone(), anthropic.clone()],
+            OPENAI_COMPLETIONS,
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].provider_type, "anthropic");
     }
 
     #[tokio::test]
@@ -9091,6 +10376,250 @@ mod tests {
             false,
         );
         assert_eq!(converted["max_tokens"], 1200);
+    }
+
+    #[test]
+    fn responses_request_maps_instructions_and_input_to_anthropic() {
+        let converted = responses_request_to_anthropic(
+            &json!({
+                "instructions": "be terse",
+                "max_output_tokens": 512,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "hello" }]
+                    }
+                ],
+                "tools": [{
+                    "type": "function",
+                    "name": "get_weather",
+                    "parameters": { "type": "object", "properties": {} }
+                }]
+            }),
+            "claude-x",
+            false,
+        );
+        assert_eq!(converted["system"], "be terse");
+        assert_eq!(converted["max_tokens"], 512);
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "hello");
+        assert_eq!(converted["tools"][0]["name"], "get_weather");
+    }
+
+    #[test]
+    fn responses_accepts_plain_string_input() {
+        let converted =
+            responses_request_to_anthropic(&json!({ "input": "hello world" }), "claude-x", false);
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn responses_function_call_items_round_trip_to_anthropic() {
+        let converted = responses_request_to_anthropic(
+            &json!({
+                "input": [
+                    { "role": "user", "content": "weather in Paris?" },
+                    {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "get_weather",
+                        "arguments": "{\"city\":\"Paris\"}"
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "call_1",
+                        "output": "18C"
+                    }
+                ]
+            }),
+            "claude-x",
+            false,
+        );
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+        let assistant = messages[1]["content"].as_array().expect("assistant blocks");
+        assert_eq!(assistant.len(), 1);
+        assert_eq!(assistant[0]["type"], "tool_use");
+        assert_eq!(assistant[0]["id"], "call_1");
+        assert_eq!(assistant[0]["name"], "get_weather");
+        assert_eq!(assistant[0]["input"]["city"], "Paris");
+        let tool_result = &messages[2]["content"][0];
+        assert_eq!(tool_result["type"], "tool_result");
+        assert_eq!(tool_result["tool_use_id"], "call_1");
+        assert_eq!(tool_result["content"], "18C");
+    }
+
+    #[test]
+    fn anthropic_response_converts_to_responses_output() {
+        let (converted, usage) = anthropic_response_to_responses(
+            &json!({
+                "id": "msg_1",
+                "model": "claude-x",
+                "stop_reason": "tool_use",
+                "content": [
+                    { "type": "text", "text": "let me check" },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "get_weather",
+                        "input": { "city": "Paris" }
+                    }
+                ],
+                "usage": { "input_tokens": 30, "output_tokens": 12 }
+            }),
+            "coding",
+        );
+        assert_eq!(converted["object"], "response");
+        assert_eq!(converted["model"], "coding");
+        assert_eq!(converted["status"], "completed");
+        assert_eq!(converted["output"][0]["type"], "message");
+        assert_eq!(converted["output"][0]["content"][0]["text"], "let me check");
+        assert_eq!(converted["output"][1]["type"], "function_call");
+        assert_eq!(converted["output"][1]["call_id"], "toolu_1");
+        assert_eq!(converted["output"][1]["name"], "get_weather");
+        assert_eq!(converted["output"][1]["arguments"], "{\"city\":\"Paris\"}");
+        assert_eq!(converted["usage"]["input_tokens"], 30);
+        assert_eq!(converted["usage"]["output_tokens"], 12);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (30, 12));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_converts_to_responses_events() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut stream = ResponsesStreamState::new("coding".to_string(), Instant::now());
+        let mut event_name = String::new();
+        for line in [
+            b"event: message_start\n".as_slice(),
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":0}}}\n".as_slice(),
+            b"event: content_block_start\n".as_slice(),
+            b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n".as_slice(),
+            b"event: content_block_delta\n".as_slice(),
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n".as_slice(),
+            b"event: content_block_stop\n".as_slice(),
+            b"data: {\"type\":\"content_block_stop\",\"index\":0}\n".as_slice(),
+            b"event: message_delta\n".as_slice(),
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n".as_slice(),
+            b"event: message_stop\n".as_slice(),
+            b"data: {\"type\":\"message_stop\"}\n".as_slice(),
+        ] {
+            stream.handle_line(line, &mut event_name, &tx).await;
+        }
+        stream.complete(&tx).await;
+        drop(tx);
+
+        let mut events = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            let chunk = chunk.expect("stream chunk");
+            events.push(String::from_utf8_lossy(&chunk).to_string());
+        }
+        let joined = events.join("");
+        assert!(joined.contains("event: response.created"));
+        assert!(joined.contains("event: response.output_text.delta"));
+        assert!(joined.contains("\"delta\":\"hello\""));
+        assert!(joined.contains("event: response.output_text.done"));
+        assert!(joined.contains("event: response.completed"));
+        assert_eq!(stream.usage.prompt_tokens, 7);
+        assert_eq!(stream.usage.completion_tokens, 3);
+    }
+
+    #[test]
+    fn completions_request_maps_prompt_to_anthropic() {
+        let converted = completions_request_to_anthropic(
+            &json!({
+                "prompt": "write a haiku",
+                "max_tokens": 64,
+                "temperature": 0.5,
+                "stop": ["\n\n"]
+            }),
+            "claude-x",
+            false,
+        );
+        assert_eq!(converted["max_tokens"], 64);
+        assert_eq!(converted["temperature"], 0.5);
+        assert_eq!(converted["stop_sequences"][0], "\n\n");
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "write a haiku");
+    }
+
+    #[test]
+    fn completions_request_joins_prompt_array() {
+        let converted = completions_request_to_anthropic(
+            &json!({ "prompt": ["hello ", "world"] }),
+            "claude-x",
+            false,
+        );
+        let messages = converted["messages"].as_array().expect("messages array");
+        assert_eq!(messages[0]["content"][0]["text"], "hello world");
+    }
+
+    #[test]
+    fn anthropic_response_converts_to_text_completion() {
+        let (converted, usage) = anthropic_response_to_completions(
+            &json!({
+                "id": "msg_1",
+                "stop_reason": "end_turn",
+                "content": [{ "type": "text", "text": "a haiku" }],
+                "usage": { "input_tokens": 9, "output_tokens": 4 }
+            }),
+            "coding",
+        );
+        assert_eq!(converted["object"], "text_completion");
+        assert_eq!(converted["model"], "coding");
+        assert_eq!(converted["choices"][0]["text"], "a haiku");
+        assert_eq!(converted["choices"][0]["finish_reason"], "stop");
+        assert_eq!(converted["usage"]["completion_tokens"], 4);
+        assert_eq!((usage.prompt_tokens, usage.completion_tokens), (9, 4));
+    }
+
+    #[tokio::test]
+    async fn anthropic_stream_converts_to_completions_events() {
+        let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+        let mut event_name = String::new();
+        let mut usage = Usage::default();
+        let mut text = String::new();
+        let mut stop_reason = None;
+        let mut first_token_ms = None;
+        for line in [
+            b"event: message_start\n".as_slice(),
+            b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n".as_slice(),
+            b"event: content_block_delta\n".as_slice(),
+            b"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n".as_slice(),
+            b"event: message_delta\n".as_slice(),
+            b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":2}}\n".as_slice(),
+        ] {
+            process_completions_anthropic_line(
+                line,
+                &mut event_name,
+                &mut usage,
+                &mut text,
+                &mut stop_reason,
+                &mut first_token_ms,
+                Instant::now(),
+                "cmpl_test",
+                "coding",
+                &tx,
+            )
+            .await;
+        }
+        drop(tx);
+        let mut events = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            events.push(String::from_utf8_lossy(&chunk.expect("chunk")).to_string());
+        }
+        let joined = events.join("");
+        assert!(joined.contains("\"object\":\"text_completion\""));
+        assert!(joined.contains("\"text\":\"hi\""));
+        assert_eq!(text, "hi");
+        assert_eq!(usage.prompt_tokens, 5);
+        assert_eq!(usage.completion_tokens, 2);
+        assert_eq!(stop_reason.as_deref(), Some("end_turn"));
     }
 
     #[tokio::test]

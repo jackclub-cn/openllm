@@ -3291,6 +3291,13 @@ pub async fn overview(
         in_flight_requests_fut,
     )?;
     let now = std::time::Instant::now();
+    let cooling_providers = {
+        let provider_cooldowns = state.provider_cooldown.lock().await;
+        provider_cooldowns
+            .values()
+            .filter(|until| **until > now)
+            .count() as i64
+    };
     let cooling_provider_keys = state
         .provider_key_cooldown
         .lock()
@@ -3481,6 +3488,7 @@ pub async fn overview(
         failed_provider_keys,
         untested_provider_keys,
         runtime_error_provider_keys,
+        cooling_providers,
         cooling_provider_keys,
         in_flight_requests,
         recent_requests: recent.into_iter().map(Into::into).collect(),
@@ -4023,6 +4031,15 @@ async fn hydrate_provider_view(state: &AppState, view: &mut ProviderView) -> App
         .map(Into::into)
         .collect();
     let now = std::time::Instant::now();
+    view.cooldown_seconds = state
+        .provider_cooldown
+        .lock()
+        .await
+        .get(&view.id)
+        .and_then(|until| {
+            let remaining = until.saturating_duration_since(now);
+            (!remaining.is_zero()).then(|| (remaining.as_secs_f64().ceil() as i64).max(1))
+        });
     let cooldowns = state.provider_key_cooldown.lock().await;
     for key in &mut view.api_keys {
         if let Some(until) = cooldowns.get(&key.id) {
@@ -4073,10 +4090,15 @@ async fn hydrate_provider_views(state: &AppState, views: &mut [ProviderView]) ->
     }
 
     let now = std::time::Instant::now();
+    let provider_cooldowns = state.provider_cooldown.lock().await;
     let cooldowns = state.provider_key_cooldown.lock().await;
     for view in views {
         view.models = models_by_provider.remove(&view.id).unwrap_or_default();
         view.api_keys = keys_by_provider.remove(&view.id).unwrap_or_default();
+        view.cooldown_seconds = provider_cooldowns.get(&view.id).and_then(|until| {
+            let remaining = until.saturating_duration_since(now);
+            (!remaining.is_zero()).then(|| (remaining.as_secs_f64().ceil() as i64).max(1))
+        });
         for key in &mut view.api_keys {
             if let Some(until) = cooldowns.get(&key.id) {
                 let remaining = until.saturating_duration_since(now);
@@ -5665,6 +5687,14 @@ mod tests {
         let provider = get_provider(&state, 1).await.unwrap();
         assert!(provider.api_keys[0].cooldown_seconds.is_some());
         assert!(provider.api_keys[0].cooldown_seconds.unwrap() > 0);
+
+        state.provider_cooldown.lock().await.insert(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(90),
+        );
+        let provider = get_provider(&state, 1).await.unwrap();
+        assert!(provider.cooldown_seconds.is_some());
+        assert!(provider.cooldown_seconds.unwrap() > 0);
     }
 
     #[tokio::test]
@@ -6799,6 +6829,10 @@ mod tests {
             99,
             std::time::Instant::now() + std::time::Duration::from_secs(120),
         );
+        state.provider_cooldown.lock().await.insert(
+            2,
+            std::time::Instant::now() + std::time::Duration::from_secs(90),
+        );
         let range_start = Utc::now() - Duration::days(2);
         let range_end = Utc::now() + Duration::days(1);
         let Json(view) = overview(
@@ -6839,6 +6873,7 @@ mod tests {
         assert_eq!(view.failed_provider_keys, 1);
         assert_eq!(view.untested_provider_keys, 1);
         assert_eq!(view.runtime_error_provider_keys, 1);
+        assert_eq!(view.cooling_providers, 1);
         assert_eq!(view.cooling_provider_keys, 1);
         assert_eq!(view.in_flight_requests, 1);
         assert_eq!(
