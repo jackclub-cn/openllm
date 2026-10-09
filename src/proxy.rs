@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
@@ -2461,6 +2461,222 @@ fn strip_tool_search_tools(body: &Value) -> Option<Value> {
     Some(compat)
 }
 
+fn responses_tool_call_id(item: &Value) -> Option<&str> {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// Aggregators reject replayed Responses histories that contain a
+/// `function_call` without its matching `function_call_output`, or an output
+/// whose call was pruned. Repair both sides before the request leaves the
+/// gateway.
+fn sanitize_responses_tool_history(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut call_ids = HashSet::new();
+    let mut result_ids = HashSet::new();
+    for item in items.iter() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                if let Some(id) = responses_tool_call_id(item) {
+                    call_ids.insert(id.to_string());
+                }
+            }
+            Some("function_call_output") => {
+                if let Some(id) = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    result_ids.insert(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let paired = call_ids
+        .intersection(&result_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let before = items.len();
+    items.retain(|item| match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => responses_tool_call_id(item).is_some_and(|id| paired.contains(id)),
+        Some("function_call_output") => item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|id| paired.contains(id)),
+        _ => true,
+    });
+    before.saturating_sub(items.len())
+}
+
+fn chat_tool_call_id(call: &Value) -> Option<&str> {
+    call.get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn chat_message_is_empty(message: &Value) -> bool {
+    let has_content = match message.get("content") {
+        Some(Value::String(text)) => !text.trim().is_empty(),
+        Some(Value::Array(parts)) => !parts.is_empty(),
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    };
+    let has_tool_calls = message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .is_some_and(|calls| !calls.is_empty());
+    !has_content && !has_tool_calls
+}
+
+/// Chat completions upstreams require every assistant `tool_calls` entry to
+/// have a matching `tool` result. Drop only the unpaired side and remove
+/// assistant shells that become empty.
+fn sanitize_chat_tool_history(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut call_ids = HashSet::new();
+    let mut result_ids = HashSet::new();
+    for message in messages.iter() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && let Some(calls) = message.get("tool_calls").and_then(Value::as_array)
+        {
+            for call in calls {
+                if let Some(id) = chat_tool_call_id(call) {
+                    call_ids.insert(id.to_string());
+                }
+            }
+        }
+        if message.get("role").and_then(Value::as_str) == Some("tool")
+            && let Some(id) = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            result_ids.insert(id.to_string());
+        }
+    }
+
+    let paired = call_ids
+        .intersection(&result_ids)
+        .cloned()
+        .collect::<HashSet<_>>();
+    let mut removed = 0;
+
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) == Some("assistant")
+            && let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
+        {
+            let before = calls.len();
+            calls.retain(|call| chat_tool_call_id(call).is_some_and(|id| paired.contains(id)));
+            removed += before.saturating_sub(calls.len());
+            if calls.is_empty() {
+                message
+                    .as_object_mut()
+                    .map(|object| object.remove("tool_calls"));
+            }
+        }
+    }
+
+    let before = messages.len();
+    messages.retain(|message| {
+        let role = message.get("role").and_then(Value::as_str);
+        if role == Some("tool") {
+            return message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .is_some_and(|id| paired.contains(id));
+        }
+        !(role == Some("assistant") && chat_message_is_empty(message))
+    });
+    removed + before.saturating_sub(messages.len())
+}
+
+fn command_code_max_output_tokens(body: &mut Value) -> usize {
+    const MAX_COMMAND_CODE_TOKENS: i64 = 200_000;
+    let mut changes = 0;
+    for key in ["max_tokens", "max_completion_tokens", "max_output_tokens"] {
+        let Some(value) = body.get(key).and_then(Value::as_i64) else {
+            continue;
+        };
+        if value <= 0 {
+            if let Some(object) = body.as_object_mut() {
+                object.remove(key);
+                changes += 1;
+            }
+        } else if value > MAX_COMMAND_CODE_TOKENS {
+            body[key] = json!(MAX_COMMAND_CODE_TOKENS);
+            changes += 1;
+        }
+    }
+    changes
+}
+
+fn normalize_command_code_reasoning_effort(body: &mut Value) -> usize {
+    let responses_shape = body.get("input").is_some() && body.get("messages").is_none();
+    let mut changes = 0;
+
+    let normalize = |value: &mut Value, changes: &mut usize| {
+        let Some(effort) = value.as_str() else {
+            return;
+        };
+        let normalized = match effort.to_ascii_lowercase().as_str() {
+            "minimal" => Some("low"),
+            "none" if !responses_shape => Some("low"),
+            _ => None,
+        };
+        if let Some(normalized) = normalized {
+            *value = json!(normalized);
+            *changes += 1;
+        }
+    };
+
+    if let Some(value) = body.get_mut("reasoning_effort") {
+        normalize(value, &mut changes);
+    }
+    if let Some(value) = body
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        .and_then(|reasoning| reasoning.get_mut("effort"))
+    {
+        normalize(value, &mut changes);
+    }
+    changes
+}
+
+fn is_command_code_target(target: &RouteTarget) -> bool {
+    let base_url = target.base_url.to_ascii_lowercase();
+    let prefix = target
+        .model_prefix
+        .trim()
+        .trim_end_matches('/')
+        .to_ascii_lowercase();
+    base_url.contains("api.commandcode.ai")
+        || base_url.contains("commandcode.ai/provider/v1")
+        || prefix == "commandcode"
+        || prefix == "command-code"
+}
+
+fn normalize_command_code_request(body: &mut Value) -> usize {
+    command_code_max_output_tokens(body) + normalize_command_code_reasoning_effort(body)
+}
+
 pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     let message = String::from_utf8_lossy(body).to_ascii_lowercase();
     if !message.contains("tool_search") {
@@ -2612,6 +2828,24 @@ async fn forward_to_target(
     let translate_completions_to_responses =
         endpoint == OPENAI_COMPLETIONS && upstream_endpoint == OPENAI_RESPONSES;
 
+    let mut normalized_request = request_json.clone();
+    let repaired_tool_items = match endpoint {
+        OPENAI_RESPONSES => sanitize_responses_tool_history(&mut normalized_request),
+        OPENAI_CHAT_COMPLETIONS => sanitize_chat_tool_history(&mut normalized_request),
+        _ => 0,
+    };
+    if repaired_tool_items > 0 {
+        tracing::warn!(
+            provider = %target.provider_name,
+            model = %target.upstream_model,
+            request_id,
+            endpoint,
+            repaired_tool_items,
+            "repaired incomplete tool history before upstream request"
+        );
+    }
+    let request_json = &normalized_request;
+
     let (url, mut request_body) = match provider_type {
         ProviderType::Anthropic => {
             let body = match endpoint {
@@ -2649,6 +2883,19 @@ async fn forward_to_target(
         && let Some(compat_body) = strip_tool_search_tools(&request_body)
     {
         request_body = compat_body;
+    }
+    if provider_type != ProviderType::Anthropic && is_command_code_target(&target) {
+        let changes = normalize_command_code_request(&mut request_body);
+        if changes > 0 {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                endpoint,
+                changes,
+                "normalized CommandCode request before upstream send"
+            );
+        }
     }
 
     let mut response = send_provider_request(
@@ -11691,6 +11938,96 @@ mod tests {
     }
 
     #[test]
+    fn repairs_orphaned_responses_tool_items() {
+        let mut body = json!({
+            "input": [
+                {"type": "function_call", "call_id": "call_paired", "name": "lookup"},
+                {"type": "function_call_output", "call_id": "call_paired", "output": "ok"},
+                {"type": "function_call", "call_id": "call_missing", "name": "lookup"},
+                {"type": "function_call_output", "call_id": "call_orphan", "output": "stale"},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+
+        assert_eq!(sanitize_responses_tool_history(&mut body), 2);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["call_id"], "call_paired");
+        assert_eq!(input[1]["call_id"], "call_paired");
+        assert_eq!(input[2]["role"], "user");
+    }
+
+    #[test]
+    fn repairs_orphaned_chat_tool_messages() {
+        let mut body = json!({
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [
+                        {
+                            "id": "call_paired",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"}
+                        },
+                        {
+                            "id": "call_missing",
+                            "type": "function",
+                            "function": {"name": "lookup", "arguments": "{}"}
+                        }
+                    ]
+                },
+                {"role": "tool", "tool_call_id": "call_paired", "content": "ok"},
+                {"role": "tool", "tool_call_id": "call_orphan", "content": "stale"},
+                {"role": "user", "content": "continue"}
+            ]
+        });
+
+        assert_eq!(sanitize_chat_tool_history(&mut body), 2);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["tool_calls"].as_array().unwrap().len(), 1);
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_paired");
+        assert_eq!(messages[1]["tool_call_id"], "call_paired");
+        assert_eq!(messages[2]["role"], "user");
+    }
+
+    #[test]
+    fn normalizes_command_code_output_caps_and_reasoning_effort() {
+        let mut responses = json!({
+            "input": "hi",
+            "max_output_tokens": 500_000,
+            "reasoning": {"effort": "none"}
+        });
+        assert_eq!(normalize_command_code_request(&mut responses), 1);
+        assert_eq!(responses["max_output_tokens"], 200_000);
+        assert_eq!(responses["reasoning"]["effort"], "none");
+
+        let mut chat = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": -1,
+            "reasoning_effort": "minimal"
+        });
+        assert_eq!(normalize_command_code_request(&mut chat), 2);
+        assert!(chat.get("max_tokens").is_none());
+        assert_eq!(chat["reasoning_effort"], "low");
+    }
+
+    #[test]
+    fn identifies_command_code_targets_by_base_url_or_prefix() {
+        let mut target = endpoint_test_target("openai", None);
+        target.base_url = "https://api.commandcode.ai/provider/v1".to_string();
+        assert!(is_command_code_target(&target));
+
+        target.base_url = "https://example.com/v1".to_string();
+        target.model_prefix = "commandcode/".to_string();
+        assert!(is_command_code_target(&target));
+
+        target.model_prefix = "gateway/".to_string();
+        assert!(!is_command_code_target(&target));
+    }
+
+    #[test]
     fn recognizes_unsupported_tool_search_error() {
         for error in [
             r#"{
@@ -11891,6 +12228,129 @@ mod tests {
 
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let captured = Arc::new(Mutex::new(None));
+        let app = axum::Router::new().route(
+            OPENAI_RESPONSES,
+            axum::routing::post({
+                let captured = captured.clone();
+                move |Json(body): Json<Value>| {
+                    let captured = captured.clone();
+                    async move {
+                        *captured.lock().await = Some(body);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "resp_ok",
+                                "object": "response",
+                                "output": [],
+                                "usage": {
+                                    "input_tokens": 1,
+                                    "output_tokens": 1,
+                                    "total_tokens": 2
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO providers (id, name, provider_type, base_url, model_prefix)
+             VALUES (1, 'command-code', 'openai', ?, 'commandcode/')",
+        )
+        .bind(format!("http://{address}"))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let state = AppState::new(pool, None);
+        let request_json = json!({
+            "model": "commandcode/deepseek/deepseek-v4.1-flash",
+            "input": [
+                {"type": "function_call", "call_id": "call_pair", "name": "lookup"},
+                {"type": "function_call_output", "call_id": "call_pair", "output": "ok"},
+                {"type": "function_call", "call_id": "call_missing", "name": "lookup"},
+                {"type": "function_call_output", "call_id": "call_orphan", "output": "stale"},
+                {"role": "user", "content": "continue"}
+            ],
+            "max_output_tokens": 500_000,
+            "reasoning": {"effort": "none"}
+        });
+        let target = RouteTarget {
+            id: 1,
+            route_id: None,
+            provider_id: 1,
+            provider_name: "command-code".to_string(),
+            provider_type: "openai".to_string(),
+            base_url: format!("http://{address}"),
+            model_prefix: "commandcode/".to_string(),
+            api_key: None,
+            provider_headers: "{}".to_string(),
+            supported_endpoints: None,
+            context_limit: None,
+            input_limit: None,
+            output_limit: None,
+            provider_enabled: None,
+            model_enabled: None,
+            tool_search_supported: 1,
+            provider_health: None,
+            upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
+            weight: 100,
+            priority: 0,
+            enabled: 1,
+            provider_api_key_id: None,
+            provider_api_key_name: None,
+            auth_retryable: false,
+        };
+
+        let response = forward_to_target(
+            &state,
+            "tool-history-repair",
+            OPENAI_RESPONSES,
+            "commandcode/deepseek/deepseek-v4.1-flash",
+            &request_json,
+            &Bytes::new(),
+            None,
+            target,
+            false,
+            10,
+            None,
+            Instant::now(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let captured = captured.lock().await.clone().unwrap();
+        assert_eq!(captured["model"], "deepseek/deepseek-v4.1-flash");
+        assert_eq!(captured["max_output_tokens"], 200_000);
+        assert_eq!(captured["reasoning"]["effort"], "none");
+        let input = captured["input"].as_array().unwrap();
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["call_id"], "call_pair");
+        assert_eq!(input[1]["call_id"], "call_pair");
+        assert_eq!(input[2]["role"], "user");
+
+        server.abort();
     }
 
     #[test]
