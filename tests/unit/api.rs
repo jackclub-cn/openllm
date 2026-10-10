@@ -98,6 +98,7 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("openllm_webhooks{state=\"enabled\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"succeeded\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));
+    assert!(body.contains("openllm_audit_logs 0"));
     assert!(body.contains("openllm_database_size_bytes"));
 }
 
@@ -1302,6 +1303,116 @@ fn validates_usage_retention_days() {
 }
 
 #[tokio::test]
+async fn audit_log_records_mutations_and_supports_filters() {
+    use tower::ServiceExt;
+
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Audit provider', 'openai', 'https://audit.example/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let router = crate::build_router(state.clone());
+
+    // A real mutation through the admin API must leave an audit trail.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/routes")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "name": "Audited route",
+                        "model_pattern": "audit-*",
+                        "strategy": "priority",
+                        "enabled": true,
+                        "targets": [
+                            {
+                                "provider_id": 1,
+                                "upstream_model": "m",
+                                "weight": 100,
+                                "priority": 0,
+                                "enabled": true,
+                            }
+                        ],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+
+    // A failed mutation must not be recorded as a change.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/routes/9999")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/audit-logs?entity=route")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let page: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(page["total"], 1, "{page}");
+    assert_eq!(page["items"][0]["action"], "create");
+    assert_eq!(page["items"][0]["entity"], "route");
+    assert_eq!(page["items"][0]["summary"], "created route 'Audited route'");
+    assert_eq!(page["items"][0]["detail"]["strategy"], "priority");
+
+    // Search matches the summary and entity id fields.
+    let Json(page) = list_audit_logs(
+        State(state.clone()),
+        Query(AuditLogQuery {
+            page: None,
+            page_size: None,
+            entity: None,
+            action: None,
+            search: Some("Audited".to_string()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.total, 1);
+
+    let Json(page) = list_audit_logs(
+        State(state),
+        Query(AuditLogQuery {
+            page: None,
+            page_size: None,
+            entity: Some("provider".to_string()),
+            action: None,
+            search: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(page.total, 0);
+}
+
+#[tokio::test]
 async fn settings_expose_database_stats() {
     let state = provider_key_test_state().await;
     sqlx::query(
@@ -1327,6 +1438,7 @@ async fn settings_expose_database_stats() {
     assert_eq!(settings.database_stats.provider_api_keys, 1);
     assert_eq!(settings.database_stats.webhooks, 0);
     assert_eq!(settings.database_stats.webhook_deliveries, 0);
+    assert_eq!(settings.database_stats.audit_logs, 0);
     assert_eq!(settings.database_stats.in_flight_requests, 0);
 }
 

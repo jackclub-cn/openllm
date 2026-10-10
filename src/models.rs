@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 mod api_key;
+mod audit;
 mod catalog;
 mod defaults;
 mod provider;
@@ -11,6 +12,7 @@ mod usage;
 mod webhook;
 
 pub(crate) use api_key::*;
+pub(crate) use audit::*;
 pub(crate) use catalog::*;
 pub(crate) use defaults::*;
 pub(crate) use provider::*;

@@ -209,6 +209,23 @@ pub async fn cleanup_usage(
         .bind(&cutoff)
         .execute(&state.pool)
         .await?;
+    record_audit(
+        &state,
+        "delete",
+        "usage",
+        None,
+        &format!(
+            "cleaned {} usage log(s) older than {} day(s)",
+            result.rows_affected(),
+            input.older_than_days
+        ),
+        Some(json!({
+            "older_than_days": input.older_than_days,
+            "deleted": result.rows_affected(),
+            "cutoff": cutoff,
+        })),
+    )
+    .await;
     Ok(Json(UsageCleanupResult {
         deleted: result.rows_affected(),
         older_than_days: input.older_than_days,
@@ -281,11 +298,21 @@ pub async fn vacuum_database(
     let before = load_database_stats(&state).await?;
     sqlx::query("VACUUM").execute(&state.pool).await?;
     let database_stats = load_database_stats(&state).await?;
+    let reclaimed_bytes = before
+        .size_bytes
+        .saturating_sub(database_stats.size_bytes)
+        .max(0);
+    record_audit(
+        &state,
+        "action",
+        "database",
+        None,
+        &format!("vacuumed database, reclaimed {reclaimed_bytes} byte(s)"),
+        Some(json!({ "reclaimed_bytes": reclaimed_bytes })),
+    )
+    .await;
     Ok(Json(DatabaseVacuumResult {
-        reclaimed_bytes: before
-            .size_bytes
-            .saturating_sub(database_stats.size_bytes)
-            .max(0),
+        reclaimed_bytes,
         database_stats,
     }))
 }

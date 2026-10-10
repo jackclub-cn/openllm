@@ -24,8 +24,8 @@ use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
     create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
     event_stream, export_usage, get_runtime_settings, get_settings, get_usage_detail, health,
-    list_api_keys, list_model_inventory, list_models, list_provider_model_limits, list_providers,
-    list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
+    list_api_keys, list_audit_logs, list_model_inventory, list_models, list_provider_model_limits,
+    list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
     preview_provider_model_sync, prometheus_metrics, provider_quota, rotate_api_key,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, test_webhook, update_api_key, update_provider,
@@ -101,6 +101,7 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let admin = Router::new()
         .route("/overview", get(overview))
+        .route("/audit-logs", get(list_audit_logs))
         .route("/database/backup", get(backup_database))
         .route("/database/vacuum", post(vacuum_database))
         .route("/providers", get(list_providers).post(create_provider))

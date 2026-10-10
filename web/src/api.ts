@@ -540,6 +540,7 @@ export type DatabaseStats = {
   access_keys: number
   webhooks: number
   webhook_deliveries: number
+  audit_logs: number
   usage_logs: number
   in_flight_requests: number
 }

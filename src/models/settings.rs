@@ -20,6 +20,7 @@ pub struct DatabaseStats {
     pub access_keys: i64,
     pub webhooks: i64,
     pub webhook_deliveries: i64,
+    pub audit_logs: i64,
     pub usage_logs: i64,
     pub in_flight_requests: i64,
 }

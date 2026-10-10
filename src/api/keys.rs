@@ -126,6 +126,18 @@ pub async fn create_api_key(
         .fetch_one(&state.pool)
         .await?;
     *state.auth_required.write().await = None;
+    record_audit(
+        &state,
+        "create",
+        "api_key",
+        Some(&id.to_string()),
+        &format!("created API key '{}'", record.name),
+        Some(json!({
+            "allowed_models": record.allowed_models.clone(),
+            "expires_at": record.expires_at.clone(),
+        })),
+    )
+    .await;
     Ok((
         StatusCode::CREATED,
         Json(ApiKeyCreated {
@@ -158,6 +170,15 @@ pub async fn rotate_api_key(
         .bind(id)
         .fetch_one(&state.pool)
         .await?;
+    record_audit(
+        &state,
+        "rotate",
+        "api_key",
+        Some(&id.to_string()),
+        &format!("rotated API key '{}'", record.name),
+        None,
+    )
+    .await;
     Ok(Json(ApiKeyCreated {
         key: raw,
         item: record.into(),
@@ -176,6 +197,15 @@ pub async fn delete_api_key(
         return Err(AppError::NotFound("API key not found".to_string()));
     }
     *state.auth_required.write().await = None;
+    record_audit(
+        &state,
+        "delete",
+        "api_key",
+        Some(&id.to_string()),
+        "deleted API key",
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -237,6 +267,15 @@ pub async fn update_api_key(
         .bind(id)
         .fetch_one(&state.pool)
         .await?;
+    record_audit(
+        &state,
+        "update",
+        "api_key",
+        Some(&id.to_string()),
+        &format!("updated API key '{}'", record.name),
+        Some(json!({ "enabled": record.enabled != 0 })),
+    )
+    .await;
     Ok(Json(record.into()))
 }
 

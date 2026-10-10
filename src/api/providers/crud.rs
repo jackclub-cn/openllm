@@ -85,6 +85,19 @@ pub async fn create_provider(
     {
         tracing::warn!(provider_id = id, %error, "automatic model sync failed");
     }
+    record_audit(
+        &state,
+        "create",
+        "provider",
+        Some(&id.to_string()),
+        &format!("created provider '{}'", input.name.trim()),
+        Some(json!({
+            "name": input.name.trim(),
+            "base_url": input.base_url,
+            "enabled": input.enabled,
+        })),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(get_provider(&state, id).await?)))
 }
 
@@ -188,7 +201,7 @@ pub async fn update_provider(
     sqlx::query(
         "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
-    .bind(name)
+    .bind(name.clone())
     .bind(provider_type.as_str())
     .bind(base_url)
     .bind(model_prefix)
@@ -238,6 +251,15 @@ pub async fn update_provider(
     {
         tracing::warn!(provider_id = id, %error, "automatic model sync failed");
     }
+    record_audit(
+        &state,
+        "update",
+        "provider",
+        Some(&id.to_string()),
+        &format!("updated provider '{}'", name.trim()),
+        None,
+    )
+    .await;
     Ok(Json(get_provider(&state, id).await?))
 }
 
@@ -264,5 +286,14 @@ pub async fn delete_provider(
         return Err(AppError::NotFound("provider not found".to_string()));
     }
     state.provider_cooldown.lock().await.remove(&id);
+    record_audit(
+        &state,
+        "delete",
+        "provider",
+        Some(&id.to_string()),
+        "deleted provider",
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }

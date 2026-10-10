@@ -201,6 +201,15 @@ pub async fn create_webhook(
     .await
     .map_err(map_sqlite_conflict)?;
     let id = result.last_insert_rowid();
+    record_audit(
+        &state,
+        "create",
+        "webhook",
+        Some(&id.to_string()),
+        &format!("created webhook '{name}'"),
+        Some(json!({ "enabled": input.enabled })),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(webhook_view(&state, id).await?)))
 }
 
@@ -253,7 +262,7 @@ pub async fn update_webhook(
         "UPDATE webhooks SET name = ?, url = ?, secret = ?, headers = ?, event_types = ?, \
          enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
-    .bind(name)
+    .bind(name.clone())
     .bind(url)
     .bind(secret)
     .bind(headers)
@@ -263,6 +272,15 @@ pub async fn update_webhook(
     .execute(&state.pool)
     .await
     .map_err(map_sqlite_conflict)?;
+    record_audit(
+        &state,
+        "update",
+        "webhook",
+        Some(&id.to_string()),
+        &format!("updated webhook '{name}'"),
+        None,
+    )
+    .await;
     Ok(Json(webhook_view(&state, id).await?))
 }
 
@@ -277,6 +295,15 @@ pub async fn delete_webhook(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("webhook not found".to_string()));
     }
+    record_audit(
+        &state,
+        "delete",
+        "webhook",
+        Some(&id.to_string()),
+        "deleted webhook",
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 

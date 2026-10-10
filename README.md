@@ -68,6 +68,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - 提供网关访问密钥、到期时间、模型权限、每日 Token/费用额度、每分钟请求数、最大并发数和密钥轮换。
 - 记录请求、会话 ID、Token、缓存、费用、总用时、首 Token 用时、TPS 和错误，并在仪表盘、请求日志和管理界面中查询与导出；仪表盘可下钻到带筛选条件的请求日志，日志筛选条件会同步到 URL。
 - 支持请求事件 Webhook：可订阅成功或失败事件，向外部 HTTP 端点发送带 HMAC-SHA256 签名的 JSON，自动重试临时故障并保留投递历史。
+- 记录配置变更审计日志：提供商、路由、访问密钥、Webhook、运行时设置和数据库操作都会写入审计轨迹，记录时间、操作、对象、摘要和变更详情。
 - 会话 ID 用于请求详情追溯和同会话亲和路由；仪表盘聚焦请求、Token、缓存、成功率和总用时等核心指标。
 - 支持额度接口的提供商可直接查看额度窗口和价格，多密钥时可切换具体 Key 查询；例如 Command Code 的 5 小时、周、月额度，OpenCode Go 的滚动、周、月窗口，以及 DeepSeek 余额和模型价格。
 
@@ -151,6 +152,17 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 连接错误、HTTP `408`、`425`、`429` 和 `5xx` 会再尝试两次；明确的其他 `4xx` 不会重试。投递采用有界并发和进程内事件总线，极端流量或进程退出时属于尽力投递，不替代持久化消息队列。每个 Webhook 最近保留 200 条投递记录，控制台可查看状态、尝试次数、耗时和错误，也可以发送测试事件。
 
+### 审计日志
+
+控制台“审计日志”页面或 `GET /api/audit-logs` 可查看配置变更历史。每次成功的写操作都会追加一条记录：
+
+- `action`：`create`、`update`、`delete`、`rotate` 或 `action`（数据库整理等）。
+- `entity`：`provider`、`route`、`api_key`、`webhook`、`settings`、`database` 或 `usage`。
+- `summary` 与 `detail`：可读描述和结构化变更字段，`detail` 不包含密钥等敏感值。
+- `actor`：`admin` 表示请求经过管理令牌鉴权，`local` 表示管理接口处于开放状态。
+
+审计写入失败不会中断被审计的操作，只会记录一条警告日志，因此磁盘或锁竞争不会把一次成功的配置变更变成报错。默认保留最近 5000 条记录，写入时自动裁剪更早的历史；查询支持按对象、操作和关键词过滤并分页。
+
 ### 协议兼容
 
 - OpenAI 与 Anthropic 请求都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可与请求日志关联。
@@ -209,7 +221,7 @@ Vite 会把 `/api` 和 `/v1` 代理到 `127.0.0.1:8080`。
 - 上游 API Key 和 Webhook 自定义请求头按原值保存在 SQLite，用于向上游或接收端发起请求；网关访问密钥只保存 SHA-256 摘要。
 - 设置页支持在线一致性备份，不需要停服或直接复制 WAL 文件，并显示数据库文件位置、占用空间、可回收空间和各主要数据表记录数；可手动整理数据库回收已删除日志占用的空间。
 - 日志保留策略支持自动清理历史请求记录。数据长期增长时，建议根据审计需求和磁盘容量设置合理的保留天数。
-- 提供 Prometheus 文本格式的 `GET /metrics`，导出请求、成功/失败、在途请求、Token（总量/输入/输出/缓存）、估算费用、未定价请求、平均延迟、提供商与密钥健康分组、每个提供商的模型数、请求数、Token、平均延迟与冷却状态、Webhook 与投递结果数量，以及数据库大小和可回收空间。开启 `OPENLLM_ADMIN_TOKEN` 时该接口需要相同的鉴权（`Authorization: Bearer` 或 `x-admin-token`）。
+- 提供 Prometheus 文本格式的 `GET /metrics`，导出请求、成功/失败、在途请求、Token（总量/输入/输出/缓存）、估算费用、未定价请求、平均延迟、提供商与密钥健康分组、每个提供商的模型数、请求数、Token、平均延迟与冷却状态、Webhook 与投递结果数量、审计日志数量，以及数据库大小和可回收空间。开启 `OPENLLM_ADMIN_TOKEN` 时该接口需要相同的鉴权（`Authorization: Bearer` 或 `x-admin-token`）。
 - SQLite 默认启用 WAL、`synchronous=NORMAL` 和 busy timeout，适合单实例部署。多个网关实例不应同时写入同一个数据库文件。
 - 开启 `OPENLLM_ADMIN_TOKEN` 时，SSE 事件接口通过 `admin_token` 查询参数鉴权，因为浏览器 EventSource 不支持自定义请求头。
 - `data/`、`dist/`、`target/` 和 `web/node_modules/` 默认不纳入版本控制。

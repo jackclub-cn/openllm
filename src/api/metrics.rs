@@ -38,6 +38,7 @@ struct StatusMetricsRow {
     webhooks_disabled: i64,
     webhook_deliveries_succeeded: i64,
     webhook_deliveries_failed: i64,
+    audit_logs: i64,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -99,7 +100,9 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
               WHERE status_code >= 200 AND status_code < 300) AS webhook_deliveries_succeeded,
             (SELECT COUNT(*) FROM webhook_deliveries
               WHERE status_code IS NULL OR status_code < 200 OR status_code >= 300)
-              AS webhook_deliveries_failed
+              AS webhook_deliveries_failed,
+
+            (SELECT COUNT(*) FROM audit_logs) AS audit_logs
         "#,
     )
     .fetch_one(&state.pool);
@@ -345,6 +348,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             value,
         );
     }
+    metric_header(
+        &mut body,
+        "openllm_audit_logs",
+        "Retained configuration change audit records",
+    );
+    push_metric(&mut body, "openllm_audit_logs", &[], statuses.audit_logs);
 
     metric_header(
         &mut body,

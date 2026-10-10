@@ -50,6 +50,19 @@ pub async fn create_route(
     replace_route_targets(&mut tx, id, &input.targets).await?;
     tx.commit().await?;
 
+    record_audit(
+        &state,
+        "create",
+        "route",
+        Some(&id.to_string()),
+        &format!("created route '{}'", input.name.trim()),
+        Some(json!({
+            "model_pattern": input.model_pattern.trim(),
+            "strategy": input.strategy.as_str(),
+            "targets": input.targets.len(),
+        })),
+    )
+    .await;
     Ok((StatusCode::CREATED, Json(get_route(&state, id).await?)))
 }
 
@@ -93,7 +106,7 @@ pub async fn update_route(
         "UPDATE routes SET name = ?, model_pattern = ?, strategy = ?, strategy_ext = ?, \
          enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
-    .bind(name)
+    .bind(name.clone())
     .bind(model_pattern)
     .bind(stored_strategy)
     .bind(stored_strategy_ext)
@@ -109,6 +122,15 @@ pub async fn update_route(
     }
     tx.commit().await?;
 
+    record_audit(
+        &state,
+        "update",
+        "route",
+        Some(&id.to_string()),
+        &format!("updated route '{name}'"),
+        None,
+    )
+    .await;
     Ok(Json(get_route(&state, id).await?))
 }
 
@@ -147,5 +169,14 @@ pub async fn delete_route(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("route not found".to_string()));
     }
+    record_audit(
+        &state,
+        "delete",
+        "route",
+        Some(&id.to_string()),
+        "deleted route",
+        None,
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }

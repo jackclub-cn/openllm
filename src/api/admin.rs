@@ -60,9 +60,10 @@ pub(super) async fn load_database_stats(state: &AppState) -> AppResult<DatabaseS
         access_keys,
         webhooks,
         webhook_deliveries,
+        audit_logs,
         usage_logs,
         in_flight_requests,
-    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, i64)>(
+    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)>(
         "SELECT \
             (SELECT COUNT(*) FROM providers), \
             (SELECT COUNT(*) FROM provider_models), \
@@ -71,6 +72,7 @@ pub(super) async fn load_database_stats(state: &AppState) -> AppResult<DatabaseS
             (SELECT COUNT(*) FROM api_keys), \
             (SELECT COUNT(*) FROM webhooks), \
             (SELECT COUNT(*) FROM webhook_deliveries), \
+            (SELECT COUNT(*) FROM audit_logs), \
             (SELECT requests FROM usage_lifetime_stats WHERE id = 1) \
                 + (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1), \
             (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1)",
@@ -88,6 +90,7 @@ pub(super) async fn load_database_stats(state: &AppState) -> AppResult<DatabaseS
         access_keys,
         webhooks,
         webhook_deliveries,
+        audit_logs,
         usage_logs,
         in_flight_requests,
     })
@@ -127,6 +130,19 @@ pub async fn update_runtime_settings(
             .await?;
     }
     *state.retention_last_run.lock().await = None;
+    record_audit(
+        &state,
+        "update",
+        "settings",
+        Some(SETTING_USAGE_RETENTION_DAYS),
+        match usage_retention_days {
+            Some(days) => format!("set usage retention to {days} day(s)"),
+            None => "cleared usage retention (keep logs forever)".to_string(),
+        }
+        .as_str(),
+        usage_retention_days.map(|days| json!({ "usage_retention_days": days })),
+    )
+    .await;
     Ok(Json(RuntimeSettingsView {
         usage_retention_days,
     }))

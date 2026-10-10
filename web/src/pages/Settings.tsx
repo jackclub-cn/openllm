@@ -201,6 +201,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
               <Tag>访问密钥 {formatCompact(settings.database_stats.access_keys)}</Tag>
               <Tag>Webhook {formatCompact(settings.database_stats.webhooks)}</Tag>
               <Tag>投递记录 {formatCompact(settings.database_stats.webhook_deliveries)}</Tag>
+              <Tag>审计日志 {formatCompact(settings.database_stats.audit_logs)}</Tag>
               <Tag>请求日志 {formatCompact(settings.database_stats.usage_logs)}</Tag>
               <Tag color={settings.database_stats.in_flight_requests ? 'processing' : 'default'}>
                 请求中 {formatCompact(settings.database_stats.in_flight_requests)}

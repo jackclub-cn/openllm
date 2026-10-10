@@ -22,6 +22,7 @@ use crate::proxy::{apply_custom_headers, join_upstream_url, upstream_rejects_too
 use crate::state::AppState;
 
 mod admin;
+mod audit;
 mod helpers;
 mod keys;
 mod metrics;
@@ -32,6 +33,7 @@ mod usage;
 mod webhooks;
 
 pub use admin::*;
+pub use audit::*;
 use helpers::*;
 pub use keys::*;
 pub use metrics::*;

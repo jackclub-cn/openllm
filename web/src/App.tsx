@@ -3,6 +3,7 @@ import {
   ApiOutlined,
   AppstoreOutlined,
   BellOutlined,
+  AuditOutlined,
   DashboardOutlined,
   KeyOutlined,
   MessageOutlined,
@@ -25,6 +26,7 @@ const RoutesPage = lazy(() => import('./pages/Routes'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
 const Usage = lazy(() => import('./pages/Usage'))
 const Webhooks = lazy(() => import('./pages/Webhooks'))
+const AuditLogs = lazy(() => import('./pages/AuditLogs'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const Playground = lazy(() => import('./pages/Playground'))
 
@@ -37,6 +39,7 @@ const navigation = [
   { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
   { key: '/usage', icon: <DashboardOutlined />, label: '请求日志' },
   { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
+  { key: '/audit', icon: <AuditOutlined />, label: '审计日志' },
   { key: '/settings', icon: <SettingOutlined />, label: '设置' },
 ]
 
@@ -154,6 +157,7 @@ function AppLayout({
               <Route path="/keys" element={<ApiKeys />} />
               <Route path="/usage" element={<Usage />} />
               <Route path="/webhooks" element={<Webhooks />} />
+              <Route path="/audit" element={<AuditLogs />} />
               <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
