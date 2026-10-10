@@ -27,12 +27,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("openllm=info,tower_http=info")),
-        )
-        .init();
+    init_tracing();
 
     let args = Args::parse();
     run(Config {
@@ -42,4 +37,27 @@ async fn main() -> anyhow::Result<()> {
         admin_token: args.admin_token,
     })
     .await
+}
+
+/// Installs the tracing subscriber.
+///
+/// `OPENLLM_LOG_FORMAT=json` switches to one JSON object per line for log
+/// pipelines (Loki, ELK); anything else keeps the human-readable default. The
+/// filter still comes from `RUST_LOG`.
+fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("openllm=info,tower_http=info"));
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    if std::env::var("OPENLLM_LOG_FORMAT")
+        .is_ok_and(|value| value.trim().eq_ignore_ascii_case("json"))
+    {
+        builder
+            .json()
+            .flatten_event(true)
+            .with_current_span(false)
+            .with_span_list(false)
+            .init();
+    } else {
+        builder.init();
+    }
 }

@@ -166,6 +166,8 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_db_pool_connections gauge"));
     assert!(body.contains("# TYPE openllm_db_pool_idle gauge"));
     assert!(body.contains("# TYPE openllm_db_pool_max_connections gauge"));
+    assert!(body.contains("# TYPE openllm_runtime_lag_millis gauge"));
+    assert!(body.contains("openllm_runtime_lag_millis 0"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(

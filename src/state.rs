@@ -72,6 +72,9 @@ pub struct AppState {
     pub memory_shed_ratio: f64,
     /// Requests shed by the memory-pressure guard since startup.
     pub memory_shed: Arc<AtomicU64>,
+    /// How late, in milliseconds, the async runtime ran its last 1s timer.
+    /// Surfaces a blocked runtime (sync I/O or a CPU-bound call on the reactor).
+    pub runtime_lag_millis: Arc<AtomicU64>,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
@@ -792,6 +795,7 @@ impl AppState {
             memory_limit_source,
             memory_shed_ratio,
             memory_shed: Arc::new(AtomicU64::new(0)),
+            runtime_lag_millis: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

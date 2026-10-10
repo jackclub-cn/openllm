@@ -57,6 +57,39 @@ pub struct Config {
     pub admin_token: Option<String>,
 }
 
+/// Measures how late the async runtime runs a 1-second timer and records it.
+///
+/// A healthy runtime wakes a timer close to its deadline. A large value means
+/// a blocking call or a CPU-bound task is occupying the reactor thread, which
+/// delays *every* in-flight request; exposing it as a gauge lets an operator
+/// alert on it instead of guessing from request latency.
+async fn monitor_runtime_lag(state: AppState) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    const INTERVAL: Duration = Duration::from_secs(1);
+    const WARN_AFTER_MS: u64 = 5_000;
+
+    let mut expected = tokio::time::Instant::now() + INTERVAL;
+    loop {
+        tokio::time::sleep_until(expected).await;
+        let now = tokio::time::Instant::now();
+        let lag_ms = now.saturating_duration_since(expected).as_millis() as u64;
+        state.runtime_lag_millis.store(lag_ms, Ordering::Relaxed);
+        if lag_ms >= WARN_AFTER_MS {
+            tracing::warn!(
+                lag_ms,
+                "async runtime lag detected; a blocking call may be stalling requests"
+            );
+        }
+        expected += INTERVAL;
+        // After a long stall, resync instead of replaying every missed tick.
+        if expected <= now {
+            expected = now + INTERVAL;
+        }
+    }
+}
+
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let database = Database::connect(&config).await?;
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
@@ -82,6 +115,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let webhook_state = state.clone();
     tokio::spawn(async move {
         crate::webhooks::run_dispatcher(webhook_state).await;
+    });
+    let lag_state = state.clone();
+    tokio::spawn(async move {
+        monitor_runtime_lag(lag_state).await;
     });
 
     let limits = state.runtime_limits();

@@ -864,6 +864,19 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         &[],
         crate::db::db_max_connections() as i64,
     );
+    metric_header(
+        &mut body,
+        "openllm_runtime_lag_millis",
+        "How late the async runtime ran its last 1s timer; a large value means a blocked runtime",
+    );
+    push_metric(
+        &mut body,
+        "openllm_runtime_lag_millis",
+        &[],
+        state
+            .runtime_lag_millis
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
 
     Response::builder()
         .status(StatusCode::OK)
