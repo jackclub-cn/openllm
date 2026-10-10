@@ -8124,12 +8124,14 @@ async fn request_capacity_slot_is_held_until_the_body_completes() {
     state.request_capacity = Some(semaphore.clone());
     state.request_capacity_limit = 1;
 
-    let RequestCapacity::Acquired(permit) = acquire_request_capacity(&state) else {
+    let RequestCapacity::Acquired(permit) =
+        acquire_request_capacity(&state, Duration::ZERO).await
+    else {
         panic!("the first request must take the only slot");
     };
     assert_eq!(semaphore.available_permits(), 0);
     assert!(matches!(
-        acquire_request_capacity(&state),
+        acquire_request_capacity(&state, Duration::ZERO).await,
         RequestCapacity::Overloaded
     ));
     assert_eq!(
@@ -8155,7 +8157,7 @@ async fn request_capacity_slot_is_held_until_the_body_completes() {
     drop(response);
     assert_eq!(semaphore.available_permits(), 1);
     assert!(matches!(
-        acquire_request_capacity(&state),
+        acquire_request_capacity(&state, Duration::ZERO).await,
         RequestCapacity::Acquired(_)
     ));
 }
@@ -8406,5 +8408,119 @@ async fn admission_sheds_bodies_over_the_inflight_byte_budget() {
         budget.used(),
         0,
         "a shed request must not leak a byte reservation"
+    );
+}
+
+#[tokio::test]
+async fn admission_wait_takes_a_slot_as_soon_as_one_frees() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    state.request_capacity = Some(semaphore.clone());
+    state.request_capacity_limit = 1;
+
+    let holder = semaphore.clone().acquire_owned().await.unwrap();
+    let waiter =
+        tokio::spawn(
+            async move { acquire_request_capacity(&state, Duration::from_secs(2)).await },
+        );
+    // Free the slot shortly after the waiter parks on it.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(holder);
+
+    match waiter.await.unwrap() {
+        RequestCapacity::Acquired(_) => {}
+        _ => panic!("a waiting request must take the slot once it frees"),
+    }
+}
+
+#[tokio::test]
+async fn admission_wait_sheds_after_the_deadline() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    // Zero permits: nothing can free, so the wait must expire into a shed.
+    state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
+    state.request_capacity_limit = 1;
+
+    let wait = Duration::from_millis(120);
+    let started = Instant::now();
+    let outcome = acquire_request_capacity(&state, wait).await;
+    assert!(
+        matches!(outcome, RequestCapacity::Overloaded),
+        "a wait with no release must still shed"
+    );
+    assert!(
+        started.elapsed() >= wait,
+        "shedding waits the configured budget before giving up"
+    );
+    assert_eq!(
+        state
+            .requests_shed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+}
+
+#[tokio::test]
+async fn byte_budget_wait_reserves_once_room_frees() {
+    let budget = std::sync::Arc::new(RequestByteBudget::new(64));
+    let held = budget.reserve(64).expect("the whole budget is free");
+    let waiter = {
+        let budget = budget.clone();
+        tokio::spawn(async move { budget.reserve_within(64, Duration::from_secs(2)).await })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    drop(held);
+    let guard = waiter
+        .await
+        .unwrap()
+        .expect("the waiter takes the bytes once they free");
+    assert_eq!(budget.used(), 64);
+    drop(guard);
+    assert_eq!(budget.used(), 0);
+}
+
+/// End-to-end: with an admission wait configured, a request that arrives while
+/// the only slot is busy is admitted once the slot frees instead of being shed.
+#[tokio::test]
+async fn admission_wait_lets_a_request_through_once_a_slot_frees() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    state.request_capacity = Some(semaphore.clone());
+    state.request_capacity_limit = 1;
+    state.admission_wait = Duration::from_secs(2);
+    let router = crate::build_router(state);
+
+    // Occupy the only slot so the request below must wait for it.
+    let holder = semaphore.clone().acquire_owned().await.unwrap();
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(OPENAI_CHAT_COMPLETIONS)
+        .header("content-type", "application/json")
+        .body(Body::from("{\"model\":\"m\",\"messages\":[]}"))
+        .unwrap();
+    let pending = tokio::spawn(async move { router.oneshot(request).await.unwrap() });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    drop(holder);
+
+    let response = pending.await.unwrap();
+    assert_ne!(
+        response.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a waiting request must be admitted once a slot frees"
     );
 }

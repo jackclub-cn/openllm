@@ -100,6 +100,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         sse_keepalive_secs = ?limits.sse_keepalive_secs,
         max_concurrent_requests = %limits.max_concurrent_requests,
         max_inflight_request_mib = %limits.max_inflight_request_mib,
+        admission_wait_ms = %limits.admission_wait_ms,
         "OpenLLM Gateway started"
     );
 

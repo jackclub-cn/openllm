@@ -12,16 +12,25 @@ pub(crate) enum RequestCapacity {
 
 /// Reserves a slot against the optional global request cap.
 ///
-/// The check is non-blocking on purpose: once the cap is reached the gateway
-/// is already under strain, so the request is shed with a `429` instead of
-/// queueing behind an unbounded backlog.
-pub(crate) fn acquire_request_capacity(state: &AppState) -> RequestCapacity {
+/// `wait` bounds how long an over-capacity request waits for a slot. A zero
+/// wait is non-blocking: once the cap is reached the request is shed at once.
+/// A positive wait lets a momentary burst serialize instead of being dropped,
+/// then still sheds with a `429` if no slot frees in time.
+pub(crate) async fn acquire_request_capacity(state: &AppState, wait: Duration) -> RequestCapacity {
     let Some(semaphore) = &state.request_capacity else {
         return RequestCapacity::Disabled;
     };
-    match semaphore.clone().try_acquire_owned() {
-        Ok(permit) => RequestCapacity::Acquired(permit),
-        Err(_) => {
+    let permit = if wait.is_zero() {
+        semaphore.clone().try_acquire_owned().ok()
+    } else {
+        match tokio::time::timeout(wait, semaphore.clone().acquire_owned()).await {
+            Ok(Ok(permit)) => Some(permit),
+            _ => None,
+        }
+    };
+    match permit {
+        Some(permit) => RequestCapacity::Acquired(permit),
+        None => {
             state
                 .requests_shed
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -36,16 +45,19 @@ pub(crate) fn acquire_request_capacity(state: &AppState) -> RequestCapacity {
 /// over-capacity request is refused without reading a potentially large body
 /// into memory. The permit is attached to the response body and released only
 /// once that body has been fully written, so a long stream keeps its slot for
-/// its whole lifetime.
+/// its whole lifetime. When `OPENLLM_ADMISSION_WAIT_MS` is set, an
+/// over-capacity request first waits that long for a slot before it is shed, so
+/// a momentary burst serializes instead of being dropped.
 pub(crate) async fn admission(
     State(state): State<AppState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
     let anthropic = request.uri().path().starts_with("/v1/messages");
+    let wait = state.admission_wait;
     // Refuse an over-capacity request before the body is read: a hanging or
     // huge body must not consume a slot or any memory first.
-    let capacity = acquire_request_capacity(&state);
+    let capacity = acquire_request_capacity(&state, wait).await;
     if let RequestCapacity::Overloaded = capacity {
         return overloaded_response(state.request_capacity_limit, anthropic);
     }
@@ -53,7 +65,7 @@ pub(crate) async fn admission(
     let (parts, body) = request.into_parts();
     let (body, byte_guard) = match state.inflight_request_bytes.clone() {
         None => (body, None),
-        Some(budget) => match charge_request_body(&budget, &parts.headers, body).await {
+        Some(budget) => match charge_request_body(&budget, &parts.headers, body, wait).await {
             Ok(charged) => charged,
             Err(BodyCharge::OverBudget) => {
                 state
@@ -95,6 +107,7 @@ async fn charge_request_body(
     budget: &std::sync::Arc<crate::state::RequestByteBudget>,
     headers: &HeaderMap,
     body: Body,
+    wait: Duration,
 ) -> Result<(Body, Option<crate::state::RequestByteGuard>), BodyCharge> {
     let declared = headers
         .get(axum::http::header::CONTENT_LENGTH)
@@ -102,9 +115,13 @@ async fn charge_request_body(
         .and_then(|value| value.trim().parse::<usize>().ok());
     // Reserve the declared size up front so a known-large body is shed before
     // any of it is read, and concurrent requests count their size immediately.
-    let mut guard = budget
-        .reserve(declared.unwrap_or(0))
-        .ok_or(BodyCharge::OverBudget)?;
+    // A known size also honors the admission wait; an unknown one reserves
+    // nothing up front and charges as it reads.
+    let mut guard = match declared {
+        Some(bytes) => budget.reserve_within(bytes, wait).await,
+        None => budget.reserve(0),
+    }
+    .ok_or(BodyCharge::OverBudget)?;
 
     let mut stream = body.into_data_stream();
     let mut buffer: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(64 * 1024));

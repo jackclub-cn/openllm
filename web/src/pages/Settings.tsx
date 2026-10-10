@@ -341,6 +341,9 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="在途请求体上限">
               {limits ? (limits.max_inflight_request_mib > 0 ? `${limits.max_inflight_request_mib} MiB` : '不限') : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="准入等待">
+              {limits ? (limits.admission_wait_ms > 0 ? `${limits.admission_wait_ms} 毫秒` : '不等待') : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="SSE 心跳">
               {limits
                 ? limits.sse_keepalive_secs != null

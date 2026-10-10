@@ -56,6 +56,9 @@ pub struct RuntimeLimits {
     pub max_concurrent_requests: usize,
     /// In-flight request-body byte budget in MiB; `0` means unlimited.
     pub max_inflight_request_mib: usize,
+    /// Admission wait in milliseconds before an over-capacity request is shed;
+    /// `0` sheds immediately.
+    pub admission_wait_ms: u64,
 }
 
 #[derive(Debug, Deserialize)]

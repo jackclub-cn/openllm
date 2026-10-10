@@ -590,6 +590,7 @@ export type RuntimeLimits = {
   sse_keepalive_secs?: number | null
   max_concurrent_requests: number
   max_inflight_request_mib: number
+  admission_wait_ms: number
 }
 
 export type GuardrailSettings = {

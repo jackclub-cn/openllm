@@ -57,6 +57,9 @@ pub struct AppState {
     pub request_bytes_limit: usize,
     /// Requests refused by the in-flight byte budget since startup.
     pub request_bytes_shed: Arc<AtomicU64>,
+    /// How long an over-capacity request waits for an admission slot before it
+    /// is shed. Zero sheds immediately.
+    pub admission_wait: Duration,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
@@ -122,6 +125,14 @@ pub(crate) const DEFAULT_MAX_UPSTREAM_BODY_MIB: usize = 64;
 /// cap. Set `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` to a positive value to shed
 /// requests whose combined buffered bodies would exceed it.
 pub(crate) const DEFAULT_MAX_INFLIGHT_REQUEST_MIB: usize = 0;
+
+/// Default admission wait in milliseconds.
+///
+/// `0` sheds an over-capacity request immediately, the non-blocking default.
+/// A positive value lets the request wait that long for a slot before it is
+/// shed, so a short coding-agent burst serializes instead of being dropped.
+/// Override with `OPENLLM_ADMISSION_WAIT_MS`.
+pub(crate) const DEFAULT_ADMISSION_WAIT_MS: u64 = 0;
 
 /// Default idle gap allowed between bytes from an upstream.
 ///
@@ -198,6 +209,20 @@ pub(crate) fn parse_inflight_bytes_mib(value: Option<&str>) -> Option<usize> {
     parse_concurrency_limit(value).map(|mib| mib.saturating_mul(1024 * 1024))
 }
 
+/// Parses the admission wait budget, in milliseconds.
+///
+/// `0` (and any unparsable value) keeps the non-blocking default: an
+/// over-capacity request is shed at once. A positive value lets it wait that
+/// long for a slot before the `429`, so a short burst serializes instead of
+/// being dropped while the gateway is only momentarily saturated.
+pub(crate) fn parse_admission_wait_ms(value: Option<&str>) -> Duration {
+    let default = Duration::from_millis(DEFAULT_ADMISSION_WAIT_MS);
+    match value.map(str::trim) {
+        None | Some("") => default,
+        Some(raw) => raw.parse::<u64>().map(Duration::from_millis).unwrap_or(default),
+    }
+}
+
 /// Parses the post-signal drain grace period.
 ///
 /// A missing or unparsable value keeps the default; an explicit `0` waits
@@ -250,6 +275,8 @@ pub struct UsageEvent {
 pub struct RequestByteBudget {
     limit: usize,
     used: AtomicUsize,
+    /// Woken whenever a reservation is released so a bounded wait can retry.
+    released: tokio::sync::Notify,
 }
 
 impl RequestByteBudget {
@@ -257,6 +284,7 @@ impl RequestByteBudget {
         Self {
             limit,
             used: AtomicUsize::new(0),
+            released: tokio::sync::Notify::new(),
         }
     }
 
@@ -306,6 +334,7 @@ impl RequestByteBudget {
     fn release(&self, bytes: usize) {
         if bytes > 0 {
             self.used.fetch_sub(bytes, Ordering::AcqRel);
+            self.released.notify_waiters();
         }
     }
 
@@ -317,6 +346,35 @@ impl RequestByteBudget {
             reserved: 0,
         };
         guard.extend(bytes).then_some(guard)
+    }
+
+    /// Reserves `bytes`, waiting up to `wait` for in-flight requests to release
+    /// room before giving up. A zero `wait` is a non-blocking [`Self::reserve`].
+    pub async fn reserve_within(
+        self: &Arc<Self>,
+        bytes: usize,
+        wait: Duration,
+    ) -> Option<RequestByteGuard> {
+        if wait.is_zero() {
+            return self.reserve(bytes);
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            // Register the waiter before checking so a release that lands
+            // between a failed reservation and the await is not missed.
+            let released = self.released.notified();
+            if let Some(guard) = self.reserve(bytes) {
+                return Some(guard);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return None;
+            }
+            if tokio::time::timeout(remaining, released).await.is_err() {
+                // Timed out; a release may still have landed, so try once more.
+                return self.reserve(bytes);
+            }
+        }
     }
 }
 
@@ -420,6 +478,9 @@ impl AppState {
             inflight_request_bytes,
             request_bytes_limit,
             request_bytes_shed: Arc::new(AtomicU64::new(0)),
+            admission_wait: parse_admission_wait_ms(
+                std::env::var("OPENLLM_ADMISSION_WAIT_MS").ok().as_deref(),
+            ),
             started_at: Instant::now(),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -555,6 +616,7 @@ impl AppState {
             sse_keepalive_secs: self.sse_keepalive.map(|interval| interval.as_secs()),
             max_concurrent_requests: self.request_capacity_limit,
             max_inflight_request_mib: self.request_bytes_limit / (1024 * 1024),
+            admission_wait_ms: self.admission_wait.as_millis() as u64,
         }
     }
 }

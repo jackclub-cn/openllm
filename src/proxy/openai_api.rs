@@ -73,7 +73,7 @@ pub(crate) async fn proxy_openai_console(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let capacity = acquire_request_capacity(&state);
+    let capacity = acquire_request_capacity(&state, state.admission_wait).await;
     if let RequestCapacity::Overloaded = &capacity {
         let response = overloaded_response(state.request_capacity_limit, false);
         return with_gateway_request_id(response, &request_id);
