@@ -474,7 +474,14 @@ pub(crate) async fn persist_provider_test(
     .execute(&state.pool)
     .await?;
     if result.ok {
+        // An authoritative success closes the runtime circuit too: clear the
+        // cooldown, reset the failure streak so escalation restarts cleanly, and
+        // release any half-open probe slot. Without this the provider would stay
+        // deprioritised (or short-circuited) until the cooldown expired even
+        // though this probe just proved it answers again.
         state.provider_cooldown.lock().await.remove(&provider_id);
+        state.provider_failure_streak.lock().await.remove(&provider_id);
+        state.provider_probe.lock().await.remove(&provider_id);
     }
     Ok(())
 }

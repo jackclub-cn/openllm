@@ -146,6 +146,7 @@ pub async fn clear_cooldowns(
         },
     };
     state.provider_failure_streak.lock().await.clear();
+    state.provider_probe.lock().await.clear();
     record_audit(
         &state,
         "clear",
@@ -186,6 +187,7 @@ async fn clear_provider_scope(
         0
     } else {
         state.provider_failure_streak.lock().await.remove(&provider_id);
+        state.provider_probe.lock().await.remove(&provider_id);
         usize::from(
             state
                 .provider_cooldown

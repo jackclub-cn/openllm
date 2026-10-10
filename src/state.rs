@@ -26,6 +26,11 @@ pub struct AppState {
     pub provider_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
     /// Consecutive provider failures, used to escalate runtime cooldowns.
     pub provider_failure_streak: Arc<Mutex<HashMap<i64, u32>>>,
+    /// Providers whose circuit is half-open, mapped to the instant the current
+    /// recovery probe was admitted. While an entry is younger than
+    /// `PROVIDER_PROBE_LEASE` the provider is treated as still open so only one
+    /// request tests recovery at a time.
+    pub provider_probe: Arc<Mutex<HashMap<i64, Instant>>>,
     /// In-memory cooldowns for a specific provider model. This keeps one
     /// overloaded model from removing every sibling model on the provider.
     pub target_cooldown: Arc<Mutex<HashMap<(i64, String), Instant>>>,
@@ -193,6 +198,29 @@ pub(crate) const DEFAULT_MEMORY_SHED_RATIO: f64 = 0.9;
 ///
 /// Override with `OPENLLM_REQUEST_TIMEOUT_SECS`.
 pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
+
+/// Default number of consecutive provider failures before its circuit
+/// hard-opens.
+///
+/// A provider below this threshold keeps the soft behaviour: its runtime
+/// cooldown only deprioritises it (see `order_targets`) while an attempt is
+/// still allowed, so a single transient blip on an otherwise healthy provider
+/// does not turn into an outage. Once the streak reaches the threshold the
+/// provider is short-circuited with a fast `503` and one request at a time is
+/// admitted to probe recovery. Zero disables the hard-open and keeps the soft
+/// cooldown only.
+///
+/// Override with `OPENLLM_PROVIDER_OPEN_THRESHOLD`.
+pub(crate) const DEFAULT_PROVIDER_OPEN_THRESHOLD: u32 = 3;
+
+/// How long a single half-open recovery probe may hold a provider's probe slot
+/// before another probe is admitted.
+///
+/// The lease only bounds the case where a probe is claimed but never settles
+/// (for example the request fell over to a healthier target before it reached
+/// this provider, so no success or failure was recorded). It is comfortably
+/// longer than a normal upstream header wait so a slow probe is not pre-empted.
+pub(crate) const PROVIDER_PROBE_LEASE: Duration = Duration::from_secs(120);
 
 /// How long a sampled memory reading is reused before it is refreshed.
 const MEMORY_SAMPLE_TTL: Duration = Duration::from_millis(500);
@@ -406,6 +434,24 @@ pub(crate) fn request_timeout() -> Option<Duration> {
         std::env::var("OPENLLM_REQUEST_TIMEOUT_SECS").ok().as_deref(),
         DEFAULT_REQUEST_TIMEOUT_SECS,
     )
+}
+
+/// Resolves the consecutive-failure threshold at which a provider's circuit
+/// hard-opens.
+pub(crate) fn provider_open_threshold() -> u32 {
+    parse_provider_open_threshold(std::env::var("OPENLLM_PROVIDER_OPEN_THRESHOLD").ok().as_deref())
+}
+
+/// Parses the provider circuit-open threshold.
+///
+/// An explicit `0` disables the hard-open (the soft cooldown still applies); a
+/// missing or unparsable value keeps the default so a typo cannot silently
+/// remove the protection.
+pub(crate) fn parse_provider_open_threshold(value: Option<&str>) -> u32 {
+    match value.map(str::trim) {
+        None | Some("") => DEFAULT_PROVIDER_OPEN_THRESHOLD,
+        Some(raw) => raw.parse::<u32>().unwrap_or(DEFAULT_PROVIDER_OPEN_THRESHOLD),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -805,6 +851,7 @@ impl AppState {
             provider_key_cursor: Arc::new(Mutex::new(HashMap::new())),
             provider_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_failure_streak: Arc::new(Mutex::new(HashMap::new())),
+            provider_probe: Arc::new(Mutex::new(HashMap::new())),
             target_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
@@ -978,6 +1025,7 @@ impl AppState {
             request_timeout_secs: self
                 .request_timeout
                 .map(|timeout| timeout.as_secs()),
+            provider_open_threshold: provider_open_threshold(),
             memory_limit_mib: self
                 .memory_pressure
                 .as_ref()

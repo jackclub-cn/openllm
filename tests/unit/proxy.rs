@@ -8898,3 +8898,213 @@ async fn request_budget_stops_the_fallback_loop() {
     slow_server.abort();
     healthy_server.abort();
 }
+
+#[test]
+fn provider_open_threshold_parsing_keeps_a_safe_default() {
+    use crate::state::{DEFAULT_PROVIDER_OPEN_THRESHOLD, parse_provider_open_threshold};
+
+    // Missing, blank, and unparsable values keep the default so a typo cannot
+    // silently disable the breaker.
+    assert_eq!(
+        parse_provider_open_threshold(None),
+        DEFAULT_PROVIDER_OPEN_THRESHOLD
+    );
+    assert_eq!(
+        parse_provider_open_threshold(Some("  ")),
+        DEFAULT_PROVIDER_OPEN_THRESHOLD
+    );
+    assert_eq!(
+        parse_provider_open_threshold(Some("nope")),
+        DEFAULT_PROVIDER_OPEN_THRESHOLD
+    );
+    // An explicit zero disables the hard-open on purpose.
+    assert_eq!(parse_provider_open_threshold(Some("0")), 0);
+    assert_eq!(parse_provider_open_threshold(Some(" 5 ")), 5);
+}
+
+/// Below the threshold the cooldown only deprioritises a provider: the attempt
+/// is still allowed, so one transient failure cannot turn into an outage.
+#[tokio::test]
+async fn provider_circuit_stays_soft_below_the_open_threshold() {
+    let state = virtual_auto_state().await;
+    state
+        .provider_failure_streak
+        .lock()
+        .await
+        .insert(1, 1);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() + Duration::from_secs(60));
+    assert!(
+        admit_provider_attempt(&state, 1).await.is_ok(),
+        "a provider below the threshold must still be attempted"
+    );
+}
+
+/// At or above the threshold the circuit hard-opens: attempts are short-
+/// circuited while the cooldown is active, and once it elapses exactly one
+/// request probes recovery.
+#[tokio::test]
+async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
+    let state = virtual_auto_state().await;
+    state
+        .provider_failure_streak
+        .lock()
+        .await
+        .insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() + Duration::from_secs(60));
+
+    let retry_after = admit_provider_attempt(&state, 1)
+        .await
+        .expect_err("an open circuit must short-circuit the attempt");
+    assert!(
+        retry_after >= Duration::from_secs(1),
+        "the block must carry a Retry-After hint, got {retry_after:?}"
+    );
+
+    // Cooldown elapsed: half-open, and only the first request is admitted.
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(1));
+    assert!(
+        admit_provider_attempt(&state, 1).await.is_ok(),
+        "the first request after the cooldown probes recovery"
+    );
+    assert!(
+        admit_provider_attempt(&state, 1).await.is_err(),
+        "a second concurrent request must not stampede a recovering provider"
+    );
+
+    // A successful probe closes the circuit and frees the probe slot.
+    mark_provider_success(&state, 1).await;
+    assert!(
+        admit_provider_attempt(&state, 1).await.is_ok(),
+        "after recovery the provider serves every request again"
+    );
+}
+
+/// A hard-open provider with no healthy alternative must fail fast with a 503
+/// instead of spending a header timeout on an upstream call.
+#[tokio::test]
+async fn hard_open_provider_fails_fast_without_an_upstream_call() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let hits = hits.clone();
+            move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-open",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'breaker', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'breaker route', 'breaker-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+            (1, 1, 'breaker-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    // Three consecutive failures with an active cooldown: the provider is open.
+    state
+        .provider_failure_streak
+        .lock()
+        .await
+        .insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() + Duration::from_secs(60));
+
+    let body = Bytes::from(
+        json!({
+            "model": "breaker-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let error = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &OPENAI_CHAT_COMPLETIONS.parse().unwrap(),
+        &body,
+        "breaker-request",
+        None,
+    )
+    .await
+    .expect_err("an open provider must fail fast instead of calling upstream");
+
+    match error {
+        AppError::UpstreamStatus {
+            status,
+            retry_after,
+            ..
+        } => {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(retry_after.is_some(), "a short-circuit must set Retry-After");
+        }
+        other => panic!("expected a 503 short-circuit, got {other:?}"),
+    }
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "the short-circuit must not reach the upstream"
+    );
+
+    server.abort();
+}

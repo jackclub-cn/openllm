@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::state::{PROVIDER_PROBE_LEASE, provider_open_threshold};
+
 pub(super) fn target_upstream_endpoint<'a>(
     target: &RouteTarget,
     request_endpoint: &'a str,
@@ -1090,6 +1092,9 @@ pub(super) async fn mark_provider_error(
         *failures = failures.saturating_add(1);
         *failures
     };
+    // A probe that just failed is no longer in flight; the cooldown below
+    // decides when the next recovery probe may be admitted.
+    state.provider_probe.lock().await.remove(&provider_id);
     state.provider_cooldown.lock().await.insert(
         provider_id,
         Instant::now()
@@ -1227,6 +1232,62 @@ pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
         .lock()
         .await
         .remove(&provider_id);
+    state.provider_probe.lock().await.remove(&provider_id);
+}
+
+/// Applies the per-provider circuit breaker to one upstream attempt.
+///
+/// Returns `Ok(())` when the request may try the provider, or `Err(retry_after)`
+/// when a hard-open circuit short-circuits it.
+///
+/// A provider below the configured failure threshold is always allowed: its
+/// runtime cooldown only deprioritises it (see `order_targets`), so one
+/// transient blip on an otherwise healthy provider cannot turn into an outage.
+/// At or above the threshold the provider stays blocked while its cooldown is
+/// active, and once the cooldown elapses exactly one request is admitted to
+/// probe recovery. That probe is what lets the provider leave the open state:
+/// a success clears the streak, a failure re-opens with the escalated cooldown.
+pub(super) async fn admit_provider_attempt(
+    state: &AppState,
+    provider_id: i64,
+) -> Result<(), Duration> {
+    let threshold = provider_open_threshold();
+    if threshold == 0 {
+        return Ok(());
+    }
+    let failures = state
+        .provider_failure_streak
+        .lock()
+        .await
+        .get(&provider_id)
+        .copied()
+        .unwrap_or(0);
+    if failures < threshold {
+        return Ok(());
+    }
+
+    let now = Instant::now();
+    let open_until = state
+        .provider_cooldown
+        .lock()
+        .await
+        .get(&provider_id)
+        .copied();
+    if let Some(until) = open_until
+        && until > now
+    {
+        return Err(until.saturating_duration_since(now));
+    }
+
+    // Cooldown elapsed: half-open. Admit exactly one probe; a probe that is
+    // still within its lease means another request is already testing recovery.
+    let mut probes = state.provider_probe.lock().await;
+    probes.retain(|_, started| now.saturating_duration_since(*started) < PROVIDER_PROBE_LEASE);
+    if probes.contains_key(&provider_id) {
+        return Err(PROVIDER_PROBE_LEASE);
+    }
+    probes.insert(provider_id, now);
+    Ok(())
 }
 
 /// The outcome of an upstream attempt that may have been resent once.
@@ -1480,6 +1541,20 @@ pub(super) async fn send_provider_request_with_compat_retry<F>(
 where
     F: Fn(&Value) -> AppResult<RequestBuilder>,
 {
+    // Circuit breaker: short-circuit a hard-open provider here, before any
+    // upstream call, so a known-bad provider cannot pin an admission slot for a
+    // full header timeout. The fallback loop moves to the next target, and if
+    // none can serve, the client gets a fast 503 with a Retry-After.
+    if let Err(retry_after) = admit_provider_attempt(state, target.provider_id).await {
+        return Err(AppError::UpstreamStatus {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: format!(
+                "{} is short-circuited after repeated failures; retry shortly or use another target",
+                target.provider_name
+            ),
+            retry_after: Some(retry_after.max(Duration::from_secs(1))),
+        });
+    }
     let resilience = resilience_policy(state).await;
     let mut retries_left = resilience.max_retries.clamp(0, MAX_SAME_TARGET_RETRIES) as u32;
     let mut retries_used = 0u32;

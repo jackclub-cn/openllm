@@ -172,6 +172,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         stream_max_secs = ?limits.stream_max_secs,
         body_read_timeout_secs = ?limits.body_read_timeout_secs,
         request_timeout_secs = ?limits.request_timeout_secs,
+        provider_open_threshold = %limits.provider_open_threshold,
         memory_limit_mib = %limits.memory_limit_mib,
         memory_limit_source = %limits.memory_limit_source,
         memory_shed_ratio_pct = %limits.memory_shed_ratio_pct,

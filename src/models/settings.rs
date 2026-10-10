@@ -67,6 +67,9 @@ pub struct RuntimeLimits {
     /// Wall-clock budget for a request's whole fallback loop in seconds;
     /// `None` disables it.
     pub request_timeout_secs: Option<u64>,
+    /// Consecutive provider failures that hard-open its circuit; `0` keeps the
+    /// soft cooldown only.
+    pub provider_open_threshold: u32,
     /// Process-memory ceiling that arms the pressure guard, in MiB; `0`
     /// disables it.
     pub memory_limit_mib: u64,

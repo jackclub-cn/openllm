@@ -370,6 +370,13 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="请求总预算">
               {limits ? (limits.request_timeout_secs != null ? `${limits.request_timeout_secs} 秒` : '不限') : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="提供商熔断阈值">
+              {limits
+                ? limits.provider_open_threshold > 0
+                  ? `连续 ${limits.provider_open_threshold} 次失败后短路`
+                  : '关闭（仅软冷却）'
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="内存压力保护">
               {limits
                 ? limits.memory_limit_mib > 0

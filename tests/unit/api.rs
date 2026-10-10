@@ -3668,6 +3668,10 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.body_read_timeout_secs, expected_body_read_timeout);
     assert_eq!(view.limits.request_timeout_secs, expected_request_timeout);
     assert_eq!(
+        view.limits.provider_open_threshold,
+        crate::state::provider_open_threshold()
+    );
+    assert_eq!(
         view.limits.stream_max_secs,
         crate::state::max_stream_lifetime().map(|lifetime| lifetime.as_secs())
     );

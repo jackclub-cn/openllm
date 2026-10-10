@@ -374,10 +374,12 @@ pub(crate) async fn proxy_openai_inner(
                 }
                 last_rate_limit = match &error {
                     AppError::UpstreamStatus {
+                        status,
                         message,
                         retry_after,
-                        ..
-                    } => Some((message.clone(), *retry_after)),
+                    } if *status == StatusCode::TOO_MANY_REQUESTS => {
+                        Some((message.clone(), *retry_after))
+                    }
                     _ => None,
                 };
                 last_error = Some(error);
@@ -421,10 +423,12 @@ pub(crate) async fn proxy_openai_inner(
             Err(error) => {
                 last_rate_limit = match &error {
                     AppError::UpstreamStatus {
+                        status,
                         message,
                         retry_after,
-                        ..
-                    } => Some((message.clone(), *retry_after)),
+                    } if *status == StatusCode::TOO_MANY_REQUESTS => {
+                        Some((message.clone(), *retry_after))
+                    }
                     _ => None,
                 };
                 last_error = Some(error);
