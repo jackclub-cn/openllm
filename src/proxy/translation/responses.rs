@@ -666,7 +666,7 @@ pub(crate) fn openai_chat_stream_to_responses(
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
 
-        while let Some(chunk) = upstream.next().await {
+        while let Some(chunk) = next_upstream_chunk(&mut upstream, &tx).await {
             let chunk = match chunk {
                 Ok(chunk) => {
                     heartbeat.touch().await;
@@ -779,7 +779,7 @@ pub(crate) fn anthropic_stream_to_responses(
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
 
-        while let Some(chunk) = upstream.next().await {
+        while let Some(chunk) = next_upstream_chunk(&mut upstream, &tx).await {
             let chunk = match chunk {
                 Ok(chunk) => {
                     heartbeat.touch().await;

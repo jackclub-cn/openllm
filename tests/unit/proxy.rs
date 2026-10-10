@@ -3055,6 +3055,21 @@ fn health_ranking_prefers_known_good_then_unknown_then_failed() {
     assert_eq!(provider_health_rank(Some(7)), 0);
 }
 
+#[tokio::test]
+async fn upstream_read_cancels_when_the_client_drops_the_stream() {
+    let (tx, rx) = mpsc::channel(1);
+    let mut upstream: UpstreamByteStream = Box::pin(futures_util::stream::pending());
+    drop(rx);
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(100),
+        next_upstream_chunk(&mut upstream, &tx),
+    )
+    .await
+    .expect("a dropped client must wake the upstream read");
+    assert!(result.is_none());
+}
+
 #[test]
 fn budget_header_requires_a_positive_number() {
     let mut headers = HeaderMap::new();

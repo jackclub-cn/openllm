@@ -1,5 +1,20 @@
 use super::*;
 
+/// Waits for upstream data or for the downstream client to disconnect.
+///
+/// Dropping the response body closes the receiver; observing that immediately
+/// lets the spawned translator drop the upstream request instead of holding an
+/// abandoned generation open until the next chunk arrives.
+pub(crate) async fn next_upstream_chunk(
+    upstream: &mut UpstreamByteStream,
+    tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+) -> Option<Result<Bytes, io::Error>> {
+    tokio::select! {
+        _ = tx.closed() => None,
+        chunk = upstream.next() => chunk,
+    }
+}
+
 /// Extracts the required `model` field from a request body.
 pub(crate) fn requested_model_of(body: &Value) -> AppResult<String> {
     body.get("model")
