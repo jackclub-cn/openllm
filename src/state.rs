@@ -65,6 +65,8 @@ pub struct AppState {
     pub body_read_timeout: Option<Duration>,
     /// Opt-in process-memory pressure guard; `None` disables it.
     pub memory_pressure: Option<Arc<MemoryPressure>>,
+    /// Where the memory ceiling came from: `"off"`, `"env"`, or `"cgroup"`.
+    pub memory_limit_source: &'static str,
     /// Configured memory shed ratio, kept for the runtime-limits view even when
     /// the guard is disabled.
     pub memory_shed_ratio: f64,
@@ -265,15 +267,50 @@ pub(crate) fn parse_admission_wait_ms(value: Option<&str>) -> Duration {
     }
 }
 
-/// Parses an operator-provided memory ceiling in MiB.
+/// Resolves the memory ceiling and its source for the pressure guard.
 ///
-/// Empty, zero, and unparsable values disable the memory-pressure guard, which
-/// needs an explicit ceiling because a Rust process cannot portably discover
-/// its container limit.
-pub(crate) fn parse_memory_limit_mib(value: Option<&str>) -> Option<usize> {
-    value
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|mib| *mib > 0)
+/// `configured` is the raw `OPENLLM_MEMORY_LIMIT_MIB` value and `auto` is the
+/// ceiling discovered from the container. An explicit positive value wins, an
+/// explicit `0` disables the guard, and an unset or blank value falls back to
+/// the discovered limit, so container deployments are protected without any
+/// tuning while bare-metal hosts (no cgroup limit) stay unaffected.
+pub(crate) fn resolve_memory_limit(
+    configured: Option<&str>,
+    auto: Option<u64>,
+) -> (Option<u64>, &'static str) {
+    match configured.map(str::trim) {
+        Some("0") => (None, "off"),
+        Some(value) if !value.is_empty() => {
+            match value.parse::<u64>().ok().filter(|mib| *mib > 0) {
+                Some(mib) => (Some(mib.saturating_mul(1024 * 1024)), "env"),
+                None => resolve_auto_memory_limit(auto),
+            }
+        }
+        _ => resolve_auto_memory_limit(auto),
+    }
+}
+
+fn resolve_auto_memory_limit(auto: Option<u64>) -> (Option<u64>, &'static str) {
+    match auto {
+        Some(bytes) => (Some(bytes), "cgroup"),
+        None => (None, "off"),
+    }
+}
+
+/// Parses a cgroup memory limit file's contents.
+///
+/// cgroup v2 writes `max` when no limit is set; cgroup v1 writes an enormous
+/// sentinel. Both, plus anything at or above 1 PiB, are treated as "no limit"
+/// so an unconstrained host never arms the guard.
+// Used by the Linux cgroup reader; other platforms exercise it through tests.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn parse_cgroup_memory_max(raw: Option<&str>) -> Option<u64> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw.eq_ignore_ascii_case("max") {
+        return None;
+    }
+    let bytes = raw.parse::<u64>().ok()?;
+    (bytes > 0 && bytes < (1u64 << 50)).then_some(bytes)
 }
 
 /// Parses the memory shed ratio, falling back to `default` unless the value is
@@ -648,6 +685,27 @@ fn read_process_memory_bytes() -> Option<u64> {
     None
 }
 
+/// Discovers the container memory limit where the OS exposes one.
+///
+/// Reads the cgroup v2 unified hierarchy first, then the cgroup v1 memory
+/// controller. `None` means "not in a constrained container" (or a non-Linux
+/// host), which leaves the pressure guard off unless the operator sets a
+/// ceiling explicitly.
+#[cfg(target_os = "linux")]
+fn cgroup_memory_max_bytes() -> Option<u64> {
+    let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();
+    if let Some(bytes) = parse_cgroup_memory_max(v2.as_deref()) {
+        return Some(bytes);
+    }
+    let v1 = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes").ok();
+    parse_cgroup_memory_max(v1.as_deref())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn cgroup_memory_max_bytes() -> Option<u64> {
+    None
+}
+
 impl AppState {
     pub fn new(pool: SqlitePool, admin_token: Option<String>) -> Self {
         let idle_timeout = parse_positive_secs(
@@ -688,15 +746,17 @@ impl AppState {
             std::env::var("OPENLLM_MEMORY_SHED_RATIO").ok().as_deref(),
             DEFAULT_MEMORY_SHED_RATIO,
         );
-        let memory_pressure =
-            parse_memory_limit_mib(std::env::var("OPENLLM_MEMORY_LIMIT_MIB").ok().as_deref()).map(
-                |mib| {
-                    Arc::new(MemoryPressure::new(
-                        (mib as u64).saturating_mul(1024 * 1024),
-                        memory_shed_ratio,
-                    ))
-                },
+        let memory_limit_env = std::env::var("OPENLLM_MEMORY_LIMIT_MIB").ok();
+        let (memory_limit_bytes, memory_limit_source) =
+            resolve_memory_limit(memory_limit_env.as_deref(), cgroup_memory_max_bytes());
+        let memory_pressure = memory_limit_bytes
+            .map(|bytes| Arc::new(MemoryPressure::new(bytes, memory_shed_ratio)));
+        if memory_limit_source == "cgroup" {
+            tracing::info!(
+                limit_mib = memory_limit_bytes.unwrap_or(0) / (1024 * 1024),
+                "memory-pressure guard armed from the container cgroup limit"
             );
+        }
         if memory_pressure.is_some() && !(cfg!(target_os = "linux") || cfg!(target_os = "windows")) {
             tracing::warn!(
                 "OPENLLM_MEMORY_LIMIT_MIB is set but memory sampling is only available on Linux \
@@ -729,6 +789,7 @@ impl AppState {
             ),
             body_read_timeout: body_read_timeout(),
             memory_pressure,
+            memory_limit_source,
             memory_shed_ratio,
             memory_shed: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
@@ -876,6 +937,7 @@ impl AppState {
                 .as_ref()
                 .map(|pressure| pressure.limit_bytes() / (1024 * 1024))
                 .unwrap_or(0),
+            memory_limit_source: self.memory_limit_source.to_string(),
             memory_shed_ratio_pct: (self.memory_shed_ratio * 100.0).round() as u64,
         }
     }

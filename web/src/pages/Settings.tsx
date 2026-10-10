@@ -352,7 +352,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="内存压力保护">
               {limits
                 ? limits.memory_limit_mib > 0
-                  ? `${limits.memory_limit_mib} MiB（达 ${limits.memory_shed_ratio_pct}% 时拒绝新请求）`
+                  ? `${limits.memory_limit_mib} MiB（${limits.memory_limit_source === 'cgroup' ? '容器限制' : '手动设置'}，达 ${limits.memory_shed_ratio_pct}% 时拒绝新请求）`
                   : '未开启'
                 : '-'}
             </Descriptions.Item>

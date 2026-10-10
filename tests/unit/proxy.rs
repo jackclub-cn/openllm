@@ -1,5 +1,7 @@
 use super::*;
-use crate::state::{MemoryPressure, RequestByteBudget};
+use crate::state::{
+    MemoryPressure, RequestByteBudget, parse_cgroup_memory_max, resolve_memory_limit,
+};
 use tower::ServiceExt;
 
 #[test]
@@ -8619,6 +8621,7 @@ async fn admission_bounds_a_hanging_request_body() {
 #[test]
 fn memory_pressure_threshold_math() {
     let pressure = MemoryPressure::with_usage(1_000, 0.9, 0);
+
     assert_eq!(pressure.limit_bytes(), 1_000);
     assert_eq!(pressure.threshold_bytes(), 900);
     assert!(!pressure.is_shedding_at(899));
@@ -8679,4 +8682,40 @@ async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
         StatusCode::OK,
         "probes must stay reachable while proxied work is shed"
     );
+}
+
+#[test]
+fn memory_limit_resolution_prefers_env_then_cgroup() {
+    let gib = 1024 * 1024 * 1024;
+    assert_eq!(
+        resolve_memory_limit(Some("512"), Some(gib)),
+        (Some(512 * 1024 * 1024), "env")
+    );
+    assert_eq!(resolve_memory_limit(Some("0"), Some(gib)), (None, "off"));
+    assert_eq!(resolve_memory_limit(None, Some(gib)), (Some(gib), "cgroup"));
+    assert_eq!(resolve_memory_limit(None, None), (None, "off"));
+    assert_eq!(
+        resolve_memory_limit(Some("  "), Some(gib)),
+        (Some(gib), "cgroup"),
+        "a blank value falls back to the discovered container limit"
+    );
+    assert_eq!(
+        resolve_memory_limit(Some("oops"), Some(gib)),
+        (Some(gib), "cgroup"),
+        "a typo must not silently disable the guard"
+    );
+    assert_eq!(resolve_memory_limit(Some("oops"), None), (None, "off"));
+}
+
+#[test]
+fn cgroup_memory_limit_parsing() {
+    assert_eq!(
+        parse_cgroup_memory_max(Some("1073741824")),
+        Some(1_073_741_824)
+    );
+    assert_eq!(parse_cgroup_memory_max(Some(" max \n")), None);
+    assert_eq!(parse_cgroup_memory_max(Some("")), None);
+    // cgroup v1's "unlimited" sentinel must not arm the guard.
+    assert_eq!(parse_cgroup_memory_max(Some("9223372036854771712")), None);
+    assert_eq!(parse_cgroup_memory_max(None), None);
 }

@@ -3647,6 +3647,7 @@ async fn runtime_settings_expose_effective_limits() {
         .map(|pressure| pressure.limit_bytes() / (1024 * 1024))
         .unwrap_or(0);
     let expected_memory_ratio_pct = (state.memory_shed_ratio * 100.0).round() as u64;
+    let expected_memory_source = state.memory_limit_source;
     let Json(view) = get_runtime_settings(State(state)).await.unwrap();
     assert!(view.limits.max_request_body_mib >= 1);
     assert!(view.limits.max_upstream_body_mib >= 1);
@@ -3660,6 +3661,7 @@ async fn runtime_settings_expose_effective_limits() {
         crate::state::max_stream_lifetime().map(|lifetime| lifetime.as_secs())
     );
     assert_eq!(view.limits.memory_limit_mib, expected_memory_limit_mib);
+    assert_eq!(view.limits.memory_limit_source, expected_memory_source);
     assert_eq!(view.limits.memory_shed_ratio_pct, expected_memory_ratio_pct);
 }
 

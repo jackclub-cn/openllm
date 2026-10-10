@@ -594,6 +594,7 @@ export type RuntimeLimits = {
   stream_max_secs?: number | null
   body_read_timeout_secs?: number | null
   memory_limit_mib: number
+  memory_limit_source: string
   memory_shed_ratio_pct: number
 }
 
