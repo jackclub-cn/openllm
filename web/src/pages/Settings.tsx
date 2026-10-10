@@ -27,6 +27,7 @@ import {
   formatError,
   getAdminToken,
   type DatabaseVacuumResult,
+  type GuardrailSettings,
   type RuntimeSettings,
   type Settings,
 } from '../api'
@@ -42,12 +43,22 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [vacuuming, setVacuuming] = useState(false)
   const [retentionDays, setRetentionDays] = useState<number | null>(null)
   const [savingRetention, setSavingRetention] = useState(false)
+  const [blockedTerms, setBlockedTerms] = useState('')
+  const [maxPromptTokens, setMaxPromptTokens] = useState<number | null>(null)
+  const [savingGuardrails, setSavingGuardrails] = useState(false)
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
     api
       .get<RuntimeSettings>('/api/settings/runtime')
       .then((runtime) => setRetentionDays(runtime.usage_retention_days ?? null))
+      .catch(() => undefined)
+    api
+      .get<GuardrailSettings>('/api/settings/guardrails')
+      .then((guardrails) => {
+        setBlockedTerms(guardrails.blocked_terms.join('\n'))
+        setMaxPromptTokens(guardrails.max_prompt_tokens ?? null)
+      })
       .catch(() => undefined)
   }, [])
 
@@ -100,6 +111,26 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setVacuuming(false)
+    }
+  }
+
+  const saveGuardrails = async () => {
+    setSavingGuardrails(true)
+    try {
+      const guardrails = await api.put<GuardrailSettings>('/api/settings/guardrails', {
+        blocked_terms: blockedTerms
+          .split(/\r?\n/)
+          .map((term) => term.trim())
+          .filter(Boolean),
+        max_prompt_tokens: maxPromptTokens && maxPromptTokens > 0 ? maxPromptTokens : null,
+      })
+      setBlockedTerms(guardrails.blocked_terms.join('\n'))
+      setMaxPromptTokens(guardrails.max_prompt_tokens ?? null)
+      message.success('请求防护策略已保存')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setSavingGuardrails(false)
     }
   }
 
@@ -257,6 +288,48 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             onClick={() => void saveRetention()}
           >
             保存保留策略
+          </Button>
+        </Form>
+      </Card>
+      <Card
+        className="settings-retention"
+        title={<Space><SafetyCertificateOutlined />请求防护</Space>}
+        bordered={false}
+      >
+        <Form layout="vertical">
+          <Form.Item
+            label="阻止词"
+            extra="每行一个，大小写不敏感；只扫描提示词文本，不扫描图片和 Base64 内容。"
+          >
+            <Input.TextArea
+              rows={5}
+              value={blockedTerms}
+              onChange={(event) => setBlockedTerms(event.target.value)}
+              placeholder={'例如：\ninternal-secret\n禁止分享的客户名'}
+            />
+          </Form.Item>
+          <Form.Item
+            label="最大提示词 Token"
+            extra="按网关估算值在路由前拦截；留空或设为 0 表示不限制。"
+          >
+            <InputNumber
+              min={0}
+              max={10000000}
+              precision={0}
+              value={maxPromptTokens}
+              onChange={(value) => setMaxPromptTokens(value ?? null)}
+              placeholder="不限制"
+              addonAfter="Token"
+              style={{ width: 220 }}
+            />
+          </Form.Item>
+          <Button
+            type="primary"
+            icon={<CheckCircleOutlined />}
+            loading={savingGuardrails}
+            onClick={() => void saveGuardrails()}
+          >
+            保存请求防护
           </Button>
         </Form>
       </Card>

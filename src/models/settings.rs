@@ -42,6 +42,20 @@ pub struct RuntimeSettingsUpdate {
     pub usage_retention_days: Option<i64>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GuardrailSettings {
+    #[serde(default)]
+    pub blocked_terms: Vec<String>,
+    #[serde(default)]
+    pub max_prompt_tokens: Option<i64>,
+}
+
+impl GuardrailSettings {
+    pub fn is_empty(&self) -> bool {
+        self.blocked_terms.is_empty() && self.max_prompt_tokens.is_none()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminTokenQuery {
     pub admin_token: Option<String>,

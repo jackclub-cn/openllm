@@ -115,6 +115,101 @@ async fn gateway_errors_expose_the_request_id_header() {
 }
 
 #[tokio::test]
+async fn proxy_openai_rejects_blocked_guardrail_terms_before_routing() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+        .bind(crate::state::SETTING_GUARDRAILS)
+        .bind(
+            json!({
+                "blocked_terms": ["classified"],
+                "max_prompt_tokens": null
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &OPENAI_CHAT_COMPLETIONS.parse().unwrap(),
+        &Bytes::from(
+            json!({
+                "model": "unconfigured-model",
+                "messages": [{"role": "user", "content": "read the classified file"}]
+            })
+            .to_string(),
+        ),
+        "guardrail-rejection",
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        response,
+        AppError::BadRequest(message) if message.contains("guardrail")
+    ));
+
+    let (status, error_message): (i64, Option<String>) =
+        sqlx::query_as("SELECT status_code, error_message FROM usage_logs WHERE request_id = ?")
+            .bind("guardrail-rejection")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(status, 400);
+    assert!(error_message.unwrap().contains("guardrail"));
+}
+
+#[tokio::test]
+async fn proxy_anthropic_rejects_prompt_above_guardrail_token_limit() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES (?, ?)")
+        .bind(crate::state::SETTING_GUARDRAILS)
+        .bind(
+            json!({
+                "blocked_terms": [],
+                "max_prompt_tokens": 1
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let error = proxy_anthropic_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/messages".parse().unwrap(),
+        &Bytes::from(
+            json!({
+                "model": "unconfigured-model",
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "a long prompt"}]
+            })
+            .to_string(),
+        ),
+        "anthropic-guardrail-rejection",
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::BadRequest(message) if message.contains("guardrail")
+    ));
+}
+
+#[tokio::test]
 async fn console_api_key_selection_uses_id_without_exposing_secret() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)

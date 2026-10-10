@@ -148,6 +148,96 @@ pub async fn update_runtime_settings(
     }))
 }
 
+pub async fn get_guardrails_settings(
+    State(state): State<AppState>,
+) -> AppResult<Json<GuardrailSettings>> {
+    Ok(Json(state.guardrail_settings().await?))
+}
+
+pub async fn update_guardrails_settings(
+    State(state): State<AppState>,
+    Json(input): Json<GuardrailSettings>,
+) -> AppResult<Json<GuardrailSettings>> {
+    let settings = normalize_guardrail_settings(input)?;
+    if settings.is_empty() {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(SETTING_GUARDRAILS)
+            .execute(&state.pool)
+            .await?;
+    } else {
+        let value = serde_json::to_string(&settings).map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize guardrail settings: {error}"
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(SETTING_GUARDRAILS)
+        .bind(value)
+        .execute(&state.pool)
+        .await?;
+    }
+    *state.guardrails.write().await = None;
+    record_audit(
+        &state,
+        "update",
+        "settings",
+        Some(SETTING_GUARDRAILS),
+        if settings.is_empty() {
+            "cleared request guardrails"
+        } else {
+            "updated request guardrails"
+        },
+        Some(json!({
+            "blocked_term_count": settings.blocked_terms.len(),
+            "max_prompt_tokens": settings.max_prompt_tokens,
+        })),
+    )
+    .await;
+    Ok(Json(settings))
+}
+
+fn normalize_guardrail_settings(mut input: GuardrailSettings) -> AppResult<GuardrailSettings> {
+    const MAX_BLOCKED_TERMS: usize = 100;
+    const MAX_BLOCKED_TERM_CHARS: usize = 200;
+    const MAX_PROMPT_TOKENS: i64 = 10_000_000;
+
+    if input.blocked_terms.len() > MAX_BLOCKED_TERMS {
+        return Err(AppError::BadRequest(format!(
+            "at most {MAX_BLOCKED_TERMS} blocked terms are allowed"
+        )));
+    }
+    if let Some(limit) = input.max_prompt_tokens
+        && !(1..=MAX_PROMPT_TOKENS).contains(&limit)
+    {
+        return Err(AppError::BadRequest(format!(
+            "max_prompt_tokens must be between 1 and {MAX_PROMPT_TOKENS}"
+        )));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let mut blocked_terms = Vec::new();
+    for term in input.blocked_terms.drain(..) {
+        let term = term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let chars = term.chars().count();
+        if chars < 2 || chars > MAX_BLOCKED_TERM_CHARS {
+            return Err(AppError::BadRequest(format!(
+                "blocked terms must contain between 2 and {MAX_BLOCKED_TERM_CHARS} characters"
+            )));
+        }
+        if seen.insert(term.to_lowercase()) {
+            blocked_terms.push(term.to_string());
+        }
+    }
+    input.blocked_terms = blocked_terms;
+    Ok(input)
+}
+
 pub async fn event_stream(
     State(state): State<AppState>,
     headers: HeaderMap,

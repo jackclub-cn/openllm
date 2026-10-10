@@ -6,6 +6,11 @@ use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock, broadcast};
 
+use crate::error::AppResult;
+use crate::models::GuardrailSettings;
+
+pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
+
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
@@ -32,6 +37,9 @@ pub struct AppState {
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
     pub auth_required: Arc<RwLock<Option<bool>>>,
+    /// Cached request-guardrail policy. `None` means it must be re-read from
+    /// SQLite after a settings update or the first request.
+    pub guardrails: Arc<RwLock<Option<GuardrailSettings>>>,
     /// Throttles `last_used_at` writes so the hot request path does not take a
     /// SQLite write lock on every single call.
     pub key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
@@ -138,6 +146,7 @@ impl AppState {
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_required: Arc::new(RwLock::new(None)),
+            guardrails: Arc::new(RwLock::new(None)),
             key_touched: Arc::new(Mutex::new(HashMap::new())),
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
@@ -156,5 +165,30 @@ impl AppState {
         errors.clear();
         errors.extend(ids);
         Ok(())
+    }
+
+    /// Returns the cached guardrail policy, loading it from SQLite on first
+    /// use or after a settings update invalidates the cache.
+    pub async fn guardrail_settings(&self) -> AppResult<GuardrailSettings> {
+        if let Some(settings) = self.guardrails.read().await.clone() {
+            return Ok(settings);
+        }
+
+        let raw = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+            .bind(SETTING_GUARDRAILS)
+            .fetch_optional(&self.pool)
+            .await?;
+        let settings = raw
+            .as_deref()
+            .and_then(|raw| match serde_json::from_str::<GuardrailSettings>(raw) {
+                Ok(settings) => Some(settings),
+                Err(error) => {
+                    tracing::warn!(%error, "ignoring invalid guardrail settings");
+                    None
+                }
+            })
+            .unwrap_or_default();
+        *self.guardrails.write().await = Some(settings.clone());
+        Ok(settings)
     }
 }

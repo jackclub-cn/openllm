@@ -128,6 +128,19 @@ pub(crate) async fn proxy_openai_inner(
         started,
     )
     .await?;
+    enforce_request_guardrails_or_log(
+        state,
+        api_key.as_ref(),
+        request_id,
+        session_id.as_deref(),
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+        &request_json,
+        request_tokens,
+    )
+    .await?;
     let budget_usd = budget_usd_from_headers(headers)?;
     let mut resolved = resolve_route_or_log(
         state,

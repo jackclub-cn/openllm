@@ -1136,6 +1136,48 @@ async fn provider_key_health_check_tests_every_enabled_key() {
 }
 
 #[tokio::test]
+async fn guardrail_settings_round_trip_validate_and_invalidate_cache() {
+    let state = provider_key_test_state().await;
+    let Json(updated) = update_guardrails_settings(
+        State(state.clone()),
+        Json(GuardrailSettings {
+            blocked_terms: vec![
+                " secret ".to_string(),
+                "SECRET".to_string(),
+                "api-key".to_string(),
+            ],
+            max_prompt_tokens: Some(4096),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.blocked_terms, vec!["secret", "api-key"]);
+    assert_eq!(updated.max_prompt_tokens, Some(4096));
+
+    let Json(loaded) = get_guardrails_settings(State(state.clone())).await.unwrap();
+    assert_eq!(loaded, updated);
+
+    let error = update_guardrails_settings(
+        State(state.clone()),
+        Json(GuardrailSettings {
+            blocked_terms: vec!["x".to_string()],
+            max_prompt_tokens: None,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+
+    let Json(cleared) =
+        update_guardrails_settings(State(state.clone()), Json(GuardrailSettings::default()))
+            .await
+            .unwrap();
+    assert!(cleared.is_empty());
+    let Json(loaded) = get_guardrails_settings(State(state)).await.unwrap();
+    assert!(loaded.is_empty());
+}
+
+#[tokio::test]
 async fn usage_views_expose_provider_api_key_name() {
     let state = provider_key_test_state().await;
     sqlx::query(

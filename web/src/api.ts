@@ -561,6 +561,11 @@ export type RuntimeSettings = {
   usage_retention_days?: number | null
 }
 
+export type GuardrailSettings = {
+  blocked_terms: string[]
+  max_prompt_tokens?: number | null
+}
+
 export type ModelCapabilities = {
   context_limit?: number
   output_limit?: number

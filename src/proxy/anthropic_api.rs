@@ -33,6 +33,9 @@ pub(crate) async fn count_tokens_inner(
     let requested_model = requested_model_of(&inbound)?;
     let api_key = authenticate_gateway(state, headers).await?;
     enforce_api_key_model_access(api_key.as_ref(), &requested_model)?;
+    let input_tokens = estimate_request_tokens(&inbound);
+    let guardrails = state.guardrail_settings().await?;
+    enforce_request_guardrails(&guardrails, &inbound, input_tokens)?;
     let model_patterns = api_key_model_patterns(api_key.as_ref())?;
     resolve_route_with_patterns(
         state,
@@ -42,7 +45,6 @@ pub(crate) async fn count_tokens_inner(
     )
     .await?;
 
-    let input_tokens = estimate_request_tokens(&inbound);
     Ok(Json(json!({"input_tokens": input_tokens})).into_response())
 }
 
@@ -152,6 +154,19 @@ pub(crate) async fn proxy_anthropic_inner(
         &endpoint,
         streamed,
         started,
+    )
+    .await?;
+    enforce_request_guardrails_or_log(
+        state,
+        api_key.as_ref(),
+        request_id,
+        session_id.as_deref(),
+        &requested_model,
+        &endpoint,
+        streamed,
+        started,
+        &request_json,
+        request_tokens,
     )
     .await?;
     let budget_usd = budget_usd_from_headers(headers)?;
