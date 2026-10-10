@@ -557,6 +557,26 @@ pub(crate) async fn forward_to_target(
     Ok(response)
 }
 
+/// Keeps a provider concurrency permit alive until the outbound response body
+/// completes, including translated and pass-through streams.
+pub(crate) fn attach_provider_slot(
+    response: Response,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Response {
+    let Some(permit) = permit else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let mut stream = body.into_data_stream();
+    let guarded = async_stream::stream! {
+        let _permit = permit;
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
 pub(crate) fn join_upstream_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = format!("/{}", path.trim_start_matches('/'));

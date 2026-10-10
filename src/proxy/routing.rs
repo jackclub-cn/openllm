@@ -610,6 +610,8 @@ pub(super) async fn diagnostic_runtime_targets(
             tool_search_supported: 1,
             timeout_seconds: None,
             cooldown_seconds: None,
+            max_concurrency: None,
+            queue_timeout_seconds: None,
             provider_health: row.provider_health,
             upstream_model: row.upstream_model.clone(),
             weight: row.target_weight,
@@ -752,6 +754,7 @@ pub(super) async fn find_prefixed_targets(
                pm.cost_cache_write_override,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
+               p.max_concurrency, p.queue_timeout_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -788,6 +791,7 @@ pub(super) async fn find_prefixed_targets(
                pm.cost_cache_write_override,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
+               p.max_concurrency, p.queue_timeout_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -855,6 +859,7 @@ pub(super) async fn find_auto_targets(
                pm.enabled AS model_enabled,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
+               p.max_concurrency, p.queue_timeout_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -912,6 +917,7 @@ pub(super) async fn load_targets(state: &AppState, route_id: i64) -> AppResult<V
                pm.cost_cache_write_override,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
+               p.max_concurrency, p.queue_timeout_seconds,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
@@ -1197,6 +1203,59 @@ pub(super) async fn send_provider_request(
                 target.provider_name
             )))
         }
+    }
+}
+
+/// Waits for a provider concurrency slot. The returned permit must stay alive
+/// until the entire response body has been consumed; streaming callers attach
+/// it to the outbound body so it is released on completion or disconnect.
+pub(super) async fn acquire_provider_slot(
+    state: &AppState,
+    target: &RouteTarget,
+) -> AppResult<Option<OwnedSemaphorePermit>> {
+    let Some(limit) = target.max_concurrency.filter(|limit| *limit > 0) else {
+        return Ok(None);
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let semaphore = {
+        let mut semaphores = state.provider_concurrency.lock().await;
+        semaphores
+            .entry(target.provider_id)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1))))
+            .clone()
+    };
+
+    let wait = target
+        .queue_timeout_seconds
+        .map(|seconds| Duration::from_secs(seconds.unsigned_abs()))
+        .unwrap_or(DEFAULT_PROVIDER_QUEUE_TIMEOUT);
+    if wait.is_zero() {
+        return semaphore.try_acquire_owned().map(Some).map_err(|_| {
+            AppError::UpstreamStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: format!(
+                    "{} is at its concurrency limit ({limit}); retry shortly",
+                    target.provider_name
+                ),
+                retry_after: Some(Duration::from_secs(1)),
+            }
+        });
+    }
+
+    match tokio::time::timeout(wait, semaphore.acquire_owned()).await {
+        Ok(Ok(permit)) => Ok(Some(permit)),
+        Ok(Err(_)) => Err(AppError::Upstream(
+            "provider concurrency gate closed".to_string(),
+        )),
+        Err(_) => Err(AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "{} stayed at its concurrency limit ({limit}) for {} seconds",
+                target.provider_name,
+                wait.as_secs()
+            ),
+            retry_after: Some(Duration::from_secs(1)),
+        }),
     }
 }
 

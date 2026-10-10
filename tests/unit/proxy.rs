@@ -561,6 +561,8 @@ fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) 
         tool_search_supported: 1,
         timeout_seconds: None,
         cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "model".to_string(),
         weight: 100,
@@ -1509,6 +1511,8 @@ async fn prefix_matching_is_literal_and_case_sensitive() {
                 last_test_ok INTEGER,
                 timeout_seconds INTEGER,
                 cooldown_seconds INTEGER,
+                max_concurrency INTEGER,
+                queue_timeout_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -1611,6 +1615,8 @@ async fn disabled_provider_model_is_skipped_by_explicit_routes() {
                 last_test_ok INTEGER,
                 timeout_seconds INTEGER,
                 cooldown_seconds INTEGER,
+                max_concurrency INTEGER,
+                queue_timeout_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -3338,6 +3344,219 @@ async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
 }
 
 #[tokio::test]
+async fn provider_concurrency_gate_queues_then_releases_slots() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.max_concurrency = Some(1);
+    target.queue_timeout_seconds = Some(1);
+
+    let first = acquire_provider_slot(&state, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let semaphore = state
+        .provider_concurrency
+        .lock()
+        .await
+        .get(&7)
+        .unwrap()
+        .clone();
+    assert_eq!(semaphore.available_permits(), 0);
+
+    let state_for_waiter = state.clone();
+    let target_for_waiter = target.clone();
+    let waiter = tokio::spawn(async move {
+        acquire_provider_slot(&state_for_waiter, &target_for_waiter).await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!waiter.is_finished());
+
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(semaphore.available_permits(), 0);
+    drop(second);
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn provider_concurrency_zero_queue_timeout_rejects_immediately() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.max_concurrency = Some(1);
+    target.queue_timeout_seconds = Some(0);
+
+    let first = acquire_provider_slot(&state, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = acquire_provider_slot(&state, &target).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            ..
+        }
+    ));
+    drop(first);
+}
+
+#[tokio::test]
+async fn provider_slot_is_held_until_streamed_body_completes() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.max_concurrency = Some(1);
+    target.queue_timeout_seconds = Some(0);
+
+    let permit = acquire_provider_slot(&state, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let semaphore = state
+        .provider_concurrency
+        .lock()
+        .await
+        .get(&7)
+        .unwrap()
+        .clone();
+    let stream = futures_util::stream::iter([
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"first")),
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"second")),
+    ]);
+    let response = Response::new(Body::from_stream(stream));
+    let response = attach_provider_slot(response, Some(permit));
+
+    assert_eq!(semaphore.available_permits(), 0);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"firstsecond");
+    assert_eq!(semaphore.available_permits(), 1);
+}
+
+#[tokio::test]
+async fn saturated_provider_falls_back_without_opening_its_circuit() {
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": "chatcmpl-ha",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {
+                        "prompt_tokens": 3,
+                        "completion_tokens": 1,
+                        "total_tokens": 4
+                    }
+                })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (
+            id, name, provider_type, base_url, enabled, max_concurrency, queue_timeout_seconds
+         ) VALUES
+            (1, 'busy', 'openai', 'http://127.0.0.1:9/v1', 1, 1, 0),
+            (2, 'healthy', 'openai', ?, 1, NULL, NULL)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'ha route', 'ha-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority, enabled)
+         VALUES (1, 1, 'ha-model', 0, 1), (1, 2, 'ha-model', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let held = semaphore.clone().acquire_owned().await.unwrap();
+    state
+        .provider_concurrency
+        .lock()
+        .await
+        .insert(1, semaphore);
+    let body = Bytes::from(
+        json!({
+            "model": "ha-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "ha-request",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert!(
+        !state.provider_cooldown.lock().await.contains_key(&1),
+        "local concurrency backpressure must not open the provider circuit"
+    );
+
+    drop(held);
+    server.abort();
+}
+
+#[tokio::test]
 async fn rate_limits_isolate_models_before_opening_the_provider_circuit() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -3932,6 +4151,8 @@ async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() 
             tool_search_supported: 1,
             timeout_seconds: None,
             cooldown_seconds: None,
+            max_concurrency: None,
+            queue_timeout_seconds: None,
             provider_health: None,
             upstream_model: "upstream".to_string(),
             weight: 100,
@@ -4087,6 +4308,8 @@ async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
         tool_search_supported: 1,
         timeout_seconds: None,
         cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
         weight: 100,
@@ -4233,6 +4456,8 @@ async fn anthropic_forward_repairs_orphan_tool_calls_for_openai_upstream() {
         tool_search_supported: 1,
         timeout_seconds: None,
         cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,
@@ -4389,6 +4614,8 @@ async fn anthropic_forward_retries_openai_upstream_without_tool_search() {
         tool_search_supported: 1,
         timeout_seconds: None,
         cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,

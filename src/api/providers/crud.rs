@@ -37,6 +37,9 @@ pub async fn create_provider(
         normalize_health_interval(input.models_sync_interval_minutes)?;
     let timeout_seconds = normalize_provider_timeout(input.timeout_seconds)?;
     let cooldown_seconds = normalize_provider_cooldown(input.configured_cooldown_seconds)?;
+    let max_concurrency = normalize_provider_concurrency(input.max_concurrency)?;
+    let queue_timeout_seconds =
+        normalize_provider_queue_timeout(input.queue_timeout_seconds)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
     // hit the network, and holding a SQLite write transaction across it would
     // block every other writer.
@@ -51,8 +54,9 @@ pub async fn create_provider(
             name, provider_type, base_url, model_prefix, models_dev_id,
             api_key, headers, enabled, tool_search_supported,
             health_check_interval_minutes, health_check_model,
-            models_sync_interval_minutes, timeout_seconds, cooldown_seconds
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
+            models_sync_interval_minutes, timeout_seconds, cooldown_seconds,
+            max_concurrency, queue_timeout_seconds
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -67,6 +71,8 @@ pub async fn create_provider(
     .bind(models_sync_interval_minutes)
     .bind(timeout_seconds)
     .bind(cooldown_seconds)
+    .bind(max_concurrency)
+    .bind(queue_timeout_seconds)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
@@ -157,6 +163,15 @@ pub async fn update_provider(
         Some(value) => normalize_provider_cooldown(Some(value))?,
         None => current.cooldown_seconds,
     };
+    let max_concurrency = match input.max_concurrency {
+        Some(value) => normalize_provider_concurrency(Some(value))?,
+        None => current.max_concurrency,
+    };
+    let queue_timeout_seconds = match input.queue_timeout_seconds {
+        Some(value) => normalize_provider_queue_timeout(Some(value))?,
+        None => current.queue_timeout_seconds,
+    };
+    let concurrency_changed = max_concurrency != current.max_concurrency;
     let api_key_update = normalize_optional(input.api_key.clone());
     let api_keys_update = if let Some(api_keys) = input.api_keys.clone() {
         Some(api_keys)
@@ -211,7 +226,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, timeout_seconds = ?, cooldown_seconds = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, timeout_seconds = ?, cooldown_seconds = ?, max_concurrency = ?, queue_timeout_seconds = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name.clone())
     .bind(provider_type.as_str())
@@ -225,6 +240,8 @@ pub async fn update_provider(
     .bind(models_sync_interval_minutes)
     .bind(timeout_seconds)
     .bind(cooldown_seconds)
+    .bind(max_concurrency)
+    .bind(queue_timeout_seconds)
     .bind(tool_search_context_changed as i64)
     .bind(tool_search_context_changed as i64)
     .bind(id)
@@ -249,6 +266,9 @@ pub async fn update_provider(
     }
     tx.commit().await?;
     state.provider_cooldown.lock().await.remove(&id);
+    if concurrency_changed {
+        state.provider_concurrency.lock().await.remove(&id);
+    }
 
     if api_keys_changed {
         let current_key_ids =
@@ -300,6 +320,7 @@ pub async fn delete_provider(
         return Err(AppError::NotFound("provider not found".to_string()));
     }
     state.provider_cooldown.lock().await.remove(&id);
+    state.provider_concurrency.lock().await.remove(&id);
     record_audit(
         &state,
         "delete",

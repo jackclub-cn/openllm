@@ -307,8 +307,12 @@ pub(crate) async fn proxy_openai_inner(
     let mut last_rate_limit: Option<(String, Option<Duration>)> = None;
     let mut last_target = None;
     let mut attempts = 0usize;
+    let mut capacity_exhausted_providers = HashSet::new();
     for target in ordered_targets {
         let target_provider_id = target.provider_id;
+        if capacity_exhausted_providers.contains(&target_provider_id) {
+            continue;
+        }
         let target_provider_name = target.provider_name.clone();
         let target_provider_key_id = target.provider_api_key_id;
         let target_upstream_model = target.upstream_model.clone();
@@ -337,6 +341,22 @@ pub(crate) async fn proxy_openai_inner(
         )
         .await;
         mark_provider_api_key_used(state, target_provider_key_id).await;
+        let provider_slot = match acquire_provider_slot(state, &target).await {
+            Ok(slot) => slot,
+            Err(error) => {
+                capacity_exhausted_providers.insert(target_provider_id);
+                last_rate_limit = match &error {
+                    AppError::UpstreamStatus {
+                        message,
+                        retry_after,
+                        ..
+                    } => Some((message.clone(), *retry_after)),
+                    _ => None,
+                };
+                last_error = Some(error);
+                continue;
+            }
+        };
         match forward_to_target(
             state,
             request_id,
@@ -369,7 +389,7 @@ pub(crate) async fn proxy_openai_inner(
                 );
                 apply_budget_headers(&mut response, budget_usd, budget_excluded_targets);
                 apply_override_headers(&mut response, &routing_overrides);
-                return Ok(response);
+                return Ok(attach_provider_slot(response, provider_slot));
             }
             Err(error) => {
                 last_rate_limit = match &error {

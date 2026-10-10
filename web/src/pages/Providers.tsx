@@ -97,6 +97,8 @@ export default function Providers() {
       models_sync_interval_minutes: 0,
       timeout_seconds: 0,
       configured_cooldown_seconds: 0,
+      max_concurrency: 0,
+      queue_timeout_seconds: 30,
       headersText: '{}',
       modelsText: '',
     } as never)
@@ -127,6 +129,8 @@ export default function Providers() {
       health_check_model: item.health_check_model || '',
       timeout_seconds: item.timeout_seconds || 0,
       configured_cooldown_seconds: item.configured_cooldown_seconds || 0,
+      max_concurrency: item.max_concurrency || 0,
+      queue_timeout_seconds: item.queue_timeout_seconds ?? 30,
       headersText: JSON.stringify(item.headers || {}, null, 2),
       modelsText: item.models.join('\n'),
     } as never)
@@ -178,6 +182,8 @@ export default function Providers() {
       models_sync_interval_minutes: values.models_sync_interval_minutes ?? 0,
       timeout_seconds: values.timeout_seconds ?? 0,
       configured_cooldown_seconds: values.configured_cooldown_seconds ?? 0,
+      max_concurrency: values.max_concurrency ?? 0,
+      queue_timeout_seconds: values.queue_timeout_seconds ?? 30,
     }
     setSaving(true)
     try {

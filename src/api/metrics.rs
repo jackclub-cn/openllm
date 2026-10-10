@@ -46,6 +46,7 @@ struct ProviderMetricsRow {
     id: i64,
     name: String,
     enabled: i64,
+    max_concurrency: Option<i64>,
     last_test_ok: Option<i64>,
     last_test_latency_ms: Option<i64>,
     models_enabled: i64,
@@ -125,7 +126,8 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             FROM provider_api_keys
             GROUP BY provider_id
         )
-        SELECT p.id, p.name, p.enabled, p.last_test_ok, p.last_test_latency_ms,
+        SELECT p.id, p.name, p.enabled, p.max_concurrency,
+               p.last_test_ok, p.last_test_latency_ms,
                COALESCE(m.models_enabled, 0) AS models_enabled,
                COALESCE(m.models_disabled, 0) AS models_disabled,
                COALESCE(k.requests, 0) AS requests,
@@ -166,6 +168,13 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .filter(|(_, until)| **until > now)
             .map(|(provider_id, _)| *provider_id)
             .collect::<HashSet<_>>()
+    };
+    let concurrency_available = {
+        let semaphores = state.provider_concurrency.lock().await;
+        semaphores
+            .iter()
+            .map(|(provider_id, semaphore)| (*provider_id, semaphore.available_permits()))
+            .collect::<HashMap<_, _>>()
     };
 
     let mut body = String::with_capacity(8 * 1024);
@@ -360,6 +369,16 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         "openllm_provider_health",
         "Current provider health as a one-hot status label",
     );
+    metric_header(
+        &mut body,
+        "openllm_provider_concurrency_limit",
+        "Configured per-provider upstream concurrency limit; zero means unlimited",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_inflight",
+        "Current upstream requests holding a per-provider concurrency slot",
+    );
     for provider in &providers {
         let state = if provider.enabled == 0 {
             "disabled"
@@ -377,6 +396,13 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             1,
         );
         let label = [("provider", provider.name.as_str())];
+        let limit = provider.max_concurrency.unwrap_or(0).max(0);
+        let in_flight = concurrency_available
+            .get(&provider.id)
+            .map(|available| limit.saturating_sub(*available as i64))
+            .unwrap_or(0);
+        push_metric(&mut body, "openllm_provider_concurrency_limit", &label, limit);
+        push_metric(&mut body, "openllm_provider_inflight", &label, in_flight);
         push_metric(
             &mut body,
             "openllm_provider_cooling",

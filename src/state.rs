@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, RwLock, broadcast};
+use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 
 use crate::error::AppResult;
 use crate::models::{GuardrailSettings, InspectorSettings};
@@ -34,6 +34,8 @@ pub struct AppState {
     pub provider_key_error_state: Arc<Mutex<HashSet<i64>>>,
     /// Throttles provider-key usage timestamps on the request hot path.
     pub provider_key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Shared semaphores enforcing each provider's concurrency cap.
+    pub provider_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     pub events: broadcast::Sender<UsageEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
@@ -148,6 +150,7 @@ impl AppState {
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
+            provider_concurrency: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),

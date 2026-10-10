@@ -56,6 +56,7 @@ pub(super) async fn route_targets(
                COALESCE(pm.enabled, 1) AS model_enabled,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
+               p.max_concurrency, p.queue_timeout_seconds,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
@@ -925,6 +926,36 @@ pub(super) fn normalize_provider_cooldown(value: Option<i64>) -> AppResult<Optio
             "cooldown must be at most {MAX_COOLDOWN_SECONDS} seconds"
         ))),
         Some(value) => Ok(Some(value)),
+    }
+}
+
+/// Per-provider upstream concurrency. `None`/`0` means unlimited.
+pub(super) fn normalize_provider_concurrency(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_CONCURRENCY: i64 = 1000;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "max concurrency must be zero or a positive integer".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) if value > MAX_CONCURRENCY => Err(AppError::BadRequest(format!(
+            "max concurrency must be at most {MAX_CONCURRENCY}"
+        ))),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
+/// Maximum queue wait for a provider concurrency slot. `None` uses the
+/// gateway default; `0` rejects immediately instead of queueing.
+pub(super) fn normalize_provider_queue_timeout(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_QUEUE_TIMEOUT_SECONDS: i64 = 300;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "queue timeout must be zero or a positive integer".to_string(),
+        )),
+        Some(value) if value > MAX_QUEUE_TIMEOUT_SECONDS => Err(AppError::BadRequest(format!(
+            "queue timeout must be at most {MAX_QUEUE_TIMEOUT_SECONDS} seconds"
+        ))),
+        value => Ok(value),
     }
 }
 

@@ -163,6 +163,10 @@ export default function ProviderTable({
                 record.configured_cooldown_seconds
                   ? `故障冷却基准 ${record.configured_cooldown_seconds}s`
                   : '',
+                record.max_concurrency ? `最大并发 ${record.max_concurrency}` : '',
+                record.max_concurrency
+                  ? `排队 ${record.queue_timeout_seconds ?? 30}s`
+                  : '',
               ]
                 .filter(Boolean)
                 .join(' · ')

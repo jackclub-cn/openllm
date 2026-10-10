@@ -15,7 +15,7 @@ use rand::distributions::{Distribution, WeightedIndex};
 use reqwest::RequestBuilder;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
+use tokio::sync::{OwnedSemaphorePermit, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::error::{AppError, AppResult};
@@ -66,6 +66,7 @@ const MAX_UPSTREAM_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const MAX_PROVIDER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_TARGET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_CONFIGURED_PROVIDER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
+const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROVIDER_KEY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const PROVIDER_RATE_LIMIT_MODEL_THRESHOLD: usize = 2;
 

@@ -105,6 +105,12 @@ pub struct RouteTarget {
     /// Per-provider cooldown override, in seconds.
     #[sqlx(default)]
     pub cooldown_seconds: Option<i64>,
+    /// Per-provider upstream concurrency cap.
+    #[sqlx(default)]
+    pub max_concurrency: Option<i64>,
+    /// Per-provider queue wait before a concurrency-limited request falls back.
+    #[sqlx(default)]
+    pub queue_timeout_seconds: Option<i64>,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
     pub upstream_model: String,

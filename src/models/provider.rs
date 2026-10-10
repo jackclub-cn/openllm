@@ -62,6 +62,10 @@ pub struct Provider {
     pub timeout_seconds: Option<i64>,
     /// Base cooldown applied after a retryable failure.
     pub cooldown_seconds: Option<i64>,
+    /// Maximum simultaneous upstream requests for this provider.
+    pub max_concurrency: Option<i64>,
+    /// Maximum time a request waits for a provider concurrency slot.
+    pub queue_timeout_seconds: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -93,6 +97,8 @@ pub struct ProviderView {
     pub cooldown_seconds: Option<i64>,
     pub configured_cooldown_seconds: Option<i64>,
     pub timeout_seconds: Option<i64>,
+    pub max_concurrency: Option<i64>,
+    pub queue_timeout_seconds: Option<i64>,
     pub quota_kind: Option<String>,
     pub models_sync_interval_minutes: Option<i64>,
     pub models_sync_attempted_at: Option<String>,
@@ -242,6 +248,10 @@ pub struct ProviderInput {
     pub timeout_seconds: Option<i64>,
     #[serde(default)]
     pub configured_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub queue_timeout_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -270,6 +280,10 @@ pub struct ProviderUpdate {
     pub timeout_seconds: Option<i64>,
     #[serde(default)]
     pub configured_cooldown_seconds: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub queue_timeout_seconds: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -552,6 +566,8 @@ impl From<Provider> for ProviderView {
             cooldown_seconds: None,
             configured_cooldown_seconds: value.cooldown_seconds,
             timeout_seconds: value.timeout_seconds,
+            max_concurrency: value.max_concurrency,
+            queue_timeout_seconds: value.queue_timeout_seconds,
             quota_kind,
             models_sync_interval_minutes: value.models_sync_interval_minutes,
             models_sync_attempted_at: value.models_sync_attempted_at,

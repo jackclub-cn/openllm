@@ -77,6 +77,22 @@ export default function ProviderEditorModal({
             />
           </Form.Item>
         </div>
+        <div className="form-grid">
+          <Form.Item
+            name="max_concurrency"
+            label="最大并发（个）"
+            extra="0 或留空表示不限制；达到上限后请求会短暂排队，再自动切换其他提供商。"
+          >
+            <InputNumber min={0} max={1000} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="queue_timeout_seconds"
+            label="并发排队上限（秒）"
+            extra="仅在上方设置最大并发后生效；0 表示立即切换，最长 300 秒。"
+          >
+            <InputNumber min={0} max={300} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+        </div>
         <Form.Item
           name="base_url"
           label="API 基础地址"

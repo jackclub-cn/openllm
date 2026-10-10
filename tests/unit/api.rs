@@ -21,10 +21,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     sqlx::query(
         "INSERT INTO providers (
-            id, name, provider_type, base_url, enabled, last_test_ok
+            id, name, provider_type, base_url, enabled, last_test_ok, max_concurrency
          ) VALUES
-            (1, 'Healthy provider', 'openai', 'https://healthy.example/v1', 1, 1),
-            (2, 'Disabled provider', 'openai', 'https://disabled.example/v1', 0, 0)",
+            (1, 'Healthy provider', 'openai', 'https://healthy.example/v1', 1, 1, 3),
+            (2, 'Disabled provider', 'openai', 'https://disabled.example/v1', 0, 0, NULL)",
     )
     .execute(&pool)
     .await
@@ -50,7 +50,12 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     .execute(&pool)
     .await
     .unwrap();
-    let router = crate::build_router(AppState::new(pool, Some("metrics-secret".to_string())));
+    let state = AppState::new(pool, Some("metrics-secret".to_string()));
+    state.provider_concurrency.lock().await.insert(
+        1,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    let router = crate::build_router(state);
 
     let unauthorized = router
         .clone()
@@ -95,6 +100,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     );
     assert!(body.contains("openllm_provider_models{provider=\"Healthy provider\"} 1"));
     assert!(body.contains("openllm_provider_models_disabled{provider=\"Healthy provider\"} 1"));
+    assert!(
+        body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3")
+    );
+    assert!(body.contains("openllm_provider_inflight{provider=\"Healthy provider\"} 2"));
     assert!(body.contains("openllm_webhooks{state=\"enabled\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"succeeded\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));
@@ -119,6 +128,8 @@ fn provider_input(api_key: Option<&str>, api_keys: Vec<ProviderApiKeyInput>) -> 
         models_sync_interval_minutes: None,
         timeout_seconds: None,
         configured_cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
     }
 }
 
@@ -154,6 +165,8 @@ fn provider_update_with_keys(api_keys: Option<Vec<ProviderApiKeyInput>>) -> Prov
         models_sync_interval_minutes: None,
         timeout_seconds: None,
         configured_cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
     }
 }
 
@@ -483,6 +496,27 @@ fn validates_provider_request_policy() {
     assert_eq!(normalize_provider_cooldown(Some(900)).unwrap(), Some(900));
     assert!(normalize_provider_cooldown(Some(-1)).is_err());
     assert!(normalize_provider_cooldown(Some(3601)).is_err());
+
+    assert_eq!(normalize_provider_concurrency(None).unwrap(), None);
+    assert_eq!(normalize_provider_concurrency(Some(0)).unwrap(), None);
+    assert_eq!(
+        normalize_provider_concurrency(Some(4)).unwrap(),
+        Some(4)
+    );
+    assert!(normalize_provider_concurrency(Some(-1)).is_err());
+    assert!(normalize_provider_concurrency(Some(1001)).is_err());
+
+    assert_eq!(normalize_provider_queue_timeout(None).unwrap(), None);
+    assert_eq!(
+        normalize_provider_queue_timeout(Some(0)).unwrap(),
+        Some(0)
+    );
+    assert_eq!(
+        normalize_provider_queue_timeout(Some(30)).unwrap(),
+        Some(30)
+    );
+    assert!(normalize_provider_queue_timeout(Some(-1)).is_err());
+    assert!(normalize_provider_queue_timeout(Some(301)).is_err());
 }
 
 #[tokio::test]
@@ -491,21 +525,40 @@ async fn provider_request_policy_round_trips_and_can_be_cleared() {
     let mut input = provider_input(None, Vec::new());
     input.timeout_seconds = Some(180);
     input.configured_cooldown_seconds = Some(600);
+    input.max_concurrency = Some(3);
+    input.queue_timeout_seconds = Some(0);
     let (_, Json(created)) = create_provider(State(state.clone()), Json(input))
         .await
         .unwrap();
     assert_eq!(created.timeout_seconds, Some(180));
     assert_eq!(created.configured_cooldown_seconds, Some(600));
+    assert_eq!(created.max_concurrency, Some(3));
+    assert_eq!(created.queue_timeout_seconds, Some(0));
     assert_eq!(created.cooldown_seconds, None);
+    state.provider_concurrency.lock().await.insert(
+        created.id,
+        std::sync::Arc::new(tokio::sync::Semaphore::new(3)),
+    );
 
     let mut update = provider_update_with_keys(None);
     update.timeout_seconds = Some(0);
     update.configured_cooldown_seconds = Some(0);
-    let Json(updated) = update_provider(State(state), Path(created.id), Json(update))
+    update.max_concurrency = Some(0);
+    update.queue_timeout_seconds = Some(0);
+    let Json(updated) = update_provider(State(state.clone()), Path(created.id), Json(update))
         .await
         .unwrap();
     assert_eq!(updated.timeout_seconds, None);
     assert_eq!(updated.configured_cooldown_seconds, None);
+    assert_eq!(updated.max_concurrency, None);
+    assert_eq!(updated.queue_timeout_seconds, Some(0));
+    assert!(
+        !state
+            .provider_concurrency
+            .lock()
+            .await
+            .contains_key(&created.id)
+    );
 }
 
 #[tokio::test]

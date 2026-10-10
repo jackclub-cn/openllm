@@ -123,6 +123,8 @@ export type Provider = {
   cooldown_seconds?: number | null
   configured_cooldown_seconds?: number | null
   timeout_seconds?: number | null
+  max_concurrency?: number | null
+  queue_timeout_seconds?: number | null
   quota_kind?: string | null
   models_sync_interval_minutes?: number | null
   models_sync_attempted_at?: string
@@ -213,6 +215,8 @@ export type ProviderInput = {
   models_sync_interval_minutes?: number | null
   timeout_seconds?: number | null
   configured_cooldown_seconds?: number | null
+  max_concurrency?: number | null
+  queue_timeout_seconds?: number | null
 }
 
 export type ProviderModelLimit = {
