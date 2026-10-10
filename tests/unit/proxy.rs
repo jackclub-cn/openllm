@@ -3252,11 +3252,80 @@ async fn upstream_read_cancels_when_the_client_drops_the_stream() {
 
     let result = tokio::time::timeout(
         Duration::from_millis(100),
-        next_upstream_chunk(&mut upstream, &tx),
+        next_upstream_chunk(&mut upstream, &tx, None),
     )
     .await
     .expect("a dropped client must wake the upstream read");
     assert!(result.is_none());
+}
+
+#[tokio::test]
+async fn sse_keepalive_fires_while_the_upstream_is_silent() {
+    let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let mut upstream: UpstreamByteStream = Box::pin(futures_util::stream::pending());
+    let pump = tokio::spawn(async move {
+        next_upstream_chunk(&mut upstream, &tx, Some(Duration::from_millis(20))).await
+    });
+
+    let first = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a silent upstream must still produce a keep-alive")
+        .expect("the keep-alive channel stays open")
+        .expect("the keep-alive is a valid frame");
+    assert_eq!(first, Bytes::from_static(SSE_KEEPALIVE_LINE));
+
+    // Dropping the client wakes the pump and stops the timer.
+    drop(rx);
+    assert!(pump.await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn sse_keepalive_does_not_delay_available_chunks() {
+    let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let chunk = Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n");
+    let expected = chunk.clone();
+    let mut upstream: UpstreamByteStream =
+        Box::pin(futures_util::stream::once(async move { Ok(chunk) }));
+
+    // The interval is far longer than the timeout, so a returned chunk proves
+    // the upstream branch won rather than the keep-alive timer.
+    let result = tokio::time::timeout(
+        Duration::from_millis(200),
+        next_upstream_chunk(&mut upstream, &tx, Some(Duration::from_secs(30))),
+    )
+    .await
+    .expect("a ready chunk must not wait for the keep-alive timer")
+    .expect("the chunk is forwarded");
+    assert_eq!(result.unwrap(), expected);
+}
+
+#[tokio::test]
+async fn sse_keepalive_is_injected_only_into_event_streams() {
+    // An idle SSE body gets a comment frame so proxies do not drop it.
+    let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+    let response = Response::builder()
+        .header(reqwest::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .body(Body::from_stream(stream))
+        .unwrap();
+    let response = attach_provider_slot(response, None, Some(Duration::from_millis(20)));
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(2), body.next())
+        .await
+        .expect("an idle event stream must emit a keep-alive")
+        .expect("the body stays open")
+        .expect("the keep-alive is a valid frame");
+    assert_eq!(first, Bytes::from_static(SSE_KEEPALIVE_LINE));
+
+    // A JSON body is passed through untouched even when a keep-alive is set.
+    let response = Response::builder()
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(Body::from("{\"ok\":true}"))
+        .unwrap();
+    let response = attach_provider_slot(response, None, Some(Duration::from_millis(20)));
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(&body[..], b"{\"ok\":true}");
 }
 
 #[test]
@@ -4259,7 +4328,7 @@ async fn provider_slot_is_held_until_streamed_body_completes() {
         Ok::<_, std::convert::Infallible>(Bytes::from_static(b"second")),
     ]);
     let response = Response::new(Body::from_stream(stream));
-    let response = attach_provider_slot(response, Some(slots));
+    let response = attach_provider_slot(response, Some(slots), None);
 
     assert_eq!(semaphore.available_permits(), 0);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -7646,8 +7715,8 @@ fn upstream_rate_limit_errors_keep_status_and_retry_after() {
 #[test]
 fn gateway_tuning_env_parsers_fall_back_safely() {
     use crate::state::{
-        DEFAULT_MAX_BODY_MIB, DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS, parse_max_body_mib,
-        parse_positive_secs,
+        DEFAULT_MAX_BODY_MIB, DEFAULT_SSE_KEEPALIVE_SECS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS,
+        parse_keepalive_secs, parse_max_body_mib, parse_positive_secs,
     };
 
     // Missing, empty, unparsable, and non-positive values keep the default so a
@@ -7667,6 +7736,23 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
     assert_eq!(parse_positive_secs(Some("0"), 300), 300);
     assert_eq!(parse_positive_secs(Some("bad"), 300), 300);
     assert_eq!(parse_positive_secs(Some(" 900 "), 300), 900);
+
+    // The keep-alive interval treats 0 as "off" while a typo keeps the default
+    // so the protection cannot be disabled by accident.
+    assert_eq!(
+        parse_keepalive_secs(None),
+        Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS))
+    );
+    assert_eq!(
+        parse_keepalive_secs(Some("  ")),
+        Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS))
+    );
+    assert_eq!(
+        parse_keepalive_secs(Some("nope")),
+        Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS))
+    );
+    assert_eq!(parse_keepalive_secs(Some("0")), None);
+    assert_eq!(parse_keepalive_secs(Some(" 5 ")), Some(Duration::from_secs(5)));
 }
 
 #[tokio::test]

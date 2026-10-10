@@ -1,17 +1,51 @@
 use super::*;
 
+/// SSE comment used to keep an idle downstream stream alive.
+///
+/// A comment line is ignored by every SSE client but still counts as traffic,
+/// so a load balancer or proxy idle timeout will not drop the connection while
+/// a model is thinking and the upstream has sent nothing.
+pub(crate) const SSE_KEEPALIVE_LINE: &[u8] = b": keep-alive\n\n";
+
 /// Waits for upstream data or for the downstream client to disconnect.
 ///
 /// Dropping the response body closes the receiver; observing that immediately
 /// lets the spawned translator drop the upstream request instead of holding an
 /// abandoned generation open until the next chunk arrives.
+///
+/// When `keepalive` is set, a silent upstream still emits an SSE comment on
+/// that interval so intermediaries do not drop the connection. The comments
+/// are written straight to `tx` and never surfaced to the caller's parser.
 pub(crate) async fn next_upstream_chunk(
     upstream: &mut UpstreamByteStream,
     tx: &mpsc::Sender<Result<Bytes, io::Error>>,
+    keepalive: Option<Duration>,
 ) -> Option<Result<Bytes, io::Error>> {
-    tokio::select! {
-        _ = tx.closed() => None,
-        chunk = upstream.next() => chunk,
+    let Some(interval) = keepalive.filter(|interval| !interval.is_zero()) else {
+        return tokio::select! {
+            _ = tx.closed() => None,
+            chunk = upstream.next() => chunk,
+        };
+    };
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // `interval`'s first tick resolves immediately; consume it so the first
+    // keep-alive only fires after a full idle interval, not at t=0.
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            _ = tx.closed() => return None,
+            chunk = upstream.next() => return chunk,
+            _ = ticker.tick() => {
+                if tx
+                    .send(Ok(Bytes::from_static(SSE_KEEPALIVE_LINE)))
+                    .await
+                    .is_err()
+                {
+                    return None;
+                }
+            }
+        }
     }
 }
 

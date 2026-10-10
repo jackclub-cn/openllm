@@ -53,6 +53,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 
 - `OPENLLM_MAX_BODY_MIB`：请求体上限，默认 `32`（MiB）。网关会整体缓冲请求体，因此这是内存保护值；多图或 PDF 场景可适当调大。
 - `OPENLLM_UPSTREAM_IDLE_TIMEOUT_SECS`：上游两次读取之间的空闲上限，默认 `300` 秒。它只限制空闲间隔，不会截断长时间流式生成；上游首字节较慢时可调大。
+- `OPENLLM_SSE_KEEPALIVE_SECS`：下游 SSE 流在静默时发送心跳注释的间隔，默认 `15` 秒；设为 `0` 可关闭。模型长时间思考、上游暂未吐字节时，心跳可避免反向代理或客户端因空闲而断开连接。
 
 ## 核心能力
 

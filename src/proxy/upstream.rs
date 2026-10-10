@@ -798,24 +798,75 @@ pub(crate) async fn forward_to_target(
 
 /// Keeps model and provider concurrency permits alive until the outbound
 /// response body completes, including translated and pass-through streams.
+///
+/// `keepalive` additionally injects SSE comments into a quiet `text/event-stream`
+/// body so intermediaries and clients do not time out while the upstream is
+/// still thinking.
 pub(crate) fn attach_provider_slot(
     response: Response,
     slots: Option<UpstreamSlots>,
+    keepalive: Option<Duration>,
 ) -> Response {
-    let Some(slots) = slots else {
-        return response;
-    };
-    let UpstreamSlots { provider, model } = slots;
     let (parts, body) = response.into_parts();
-    let mut stream = body.into_data_stream();
-    let guarded = async_stream::stream! {
-        let _provider_slot = provider;
-        let _model_slot = model;
-        while let Some(chunk) = stream.next().await {
-            yield chunk;
-        }
+    let keepalive = keepalive
+        .filter(|interval| !interval.is_zero())
+        .filter(|_| is_event_stream(&parts.headers));
+    if slots.is_none() && keepalive.is_none() {
+        return Response::from_parts(parts, body);
+    }
+    let (provider, model) = match slots {
+        Some(UpstreamSlots { provider, model }) => (provider, model),
+        None => (None, None),
     };
+    let mut stream = body.into_data_stream();
+    let guarded: futures_util::stream::BoxStream<'static, Result<Bytes, axum::Error>> =
+        match keepalive {
+            Some(interval) => {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                Box::pin(async_stream::stream! {
+                    let _provider_slot = provider;
+                    let _model_slot = model;
+                    // Skip the immediate first tick so the first keep-alive
+                    // waits a full interval instead of firing at t=0.
+                    ticker.tick().await;
+                    loop {
+                        tokio::select! {
+                            chunk = stream.next() => match chunk {
+                                Some(chunk) => yield chunk,
+                                None => break,
+                            },
+                            _ = ticker.tick() => {
+                                yield Ok(Bytes::from_static(SSE_KEEPALIVE_LINE));
+                            }
+                        }
+                    }
+                })
+            }
+            None => Box::pin(async_stream::stream! {
+                let _provider_slot = provider;
+                let _model_slot = model;
+                while let Some(chunk) = stream.next().await {
+                    yield chunk;
+                }
+            }),
+        };
     Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+/// True when the response advertises an SSE body, ignoring any parameters.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("text/event-stream")
+        })
 }
 
 pub(crate) fn join_upstream_url(base: &str, path: &str) -> String {

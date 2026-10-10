@@ -52,6 +52,9 @@ pub struct AppState {
     /// Cached transient-failure retry policy. `None` means it must be re-read
     /// from SQLite after a settings update or the first request.
     pub resilience: Arc<RwLock<Option<ResilienceSettings>>>,
+    /// Interval between downstream SSE keep-alive comments on a stream that has
+    /// gone quiet. `None` disables them.
+    pub sse_keepalive: Option<Duration>,
     /// Throttles `last_used_at` writes so the hot request path does not take a
     /// SQLite write lock on every single call.
     pub key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
@@ -89,6 +92,13 @@ pub(crate) const DEFAULT_MAX_BODY_MIB: usize = 32;
 /// silent for longer before the first byte.
 pub(crate) const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Default gap after which a silent downstream SSE stream gets a keep-alive
+/// comment so load balancers, proxies, and clients do not drop the connection
+/// while the model is still thinking. Zero disables the comments.
+///
+/// Override with `OPENLLM_SSE_KEEPALIVE_SECS`.
+pub(crate) const DEFAULT_SSE_KEEPALIVE_SECS: u64 = 15;
+
 /// Parses an operator-provided request-body cap, falling back to the default
 /// for empty, unparsable, or non-positive values.
 pub(crate) fn parse_max_body_mib(value: Option<&str>) -> usize {
@@ -101,6 +111,22 @@ pub(crate) fn parse_max_body_mib(value: Option<&str>) -> usize {
 /// `default` for empty, unparsable, or zero values.
 pub(crate) fn parse_positive_secs(value: Option<&str>, default: u64) -> u64 {
     parse_positive(value).unwrap_or(default)
+}
+
+/// Parses an operator-provided SSE keep-alive interval.
+///
+/// Unlike the idle timeout, `0` is meaningful here: it disables the comments.
+/// Anything missing or unparsable keeps the default so a typo cannot silently
+/// turn the protection off.
+pub(crate) fn parse_keepalive_secs(value: Option<&str>) -> Option<Duration> {
+    match value.map(str::trim) {
+        None | Some("") => Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS)),
+        Some("0") => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(secs) => Some(Duration::from_secs(secs)),
+            Err(_) => Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS)),
+        },
+    }
 }
 
 fn parse_positive(value: Option<&str>) -> Option<u64> {
@@ -163,6 +189,9 @@ impl AppState {
             guardrails: Arc::new(RwLock::new(None)),
             inspector: Arc::new(RwLock::new(None)),
             resilience: Arc::new(RwLock::new(None)),
+            sse_keepalive: parse_keepalive_secs(
+                std::env::var("OPENLLM_SSE_KEEPALIVE_SECS").ok().as_deref(),
+            ),
             key_touched: Arc::new(Mutex::new(HashMap::new())),
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),

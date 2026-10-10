@@ -393,7 +393,7 @@ pub(crate) async fn proxy_openai_inner(
                 );
                 apply_budget_headers(&mut response, budget_usd, budget_excluded_targets);
                 apply_override_headers(&mut response, &routing_overrides);
-                return Ok(attach_provider_slot(response, upstream_slots));
+                return Ok(attach_provider_slot(response, upstream_slots, state.sse_keepalive));
             }
             Err(error) => {
                 last_rate_limit = match &error {
