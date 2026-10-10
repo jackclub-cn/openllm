@@ -30,8 +30,16 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO provider_models (provider_id, model_name, enabled)
-         VALUES (1, 'model-a', 1), (1, 'model-b', 0), (2, 'model-c', 1)",
+        "INSERT INTO provider_models (provider_id, model_name, enabled, max_concurrency)
+         VALUES (1, 'model-a', 1, 2), (1, 'model-b', 0, NULL), (2, 'model-c', 1, NULL)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+         VALUES (1, 1, 'Primary', 'sk-primary', 1),
+                (2, 1, 'Backup', 'sk-backup', 1)",
     )
     .execute(&pool)
     .await
@@ -54,6 +62,18 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     state.provider_concurrency.lock().await.insert(
         1,
         std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    state.model_concurrency.lock().await.insert(
+        (1, "model-a".to_string()),
+        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+    );
+    state.target_cooldown.lock().await.insert(
+        (1, "model-a".to_string()),
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
+    );
+    state.provider_key_cooldown.lock().await.insert(
+        1,
+        std::time::Instant::now() + std::time::Duration::from_secs(60),
     );
     let router = crate::build_router(state);
 
@@ -104,6 +124,32 @@ async fn prometheus_metrics_render_and_require_admin_token() {
         body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3")
     );
     assert!(body.contains("openllm_provider_inflight{provider=\"Healthy provider\"} 2"));
+    assert!(
+        body.contains(
+            "openllm_model_cooling{provider=\"Healthy provider\",model=\"model-a\"} 1"
+        )
+    );
+    assert!(
+        body.contains(
+            "openllm_model_cooling{provider=\"Healthy provider\",model=\"model-b\"} 0"
+        )
+    );
+    assert!(
+        body.contains(
+            "openllm_model_concurrency_limit{provider=\"Healthy provider\",model=\"model-a\"} 2"
+        )
+    );
+    assert!(
+        body.contains(
+            "openllm_model_inflight{provider=\"Healthy provider\",model=\"model-a\"} 1"
+        )
+    );
+    assert!(body.contains(
+        "openllm_provider_key_cooling{provider=\"Healthy provider\",key=\"Primary\",key_id=\"1\"} 1"
+    ));
+    assert!(body.contains(
+        "openllm_provider_key_cooling{provider=\"Healthy provider\",key=\"Backup\",key_id=\"2\"} 0"
+    ));
     assert!(body.contains("openllm_webhooks{state=\"enabled\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"succeeded\"} 1"));
     assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));

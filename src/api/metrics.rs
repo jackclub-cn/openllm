@@ -58,6 +58,21 @@ struct ProviderMetricsRow {
     completion_tokens: i64,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct ProviderModelMetricsRow {
+    provider_id: i64,
+    provider: String,
+    model: String,
+    max_concurrency: Option<i64>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ProviderKeyMetricsRow {
+    id: i64,
+    provider: String,
+    name: String,
+}
+
 pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Response> {
     let lifetime_fut = sqlx::query_as::<_, LifetimeMetricsRow>(
         r#"
@@ -142,6 +157,25 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         "#,
     )
     .fetch_all(&state.pool);
+    let provider_models_fut = sqlx::query_as::<_, ProviderModelMetricsRow>(
+        r#"
+        SELECT pm.provider_id, p.name AS provider, pm.model_name AS model,
+               pm.max_concurrency
+        FROM provider_models pm
+        JOIN providers p ON p.id = pm.provider_id
+        ORDER BY p.name COLLATE NOCASE, pm.model_name COLLATE NOCASE, pm.id
+        "#,
+    )
+    .fetch_all(&state.pool);
+    let provider_keys_fut = sqlx::query_as::<_, ProviderKeyMetricsRow>(
+        r#"
+        SELECT k.id, p.name AS provider, k.name
+        FROM provider_api_keys k
+        JOIN providers p ON p.id = k.provider_id
+        ORDER BY p.name COLLATE NOCASE, k.name COLLATE NOCASE, k.id
+        "#,
+    )
+    .fetch_all(&state.pool);
     let in_flight_fut =
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
             .fetch_one(&state.pool);
@@ -150,10 +184,22 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     let free_pages_fut =
         sqlx::query_scalar::<_, i64>("PRAGMA freelist_count").fetch_one(&state.pool);
 
-    let (lifetime, statuses, providers, in_flight, page_count, page_size, free_pages) = tokio::try_join!(
+    let (
+        lifetime,
+        statuses,
+        providers,
+        provider_models,
+        provider_keys,
+        in_flight,
+        page_count,
+        page_size,
+        free_pages,
+    ) = tokio::try_join!(
         lifetime_fut,
         statuses_fut,
         providers_fut,
+        provider_models_fut,
+        provider_keys_fut,
         in_flight_fut,
         page_count_fut,
         page_size_fut,
@@ -174,6 +220,31 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         semaphores
             .iter()
             .map(|(provider_id, semaphore)| (*provider_id, semaphore.available_permits()))
+            .collect::<HashMap<_, _>>()
+    };
+    let model_cooling = {
+        let cooldowns = state.target_cooldown.lock().await;
+        cooldowns
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|((provider_id, model), _)| (*provider_id, model.clone()))
+            .collect::<HashSet<_>>()
+    };
+    let provider_key_cooling = {
+        let cooldowns = state.provider_key_cooldown.lock().await;
+        cooldowns
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(key_id, _)| *key_id)
+            .collect::<HashSet<_>>()
+    };
+    let model_concurrency_available = {
+        let semaphores = state.model_concurrency.lock().await;
+        semaphores
+            .iter()
+            .map(|((provider_id, model), semaphore)| {
+                ((*provider_id, model.clone()), semaphore.available_permits())
+            })
             .collect::<HashMap<_, _>>()
     };
 
@@ -465,6 +536,66 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
                 latency,
             );
         }
+    }
+
+    metric_header(
+        &mut body,
+        "openllm_model_cooling",
+        "Current model cooldown state",
+    );
+    metric_header(
+        &mut body,
+        "openllm_model_concurrency_limit",
+        "Configured per-model upstream concurrency limit; zero means unlimited",
+    );
+    metric_header(
+        &mut body,
+        "openllm_model_inflight",
+        "Current upstream requests holding a per-model concurrency slot",
+    );
+    for model in &provider_models {
+        let label = [
+            ("provider", model.provider.as_str()),
+            ("model", model.model.as_str()),
+        ];
+        let limit = model.max_concurrency.unwrap_or(0).max(0);
+        let in_flight = model_concurrency_available
+            .get(&(model.provider_id, model.model.clone()))
+            .map(|available| limit.saturating_sub(*available as i64))
+            .unwrap_or(0);
+        push_metric(
+            &mut body,
+            "openllm_model_cooling",
+            &label,
+            model_cooling.contains(&(model.provider_id, model.model.clone())) as u8,
+        );
+        push_metric(
+            &mut body,
+            "openllm_model_concurrency_limit",
+            &label,
+            limit,
+        );
+        push_metric(&mut body, "openllm_model_inflight", &label, in_flight);
+    }
+
+    metric_header(
+        &mut body,
+        "openllm_provider_key_cooling",
+        "Current provider key cooldown state",
+    );
+    for key in &provider_keys {
+        let key_id = key.id.to_string();
+        let label = [
+            ("provider", key.provider.as_str()),
+            ("key", key.name.as_str()),
+            ("key_id", key_id.as_str()),
+        ];
+        push_metric(
+            &mut body,
+            "openllm_provider_key_cooling",
+            &label,
+            provider_key_cooling.contains(&key.id) as u8,
+        );
     }
 
     metric_header(
