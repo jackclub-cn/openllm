@@ -2637,17 +2637,36 @@ fn retry_backoff_is_exponential_and_capped() {
         retry_backoff_ms: 100,
         retry_max_backoff_ms: 400,
     };
-    assert_eq!(retry_backoff(&settings, 0), Duration::from_millis(100));
-    assert_eq!(retry_backoff(&settings, 1), Duration::from_millis(200));
-    assert_eq!(retry_backoff(&settings, 2), Duration::from_millis(400));
-    assert_eq!(retry_backoff(&settings, 9), Duration::from_millis(400));
+    assert_eq!(
+        retry_backoff_with_draw(&settings, 0, 0.0),
+        Duration::from_millis(100)
+    );
+    assert_eq!(
+        retry_backoff_with_draw(&settings, 0, 1.0),
+        Duration::from_millis(125)
+    );
+    assert_eq!(
+        retry_backoff_with_draw(&settings, 1, 0.4),
+        Duration::from_millis(220)
+    );
+    assert_eq!(
+        retry_backoff_with_draw(&settings, 2, 1.0),
+        Duration::from_millis(400)
+    );
+    assert_eq!(
+        retry_backoff_with_draw(&settings, 9, 1.0),
+        Duration::from_millis(400)
+    );
 
     let disabled = crate::models::ResilienceSettings {
         max_retries: 0,
         retry_backoff_ms: 0,
         retry_max_backoff_ms: 0,
     };
-    assert_eq!(retry_backoff(&disabled, 0), Duration::from_millis(0));
+    assert_eq!(
+        retry_backoff_with_draw(&disabled, 0, 1.0),
+        Duration::from_millis(0)
+    );
 }
 
 #[tokio::test]

@@ -959,10 +959,27 @@ pub(super) fn retry_backoff(
     settings: &crate::models::ResilienceSettings,
     retry_index: u32,
 ) -> Duration {
+    retry_backoff_with_draw(settings, retry_index, rand::random::<f64>())
+}
+
+/// Deterministic form of [`retry_backoff`] used by tests.
+///
+/// The jitter only extends the delay, never shortens it, so an operator's
+/// configured minimum remains a real floor. The configured cap still wins.
+pub(super) fn retry_backoff_with_draw(
+    settings: &crate::models::ResilienceSettings,
+    retry_index: u32,
+    draw: f64,
+) -> Duration {
     let base = settings.retry_backoff_ms.max(0) as u64;
     let cap = settings.retry_max_backoff_ms.max(0) as u64;
     let multiplier = 1u64 << retry_index.min(6);
-    Duration::from_millis(base.saturating_mul(multiplier).min(cap))
+    let delay = base.saturating_mul(multiplier).min(cap);
+    let jitter_percent = (draw.clamp(0.0, 1.0) * 25.0).round() as u64;
+    let jittered = delay
+        .saturating_mul(100u64.saturating_add(jitter_percent))
+        / 100;
+    Duration::from_millis(jittered.min(cap))
 }
 
 pub(super) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
