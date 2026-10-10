@@ -319,6 +319,19 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_requests_shed_total",
+        "Requests refused by the global admission cap since startup",
+    );
+    push_metric(
+        &mut body,
+        "openllm_requests_shed_total",
+        &[],
+        state
+            .requests_shed
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
+    metric_header(
+        &mut body,
         "openllm_tokens_total",
         "Retained token counts by type",
     );

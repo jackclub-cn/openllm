@@ -7913,6 +7913,13 @@ async fn request_capacity_slot_is_held_until_the_body_completes() {
         acquire_request_capacity(&state),
         RequestCapacity::Overloaded
     ));
+    assert_eq!(
+        state
+            .requests_shed
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a refused request is counted for metrics"
+    );
 
     // Attaching moves the permit into the response body so a stream keeps the
     // slot for its whole lifetime, not just until the headers are returned.

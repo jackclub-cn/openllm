@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -45,6 +46,8 @@ pub struct AppState {
     pub request_capacity: Option<Arc<Semaphore>>,
     /// Configured global request cap, `0` when disabled. Kept for metrics.
     pub request_capacity_limit: usize,
+    /// Requests refused by the global admission cap since startup.
+    pub requests_shed: Arc<AtomicU64>,
     pub events: broadcast::Sender<UsageEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
@@ -233,6 +236,7 @@ impl AppState {
             model_concurrency: Arc::new(Mutex::new(HashMap::new())),
             request_capacity,
             request_capacity_limit,
+            requests_shed: Arc::new(AtomicU64::new(0)),
             events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),

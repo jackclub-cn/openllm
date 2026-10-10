@@ -21,7 +21,12 @@ pub(crate) fn acquire_request_capacity(state: &AppState) -> RequestCapacity {
     };
     match semaphore.clone().try_acquire_owned() {
         Ok(permit) => RequestCapacity::Acquired(permit),
-        Err(_) => RequestCapacity::Overloaded,
+        Err(_) => {
+            state
+                .requests_shed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            RequestCapacity::Overloaded
+        }
     }
 }
 
