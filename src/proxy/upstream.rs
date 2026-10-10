@@ -23,6 +23,7 @@ impl UpstreamResponse {
             .bytes_stream()
             .map_err(std::io::Error::other)
             .boxed();
+        let stream = with_stream_deadline(stream, crate::state::max_stream_lifetime());
         Self {
             status,
             headers,
@@ -123,6 +124,81 @@ impl UpstreamResponse {
             stream: prefix.chain(stream).boxed(),
         }
     }
+}
+
+/// Wraps an upstream byte stream with a hard total-lifetime deadline.
+///
+/// The client's idle timeout only bounds the gap between reads, so a stream
+/// that keeps trickling bytes can pin a provider slot forever. Once `lifetime`
+/// elapses the stream ends with a timeout error so the caller can cool the
+/// provider and free the slot. `None` or zero leaves the stream untouched.
+pub(crate) fn with_stream_deadline(
+    stream: UpstreamByteStream,
+    lifetime: Option<Duration>,
+) -> UpstreamByteStream {
+    let Some(lifetime) = lifetime.filter(|lifetime| !lifetime.is_zero()) else {
+        return stream;
+    };
+    async_stream::stream! {
+        let deadline = tokio::time::sleep(lifetime);
+        tokio::pin!(deadline);
+        let mut stream = stream;
+        loop {
+            tokio::select! {
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => yield chunk,
+                    None => break,
+                },
+                _ = &mut deadline => {
+                    yield Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "upstream stream exceeded its {} second lifetime",
+                            lifetime.as_secs()
+                        ),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    .boxed()
+}
+
+/// Bounds how long the gateway will spend reading a request body.
+///
+/// A slow or hostile client can otherwise hold an admission slot (and, with a
+/// large body, memory) by trickling bytes forever. Once `timeout` elapses the
+/// wrapped stream yields an error so the body extractor fails fast. `None` or
+/// zero leaves the body untouched.
+pub(crate) fn with_body_read_deadline(body: Body, timeout: Option<Duration>) -> Body {
+    let Some(timeout) = timeout.filter(|timeout| !timeout.is_zero()) else {
+        return body;
+    };
+    let mut stream = body.into_data_stream();
+    let stream = async_stream::stream! {
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                chunk = stream.next() => match chunk {
+                    Some(chunk) => yield chunk,
+                    None => break,
+                },
+                _ = &mut deadline => {
+                    yield Err(axum::Error::new(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        format!(
+                            "request body was not fully received within {} seconds",
+                            timeout.as_secs()
+                        ),
+                    )));
+                    break;
+                }
+            }
+        }
+    };
+    Body::from_stream(stream)
 }
 
 /// Reads an upstream body into memory, refusing to grow past `limit`.

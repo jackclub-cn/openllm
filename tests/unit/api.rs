@@ -3636,6 +3636,7 @@ async fn runtime_settings_expose_effective_limits() {
     let expected_concurrency = state.request_capacity_limit;
     let expected_inflight_mib = state.request_bytes_limit / (1024 * 1024);
     let expected_admission_wait_ms = state.admission_wait.as_millis() as u64;
+    let expected_body_read_timeout = state.body_read_timeout.map(|timeout| timeout.as_secs());
     let Json(view) = get_runtime_settings(State(state)).await.unwrap();
     assert!(view.limits.max_request_body_mib >= 1);
     assert!(view.limits.max_upstream_body_mib >= 1);
@@ -3643,6 +3644,11 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.max_concurrent_requests, expected_concurrency);
     assert_eq!(view.limits.max_inflight_request_mib, expected_inflight_mib);
     assert_eq!(view.limits.admission_wait_ms, expected_admission_wait_ms);
+    assert_eq!(view.limits.body_read_timeout_secs, expected_body_read_timeout);
+    assert_eq!(
+        view.limits.stream_max_secs,
+        crate::state::max_stream_lifetime().map(|lifetime| lifetime.as_secs())
+    );
 }
 
 #[tokio::test]

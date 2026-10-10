@@ -59,6 +59,11 @@ pub struct RuntimeLimits {
     /// Admission wait in milliseconds before an over-capacity request is shed;
     /// `0` sheds immediately.
     pub admission_wait_ms: u64,
+    /// Hard cap on an upstream stream's total lifetime in seconds; `None`
+    /// disables it.
+    pub stream_max_secs: Option<u64>,
+    /// Bound on reading a client request body in seconds; `None` disables it.
+    pub body_read_timeout_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

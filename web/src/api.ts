@@ -591,6 +591,8 @@ export type RuntimeLimits = {
   max_concurrent_requests: number
   max_inflight_request_mib: number
   admission_wait_ms: number
+  stream_max_secs?: number | null
+  body_read_timeout_secs?: number | null
 }
 
 export type GuardrailSettings = {

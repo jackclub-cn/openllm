@@ -344,6 +344,11 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="准入等待">
               {limits ? (limits.admission_wait_ms > 0 ? `${limits.admission_wait_ms} 毫秒` : '不等待') : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="流最长存活 / 请求体读取上限">
+              {limits
+                ? `${limits.stream_max_secs != null ? `${limits.stream_max_secs} 秒` : '不限'} / ${limits.body_read_timeout_secs != null ? `${limits.body_read_timeout_secs} 秒` : '不限'}`
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="SSE 心跳">
               {limits
                 ? limits.sse_keepalive_secs != null

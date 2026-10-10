@@ -60,6 +60,9 @@ pub struct AppState {
     /// How long an over-capacity request waits for an admission slot before it
     /// is shed. Zero sheds immediately.
     pub admission_wait: Duration,
+    /// How long the gateway will spend reading a request body before giving up.
+    /// `None` leaves the read unbounded.
+    pub body_read_timeout: Option<Duration>,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
@@ -134,6 +137,25 @@ pub(crate) const DEFAULT_MAX_INFLIGHT_REQUEST_MIB: usize = 0;
 /// Override with `OPENLLM_ADMISSION_WAIT_MS`.
 pub(crate) const DEFAULT_ADMISSION_WAIT_MS: u64 = 0;
 
+/// Default hard cap on an upstream stream's total lifetime in seconds.
+///
+/// The idle timeout only bounds the gap *between* reads, so a stream that
+/// trickles a keep-alive byte forever would hold its provider slot and memory
+/// indefinitely. This cap bounds total stream duration, matching the largest
+/// per-provider timeout budget with a margin. Zero disables it.
+///
+/// Override with `OPENLLM_STREAM_MAX_SECS`.
+pub(crate) const DEFAULT_STREAM_MAX_SECS: u64 = 1260;
+
+/// Default bound, in seconds, on how long the gateway will spend reading a
+/// request body from a client.
+///
+/// Without it a slow or hostile client can hold an admission slot (and, with a
+/// large body, memory) by trickling bytes forever. Zero disables the bound.
+///
+/// Override with `OPENLLM_BODY_READ_TIMEOUT_SECS`.
+pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 600;
+
 /// Default idle gap allowed between bytes from an upstream.
 ///
 /// A total-request timeout would abort long generations (reasoning models
@@ -181,13 +203,18 @@ pub(crate) fn parse_positive_secs(value: Option<&str>, default: u64) -> u64 {
 /// Anything missing or unparsable keeps the default so a typo cannot silently
 /// turn the protection off.
 pub(crate) fn parse_keepalive_secs(value: Option<&str>) -> Option<Duration> {
+    parse_optional_secs(value, DEFAULT_SSE_KEEPALIVE_SECS)
+}
+
+/// Parses an optional "N seconds" bound where an explicit `0` disables it.
+///
+/// A missing or unparsable value keeps `default` so a typo cannot silently
+/// remove a safety bound; an explicit `0` turns the bound off on purpose.
+pub(crate) fn parse_optional_secs(value: Option<&str>, default: u64) -> Option<Duration> {
     match value.map(str::trim) {
-        None | Some("") => Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS)),
+        None | Some("") => Some(Duration::from_secs(default)),
         Some("0") => None,
-        Some(raw) => match raw.parse::<u64>() {
-            Ok(secs) => Some(Duration::from_secs(secs)),
-            Err(_) => Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS)),
-        },
+        Some(raw) => Some(Duration::from_secs(raw.parse::<u64>().unwrap_or(default))),
     }
 }
 
@@ -254,6 +281,22 @@ pub(crate) fn max_upstream_body_bytes() -> usize {
         DEFAULT_MAX_UPSTREAM_BODY_MIB,
     )
         .saturating_mul(1024 * 1024)
+}
+
+/// Resolves the configured hard cap on an upstream stream's total lifetime.
+pub(crate) fn max_stream_lifetime() -> Option<Duration> {
+    parse_optional_secs(
+        std::env::var("OPENLLM_STREAM_MAX_SECS").ok().as_deref(),
+        DEFAULT_STREAM_MAX_SECS,
+    )
+}
+
+/// Resolves the configured bound on reading a request body from a client.
+pub(crate) fn body_read_timeout() -> Option<Duration> {
+    parse_optional_secs(
+        std::env::var("OPENLLM_BODY_READ_TIMEOUT_SECS").ok().as_deref(),
+        DEFAULT_BODY_READ_TIMEOUT_SECS,
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -481,6 +524,7 @@ impl AppState {
             admission_wait: parse_admission_wait_ms(
                 std::env::var("OPENLLM_ADMISSION_WAIT_MS").ok().as_deref(),
             ),
+            body_read_timeout: body_read_timeout(),
             started_at: Instant::now(),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -617,6 +661,10 @@ impl AppState {
             max_concurrent_requests: self.request_capacity_limit,
             max_inflight_request_mib: self.request_bytes_limit / (1024 * 1024),
             admission_wait_ms: self.admission_wait.as_millis() as u64,
+            stream_max_secs: max_stream_lifetime().map(|lifetime| lifetime.as_secs()),
+            body_read_timeout_secs: self
+                .body_read_timeout
+                .map(|timeout| timeout.as_secs()),
         }
     }
 }

@@ -63,6 +63,9 @@ pub(crate) async fn admission(
     }
 
     let (parts, body) = request.into_parts();
+    // Bound how long a client may trickle its body so it cannot pin the slot
+    // it just took; the wrapped stream flows through to the handler.
+    let body = with_body_read_deadline(body, state.body_read_timeout);
     let (body, byte_guard) = match state.inflight_request_bytes.clone() {
         None => (body, None),
         Some(budget) => match charge_request_body(&budget, &parts.headers, body, wait).await {
