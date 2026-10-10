@@ -64,6 +64,9 @@ pub struct RuntimeLimits {
     pub stream_max_secs: Option<u64>,
     /// Bound on reading a client request body in seconds; `None` disables it.
     pub body_read_timeout_secs: Option<u64>,
+    /// Wall-clock budget for a request's whole fallback loop in seconds;
+    /// `None` disables it.
+    pub request_timeout_secs: Option<u64>,
     /// Process-memory ceiling that arms the pressure guard, in MiB; `0`
     /// disables it.
     pub memory_limit_mib: u64,

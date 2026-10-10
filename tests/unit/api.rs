@@ -3650,6 +3650,7 @@ async fn runtime_settings_expose_effective_limits() {
     let expected_inflight_mib = state.request_bytes_limit / (1024 * 1024);
     let expected_admission_wait_ms = state.admission_wait.as_millis() as u64;
     let expected_body_read_timeout = state.body_read_timeout.map(|timeout| timeout.as_secs());
+    let expected_request_timeout = state.request_timeout.map(|timeout| timeout.as_secs());
     let expected_memory_limit_mib = state
         .memory_pressure
         .as_ref()
@@ -3665,6 +3666,7 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.max_inflight_request_mib, expected_inflight_mib);
     assert_eq!(view.limits.admission_wait_ms, expected_admission_wait_ms);
     assert_eq!(view.limits.body_read_timeout_secs, expected_body_read_timeout);
+    assert_eq!(view.limits.request_timeout_secs, expected_request_timeout);
     assert_eq!(
         view.limits.stream_max_secs,
         crate::state::max_stream_lifetime().map(|lifetime| lifetime.as_secs())

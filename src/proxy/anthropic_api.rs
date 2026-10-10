@@ -333,7 +333,21 @@ pub(crate) async fn proxy_anthropic_inner(
     let mut last_target = None;
     let mut attempts = 0usize;
     let mut capacity_exhausted_providers = HashSet::new();
+    let request_deadline = state.request_deadline();
     for target in ordered_targets {
+        // Stop *starting* new targets once the budget is spent; an attempt that
+        // is already running is never cut short, so a slow provider is safe.
+        if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let elapsed = started.elapsed().as_secs();
+            last_error = Some(AppError::UpstreamStatus {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                message: format!(
+                    "request budget exhausted after {elapsed}s and {attempts} attempt(s); giving up"
+                ),
+                retry_after: None,
+            });
+            break;
+        }
         let target_provider_id = target.provider_id;
         if capacity_exhausted_providers.contains(&target_provider_id) {
             continue;
@@ -441,19 +455,17 @@ pub(crate) async fn proxy_anthropic_inner(
         }
     }
 
-    let error = last_error
-        .unwrap_or_else(|| AppError::Upstream("all configured route targets failed".to_string()));
-    let (status_code, error) = match last_rate_limit {
-        Some((message, retry_after)) => (
-            StatusCode::TOO_MANY_REQUESTS.as_u16() as i64,
-            AppError::UpstreamStatus {
-                status: StatusCode::TOO_MANY_REQUESTS,
-                message,
-                retry_after,
-            },
-        ),
-        None => (502, error),
+    let error = match last_rate_limit {
+        Some((message, retry_after)) => AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message,
+            retry_after,
+        },
+        None => last_error.unwrap_or_else(|| {
+            AppError::Upstream("all configured route targets failed".to_string())
+        }),
     };
+    let status_code = finalized_fallback_status(&error);
     let message = error.to_string();
     log_usage(
         state,

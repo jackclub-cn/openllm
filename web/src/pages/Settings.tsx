@@ -367,6 +367,9 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
                 ? `${limits.stream_max_secs != null ? `${limits.stream_max_secs} 秒` : '不限'} / ${limits.body_read_timeout_secs != null ? `${limits.body_read_timeout_secs} 秒` : '不限'}`
                 : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="请求总预算">
+              {limits ? (limits.request_timeout_secs != null ? `${limits.request_timeout_secs} 秒` : '不限') : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="内存压力保护">
               {limits
                 ? limits.memory_limit_mib > 0

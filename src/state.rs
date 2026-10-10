@@ -63,6 +63,11 @@ pub struct AppState {
     /// How long the gateway will spend reading a request body before giving up.
     /// `None` leaves the read unbounded.
     pub body_read_timeout: Option<Duration>,
+    /// Wall-clock budget for a request's entire fallback loop. Once it elapses
+    /// the gateway stops starting further route targets and returns the last
+    /// error, so a route full of failing targets cannot pin an admission slot
+    /// for minutes. `None` disables the budget.
+    pub request_timeout: Option<Duration>,
     /// Opt-in process-memory pressure guard; `None` disables it.
     pub memory_pressure: Option<Arc<MemoryPressure>>,
     /// Where the memory ceiling came from: `"off"`, `"env"`, or `"cgroup"`.
@@ -177,6 +182,17 @@ pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 600;
 /// starts shedding new proxied requests. A little headroom is left above it so
 /// the process can still finish the work already in flight.
 pub(crate) const DEFAULT_MEMORY_SHED_RATIO: f64 = 0.9;
+
+/// Default wall-clock budget for a request's fallback loop, in seconds.
+///
+/// Once it elapses the gateway stops *starting* further route targets and
+/// returns the last error, so a route full of failing targets cannot hold a
+/// request (and its admission slot) for minutes. It never cuts an attempt that
+/// is already running, so a slow-but-working provider is unaffected. Zero
+/// disables the budget.
+///
+/// Override with `OPENLLM_REQUEST_TIMEOUT_SECS`.
+pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 
 /// How long a sampled memory reading is reused before it is refreshed.
 const MEMORY_SAMPLE_TTL: Duration = Duration::from_millis(500);
@@ -380,6 +396,15 @@ pub(crate) fn body_read_timeout() -> Option<Duration> {
     parse_optional_secs(
         std::env::var("OPENLLM_BODY_READ_TIMEOUT_SECS").ok().as_deref(),
         DEFAULT_BODY_READ_TIMEOUT_SECS,
+    )
+}
+
+/// Resolves the configured total wall-clock budget for a request's fallback
+/// loop.
+pub(crate) fn request_timeout() -> Option<Duration> {
+    parse_optional_secs(
+        std::env::var("OPENLLM_REQUEST_TIMEOUT_SECS").ok().as_deref(),
+        DEFAULT_REQUEST_TIMEOUT_SECS,
     )
 }
 
@@ -796,6 +821,7 @@ impl AppState {
                 std::env::var("OPENLLM_ADMISSION_WAIT_MS").ok().as_deref(),
             ),
             body_read_timeout: body_read_timeout(),
+            request_timeout: request_timeout(),
             memory_pressure,
             memory_limit_source,
             memory_shed_ratio,
@@ -913,6 +939,12 @@ impl AppState {
         Ok(settings)
     }
 
+    /// Wall-clock deadline for the current request's fallback loop, or `None`
+    /// when `OPENLLM_REQUEST_TIMEOUT_SECS=0` has disabled the budget.
+    pub(crate) fn request_deadline(&self) -> Option<Instant> {
+        self.request_timeout.map(|budget| Instant::now() + budget)
+    }
+
     /// Reports the effective environment-derived runtime limits.
     ///
     /// Re-derives the same values the process parsed at startup so the console
@@ -942,6 +974,9 @@ impl AppState {
             stream_max_secs: max_stream_lifetime().map(|lifetime| lifetime.as_secs()),
             body_read_timeout_secs: self
                 .body_read_timeout
+                .map(|timeout| timeout.as_secs()),
+            request_timeout_secs: self
+                .request_timeout
                 .map(|timeout| timeout.as_secs()),
             memory_limit_mib: self
                 .memory_pressure

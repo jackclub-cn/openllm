@@ -356,6 +356,18 @@ pub(crate) fn upstream_failure_error(
     }
 }
 
+/// Logged HTTP status for the final failure of a fallback loop.
+///
+/// Mirrors how `AppError` renders so the usage row matches the response: a
+/// carried `UpstreamStatus` keeps its own code (a `429` rate limit or a `504`
+/// budget timeout), and everything else logs `502` like the client sees.
+pub(crate) fn finalized_fallback_status(error: &AppError) -> i64 {
+    match error {
+        AppError::UpstreamStatus { status, .. } => status.as_u16() as i64,
+        _ => 502,
+    }
+}
+
 pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     let message = String::from_utf8_lossy(body).to_ascii_lowercase();
     if !message.contains("tool_search") {
