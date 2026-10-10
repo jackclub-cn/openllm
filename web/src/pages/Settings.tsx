@@ -5,6 +5,7 @@ import {
   CompressOutlined,
   DatabaseOutlined,
   DownloadOutlined,
+  FileSearchOutlined,
   SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import {
@@ -18,6 +19,7 @@ import {
   InputNumber,
   Popconfirm,
   Space,
+  Switch,
   Tag,
   Tooltip,
   Typography,
@@ -28,6 +30,7 @@ import {
   getAdminToken,
   type DatabaseVacuumResult,
   type GuardrailSettings,
+  type InspectorSettings,
   type RuntimeSettings,
   type Settings,
 } from '../api'
@@ -46,6 +49,9 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [blockedTerms, setBlockedTerms] = useState('')
   const [maxPromptTokens, setMaxPromptTokens] = useState<number | null>(null)
   const [savingGuardrails, setSavingGuardrails] = useState(false)
+  const [captureRequestPreviews, setCaptureRequestPreviews] = useState(false)
+  const [requestPreviewMaxChars, setRequestPreviewMaxChars] = useState(4000)
+  const [savingInspector, setSavingInspector] = useState(false)
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
@@ -58,6 +64,13 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       .then((guardrails) => {
         setBlockedTerms(guardrails.blocked_terms.join('\n'))
         setMaxPromptTokens(guardrails.max_prompt_tokens ?? null)
+      })
+      .catch(() => undefined)
+    api
+      .get<InspectorSettings>('/api/settings/inspector')
+      .then((inspector) => {
+        setCaptureRequestPreviews(inspector.capture_request_previews)
+        setRequestPreviewMaxChars(inspector.request_preview_max_chars)
       })
       .catch(() => undefined)
   }, [])
@@ -131,6 +144,23 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setSavingGuardrails(false)
+    }
+  }
+
+  const saveInspector = async () => {
+    setSavingInspector(true)
+    try {
+      const inspector = await api.put<InspectorSettings>('/api/settings/inspector', {
+        capture_request_previews: captureRequestPreviews,
+        request_preview_max_chars: requestPreviewMaxChars,
+      })
+      setCaptureRequestPreviews(inspector.capture_request_previews)
+      setRequestPreviewMaxChars(inspector.request_preview_max_chars)
+      message.success('请求检查设置已保存')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setSavingInspector(false)
     }
   }
 
@@ -330,6 +360,46 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             onClick={() => void saveGuardrails()}
           >
             保存请求防护
+          </Button>
+        </Form>
+      </Card>
+      <Card
+        className="settings-retention"
+        title={<Space><FileSearchOutlined />请求检查</Space>}
+        bordered={false}
+      >
+        <Form layout="vertical">
+          <Form.Item
+            label="捕获请求内容"
+            extra="默认关闭。开启后可在请求详情中查看脱敏后的请求体，便于排查上游问题；内容按下方上限截断。"
+          >
+            <Switch
+              checked={captureRequestPreviews}
+              onChange={setCaptureRequestPreviews}
+            />
+          </Form.Item>
+          <Form.Item
+            label="最大保留字符数"
+            extra="范围 256 到 65536，过长内容会截断。"
+          >
+            <InputNumber
+              min={256}
+              max={65536}
+              precision={0}
+              value={requestPreviewMaxChars}
+              onChange={(value) => setRequestPreviewMaxChars(value ?? 4000)}
+              addonAfter="字符"
+              style={{ width: 220 }}
+              disabled={!captureRequestPreviews}
+            />
+          </Form.Item>
+          <Button
+            type="primary"
+            icon={<CheckCircleOutlined />}
+            loading={savingInspector}
+            onClick={() => void saveInspector()}
+          >
+            保存请求检查
           </Button>
         </Form>
       </Card>

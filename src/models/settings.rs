@@ -56,6 +56,27 @@ impl GuardrailSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InspectorSettings {
+    #[serde(default)]
+    pub capture_request_previews: bool,
+    #[serde(default = "default_preview_max_chars")]
+    pub request_preview_max_chars: i64,
+}
+
+impl Default for InspectorSettings {
+    fn default() -> Self {
+        Self {
+            capture_request_previews: false,
+            request_preview_max_chars: default_preview_max_chars(),
+        }
+    }
+}
+
+fn default_preview_max_chars() -> i64 {
+    4000
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminTokenQuery {
     pub admin_token: Option<String>,

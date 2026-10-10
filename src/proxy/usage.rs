@@ -524,6 +524,60 @@ pub(crate) fn response_preview(bytes: &[u8]) -> Option<String> {
     Some(preview)
 }
 
+/// Builds a bounded request preview with common credential fields masked.
+///
+/// Stored previews are opt-in because prompts may contain sensitive data. The
+/// masking pass covers the usual secret-bearing keys without touching normal
+/// budget fields such as `max_tokens`.
+pub(crate) fn request_preview(body: &Value, max_chars: usize) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    let masked = mask_sensitive_values(body);
+    let text = serde_json::to_string_pretty(&masked).ok()?;
+    let preview = text.trim().chars().take(max_chars).collect::<String>();
+    (!preview.is_empty()).then_some(preview)
+}
+
+fn mask_sensitive_values(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, value)| {
+                    let value = if sensitive_request_key(key) {
+                        Value::String("<redacted>".to_string())
+                    } else {
+                        mask_sensitive_values(value)
+                    };
+                    (key.clone(), value)
+                })
+                .collect(),
+        ),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(mask_sensitive_values).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+fn sensitive_request_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "api_key"
+            | "apikey"
+            | "authorization"
+            | "password"
+            | "secret"
+            | "token"
+            | "access_token"
+            | "refresh_token"
+            | "cookie"
+            | "set-cookie"
+    ) || key.ends_with("_token")
+        || key.ends_with("-token")
+}
+
 /// Upper bound on how much streamed text is retained for the preview. Anything
 /// beyond this is discarded as it arrives, so a very long generation does not
 /// buffer its entire output in memory just to store 2000 characters.
@@ -617,6 +671,7 @@ pub(crate) async fn log_usage_started(
     endpoint: &str,
     request_tokens: i64,
     streamed: bool,
+    request_preview: Option<&str>,
 ) {
     let result = sqlx::query(
         r#"
@@ -625,10 +680,11 @@ pub(crate) async fn log_usage_started(
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
-            success, streamed, error_message, response_preview, last_activity_at
+            success, streamed, error_message, request_preview, response_preview,
+            last_activity_at
         ) VALUES (
             ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?,
-            NULL, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            NULL, ?, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
         ON CONFLICT(request_id) DO UPDATE SET
             session_id = COALESCE(excluded.session_id, usage_logs.session_id),
@@ -638,6 +694,7 @@ pub(crate) async fn log_usage_started(
             prompt_tokens = excluded.prompt_tokens,
             total_tokens = excluded.total_tokens,
             streamed = excluded.streamed,
+            request_preview = COALESCE(excluded.request_preview, usage_logs.request_preview),
             last_activity_at = excluded.last_activity_at,
             in_flight = 1
         WHERE usage_logs.in_flight = 1
@@ -652,6 +709,7 @@ pub(crate) async fn log_usage_started(
     .bind(request_tokens)
     .bind(request_tokens)
     .bind(streamed as i64)
+    .bind(request_preview)
     .execute(&state.pool)
     .await;
 

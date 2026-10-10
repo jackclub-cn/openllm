@@ -19,7 +19,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::models_dev;
 use crate::proxy::{apply_custom_headers, join_upstream_url, upstream_rejects_tool_search};
-use crate::state::{AppState, SETTING_GUARDRAILS};
+use crate::state::{AppState, SETTING_GUARDRAILS, SETTING_INSPECTOR};
 
 mod admin;
 mod audit;

@@ -23,14 +23,15 @@ use tower_http::trace::TraceLayer;
 use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
     create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
-    event_stream, export_usage, get_guardrails_settings, get_runtime_settings, get_settings,
-    get_usage_detail, health, list_api_keys, list_audit_logs, list_model_inventory, list_models,
-    list_provider_model_limits, list_providers, list_routes, list_usage, list_webhook_deliveries,
-    list_webhooks, overview, preview_provider_model_sync, prometheus_metrics, provider_quota,
-    rotate_api_key, sync_provider_models, test_all_provider_keys, test_all_providers,
-    test_provider, test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
-    update_provider, update_provider_model_limits, update_route, update_runtime_settings,
-    update_webhook, vacuum_database,
+    event_stream, export_usage, get_guardrails_settings, get_inspector_settings,
+    get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys, list_audit_logs,
+    list_model_inventory, list_models, list_provider_model_limits, list_providers, list_routes,
+    list_usage, list_webhook_deliveries, list_webhooks, overview, preview_provider_model_sync,
+    prometheus_metrics, provider_quota, rotate_api_key, sync_provider_models, test_all_provider_keys,
+    test_all_providers, test_provider, test_provider_keys, test_webhook, update_api_key,
+    update_guardrails_settings, update_inspector_settings, update_provider,
+    update_provider_model_limits, update_route, update_runtime_settings, update_webhook,
+    vacuum_database,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -143,6 +144,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/settings/guardrails",
             get(get_guardrails_settings).put(update_guardrails_settings),
+        )
+        .route(
+            "/settings/inspector",
+            get(get_inspector_settings).put(update_inspector_settings),
         )
         .route("/webhooks", get(list_webhooks).post(create_webhook))
         .route("/webhooks/{id}", put(update_webhook).delete(delete_webhook))

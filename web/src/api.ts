@@ -444,6 +444,7 @@ export type UsageLog = {
   success: boolean
   streamed: boolean
   error_message?: string
+  request_preview?: string
   response_preview?: string
   warning_message?: string
   created_at: string
@@ -564,6 +565,11 @@ export type RuntimeSettings = {
 export type GuardrailSettings = {
   blocked_terms: string[]
   max_prompt_tokens?: number | null
+}
+
+export type InspectorSettings = {
+  capture_request_previews: boolean
+  request_preview_max_chars: number
 }
 
 export type ModelCapabilities = {

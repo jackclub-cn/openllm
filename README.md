@@ -172,6 +172,14 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 被阻止的请求会以 `400` 拒绝并写入请求日志；成功保存或清空策略会写入审计日志。将阻止词清空并取消 Token 上限即可关闭请求防护。
 
+### 请求检查
+
+控制台“设置”页或 `GET/PUT /api/settings/inspector` 可以按需开启请求内容捕获。该功能默认关闭，开启后接受路由的请求会在 `usage_logs.request_preview` 中保存一段有上限的请求体预览，并显示在“请求日志”详情抽屉中。
+
+- 捕获前会递归遮蔽 `api_key`、`authorization`、`password`、`secret`、`token`、`access_token`、`refresh_token`、`cookie` 等常见凭据字段，但提示词和工具参数仍可能包含业务敏感信息，因此只应在确有排障需求时开启。
+- 预览默认最多保留 4000 个字符，可在 256 到 65536 之间调整；超过上限的内容会被截断。
+- 预览只覆盖已经进入上游调用流程的请求。认证、权限、路由或请求防护阶段的早期拒绝不会保存请求体，避免把无效或恶意请求长期持久化。
+
 ### 协议兼容
 
 - OpenAI 与 Anthropic 请求都会在响应头返回 `x-request-id` 和 `x-openllm-request-id`，可与请求日志关联。

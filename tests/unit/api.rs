@@ -1178,6 +1178,44 @@ async fn guardrail_settings_round_trip_validate_and_invalidate_cache() {
 }
 
 #[tokio::test]
+async fn inspector_settings_round_trip_validate_and_invalidate_cache() {
+    let state = provider_key_test_state().await;
+    let Json(updated) = update_inspector_settings(
+        State(state.clone()),
+        Json(InspectorSettings {
+            capture_request_previews: true,
+            request_preview_max_chars: 8192,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(updated.capture_request_previews);
+    assert_eq!(updated.request_preview_max_chars, 8192);
+
+    let Json(loaded) = get_inspector_settings(State(state.clone())).await.unwrap();
+    assert_eq!(loaded, updated);
+
+    let error = update_inspector_settings(
+        State(state.clone()),
+        Json(InspectorSettings {
+            capture_request_previews: true,
+            request_preview_max_chars: 64,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+
+    let Json(defaults) = update_inspector_settings(
+        State(state.clone()),
+        Json(InspectorSettings::default()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(defaults, InspectorSettings::default());
+}
+
+#[tokio::test]
 async fn usage_views_expose_provider_api_key_name() {
     let state = provider_key_test_state().await;
     sqlx::query(

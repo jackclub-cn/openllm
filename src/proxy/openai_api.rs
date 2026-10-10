@@ -263,6 +263,16 @@ pub(crate) async fn proxy_openai_inner(
         started,
     )
     .await?;
+    let inspector = state.inspector_settings().await?;
+    let captured_request_preview = inspector
+        .capture_request_previews
+        .then(|| {
+            request_preview(
+                &request_json,
+                inspector.request_preview_max_chars.max(0) as usize,
+            )
+        })
+        .flatten();
     log_usage_started(
         state,
         request_id,
@@ -273,6 +283,7 @@ pub(crate) async fn proxy_openai_inner(
         &endpoint,
         request_tokens,
         streamed,
+        captured_request_preview.as_deref(),
     )
     .await;
     if let (Some(budget), true) = (budget_usd, budget_excluded_targets > 0) {

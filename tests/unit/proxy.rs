@@ -1789,6 +1789,7 @@ async fn in_flight_usage_log_is_replaced_by_final_status() {
         "/v1/chat/completions",
         10,
         false,
+        None,
     )
     .await;
     let pending: (i64, i64, i64, i64, Option<String>) = sqlx::query_as(
@@ -4376,6 +4377,7 @@ async fn usage_warning_appends_once_per_unique_message() {
         OPENAI_RESPONSES,
         10,
         false,
+        None,
     )
     .await;
     log_usage_warning(&state, "warning-test", "first warning").await;
@@ -4926,6 +4928,63 @@ fn stream_preview_is_bounded() {
         preview.chars().count() <= PREVIEW_CHAR_LIMIT,
         "preview should be capped at {PREVIEW_CHAR_LIMIT}, got {}",
         preview.chars().count()
+    );
+}
+
+#[test]
+fn request_preview_masks_common_secrets_and_respects_the_limit() {
+    let body = json!({
+        "model": "model",
+        "max_tokens": 1024,
+        "api_key": "sk-secret",
+        "metadata": {
+            "access_token": "token-secret",
+            "password": "pw-secret"
+        },
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+    let preview = request_preview(&body, 4000).unwrap();
+    assert!(preview.contains("<redacted>"));
+    assert!(!preview.contains("sk-secret"));
+    assert!(!preview.contains("token-secret"));
+    assert!(preview.contains("\"max_tokens\": 1024"));
+
+    let bounded = request_preview(&body, 32).unwrap();
+    assert_eq!(bounded.chars().count(), 32);
+}
+
+#[tokio::test]
+async fn request_preview_is_persisted_when_supplied() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+    log_usage_started(
+        &state,
+        "request-preview",
+        None,
+        None,
+        None,
+        "model",
+        "/v1/chat/completions",
+        3,
+        false,
+        Some("{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}"),
+    )
+    .await;
+
+    let preview: Option<String> =
+        sqlx::query_scalar("SELECT request_preview FROM usage_logs WHERE request_id = ?")
+            .bind("request-preview")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        preview.as_deref(),
+        Some("{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}")
     );
 }
 

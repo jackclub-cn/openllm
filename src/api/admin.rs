@@ -238,6 +238,71 @@ fn normalize_guardrail_settings(mut input: GuardrailSettings) -> AppResult<Guard
     Ok(input)
 }
 
+pub async fn get_inspector_settings(
+    State(state): State<AppState>,
+) -> AppResult<Json<InspectorSettings>> {
+    Ok(Json(state.inspector_settings().await?))
+}
+
+pub async fn update_inspector_settings(
+    State(state): State<AppState>,
+    Json(input): Json<InspectorSettings>,
+) -> AppResult<Json<InspectorSettings>> {
+    let settings = normalize_inspector_settings(input)?;
+    if settings == InspectorSettings::default() {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(SETTING_INSPECTOR)
+            .execute(&state.pool)
+            .await?;
+    } else {
+        let value = serde_json::to_string(&settings).map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize inspector settings: {error}"
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(SETTING_INSPECTOR)
+        .bind(value)
+        .execute(&state.pool)
+        .await?;
+    }
+    *state.inspector.write().await = None;
+    record_audit(
+        &state,
+        "update",
+        "settings",
+        Some(SETTING_INSPECTOR),
+        if settings.capture_request_previews {
+            "updated request inspector"
+        } else {
+            "disabled request inspector"
+        },
+        Some(json!({
+            "capture_request_previews": settings.capture_request_previews,
+            "request_preview_max_chars": settings.request_preview_max_chars,
+        })),
+    )
+    .await;
+    Ok(Json(settings))
+}
+
+fn normalize_inspector_settings(mut input: InspectorSettings) -> AppResult<InspectorSettings> {
+    const MIN_PREVIEW_CHARS: i64 = 256;
+    const MAX_PREVIEW_CHARS: i64 = 65_536;
+    if !(MIN_PREVIEW_CHARS..=MAX_PREVIEW_CHARS).contains(&input.request_preview_max_chars) {
+        return Err(AppError::BadRequest(format!(
+            "request_preview_max_chars must be between {MIN_PREVIEW_CHARS} and {MAX_PREVIEW_CHARS}"
+        )));
+    }
+    if !input.capture_request_previews {
+        input.request_preview_max_chars = InspectorSettings::default().request_preview_max_chars;
+    }
+    Ok(input)
+}
+
 pub async fn event_stream(
     State(state): State<AppState>,
     headers: HeaderMap,

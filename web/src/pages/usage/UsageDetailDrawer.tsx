@@ -185,6 +185,31 @@ export default function UsageDetailDrawer({
               <pre className="error-block">{detail.error_message}</pre>
             </div>
           )}
+          {detail.request_preview && (
+            <div>
+              <Space style={{ width: '100%', justifyContent: 'space-between' }}>
+                <Typography.Text strong>请求内容预览</Typography.Text>
+                <Button
+                  type="link"
+                  size="small"
+                  icon={<CopyOutlined />}
+                  onClick={() => {
+                    void navigator.clipboard.writeText(detail.request_preview || '')
+                    message.success('已复制')
+                  }}
+                >
+                  复制
+                </Button>
+              </Space>
+              <Alert
+                type="warning"
+                showIcon
+                message="请求体可能包含业务敏感信息，请仅在需要排查时查看。"
+                style={{ marginBottom: 8 }}
+              />
+              <pre className="response-block">{detail.request_preview}</pre>
+            </div>
+          )}
           {detail.response_preview && (
             <div>
               <Space style={{ width: '100%', justifyContent: 'space-between' }}>
