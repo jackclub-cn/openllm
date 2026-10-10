@@ -1124,6 +1124,24 @@ pub(super) async fn mark_target_success(state: &AppState, provider_id: i64, upst
         .remove(&(provider_id, upstream_model.to_string()));
 }
 
+/// Cools a target after its response stream failed mid-flight.
+///
+/// A stream that dies after the headers were sent (idle timeout, reset) is the
+/// same class of transport fault as a pre-header failure, so it takes the
+/// provider-wide path `send_provider_request` uses. The client already has a
+/// truncated answer, but without this the next request would pick the same
+/// unhealthy provider and stall again.
+pub(super) async fn mark_stream_failure(state: &AppState, target: &RouteTarget, message: &str) {
+    tracing::warn!(
+        provider = %target.provider_name,
+        model = %target.upstream_model,
+        %message,
+        "upstream stream failed before it finished; cooling the provider"
+    );
+    mark_provider_error(state, target.provider_id, None, None, target.cooldown_seconds).await;
+    mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
+}
+
 pub(super) async fn record_upstream_failure(
     state: &AppState,
     target: &RouteTarget,

@@ -591,7 +591,9 @@ pub(crate) fn openai_stream_to_anthropic(
                     chunk
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     break;
                 }
             };
@@ -702,7 +704,9 @@ pub(crate) fn responses_stream_to_anthropic(
                     chunk
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     break;
                 }
             };
@@ -988,7 +992,9 @@ pub(crate) fn passthrough_stream_response(
                     }
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     let _ = tx.send(Err(io::Error::other(error))).await;
                     break;
                 }
@@ -1087,7 +1093,9 @@ pub(crate) fn anthropic_stream_response(
                     chunk
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     break;
                 }
             };

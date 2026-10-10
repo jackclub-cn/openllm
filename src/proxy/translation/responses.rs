@@ -673,7 +673,9 @@ pub(crate) fn openai_chat_stream_to_responses(
                     chunk
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     break;
                 }
             };
@@ -786,7 +788,9 @@ pub(crate) fn anthropic_stream_to_responses(
                     chunk
                 }
                 Err(error) => {
-                    stream_error = Some(error.to_string());
+                    let message = error.to_string();
+                    mark_stream_failure(&state, &target, &message).await;
+                    stream_error = Some(message);
                     break;
                 }
             };
