@@ -3635,6 +3635,29 @@ async fn runtime_settings_expose_effective_limits() {
 }
 
 #[tokio::test]
+async fn probes_stay_reachable_when_the_request_cap_is_saturated() {
+    let mut state = provider_key_test_state().await;
+    // Zero permits: the admission cap would reject any proxied request.
+    state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
+    state.request_capacity_limit = 1;
+    let router = crate::build_router(state);
+
+    for path in ["/api/health", "/api/ready"] {
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{path} must stay reachable while the proxy cap is saturated"
+        );
+    }
+}
+
+#[tokio::test]
 async fn readiness_reports_ready_when_the_database_answers() {
     let state = provider_key_test_state().await;
     let response = ready(State(state)).await;
