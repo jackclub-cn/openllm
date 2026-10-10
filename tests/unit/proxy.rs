@@ -2614,6 +2614,298 @@ fn retries_only_transient_statuses() {
 }
 
 #[test]
+fn same_target_retry_skips_rate_limits_and_client_errors() {
+    for status in [408, 425, 500, 502, 503, 504, 529] {
+        assert!(
+            retryable_same_target_status(StatusCode::from_u16(status).unwrap()),
+            "{status} should be retried against the same target"
+        );
+    }
+    // A rate limit is handled by the cooldown/fallback machinery instead.
+    for status in [400, 401, 403, 404, 409, 422, 429] {
+        assert!(
+            !retryable_same_target_status(StatusCode::from_u16(status).unwrap()),
+            "{status} should not be retried against the same target"
+        );
+    }
+}
+
+#[test]
+fn retry_backoff_is_exponential_and_capped() {
+    let settings = crate::models::ResilienceSettings {
+        max_retries: 3,
+        retry_backoff_ms: 100,
+        retry_max_backoff_ms: 400,
+    };
+    assert_eq!(retry_backoff(&settings, 0), Duration::from_millis(100));
+    assert_eq!(retry_backoff(&settings, 1), Duration::from_millis(200));
+    assert_eq!(retry_backoff(&settings, 2), Duration::from_millis(400));
+    assert_eq!(retry_backoff(&settings, 9), Duration::from_millis(400));
+
+    let disabled = crate::models::ResilienceSettings {
+        max_retries: 0,
+        retry_backoff_ms: 0,
+        retry_max_backoff_ms: 0,
+    };
+    assert_eq!(retry_backoff(&disabled, 0), Duration::from_millis(0));
+}
+
+#[tokio::test]
+async fn transient_5xx_is_retried_on_the_same_target_before_falling_back() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({"error": {"message": "upstream overloaded"}})),
+                        )
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "chatcmpl-retry",
+                                "object": "chat.completion",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "recovered"},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 3,
+                                    "completion_tokens": 1,
+                                    "total_tokens": 4
+                                }
+                            })),
+                        )
+                            .into_response()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'flaky', 'openai', ?),
+            (2, 'never-used', 'openai', 'http://127.0.0.1:9/v1')",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'retry route', 'retry-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+            (1, 1, 'retry-model', 0),
+            (1, 2, 'retry-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Keep the retry fast so the test stays quick.
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resilience', ?)")
+        .bind(
+            json!({
+                "max_retries": 1,
+                "retry_backoff_ms": 1,
+                "retry_max_backoff_ms": 5
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "retry-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "retry-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    // The retry stayed on the first target, so no fallback was recorded.
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "0");
+    assert_eq!(response.headers()["x-openllm-routed-provider"], "flaky");
+    assert!(
+        !state.provider_cooldown.lock().await.contains_key(&1),
+        "a recovered retry must not leave the provider cooling down"
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn retries_can_be_disabled_and_then_fall_back() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let flaky_attempts = Arc::new(AtomicUsize::new(0));
+    let flaky = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let flaky_attempts = flaky_attempts.clone();
+            move || {
+                let flaky_attempts = flaky_attempts.clone();
+                async move {
+                    flaky_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        Json(json!({"error": {"message": "down"}})),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let healthy = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": "chatcmpl-fallback",
+                    "object": "chat.completion",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                })),
+            )
+                .into_response()
+        }),
+    );
+    let flaky_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flaky_address = flaky_listener.local_addr().unwrap();
+    let healthy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let healthy_address = healthy_listener.local_addr().unwrap();
+    let flaky_server = tokio::spawn(async move {
+        axum::serve(flaky_listener, flaky).await.unwrap();
+    });
+    let healthy_server = tokio::spawn(async move {
+        axum::serve(healthy_listener, healthy).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'flaky', 'openai', ?),
+            (2, 'healthy', 'openai', ?)",
+    )
+    .bind(format!("http://{flaky_address}/v1"))
+    .bind(format!("http://{healthy_address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'no-retry route', 'no-retry-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+            (1, 1, 'no-retry-model', 0),
+            (1, 2, 'no-retry-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resilience', ?)")
+        .bind(
+            json!({
+                "max_retries": 0,
+                "retry_backoff_ms": 1,
+                "retry_max_backoff_ms": 5
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "no-retry-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "no-retry-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        flaky_attempts.load(Ordering::SeqCst),
+        1,
+        "disabling retries must send exactly one request to the failing target"
+    );
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
+
+    flaky_server.abort();
+    healthy_server.abort();
+}
+
+#[test]
 fn health_ranking_prefers_known_good_then_unknown_then_failed() {
     assert_eq!(provider_health_rank(Some(1)), 0);
     assert_eq!(provider_health_rank(None), 1);
@@ -3321,16 +3613,32 @@ async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    // Disable same-target retries so this test measures the timeout path only.
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resilience', ?)")
+        .bind(
+            json!({
+                "max_retries": 0,
+                "retry_backoff_ms": 1,
+                "retry_max_backoff_ms": 5
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
     let state = AppState::new(pool, None);
     let mut target = endpoint_test_target("openai", None);
     target.provider_id = 7;
     target.base_url = format!("http://{address}");
     target.timeout_seconds = Some(1);
 
-    let request = state
-        .client
-        .post(format!("http://{address}/v1/chat/completions"));
-    assert!(send_provider_request(&state, &target, request).await.is_err());
+    let url = format!("http://{address}/v1/chat/completions");
+    assert!(
+        send_provider_request(&state, &target, || Ok(state.client.post(&url)))
+            .await
+            .is_err()
+    );
     assert!(
         state
             .target_cooldown
@@ -3339,6 +3647,39 @@ async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
             .contains_key(&(7, target.upstream_model.clone()))
     );
     assert!(state.provider_cooldown.lock().await.contains_key(&7));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn unreadable_resilience_settings_do_not_break_the_data_path() {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async { StatusCode::OK }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // No migrations: the `settings` table does not exist, which stands in for a
+    // corrupt or unavailable policy store.
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.base_url = format!("http://{address}");
+
+    let url = format!("http://{address}/v1/chat/completions");
+    let response = send_provider_request(&state, &target, || Ok(state.client.post(&url)))
+        .await
+        .expect("a settings read failure must not fail the request");
+    assert_eq!(response.status(), StatusCode::OK);
 
     server.abort();
 }

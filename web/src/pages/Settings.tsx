@@ -31,6 +31,7 @@ import {
   type DatabaseVacuumResult,
   type GuardrailSettings,
   type InspectorSettings,
+  type ResilienceSettings,
   type RuntimeSettings,
   type Settings,
 } from '../api'
@@ -52,6 +53,10 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [captureRequestPreviews, setCaptureRequestPreviews] = useState(false)
   const [requestPreviewMaxChars, setRequestPreviewMaxChars] = useState(4000)
   const [savingInspector, setSavingInspector] = useState(false)
+  const [maxRetries, setMaxRetries] = useState(1)
+  const [retryBackoffMs, setRetryBackoffMs] = useState(200)
+  const [retryMaxBackoffMs, setRetryMaxBackoffMs] = useState(2000)
+  const [savingResilience, setSavingResilience] = useState(false)
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
@@ -71,6 +76,14 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       .then((inspector) => {
         setCaptureRequestPreviews(inspector.capture_request_previews)
         setRequestPreviewMaxChars(inspector.request_preview_max_chars)
+      })
+      .catch(() => undefined)
+    api
+      .get<ResilienceSettings>('/api/settings/resilience')
+      .then((resilience) => {
+        setMaxRetries(resilience.max_retries)
+        setRetryBackoffMs(resilience.retry_backoff_ms)
+        setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
       })
       .catch(() => undefined)
   }, [])
@@ -161,6 +174,25 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setSavingInspector(false)
+    }
+  }
+
+  const saveResilience = async () => {
+    setSavingResilience(true)
+    try {
+      const resilience = await api.put<ResilienceSettings>('/api/settings/resilience', {
+        max_retries: maxRetries,
+        retry_backoff_ms: retryBackoffMs,
+        retry_max_backoff_ms: retryMaxBackoffMs,
+      })
+      setMaxRetries(resilience.max_retries)
+      setRetryBackoffMs(resilience.retry_backoff_ms)
+      setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
+      message.success('重试策略已保存')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setSavingResilience(false)
     }
   }
 
@@ -400,6 +432,64 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             onClick={() => void saveInspector()}
           >
             保存请求检查
+          </Button>
+        </Form>
+      </Card>
+      <Card
+        className="settings-retention"
+        title={<Space><SafetyCertificateOutlined />失败重试</Space>}
+        bordered={false}
+      >
+        <Form layout="vertical">
+          <Form.Item
+            label="同目标重试次数"
+            extra="连接错误、超时和可重试 5xx 会先按指数退避重试当前目标，再切换到下一个目标；0 表示关闭。"
+          >
+            <InputNumber
+              min={0}
+              max={5}
+              precision={0}
+              value={maxRetries}
+              onChange={(value) => setMaxRetries(value ?? 0)}
+              addonAfter="次"
+              style={{ width: 220 }}
+            />
+          </Form.Item>
+          <Form.Item
+            label="首次退避"
+            extra="范围 0 到 60000 毫秒，之后每次重试翻倍。"
+          >
+            <InputNumber
+              min={0}
+              max={60000}
+              precision={0}
+              value={retryBackoffMs}
+              onChange={(value) => setRetryBackoffMs(value ?? 0)}
+              addonAfter="ms"
+              style={{ width: 220 }}
+            />
+          </Form.Item>
+          <Form.Item
+            label="退避上限"
+            extra="范围 0 到 60000 毫秒，且不得小于首次退避。"
+          >
+            <InputNumber
+              min={0}
+              max={60000}
+              precision={0}
+              value={retryMaxBackoffMs}
+              onChange={(value) => setRetryMaxBackoffMs(value ?? 0)}
+              addonAfter="ms"
+              style={{ width: 220 }}
+            />
+          </Form.Item>
+          <Button
+            type="primary"
+            icon={<CheckCircleOutlined />}
+            loading={savingResilience}
+            onClick={() => void saveResilience()}
+          >
+            保存重试策略
           </Button>
         </Form>
       </Card>

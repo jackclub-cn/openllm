@@ -616,6 +616,26 @@ pub(crate) fn retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
 }
 
+/// Statuses worth one more attempt against the *same* target before the request
+/// falls back to another route target.
+///
+/// Rate limits (`429`) are deliberately excluded: the provider just refused the
+/// call, and an immediate retry would spend quota instead of letting the cooldown
+/// and fallback machinery work. `409` is excluded too because it is usually a
+/// client-side state conflict rather than a blip.
+pub(crate) fn retryable_same_target_status(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 408 | 425 | 500..=599)
+}
+
+/// A transport fault that another attempt could plausibly survive.
+///
+/// Builder errors (bad URL, unsupported scheme) are permanent, so they are not
+/// retried; connection, timeout, and body faults are.
+pub(crate) fn retryable_transport_error(error: &reqwest::Error) -> bool {
+    !error.is_builder()
+        && (error.is_connect() || error.is_timeout() || error.is_request() || error.is_body())
+}
+
 /// Detects the opaque 4xx that aggregator upstreams return when one of their
 /// internal channels fails: an "invalid request error" that carries only a
 /// trace id and no actionable `param`. These are transient routing failures, so

@@ -77,6 +77,48 @@ fn default_preview_max_chars() -> i64 {
     4000
 }
 
+/// Availability policy for transient upstream failures.
+///
+/// A transient failure (connection error, timeout, or a retryable 5xx) is
+/// first retried against the same target before the request falls back to the
+/// next route target. This keeps a single-target route serving through a blip
+/// instead of failing outright, while the bounded budget keeps a hard outage
+/// from stalling the request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ResilienceSettings {
+    /// Extra attempts against the same target. `0` disables same-target retry.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: i64,
+    /// First backoff delay; each further retry doubles it.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: i64,
+    /// Ceiling for the exponential backoff.
+    #[serde(default = "default_retry_max_backoff_ms")]
+    pub retry_max_backoff_ms: i64,
+}
+
+fn default_max_retries() -> i64 {
+    1
+}
+
+fn default_retry_backoff_ms() -> i64 {
+    200
+}
+
+fn default_retry_max_backoff_ms() -> i64 {
+    2_000
+}
+
+impl Default for ResilienceSettings {
+    fn default() -> Self {
+        Self {
+            max_retries: default_max_retries(),
+            retry_backoff_ms: default_retry_backoff_ms(),
+            retry_max_backoff_ms: default_retry_max_backoff_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AdminTokenQuery {
     pub admin_token: Option<String>,

@@ -1313,6 +1313,68 @@ async fn inspector_settings_round_trip_validate_and_invalidate_cache() {
 }
 
 #[tokio::test]
+async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
+    let state = provider_key_test_state().await;
+    assert_eq!(
+        state.resilience_settings().await.unwrap(),
+        ResilienceSettings::default()
+    );
+
+    let Json(updated) = update_resilience_settings(
+        State(state.clone()),
+        Json(ResilienceSettings {
+            max_retries: 3,
+            retry_backoff_ms: 250,
+            retry_max_backoff_ms: 4_000,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.max_retries, 3);
+    // The stale cache must be invalidated so the new policy takes effect.
+    assert_eq!(state.resilience_settings().await.unwrap(), updated);
+    let Json(loaded) = get_resilience_settings(State(state.clone())).await.unwrap();
+    assert_eq!(loaded, updated);
+
+    let too_many = update_resilience_settings(
+        State(state.clone()),
+        Json(ResilienceSettings {
+            max_retries: 9,
+            ..ResilienceSettings::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(too_many, AppError::BadRequest(_)));
+
+    let inverted = update_resilience_settings(
+        State(state.clone()),
+        Json(ResilienceSettings {
+            max_retries: 2,
+            retry_backoff_ms: 5_000,
+            retry_max_backoff_ms: 100,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(inverted, AppError::BadRequest(_)));
+
+    // Disabling retries falls back to the default backoff values and clears the
+    // stored row so a fresh start uses defaults.
+    let Json(cleared) =
+        update_resilience_settings(State(state.clone()), Json(ResilienceSettings::default()))
+            .await
+            .unwrap();
+    assert_eq!(cleared, ResilienceSettings::default());
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'resilience'")
+            .fetch_optional(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, None);
+}
+
+#[tokio::test]
 async fn api_key_routing_policy_round_trips_and_validates() {
     let state = provider_key_test_state().await;
     let (_, Json(created)) = create_api_key(

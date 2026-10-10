@@ -303,6 +303,89 @@ fn normalize_inspector_settings(mut input: InspectorSettings) -> AppResult<Inspe
     Ok(input)
 }
 
+pub async fn get_resilience_settings(
+    State(state): State<AppState>,
+) -> AppResult<Json<ResilienceSettings>> {
+    Ok(Json(state.resilience_settings().await?))
+}
+
+pub async fn update_resilience_settings(
+    State(state): State<AppState>,
+    Json(input): Json<ResilienceSettings>,
+) -> AppResult<Json<ResilienceSettings>> {
+    let settings = normalize_resilience_settings(input)?;
+    if settings == ResilienceSettings::default() {
+        sqlx::query("DELETE FROM settings WHERE key = ?")
+            .bind(SETTING_RESILIENCE)
+            .execute(&state.pool)
+            .await?;
+    } else {
+        let value = serde_json::to_string(&settings).map_err(|error| {
+            AppError::Internal(anyhow::anyhow!(
+                "failed to serialize resilience settings: {error}"
+            ))
+        })?;
+        sqlx::query(
+            "INSERT INTO settings (key, value) VALUES (?, ?) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(SETTING_RESILIENCE)
+        .bind(value)
+        .execute(&state.pool)
+        .await?;
+    }
+    *state.resilience.write().await = None;
+    record_audit(
+        &state,
+        "update",
+        "settings",
+        Some(SETTING_RESILIENCE),
+        if settings.max_retries == 0 {
+            "disabled same-target retries"
+        } else {
+            "updated same-target retry policy"
+        },
+        Some(json!({
+            "max_retries": settings.max_retries,
+            "retry_backoff_ms": settings.retry_backoff_ms,
+            "retry_max_backoff_ms": settings.retry_max_backoff_ms,
+        })),
+    )
+    .await;
+    Ok(Json(settings))
+}
+
+fn normalize_resilience_settings(mut input: ResilienceSettings) -> AppResult<ResilienceSettings> {
+    const MAX_RETRIES: i64 = 5;
+    const MAX_BACKOFF_MS: i64 = 60_000;
+    if !(0..=MAX_RETRIES).contains(&input.max_retries) {
+        return Err(AppError::BadRequest(format!(
+            "max_retries must be between 0 and {MAX_RETRIES}"
+        )));
+    }
+    if !(0..=MAX_BACKOFF_MS).contains(&input.retry_backoff_ms) {
+        return Err(AppError::BadRequest(format!(
+            "retry_backoff_ms must be between 0 and {MAX_BACKOFF_MS}"
+        )));
+    }
+    if !(0..=MAX_BACKOFF_MS).contains(&input.retry_max_backoff_ms) {
+        return Err(AppError::BadRequest(format!(
+            "retry_max_backoff_ms must be between 0 and {MAX_BACKOFF_MS}"
+        )));
+    }
+    if input.retry_max_backoff_ms < input.retry_backoff_ms {
+        return Err(AppError::BadRequest(
+            "retry_max_backoff_ms must not be smaller than retry_backoff_ms".to_string(),
+        ));
+    }
+    if input.max_retries == 0 {
+        let defaults = ResilienceSettings::default();
+        input.retry_backoff_ms = defaults.retry_backoff_ms;
+        input.retry_max_backoff_ms = defaults.retry_max_backoff_ms;
+    }
+    Ok(input)
+}
+
 pub async fn event_stream(
     State(state): State<AppState>,
     headers: HeaderMap,

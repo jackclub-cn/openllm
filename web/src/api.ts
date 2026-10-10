@@ -587,6 +587,12 @@ export type InspectorSettings = {
   request_preview_max_chars: number
 }
 
+export type ResilienceSettings = {
+  max_retries: number
+  retry_backoff_ms: number
+  retry_max_backoff_ms: number
+}
+
 export type ModelCapabilities = {
   context_limit?: number
   output_limit?: number

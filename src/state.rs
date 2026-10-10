@@ -7,10 +7,11 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 
 use crate::error::AppResult;
-use crate::models::{GuardrailSettings, InspectorSettings};
+use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings};
 
 pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
 pub(crate) const SETTING_INSPECTOR: &str = "inspector";
+pub(crate) const SETTING_RESILIENCE: &str = "resilience";
 
 #[derive(Clone)]
 pub struct AppState {
@@ -46,6 +47,9 @@ pub struct AppState {
     /// Cached request-inspector policy. `None` means it must be re-read from
     /// SQLite after a settings update or the first request.
     pub inspector: Arc<RwLock<Option<InspectorSettings>>>,
+    /// Cached transient-failure retry policy. `None` means it must be re-read
+    /// from SQLite after a settings update or the first request.
+    pub resilience: Arc<RwLock<Option<ResilienceSettings>>>,
     /// Throttles `last_used_at` writes so the hot request path does not take a
     /// SQLite write lock on every single call.
     pub key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
@@ -155,6 +159,7 @@ impl AppState {
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),
             inspector: Arc::new(RwLock::new(None)),
+            resilience: Arc::new(RwLock::new(None)),
             key_touched: Arc::new(Mutex::new(HashMap::new())),
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
@@ -222,6 +227,33 @@ impl AppState {
             })
             .unwrap_or_default();
         *self.inspector.write().await = Some(settings.clone());
+        Ok(settings)
+    }
+
+    /// Returns the cached same-target retry policy, loading it from SQLite on
+    /// first use or after a settings update invalidates the cache.
+    pub async fn resilience_settings(&self) -> AppResult<ResilienceSettings> {
+        if let Some(settings) = self.resilience.read().await.clone() {
+            return Ok(settings);
+        }
+
+        let raw = sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
+            .bind(SETTING_RESILIENCE)
+            .fetch_optional(&self.pool)
+            .await?;
+        let settings = raw
+            .as_deref()
+            .and_then(
+                |raw| match serde_json::from_str::<ResilienceSettings>(raw) {
+                    Ok(settings) => Some(settings),
+                    Err(error) => {
+                        tracing::warn!(%error, "ignoring invalid resilience settings");
+                        None
+                    }
+                },
+            )
+            .unwrap_or_default();
+        *self.resilience.write().await = Some(settings.clone());
         Ok(settings)
     }
 }

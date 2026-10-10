@@ -954,6 +954,17 @@ pub(super) fn bounded_retry_after(duration: Duration, max: Duration) -> Option<D
     (!duration.is_zero()).then(|| duration.min(max))
 }
 
+/// Exponential backoff for a same-target retry, capped by the operator setting.
+pub(super) fn retry_backoff(
+    settings: &crate::models::ResilienceSettings,
+    retry_index: u32,
+) -> Duration {
+    let base = settings.retry_backoff_ms.max(0) as u64;
+    let cap = settings.retry_max_backoff_ms.max(0) as u64;
+    let multiplier = 1u64 << retry_index.min(6);
+    Duration::from_millis(base.saturating_mul(multiplier).min(cap))
+}
+
 pub(super) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> {
     if let Some(value) = headers
         .get("retry-after-ms")
@@ -1173,35 +1184,74 @@ pub(super) enum UpstreamAttempt {
     },
 }
 
+/// Reads the retry policy for the data path.
+///
+/// A broken or missing settings row must never take inference down, so a read
+/// failure degrades to the built-in defaults with a warning instead of
+/// propagating.
+async fn resilience_policy(state: &AppState) -> crate::models::ResilienceSettings {
+    match state.resilience_settings().await {
+        Ok(settings) => settings,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load resilience settings; using defaults");
+            crate::models::ResilienceSettings::default()
+        }
+    }
+}
+
 pub(super) async fn send_provider_request(
     state: &AppState,
     target: &RouteTarget,
-    request: RequestBuilder,
+    build: impl Fn() -> AppResult<RequestBuilder>,
 ) -> AppResult<reqwest::Response> {
-    // A provider may cap how long one call may take; without an override the
-    // shared client's idle timeout applies.
-    let request = match target.timeout_seconds {
-        Some(seconds) if seconds > 0 => {
-            request.timeout(Duration::from_secs(seconds.unsigned_abs()))
-        }
-        _ => request,
-    };
-    match request.send().await {
-        Ok(response) => Ok(response),
-        Err(error) => {
-            mark_provider_error(
-                state,
-                target.provider_id,
-                None,
-                None,
-                target.cooldown_seconds,
-            )
-            .await;
-            mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
-            Err(AppError::Upstream(format!(
-                "{} request failed: {error}",
-                target.provider_name
-            )))
+    let resilience = resilience_policy(state).await;
+    let mut retries_left = resilience.max_retries.clamp(0, MAX_SAME_TARGET_RETRIES) as u32;
+    let mut retries_used = 0u32;
+
+    loop {
+        // A provider may cap how long one call may take; without an override the
+        // shared client's idle timeout applies.
+        let request = build()?;
+        let request = match target.timeout_seconds {
+            Some(seconds) if seconds > 0 => {
+                request.timeout(Duration::from_secs(seconds.unsigned_abs()))
+            }
+            _ => request,
+        };
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            Err(error) => {
+                // Transport faults are worth one more attempt: a reset socket or
+                // a slow upstream often recovers without the caller noticing.
+                if retries_left > 0 && retryable_transport_error(&error) {
+                    retries_left -= 1;
+                    let delay = retry_backoff(&resilience, retries_used);
+                    retries_used += 1;
+                    tracing::warn!(
+                        provider = %target.provider_name,
+                        model = %target.upstream_model,
+                        retry = retries_used,
+                        delay_ms = delay.as_millis() as u64,
+                        %error,
+                        "upstream transport error; retrying the same target"
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                mark_provider_error(
+                    state,
+                    target.provider_id,
+                    None,
+                    None,
+                    target.cooldown_seconds,
+                )
+                .await;
+                mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
+                return Err(AppError::Upstream(format!(
+                    "{} request failed: {error}",
+                    target.provider_name
+                )));
+            }
         }
     }
 }
@@ -1281,7 +1331,11 @@ pub(super) async fn send_provider_request_with_compat_retry<F>(
 where
     F: Fn(&Value) -> AppResult<RequestBuilder>,
 {
-    let mut response = send_provider_request(state, target, build(body)?).await?;
+    let resilience = resilience_policy(state).await;
+    let mut retries_left = resilience.max_retries.clamp(0, MAX_SAME_TARGET_RETRIES) as u32;
+    let mut retries_used = 0u32;
+
+    let mut response = send_provider_request(state, target, || build(body)).await?;
     let mut transient_retry_used = false;
 
     loop {
@@ -1294,6 +1348,27 @@ where
             .bytes()
             .await
             .map_err(|error| AppError::Upstream(error.to_string()))?;
+
+        // One bounded retry against the same target turns a momentary 5xx into
+        // a served request instead of a fallback or a client-visible failure.
+        if retries_left > 0 && retryable_same_target_status(status) {
+            retries_left -= 1;
+            let delay = retry_backoff(&resilience, retries_used);
+            retries_used += 1;
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                endpoint,
+                %status,
+                retry = retries_used,
+                delay_ms = delay.as_millis() as u64,
+                "upstream returned a transient status; retrying the same target"
+            );
+            tokio::time::sleep(delay).await;
+            response = send_provider_request(state, target, || build(body)).await?;
+            continue;
+        }
 
         if !transient_retry_used && transient_upstream_4xx(status, &response_body) {
             transient_retry_used = true;
@@ -1309,7 +1384,7 @@ where
                 has_tool_search = strip_tool_search_tools(body).is_some(),
                 "upstream returned an opaque 4xx; retrying once"
             );
-            response = send_provider_request(state, target, build(body)?).await?;
+            response = send_provider_request(state, target, || build(body)).await?;
             continue;
         }
 
@@ -1328,7 +1403,7 @@ where
             );
             mark_provider_tool_search_unsupported(state, target.provider_id).await;
             *body = compat_body;
-            response = send_provider_request(state, target, build(body)?).await?;
+            response = send_provider_request(state, target, || build(body)).await?;
             continue;
         }
 
