@@ -84,6 +84,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         crate::webhooks::run_dispatcher(webhook_state).await;
     });
 
+    let limits = state.runtime_limits();
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind)
         .await
@@ -92,6 +93,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         address = %config.bind,
         console = %format!("http://{}", config.bind),
+        upstream_idle_timeout_secs = limits.upstream_idle_timeout_secs,
+        shutdown_grace_secs = limits.shutdown_grace_secs,
+        max_request_body_mib = %limits.max_request_body_mib,
+        max_upstream_body_mib = %limits.max_upstream_body_mib,
+        sse_keepalive_secs = ?limits.sse_keepalive_secs,
+        max_concurrent_requests = %limits.max_concurrent_requests,
         "OpenLLM Gateway started"
     );
 

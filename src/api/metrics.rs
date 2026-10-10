@@ -258,6 +258,28 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_start_time_seconds",
+        "Unix timestamp when the process started",
+    );
+    push_metric(
+        &mut body,
+        "openllm_start_time_seconds",
+        &[],
+        state.started_unix,
+    );
+    metric_header(
+        &mut body,
+        "openllm_uptime_seconds",
+        "Seconds since the process started",
+    );
+    push_metric(
+        &mut body,
+        "openllm_uptime_seconds",
+        &[],
+        state.started_at.elapsed().as_secs() as i64,
+    );
+    metric_header(
+        &mut body,
         "openllm_requests_total",
         "Completed requests retained by the gateway",
     );

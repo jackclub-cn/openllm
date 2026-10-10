@@ -48,6 +48,10 @@ pub struct AppState {
     pub request_capacity_limit: usize,
     /// Requests refused by the global admission cap since startup.
     pub requests_shed: Arc<AtomicU64>,
+    /// Wall-clock instant the process state was created, for uptime.
+    pub started_at: Instant,
+    /// Unix timestamp at startup, for the Prometheus start-time gauge.
+    pub started_unix: i64,
     pub events: broadcast::Sender<UsageEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
@@ -255,6 +259,11 @@ impl AppState {
             request_capacity,
             request_capacity_limit,
             requests_shed: Arc::new(AtomicU64::new(0)),
+            started_at: Instant::now(),
+            started_unix: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_secs() as i64)
+                .unwrap_or(0),
             events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),

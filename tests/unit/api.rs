@@ -152,6 +152,8 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     let body = String::from_utf8(body.to_vec()).unwrap();
     assert!(body.contains("# TYPE openllm_requests_total counter"));
     assert!(body.contains("# TYPE openllm_requests_in_flight gauge"));
+    assert!(body.contains("# TYPE openllm_uptime_seconds gauge"));
+    assert!(body.contains("# TYPE openllm_start_time_seconds gauge"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(
