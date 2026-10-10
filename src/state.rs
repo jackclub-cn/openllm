@@ -39,6 +39,12 @@ pub struct AppState {
     pub provider_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     /// Shared semaphores enforcing each provider model's concurrency cap.
     pub model_concurrency: Arc<Mutex<HashMap<(i64, String), Arc<Semaphore>>>>,
+    /// Optional global cap on concurrent proxied requests. Enforced at
+    /// admission so a burst of streams cannot exhaust memory before the
+    /// per-provider and per-key limits get a chance to shed load.
+    pub request_capacity: Option<Arc<Semaphore>>,
+    /// Configured global request cap, `0` when disabled. Kept for metrics.
+    pub request_capacity_limit: usize,
     pub events: broadcast::Sender<UsageEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
@@ -129,6 +135,16 @@ pub(crate) fn parse_keepalive_secs(value: Option<&str>) -> Option<Duration> {
     }
 }
 
+/// Parses an operator-provided global concurrency cap.
+///
+/// Empty, zero, and unparsable values all disable the cap, matching the
+/// opt-in default: no admission limit unless an operator asks for one.
+pub(crate) fn parse_concurrency_limit(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+}
+
 fn parse_positive(value: Option<&str>) -> Option<u64> {
     value
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -169,6 +185,14 @@ impl AppState {
             .expect("failed to build HTTP client");
 
         let (events, _) = broadcast::channel(128);
+        let request_capacity_limit = parse_concurrency_limit(
+            std::env::var("OPENLLM_MAX_CONCURRENT_REQUESTS")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or(0);
+        let request_capacity = (request_capacity_limit > 0)
+            .then(|| Arc::new(Semaphore::new(request_capacity_limit)));
 
         Self {
             pool,
@@ -184,6 +208,8 @@ impl AppState {
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
             provider_concurrency: Arc::new(Mutex::new(HashMap::new())),
             model_concurrency: Arc::new(Mutex::new(HashMap::new())),
+            request_capacity,
+            request_capacity_limit,
             events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),

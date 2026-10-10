@@ -869,6 +869,57 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         })
 }
 
+/// Keeps a global admission permit alive until the outbound body completes.
+///
+/// Error responses finish immediately, so this is a no-op for anything that is
+/// not a stream: the permit simply drops when the body is consumed.
+pub(crate) fn attach_request_capacity(
+    response: Response,
+    permit: Option<OwnedSemaphorePermit>,
+) -> Response {
+    let Some(permit) = permit else {
+        return response;
+    };
+    let (parts, body) = response.into_parts();
+    let mut stream = body.into_data_stream();
+    let guarded = async_stream::stream! {
+        let _permit = permit;
+        while let Some(chunk) = stream.next().await {
+            yield chunk;
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(guarded))
+}
+
+/// Builds the `429` returned when the global request cap is saturated.
+///
+/// `anthropic` selects the Anthropic error envelope so each client family can
+/// parse the refusal with its usual error handling.
+pub(crate) fn overloaded_response(limit: usize, anthropic: bool) -> Response {
+    const RETRY_AFTER_SECS: u64 = 5;
+    let message = format!(
+        "gateway is at its concurrency limit ({limit}); retry after {RETRY_AFTER_SECS}s"
+    );
+    let body = if anthropic {
+        anthropic_error_body("overloaded_error", &message)
+    } else {
+        json!({"error": {"message": message, "type": "rate_limit_error", "code": 429}})
+    };
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, Json(body)).into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&RETRY_AFTER_SECS.to_string()) {
+        headers.insert(reqwest::header::RETRY_AFTER, value);
+    }
+    if let Ok(value) = HeaderValue::from_str(&limit.to_string()) {
+        headers.insert(HeaderName::from_static("x-ratelimit-limit"), value);
+    }
+    headers.insert(
+        HeaderName::from_static("x-ratelimit-remaining"),
+        HeaderValue::from_static("0"),
+    );
+    response
+}
+
 pub(crate) fn join_upstream_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     let path = format!("/{}", path.trim_start_matches('/'));

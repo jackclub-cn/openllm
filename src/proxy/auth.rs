@@ -1,5 +1,30 @@
 use super::*;
 
+/// Outcome of the global admission check.
+pub(crate) enum RequestCapacity {
+    /// No global cap is configured.
+    Disabled,
+    /// A slot was taken; the permit must outlive the response body.
+    Acquired(OwnedSemaphorePermit),
+    /// The global cap is saturated.
+    Overloaded,
+}
+
+/// Reserves a slot against the optional global request cap.
+///
+/// The check is non-blocking on purpose: once the cap is reached the gateway
+/// is already under strain, so the request is shed with a `429` instead of
+/// queueing behind an unbounded backlog.
+pub(crate) fn acquire_request_capacity(state: &AppState) -> RequestCapacity {
+    let Some(semaphore) = &state.request_capacity else {
+        return RequestCapacity::Disabled;
+    };
+    match semaphore.clone().try_acquire_owned() {
+        Ok(permit) => RequestCapacity::Acquired(permit),
+        Err(_) => RequestCapacity::Overloaded,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn selected_console_api_key(
     state: &AppState,

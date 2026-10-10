@@ -292,6 +292,33 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     push_metric(&mut body, "openllm_requests_in_flight", &[], in_flight);
     metric_header(
         &mut body,
+        "openllm_request_capacity_limit",
+        "Configured global concurrent request cap; zero means unlimited",
+    );
+    push_metric(
+        &mut body,
+        "openllm_request_capacity_limit",
+        &[],
+        state.request_capacity_limit as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_request_capacity_available",
+        "Global admission slots still free; zero when capped or unlimited",
+    );
+    let available = state
+        .request_capacity
+        .as_ref()
+        .map(|semaphore| semaphore.available_permits() as i64)
+        .unwrap_or(0);
+    push_metric(
+        &mut body,
+        "openllm_request_capacity_available",
+        &[],
+        available,
+    );
+    metric_header(
+        &mut body,
         "openllm_tokens_total",
         "Retained token counts by type",
     );

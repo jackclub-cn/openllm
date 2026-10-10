@@ -59,12 +59,21 @@ pub(crate) async fn proxy_openai(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let capacity = acquire_request_capacity(&state);
+    if let RequestCapacity::Overloaded = &capacity {
+        let response = overloaded_response(state.request_capacity_limit, false);
+        return with_gateway_request_id(response, &request_id);
+    }
     let result = proxy_openai_inner(&state, &headers, &uri, &body, &request_id, None).await;
     let response = match result {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
-    with_gateway_request_id(response, &request_id)
+    let permit = match capacity {
+        RequestCapacity::Acquired(permit) => Some(permit),
+        _ => None,
+    };
+    with_gateway_request_id(attach_request_capacity(response, permit), &request_id)
 }
 
 pub(crate) async fn proxy_openai_console(
@@ -73,12 +82,21 @@ pub(crate) async fn proxy_openai_console(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let capacity = acquire_request_capacity(&state);
+    if let RequestCapacity::Overloaded = &capacity {
+        let response = overloaded_response(state.request_capacity_limit, false);
+        return with_gateway_request_id(response, &request_id);
+    }
     let result = proxy_openai_console_inner(&state, &headers, &body, &request_id).await;
     let response = match result {
         Ok(response) => response,
         Err(error) => error.into_response(),
     };
-    with_gateway_request_id(response, &request_id)
+    let permit = match capacity {
+        RequestCapacity::Acquired(permit) => Some(permit),
+        _ => None,
+    };
+    with_gateway_request_id(attach_request_capacity(response, permit), &request_id)
 }
 
 pub(crate) async fn proxy_openai_console_inner(

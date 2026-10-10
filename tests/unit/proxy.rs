@@ -7716,7 +7716,7 @@ fn upstream_rate_limit_errors_keep_status_and_retry_after() {
 fn gateway_tuning_env_parsers_fall_back_safely() {
     use crate::state::{
         DEFAULT_MAX_BODY_MIB, DEFAULT_SSE_KEEPALIVE_SECS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS,
-        parse_keepalive_secs, parse_max_body_mib, parse_positive_secs,
+        parse_concurrency_limit, parse_keepalive_secs, parse_max_body_mib, parse_positive_secs,
     };
 
     // Missing, empty, unparsable, and non-positive values keep the default so a
@@ -7753,6 +7753,15 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
     );
     assert_eq!(parse_keepalive_secs(Some("0")), None);
     assert_eq!(parse_keepalive_secs(Some(" 5 ")), Some(Duration::from_secs(5)));
+
+    // The global cap is opt-in: only a positive integer turns it on.
+    assert_eq!(parse_concurrency_limit(None), None);
+    assert_eq!(parse_concurrency_limit(Some("")), None);
+    assert_eq!(parse_concurrency_limit(Some("  ")), None);
+    assert_eq!(parse_concurrency_limit(Some("0")), None);
+    assert_eq!(parse_concurrency_limit(Some("-3")), None);
+    assert_eq!(parse_concurrency_limit(Some("many")), None);
+    assert_eq!(parse_concurrency_limit(Some(" 12 ")), Some(12));
 }
 
 #[tokio::test]
@@ -7822,6 +7831,173 @@ async fn all_rate_limited_targets_surface_429_to_the_client() {
         "30"
     );
     assert!(response.headers().get("x-openllm-request-id").is_some());
+
+    server.abort();
+}
+
+#[test]
+fn overloaded_response_is_a_retryable_429_with_limit_headers() {
+    let response = overloaded_response(4, false);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        "5"
+    );
+    assert_eq!(response.headers().get("x-ratelimit-limit").unwrap(), "4");
+    assert_eq!(response.headers().get("x-ratelimit-remaining").unwrap(), "0");
+}
+
+#[tokio::test]
+async fn overloaded_response_uses_the_anthropic_envelope_when_asked() {
+    let response = overloaded_response(2, true);
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "overloaded_error");
+    assert!(
+        value["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("concurrency limit")
+    );
+}
+
+#[tokio::test]
+async fn request_capacity_slot_is_held_until_the_body_completes() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    state.request_capacity = Some(semaphore.clone());
+    state.request_capacity_limit = 1;
+
+    let RequestCapacity::Acquired(permit) = acquire_request_capacity(&state) else {
+        panic!("the first request must take the only slot");
+    };
+    assert_eq!(semaphore.available_permits(), 0);
+    assert!(matches!(
+        acquire_request_capacity(&state),
+        RequestCapacity::Overloaded
+    ));
+
+    // Attaching moves the permit into the response body so a stream keeps the
+    // slot for its whole lifetime, not just until the headers are returned.
+    let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+    let response = Response::new(Body::from_stream(stream));
+    let response = attach_request_capacity(response, Some(permit));
+    assert_eq!(
+        semaphore.available_permits(),
+        0,
+        "a live body must keep holding the slot"
+    );
+
+    // Completing (here, dropping) the body releases the slot for the next call.
+    drop(response);
+    assert_eq!(semaphore.available_permits(), 1);
+    assert!(matches!(
+        acquire_request_capacity(&state),
+        RequestCapacity::Acquired(_)
+    ));
+}
+
+#[tokio::test]
+async fn global_request_cap_sheds_excess_streams_with_429() {
+    // Upstream that opens an SSE stream and then stays silent, so the caller
+    // holds the slot for as long as it keeps the response body.
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post(|| async {
+            let stream = futures_util::stream::once(async {
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n",
+                ))
+            })
+            .chain(futures_util::stream::pending());
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, model_prefix, enabled)
+             VALUES (1, 'streamer', 'openai', ?, '', 1)",
+    )
+    .bind(format!("http://{address}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled)
+             VALUES (1, 'stream-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let mut state = AppState::new(pool, None);
+    state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
+    state.request_capacity_limit = 1;
+
+    let uri: Uri = OPENAI_CHAT_COMPLETIONS.parse().unwrap();
+    let body = Bytes::from(
+        json!({
+            "model": "stream-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+
+    let first = proxy_openai(
+        State(state.clone()),
+        HeaderMap::new(),
+        uri.clone(),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(first.status(), StatusCode::OK, "the first request is admitted");
+
+    let second = proxy_openai(
+        State(state.clone()),
+        HeaderMap::new(),
+        uri.clone(),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(
+        second.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second stream while the first holds the slot must be shed"
+    );
+    assert_eq!(
+        second.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        "5"
+    );
+
+    // Releasing the first body frees the slot for the next request.
+    drop(first);
+    let third = proxy_openai(State(state.clone()), HeaderMap::new(), uri, body).await;
+    assert_eq!(third.status(), StatusCode::OK);
 
     server.abort();
 }

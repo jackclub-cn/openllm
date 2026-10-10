@@ -62,11 +62,20 @@ pub(crate) async fn proxy_anthropic(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
+    let capacity = acquire_request_capacity(&state);
+    if let RequestCapacity::Overloaded = &capacity {
+        let response = overloaded_response(state.request_capacity_limit, true);
+        return with_gateway_request_id(response, &request_id);
+    }
     let response = match proxy_anthropic_inner(&state, &headers, &uri, &body, &request_id).await {
         Ok(response) => response,
         Err(error) => anthropic_error_response(error),
     };
-    with_gateway_request_id(response, &request_id)
+    let permit = match capacity {
+        RequestCapacity::Acquired(permit) => Some(permit),
+        _ => None,
+    };
+    with_gateway_request_id(attach_request_capacity(response, permit), &request_id)
 }
 
 /// Renders a gateway error in Anthropic's envelope and status vocabulary so an
