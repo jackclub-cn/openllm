@@ -21,11 +21,13 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api::{
-    admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
+    admin_auth, backup_database, cleanup_usage, clear_cooldowns, create_api_key, create_provider,
+    create_route,
     create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
     event_stream, export_usage, get_guardrails_settings, get_inspector_settings,
     get_resilience_settings, get_runtime_settings, get_settings, get_usage_detail, health,
-    list_api_keys, list_audit_logs, list_model_inventory, list_models, list_provider_model_limits,
+    list_api_keys, list_audit_logs, list_cooldowns, list_model_inventory, list_models,
+    list_provider_model_limits,
     list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
     preview_provider_model_sync, prometheus_metrics, provider_quota, rotate_api_key,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
@@ -125,6 +127,11 @@ pub fn build_router(state: AppState) -> Router {
             get(list_provider_model_limits).put(update_provider_model_limits),
         )
         .route("/providers/{id}/quota", get(provider_quota))
+        .route("/resilience/cooldowns", get(list_cooldowns))
+        .route(
+            "/resilience/cooldowns/clear",
+            post(clear_cooldowns),
+        )
         .route("/model-inventory", get(list_model_inventory))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/diagnose", post(diagnose_route))

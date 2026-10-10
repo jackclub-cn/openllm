@@ -1375,6 +1375,149 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
 }
 
 #[tokio::test]
+async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'alpha', 'openai', 'https://alpha.example/v1'),
+            (2, 'beta', 'openai', 'https://beta.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret) \
+         VALUES (11, 1, 'main', 'sk-main')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let now = std::time::Instant::now();
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, now + std::time::Duration::from_secs(60));
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state.target_cooldown.lock().await.insert(
+        (1, "model-a".to_string()),
+        now + std::time::Duration::from_secs(30),
+    );
+    state.target_cooldown.lock().await.insert(
+        (2, "model-b".to_string()),
+        now + std::time::Duration::from_secs(30),
+    );
+    state
+        .provider_key_cooldown
+        .lock()
+        .await
+        .insert(11, now + std::time::Duration::from_secs(45));
+    // An already-expired entry must not leak into the snapshot.
+    state.target_cooldown.lock().await.insert(
+        (2, "stale".to_string()),
+        now - std::time::Duration::from_secs(5),
+    );
+
+    let Json(snapshot) = list_cooldowns(State(state.clone())).await.unwrap();
+    assert_eq!(snapshot.provider_cooldowns.len(), 1);
+    assert_eq!(
+        snapshot.provider_cooldowns[0].provider_name.as_deref(),
+        Some("alpha")
+    );
+    assert_eq!(snapshot.provider_cooldowns[0].failure_streak, 3);
+    assert_eq!(snapshot.provider_cooldowns[0].remaining_seconds, 60);
+    assert_eq!(snapshot.model_cooldowns.len(), 2);
+    assert_eq!(snapshot.provider_key_cooldowns.len(), 1);
+    assert_eq!(
+        snapshot.provider_key_cooldowns[0].key_name.as_deref(),
+        Some("main")
+    );
+    assert_eq!(
+        snapshot.provider_key_cooldowns[0].provider_name.as_deref(),
+        Some("alpha")
+    );
+
+    // An empty body is rejected rather than silently clearing everything.
+    let error = clear_cooldowns(
+        State(state.clone()),
+        Json(ClearCooldownsInput::default()),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+
+    // Clearing one model leaves the sibling model and the provider circuit alone.
+    let Json(cleared) = clear_cooldowns(
+        State(state.clone()),
+        Json(ClearCooldownsInput {
+            provider_id: Some(1),
+            model: Some("model-a".to_string()),
+            ..ClearCooldownsInput::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.cleared_model_cooldowns, 1);
+    assert_eq!(cleared.cleared_provider_cooldowns, 0);
+    assert!(
+        !state
+            .target_cooldown
+            .lock()
+            .await
+            .contains_key(&(1, "model-a".to_string()))
+    );
+    assert!(state.provider_cooldown.lock().await.contains_key(&1));
+
+    // A provider-scoped clear also resets the escalation streak.
+    let Json(cleared) = clear_cooldowns(
+        State(state.clone()),
+        Json(ClearCooldownsInput {
+            provider_id: Some(1),
+            ..ClearCooldownsInput::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.cleared_provider_cooldowns, 1);
+    assert!(!state.provider_cooldown.lock().await.contains_key(&1));
+    assert!(!state.provider_failure_streak.lock().await.contains_key(&1));
+
+    let Json(cleared) = clear_cooldowns(
+        State(state.clone()),
+        Json(ClearCooldownsInput {
+            provider_key_id: Some(11),
+            ..ClearCooldownsInput::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.cleared_provider_key_cooldowns, 1);
+    assert!(!state.provider_key_cooldown.lock().await.contains_key(&11));
+
+    let Json(cleared) = clear_cooldowns(
+        State(state.clone()),
+        Json(ClearCooldownsInput {
+            all: true,
+            ..ClearCooldownsInput::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(cleared.cleared_model_cooldowns, 1);
+    let Json(snapshot) = list_cooldowns(State(state.clone())).await.unwrap();
+    assert!(snapshot.model_cooldowns.is_empty());
+    assert!(snapshot.provider_cooldowns.is_empty());
+    assert!(snapshot.provider_key_cooldowns.is_empty());
+}
+
+#[tokio::test]
 async fn api_key_routing_policy_round_trips_and_validates() {
     let state = provider_key_test_state().await;
     let (_, Json(created)) = create_api_key(

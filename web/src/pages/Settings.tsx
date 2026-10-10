@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import {
+  ClearOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
   CompressOutlined,
   DatabaseOutlined,
   DownloadOutlined,
   FileSearchOutlined,
+  ReloadOutlined,
   SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import {
@@ -20,6 +22,7 @@ import {
   Popconfirm,
   Space,
   Switch,
+  Table,
   Tag,
   Tooltip,
   Typography,
@@ -29,6 +32,8 @@ import {
   formatError,
   getAdminToken,
   type DatabaseVacuumResult,
+  type ClearCooldownsResult,
+  type CooldownSnapshot,
   type GuardrailSettings,
   type InspectorSettings,
   type ResilienceSettings,
@@ -57,6 +62,18 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [retryBackoffMs, setRetryBackoffMs] = useState(200)
   const [retryMaxBackoffMs, setRetryMaxBackoffMs] = useState(2000)
   const [savingResilience, setSavingResilience] = useState(false)
+  const [cooldowns, setCooldowns] = useState<CooldownSnapshot>()
+  const [loadingCooldowns, setLoadingCooldowns] = useState(false)
+  const [clearingCooldowns, setClearingCooldowns] = useState(false)
+
+  const loadCooldowns = () => {
+    setLoadingCooldowns(true)
+    api
+      .get<CooldownSnapshot>('/api/resilience/cooldowns')
+      .then(setCooldowns)
+      .catch(() => undefined)
+      .finally(() => setLoadingCooldowns(false))
+  }
 
   useEffect(() => {
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
@@ -86,7 +103,63 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
         setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
       })
       .catch(() => undefined)
+    loadCooldowns()
   }, [])
+
+  const clearCooldowns = async (body: Record<string, unknown>) => {
+    setClearingCooldowns(true)
+    try {
+      const result = await api.post<ClearCooldownsResult>(
+        '/api/resilience/cooldowns/clear',
+        body,
+      )
+      const total =
+        result.cleared_provider_cooldowns +
+        result.cleared_model_cooldowns +
+        result.cleared_provider_key_cooldowns
+      message.success(total ? `已清除 ${total} 条冷却` : '没有匹配的冷却')
+      loadCooldowns()
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setClearingCooldowns(false)
+    }
+  }
+
+  type CooldownRow = {
+    key: string
+    scope: string
+    target: string
+    detail: string
+    remaining: number
+    clear: Record<string, unknown>
+  }
+  const cooldownRows: CooldownRow[] = [
+    ...(cooldowns?.provider_cooldowns ?? []).map((item) => ({
+      key: `provider-${item.provider_id}`,
+      scope: '提供商',
+      target: item.provider_name ?? `#${item.provider_id}`,
+      detail: item.failure_streak ? `连续失败 ${item.failure_streak} 次` : '',
+      remaining: item.remaining_seconds,
+      clear: { provider_id: item.provider_id },
+    })),
+    ...(cooldowns?.model_cooldowns ?? []).map((item) => ({
+      key: `model-${item.provider_id}-${item.model}`,
+      scope: '模型',
+      target: `${item.provider_name ?? `#${item.provider_id}`} · ${item.model}`,
+      detail: '',
+      remaining: item.remaining_seconds,
+      clear: { provider_id: item.provider_id, model: item.model },
+    })),
+    ...(cooldowns?.provider_key_cooldowns ?? []).map((item) => ({
+      key: `key-${item.provider_key_id}`,
+      scope: '上游密钥',
+      target: `${item.provider_name ?? '-'} · ${item.key_name ?? `#${item.provider_key_id}`}`,
+      detail: '',
+      remaining: item.remaining_seconds,
+      clear: { provider_key_id: item.provider_key_id },
+    })),
+  ]
 
   const backup = async () => {
     setBackingUp(true)
@@ -492,6 +565,81 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             保存重试策略
           </Button>
         </Form>
+      </Card>
+      <Card
+        className="settings-retention"
+        title={<Space><ClockCircleOutlined />冷却管理</Space>}
+        bordered={false}
+        extra={
+          <Space>
+            <Button icon={<ReloadOutlined />} loading={loadingCooldowns} onClick={loadCooldowns}>
+              刷新
+            </Button>
+            <Popconfirm
+              title="清除全部冷却？"
+              onConfirm={() => void clearCooldowns({ all: true })}
+            >
+              <Button
+                danger
+                icon={<ClearOutlined />}
+                disabled={!cooldownRows.length}
+                loading={clearingCooldowns}
+              >
+                全部清除
+              </Button>
+            </Popconfirm>
+          </Space>
+        }
+      >
+        <Typography.Paragraph type="secondary">
+          冷却只存在于当前进程内，处于冷却的提供商、模型或上游密钥会暂时退出路由。上游已经恢复时可以在这里提前解除。
+        </Typography.Paragraph>
+        <Table
+          rowKey="key"
+          size="small"
+          loading={loadingCooldowns}
+          dataSource={cooldownRows}
+          pagination={false}
+          locale={{ emptyText: '当前没有冷却中的目标' }}
+          columns={[
+            {
+              title: '范围',
+              dataIndex: 'scope',
+              width: 100,
+              render: (value: string) => <Tag>{value}</Tag>,
+            },
+            {
+              title: '目标',
+              dataIndex: 'target',
+            },
+            {
+              title: '备注',
+              dataIndex: 'detail',
+              width: 160,
+              render: (value: string) =>
+                value || <Typography.Text type="secondary">-</Typography.Text>,
+            },
+            {
+              title: '剩余',
+              dataIndex: 'remaining',
+              width: 100,
+              render: (value: number) => `${value}s`,
+            },
+            {
+              title: '操作',
+              width: 100,
+              render: (_, record) => (
+                <Button
+                  size="small"
+                  loading={clearingCooldowns}
+                  onClick={() => void clearCooldowns(record.clear)}
+                >
+                  清除
+                </Button>
+              ),
+            },
+          ]}
+        />
       </Card>
     </>
   )

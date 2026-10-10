@@ -597,6 +597,40 @@ export type ResilienceSettings = {
   retry_max_backoff_ms: number
 }
 
+export type ProviderCooldown = {
+  provider_id: number
+  provider_name?: string | null
+  remaining_seconds: number
+  failure_streak: number
+}
+
+export type ModelCooldown = {
+  provider_id: number
+  provider_name?: string | null
+  model: string
+  remaining_seconds: number
+}
+
+export type ProviderKeyCooldown = {
+  provider_key_id: number
+  provider_name?: string | null
+  key_name?: string | null
+  remaining_seconds: number
+}
+
+export type CooldownSnapshot = {
+  provider_cooldowns: ProviderCooldown[]
+  model_cooldowns: ModelCooldown[]
+  provider_key_cooldowns: ProviderKeyCooldown[]
+  generated_at: string
+}
+
+export type ClearCooldownsResult = {
+  cleared_provider_cooldowns: number
+  cleared_model_cooldowns: number
+  cleared_provider_key_cooldowns: number
+}
+
 export type ModelCapabilities = {
   context_limit?: number
   output_limit?: number
