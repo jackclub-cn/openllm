@@ -159,6 +159,10 @@ export default function ProviderTable({
                 record.health_check_interval_minutes
                   ? `自动每 ${record.health_check_interval_minutes} 分钟`
                   : '',
+                record.timeout_seconds ? `请求超时 ${record.timeout_seconds}s` : '',
+                record.configured_cooldown_seconds
+                  ? `故障冷却基准 ${record.configured_cooldown_seconds}s`
+                  : '',
               ]
                 .filter(Boolean)
                 .join(' · ')

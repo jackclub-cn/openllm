@@ -35,6 +35,8 @@ pub async fn create_provider(
     let health_check_model = normalize_health_check_model(input.health_check_model.as_deref());
     let models_sync_interval_minutes =
         normalize_health_interval(input.models_sync_interval_minutes)?;
+    let timeout_seconds = normalize_provider_timeout(input.timeout_seconds)?;
+    let cooldown_seconds = normalize_provider_cooldown(input.configured_cooldown_seconds)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
     // hit the network, and holding a SQLite write transaction across it would
     // block every other writer.
@@ -49,8 +51,8 @@ pub async fn create_provider(
             name, provider_type, base_url, model_prefix, models_dev_id,
             api_key, headers, enabled, tool_search_supported,
             health_check_interval_minutes, health_check_model,
-            models_sync_interval_minutes
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+            models_sync_interval_minutes, timeout_seconds, cooldown_seconds
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
@@ -63,6 +65,8 @@ pub async fn create_provider(
     .bind(health_check_interval_minutes)
     .bind(health_check_model)
     .bind(models_sync_interval_minutes)
+    .bind(timeout_seconds)
+    .bind(cooldown_seconds)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
@@ -145,6 +149,14 @@ pub async fn update_provider(
         Some(value) => normalize_health_interval(Some(value))?,
         None => current.models_sync_interval_minutes,
     };
+    let timeout_seconds = match input.timeout_seconds {
+        Some(value) => normalize_provider_timeout(Some(value))?,
+        None => current.timeout_seconds,
+    };
+    let cooldown_seconds = match input.configured_cooldown_seconds {
+        Some(value) => normalize_provider_cooldown(Some(value))?,
+        None => current.cooldown_seconds,
+    };
     let api_key_update = normalize_optional(input.api_key.clone());
     let api_keys_update = if let Some(api_keys) = input.api_keys.clone() {
         Some(api_keys)
@@ -199,7 +211,7 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, timeout_seconds = ?, cooldown_seconds = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name.clone())
     .bind(provider_type.as_str())
@@ -211,6 +223,8 @@ pub async fn update_provider(
     .bind(health_check_interval_minutes)
     .bind(health_check_model)
     .bind(models_sync_interval_minutes)
+    .bind(timeout_seconds)
+    .bind(cooldown_seconds)
     .bind(tool_search_context_changed as i64)
     .bind(tool_search_context_changed as i64)
     .bind(id)

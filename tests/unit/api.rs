@@ -117,6 +117,8 @@ fn provider_input(api_key: Option<&str>, api_keys: Vec<ProviderApiKeyInput>) -> 
         health_check_interval_minutes: None,
         health_check_model: None,
         models_sync_interval_minutes: None,
+        timeout_seconds: None,
+        configured_cooldown_seconds: None,
     }
 }
 
@@ -150,6 +152,8 @@ fn provider_update_with_keys(api_keys: Option<Vec<ProviderApiKeyInput>>) -> Prov
         health_check_interval_minutes: None,
         health_check_model: None,
         models_sync_interval_minutes: None,
+        timeout_seconds: None,
+        configured_cooldown_seconds: None,
     }
 }
 
@@ -464,6 +468,44 @@ fn validates_provider_health_interval() {
     assert_eq!(normalize_health_interval(Some(0)).unwrap(), None);
     assert_eq!(normalize_health_interval(Some(30)).unwrap(), Some(30));
     assert!(normalize_health_interval(Some(-1)).is_err());
+}
+
+#[test]
+fn validates_provider_request_policy() {
+    assert_eq!(normalize_provider_timeout(None).unwrap(), None);
+    assert_eq!(normalize_provider_timeout(Some(0)).unwrap(), None);
+    assert_eq!(normalize_provider_timeout(Some(120)).unwrap(), Some(120));
+    assert!(normalize_provider_timeout(Some(-1)).is_err());
+    assert!(normalize_provider_timeout(Some(3601)).is_err());
+
+    assert_eq!(normalize_provider_cooldown(None).unwrap(), None);
+    assert_eq!(normalize_provider_cooldown(Some(0)).unwrap(), None);
+    assert_eq!(normalize_provider_cooldown(Some(900)).unwrap(), Some(900));
+    assert!(normalize_provider_cooldown(Some(-1)).is_err());
+    assert!(normalize_provider_cooldown(Some(3601)).is_err());
+}
+
+#[tokio::test]
+async fn provider_request_policy_round_trips_and_can_be_cleared() {
+    let state = provider_key_test_state().await;
+    let mut input = provider_input(None, Vec::new());
+    input.timeout_seconds = Some(180);
+    input.configured_cooldown_seconds = Some(600);
+    let (_, Json(created)) = create_provider(State(state.clone()), Json(input))
+        .await
+        .unwrap();
+    assert_eq!(created.timeout_seconds, Some(180));
+    assert_eq!(created.configured_cooldown_seconds, Some(600));
+    assert_eq!(created.cooldown_seconds, None);
+
+    let mut update = provider_update_with_keys(None);
+    update.timeout_seconds = Some(0);
+    update.configured_cooldown_seconds = Some(0);
+    let Json(updated) = update_provider(State(state), Path(created.id), Json(update))
+        .await
+        .unwrap();
+    assert_eq!(updated.timeout_seconds, None);
+    assert_eq!(updated.configured_cooldown_seconds, None);
 }
 
 #[tokio::test]

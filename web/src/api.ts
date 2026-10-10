@@ -121,6 +121,8 @@ export type Provider = {
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
   cooldown_seconds?: number | null
+  configured_cooldown_seconds?: number | null
+  timeout_seconds?: number | null
   quota_kind?: string | null
   models_sync_interval_minutes?: number | null
   models_sync_attempted_at?: string
@@ -209,6 +211,8 @@ export type ProviderInput = {
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
   models_sync_interval_minutes?: number | null
+  timeout_seconds?: number | null
+  configured_cooldown_seconds?: number | null
 }
 
 export type ProviderModelLimit = {

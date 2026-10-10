@@ -65,6 +65,7 @@ const OPENAI_RESPONSES: &str = "/v1/responses";
 const MAX_UPSTREAM_RETRY_AFTER: Duration = Duration::from_secs(60 * 60);
 const MAX_PROVIDER_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_TARGET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
+const MAX_CONFIGURED_PROVIDER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const MAX_PROVIDER_KEY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const PROVIDER_RATE_LIMIT_MODEL_THRESHOLD: usize = 2;
 

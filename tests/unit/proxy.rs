@@ -559,6 +559,8 @@ fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) 
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
         provider_health: None,
         upstream_model: "model".to_string(),
         weight: 100,
@@ -1505,6 +1507,8 @@ async fn prefix_matching_is_literal_and_case_sensitive() {
                 models_sync_error TEXT,
                 tool_search_supported INTEGER NOT NULL DEFAULT 1,
                 last_test_ok INTEGER,
+                timeout_seconds INTEGER,
+                cooldown_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -1605,6 +1609,8 @@ async fn disabled_provider_model_is_skipped_by_explicit_routes() {
                 models_sync_error TEXT,
                 tool_search_supported INTEGER NOT NULL DEFAULT 1,
                 last_test_ok INTEGER,
+                timeout_seconds INTEGER,
+                cooldown_seconds INTEGER,
                 created_at TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL DEFAULT ''
             )
@@ -3254,25 +3260,81 @@ fn parses_retry_after_seconds_milliseconds_and_http_dates() {
 #[test]
 fn provider_cooldown_escalates_with_consecutive_failures_and_caps() {
     assert_eq!(
-        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 1, None),
+        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 1, None, None),
         Duration::from_secs(30)
     );
     assert_eq!(
-        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 2, None),
+        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 2, None, None),
         Duration::from_secs(60)
     );
     assert_eq!(
-        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 9, None),
+        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 9, None, None),
         MAX_PROVIDER_COOLDOWN
     );
     assert_eq!(
         provider_cooldown(
             Some(StatusCode::TOO_MANY_REQUESTS),
             2,
-            Some(Duration::from_secs(5))
+            Some(Duration::from_secs(5)),
+            None
         ),
         Duration::from_secs(10)
     );
+    assert_eq!(
+        provider_cooldown(Some(StatusCode::TOO_MANY_REQUESTS), 1, None, Some(900)),
+        Duration::from_secs(900)
+    );
+    assert_eq!(
+        provider_cooldown(
+            Some(StatusCode::TOO_MANY_REQUESTS),
+            1,
+            Some(Duration::from_secs(1800)),
+            Some(60)
+        ),
+        Duration::from_secs(1800)
+    );
+}
+
+#[tokio::test]
+async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post(|| async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            StatusCode::OK
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.base_url = format!("http://{address}");
+    target.timeout_seconds = Some(1);
+
+    let request = state
+        .client
+        .post(format!("http://{address}/v1/chat/completions"));
+    assert!(send_provider_request(&state, &target, request).await.is_err());
+    assert!(
+        state
+            .target_cooldown
+            .lock()
+            .await
+            .contains_key(&(7, target.upstream_model.clone()))
+    );
+    assert!(state.provider_cooldown.lock().await.contains_key(&7));
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -3391,7 +3453,7 @@ async fn provider_cooldown_is_set_for_retryable_failures_and_cleared_on_success(
         .unwrap();
     let state = AppState::new(pool, None);
 
-    mark_provider_error(&state, 7, Some(StatusCode::TOO_MANY_REQUESTS), None).await;
+    mark_provider_error(&state, 7, Some(StatusCode::TOO_MANY_REQUESTS), None, None).await;
     let until = state
         .provider_cooldown
         .lock()
@@ -3868,6 +3930,8 @@ async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() 
             provider_enabled: None,
             model_enabled: None,
             tool_search_supported: 1,
+            timeout_seconds: None,
+            cooldown_seconds: None,
             provider_health: None,
             upstream_model: "upstream".to_string(),
             weight: 100,
@@ -4021,6 +4085,8 @@ async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
         provider_health: None,
         upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
         weight: 100,
@@ -4165,6 +4231,8 @@ async fn anthropic_forward_repairs_orphan_tool_calls_for_openai_upstream() {
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,
@@ -4319,6 +4387,8 @@ async fn anthropic_forward_retries_openai_upstream_without_tool_search() {
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,

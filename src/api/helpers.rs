@@ -55,6 +55,7 @@ pub(super) async fn route_targets(
                COALESCE(pm.output_override, pm.output_limit) AS output_limit,
                COALESCE(pm.enabled, 1) AS model_enabled,
                p.tool_search_supported,
+               p.timeout_seconds, p.cooldown_seconds,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
@@ -891,6 +892,38 @@ pub(super) fn normalize_health_interval(value: Option<i64>) -> AppResult<Option<
             "health check interval must be zero or a positive integer".to_string(),
         )),
         Some(0) | None => Ok(None),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
+/// Per-provider request timeout. `None`/`0` keeps the gateway-wide idle
+/// timeout; anything else bounds one upstream call, capped at one hour.
+pub(super) fn normalize_provider_timeout(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_TIMEOUT_SECONDS: i64 = 3600;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "request timeout must be zero or a positive integer".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) if value > MAX_TIMEOUT_SECONDS => Err(AppError::BadRequest(format!(
+            "request timeout must be at most {MAX_TIMEOUT_SECONDS} seconds"
+        ))),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
+/// Per-provider cooldown base after a retryable failure. `None`/`0` keeps the
+/// derived schedule (30s for rate limits, 20s otherwise, then exponential).
+pub(super) fn normalize_provider_cooldown(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_COOLDOWN_SECONDS: i64 = 3600;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "cooldown must be zero or a positive integer".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) if value > MAX_COOLDOWN_SECONDS => Err(AppError::BadRequest(format!(
+            "cooldown must be at most {MAX_COOLDOWN_SECONDS} seconds"
+        ))),
         Some(value) => Ok(Some(value)),
     }
 }

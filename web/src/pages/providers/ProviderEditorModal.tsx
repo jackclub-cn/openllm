@@ -184,6 +184,22 @@ export default function ProviderEditorModal({
         >
           <InputNumber min={0} precision={0} style={{ width: '100%' }} />
         </Form.Item>
+        <div className="form-grid">
+          <Form.Item
+            name="timeout_seconds"
+            label="请求超时（秒）"
+            extra="0 或留空沿用全局空闲超时；设置后限制单次上游请求总时长，最长 3600 秒。"
+          >
+            <InputNumber min={0} max={3600} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="configured_cooldown_seconds"
+            label="失败冷却基准（秒）"
+            extra="0 或留空沿用内置策略；连续失败会递增，并至少遵循上游 Retry-After，最长 3600 秒。"
+          >
+            <InputNumber min={0} max={3600} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+        </div>
         <Form.Item
           name="modelsText"
           label="支持的模型"

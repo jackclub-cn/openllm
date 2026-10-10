@@ -95,6 +95,8 @@ export default function Providers() {
       health_check_interval_minutes: 0,
       health_check_model: '',
       models_sync_interval_minutes: 0,
+      timeout_seconds: 0,
+      configured_cooldown_seconds: 0,
       headersText: '{}',
       modelsText: '',
     } as never)
@@ -123,6 +125,8 @@ export default function Providers() {
       auto_sync_models: false,
       health_check_interval_minutes: item.health_check_interval_minutes || 0,
       health_check_model: item.health_check_model || '',
+      timeout_seconds: item.timeout_seconds || 0,
+      configured_cooldown_seconds: item.configured_cooldown_seconds || 0,
       headersText: JSON.stringify(item.headers || {}, null, 2),
       modelsText: item.models.join('\n'),
     } as never)
@@ -172,6 +176,8 @@ export default function Providers() {
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
       health_check_model: values.health_check_model?.trim() || '',
       models_sync_interval_minutes: values.models_sync_interval_minutes ?? 0,
+      timeout_seconds: values.timeout_seconds ?? 0,
+      configured_cooldown_seconds: values.configured_cooldown_seconds ?? 0,
     }
     setSaving(true)
     try {

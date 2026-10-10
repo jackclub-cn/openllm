@@ -99,6 +99,12 @@ pub struct RouteTarget {
     #[sqlx(default)]
     pub model_enabled: Option<i64>,
     pub tool_search_supported: i64,
+    /// Per-provider request timeout override, in seconds.
+    #[sqlx(default)]
+    pub timeout_seconds: Option<i64>,
+    /// Per-provider cooldown override, in seconds.
+    #[sqlx(default)]
+    pub cooldown_seconds: Option<i64>,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
     pub upstream_model: String,

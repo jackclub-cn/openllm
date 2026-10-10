@@ -608,6 +608,8 @@ pub(super) async fn diagnostic_runtime_targets(
             provider_enabled: None,
             model_enabled: None,
             tool_search_supported: 1,
+            timeout_seconds: None,
+            cooldown_seconds: None,
             provider_health: row.provider_health,
             upstream_model: row.upstream_model.clone(),
             weight: row.target_weight,
@@ -749,6 +751,7 @@ pub(super) async fn find_prefixed_targets(
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
                p.tool_search_supported,
+               p.timeout_seconds, p.cooldown_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -784,6 +787,7 @@ pub(super) async fn find_prefixed_targets(
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
                p.tool_search_supported,
+               p.timeout_seconds, p.cooldown_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -850,6 +854,7 @@ pub(super) async fn find_auto_targets(
                p.enabled AS provider_enabled,
                pm.enabled AS model_enabled,
                p.tool_search_supported,
+               p.timeout_seconds, p.cooldown_seconds,
                p.last_test_ok AS provider_health,
                pm.model_name AS upstream_model,
                100 AS weight, 0 AS priority, 1 AS enabled
@@ -906,6 +911,7 @@ pub(super) async fn load_targets(state: &AppState, route_id: i64) -> AppResult<V
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
                p.tool_search_supported,
+               p.timeout_seconds, p.cooldown_seconds,
                p.last_test_ok AS provider_health,
                p.enabled AS provider_enabled
         FROM route_targets rt
@@ -969,14 +975,26 @@ pub(super) fn provider_cooldown(
     status: Option<StatusCode>,
     failures: u32,
     retry_after: Option<Duration>,
+    configured_seconds: Option<i64>,
 ) -> Duration {
-    let base = retry_after.unwrap_or_else(|| match status {
+    let default_base = match status {
         Some(StatusCode::TOO_MANY_REQUESTS) => Duration::from_secs(30),
         _ => Duration::from_secs(20),
-    });
+    };
+    let configured_base = configured_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds.unsigned_abs()));
+    let base = match configured_base {
+        Some(configured) => configured.max(retry_after.unwrap_or_default()),
+        None => retry_after.unwrap_or(default_base),
+    };
     let exponent = failures.saturating_sub(1).min(4);
-    base.saturating_mul(1u32 << exponent)
-        .min(MAX_PROVIDER_COOLDOWN)
+    let cap = if configured_base.is_some() {
+        MAX_CONFIGURED_PROVIDER_COOLDOWN
+    } else {
+        MAX_PROVIDER_COOLDOWN
+    };
+    base.saturating_mul(1u32 << exponent).min(cap)
 }
 
 pub(super) fn provider_key_cooldown(status: StatusCode, retry_after: Option<Duration>) -> Duration {
@@ -991,12 +1009,28 @@ pub(super) fn provider_key_cooldown(status: StatusCode, retry_after: Option<Dura
         .min(MAX_PROVIDER_KEY_COOLDOWN)
 }
 
-pub(super) fn target_cooldown(status: StatusCode, retry_after: Option<Duration>) -> Duration {
-    let base = retry_after.unwrap_or_else(|| match status {
+pub(super) fn target_cooldown(
+    status: StatusCode,
+    retry_after: Option<Duration>,
+    configured_seconds: Option<i64>,
+) -> Duration {
+    let default_base = match status {
         StatusCode::TOO_MANY_REQUESTS => Duration::from_secs(30),
         _ => Duration::from_secs(20),
-    });
-    base.min(MAX_TARGET_COOLDOWN)
+    };
+    let configured_base = configured_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds.unsigned_abs()));
+    let base = match configured_base {
+        Some(configured) => configured.max(retry_after.unwrap_or_default()),
+        None => retry_after.unwrap_or(default_base),
+    };
+    let cap = if configured_base.is_some() {
+        MAX_CONFIGURED_PROVIDER_COOLDOWN
+    } else {
+        MAX_TARGET_COOLDOWN
+    };
+    base.min(cap)
 }
 
 pub(super) async fn mark_provider_error(
@@ -1004,6 +1038,7 @@ pub(super) async fn mark_provider_error(
     provider_id: i64,
     status: Option<StatusCode>,
     retry_after: Option<Duration>,
+    configured_cooldown_seconds: Option<i64>,
 ) {
     let failures = {
         let mut streaks = state.provider_failure_streak.lock().await;
@@ -1013,7 +1048,8 @@ pub(super) async fn mark_provider_error(
     };
     state.provider_cooldown.lock().await.insert(
         provider_id,
-        Instant::now() + provider_cooldown(status, failures, retry_after),
+        Instant::now()
+            + provider_cooldown(status, failures, retry_after, configured_cooldown_seconds),
     );
 }
 
@@ -1028,7 +1064,7 @@ pub(super) async fn mark_target_error(
     cooldowns.retain(|_, until| *until > now);
     cooldowns.insert(
         (target.provider_id, target.upstream_model.clone()),
-        now + target_cooldown(status, retry_after),
+        now + target_cooldown(status, retry_after, target.cooldown_seconds),
     );
     cooldowns
         .keys()
@@ -1057,7 +1093,14 @@ pub(super) async fn record_upstream_failure(
         if status != StatusCode::TOO_MANY_REQUESTS
             || active_model_cooldowns >= PROVIDER_RATE_LIMIT_MODEL_THRESHOLD
         {
-            mark_provider_error(state, target.provider_id, Some(status), retry_after).await;
+            mark_provider_error(
+                state,
+                target.provider_id,
+                Some(status),
+                retry_after,
+                target.cooldown_seconds,
+            )
+            .await;
         }
     }
     if provider_key_failure(status) {
@@ -1129,10 +1172,25 @@ pub(super) async fn send_provider_request(
     target: &RouteTarget,
     request: RequestBuilder,
 ) -> AppResult<reqwest::Response> {
+    // A provider may cap how long one call may take; without an override the
+    // shared client's idle timeout applies.
+    let request = match target.timeout_seconds {
+        Some(seconds) if seconds > 0 => {
+            request.timeout(Duration::from_secs(seconds.unsigned_abs()))
+        }
+        _ => request,
+    };
     match request.send().await {
         Ok(response) => Ok(response),
         Err(error) => {
-            mark_provider_error(state, target.provider_id, None, None).await;
+            mark_provider_error(
+                state,
+                target.provider_id,
+                None,
+                None,
+                target.cooldown_seconds,
+            )
+            .await;
             mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
             Err(AppError::Upstream(format!(
                 "{} request failed: {error}",
