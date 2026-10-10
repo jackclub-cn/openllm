@@ -1,5 +1,36 @@
 use super::*;
 
+/// Runs one maintenance cycle: due health checks, model syncs, stale-request
+/// reconciliation, and usage retention.
+///
+/// Shared by the 60-second background loop and the on-demand admin endpoint so
+/// both do exactly the same work. It records a completion count and timestamp
+/// so an operator can confirm maintenance is actually running.
+pub async fn run_maintenance_cycle(state: &AppState) {
+    run_due_provider_health_checks(state.clone()).await;
+    run_due_provider_model_syncs(state.clone()).await;
+    reconcile_stale_usage_requests(state.clone()).await;
+    run_due_usage_retention(state.clone()).await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    state
+        .maintenance_last_run_unix
+        .store(now, std::sync::atomic::Ordering::Relaxed);
+    state
+        .maintenance_runs
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Admin handler: run a maintenance cycle immediately instead of waiting for
+/// the next scheduled tick.
+pub async fn run_maintenance(State(state): State<AppState>) -> AppResult<Json<Value>> {
+    run_maintenance_cycle(&state).await;
+    Ok(Json(json!({ "status": "completed" })))
+}
+
 pub async fn run_due_provider_health_checks(state: AppState) {
     let due = match sqlx::query_scalar::<_, i64>(
         r#"

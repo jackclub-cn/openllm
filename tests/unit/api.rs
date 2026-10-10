@@ -168,6 +168,9 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_db_pool_max_connections gauge"));
     assert!(body.contains("# TYPE openllm_runtime_lag_millis gauge"));
     assert!(body.contains("openllm_runtime_lag_millis 0"));
+    assert!(body.contains("# TYPE openllm_maintenance_runs_total counter"));
+    assert!(body.contains("openllm_maintenance_runs_total 0"));
+    assert!(body.contains("openllm_maintenance_last_run_timestamp_seconds 0"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(
@@ -3642,6 +3645,7 @@ async fn stale_reconciliation_uses_last_activity_for_long_streams() {
 #[tokio::test]
 async fn runtime_settings_expose_effective_limits() {
     let state = provider_key_test_state().await;
+
     let expected_concurrency = state.request_capacity_limit;
     let expected_inflight_mib = state.request_bytes_limit / (1024 * 1024);
     let expected_admission_wait_ms = state.admission_wait.as_millis() as u64;
@@ -3676,6 +3680,24 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(
         view.limits.db_acquire_timeout_secs,
         crate::db::db_acquire_timeout_secs()
+    );
+}
+
+/// The on-demand maintenance endpoint runs a full cycle and records that it
+/// happened, so an operator can both trigger and confirm maintenance.
+#[tokio::test]
+async fn run_maintenance_runs_a_cycle_and_records_it() {
+    let state = provider_key_test_state().await;
+    let runs = state.maintenance_runs.clone();
+    let last_run = state.maintenance_last_run_unix.clone();
+    assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 0);
+
+    let Json(body) = run_maintenance(State(state)).await.unwrap();
+    assert_eq!(body["status"], "completed");
+    assert_eq!(runs.load(std::sync::atomic::Ordering::Relaxed), 1);
+    assert!(
+        last_run.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the completion timestamp must be recorded"
     );
 }
 

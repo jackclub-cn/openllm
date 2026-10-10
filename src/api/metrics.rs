@@ -877,6 +877,32 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .runtime_lag_millis
             .load(std::sync::atomic::Ordering::Relaxed) as i64,
     );
+    metric_header(
+        &mut body,
+        "openllm_maintenance_runs_total",
+        "Completed maintenance cycles since startup",
+    );
+    push_metric(
+        &mut body,
+        "openllm_maintenance_runs_total",
+        &[],
+        state
+            .maintenance_runs
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_maintenance_last_run_timestamp_seconds",
+        "Unix time of the last completed maintenance cycle; zero means none yet",
+    );
+    push_metric(
+        &mut body,
+        "openllm_maintenance_last_run_timestamp_seconds",
+        &[],
+        state
+            .maintenance_last_run_unix
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
 
     Response::builder()
         .status(StatusCode::OK)

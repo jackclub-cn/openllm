@@ -35,6 +35,7 @@ use crate::api::{
     list_provider_model_limits,
     list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
     preview_provider_model_sync, prometheus_metrics, provider_quota, ready, rotate_api_key,
+    run_maintenance,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
     update_inspector_settings, update_provider, update_provider_model_limits,
@@ -138,10 +139,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                crate::api::run_due_provider_health_checks(state.clone()).await;
-                crate::api::run_due_provider_model_syncs(state.clone()).await;
-                crate::api::reconcile_stale_usage_requests(state.clone()).await;
-                crate::api::run_due_usage_retention(state.clone()).await;
+                crate::api::run_maintenance_cycle(&state).await;
             }
         }
     });
@@ -247,6 +245,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/audit-logs", get(list_audit_logs))
         .route("/database/backup", get(backup_database))
         .route("/database/vacuum", post(vacuum_database))
+        .route("/maintenance/run", post(run_maintenance))
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/test-all", post(test_all_providers))
         .route("/providers/test-all-keys", post(test_all_provider_keys))

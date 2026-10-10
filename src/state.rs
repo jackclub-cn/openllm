@@ -75,6 +75,11 @@ pub struct AppState {
     /// How late, in milliseconds, the async runtime ran its last 1s timer.
     /// Surfaces a blocked runtime (sync I/O or a CPU-bound call on the reactor).
     pub runtime_lag_millis: Arc<AtomicU64>,
+    /// Unix timestamp of the last completed maintenance cycle; `0` means none
+    /// has run yet.
+    pub maintenance_last_run_unix: Arc<AtomicU64>,
+    /// Completed maintenance cycles since startup.
+    pub maintenance_runs: Arc<AtomicU64>,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
@@ -796,6 +801,8 @@ impl AppState {
             memory_shed_ratio,
             memory_shed: Arc::new(AtomicU64::new(0)),
             runtime_lag_millis: Arc::new(AtomicU64::new(0)),
+            maintenance_last_run_unix: Arc::new(AtomicU64::new(0)),
+            maintenance_runs: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

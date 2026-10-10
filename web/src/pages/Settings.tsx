@@ -51,6 +51,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [token, setToken] = useState(getAdminToken())
   const [backingUp, setBackingUp] = useState(false)
   const [vacuuming, setVacuuming] = useState(false)
+  const [runningMaintenance, setRunningMaintenance] = useState(false)
   const [retentionDays, setRetentionDays] = useState<number | null>(null)
   const [savingRetention, setSavingRetention] = useState(false)
   const [limits, setLimits] = useState<RuntimeLimits>()
@@ -200,6 +201,18 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       message.error(formatError(error))
     } finally {
       setSavingRetention(false)
+    }
+  }
+
+  const runMaintenance = async () => {
+    setRunningMaintenance(true)
+    try {
+      await api.post('/api/maintenance/run')
+      message.success('维护任务已运行')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setRunningMaintenance(false)
     }
   }
 
@@ -385,6 +398,15 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
                 onClick={() => void backup()}
               >
                 下载备份
+              </Button>
+            </Descriptions.Item>
+            <Descriptions.Item label="定时维护">
+              <Button
+                icon={<ReloadOutlined />}
+                loading={runningMaintenance}
+                onClick={() => void runMaintenance()}
+              >
+                立即运行
               </Button>
             </Descriptions.Item>
           </Descriptions>
