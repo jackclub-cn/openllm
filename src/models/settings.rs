@@ -71,6 +71,12 @@ pub struct RuntimeLimits {
     pub memory_limit_source: String,
     /// Fraction of the ceiling at which new requests are shed, as a percent.
     pub memory_shed_ratio_pct: u64,
+    /// SQLite connection-pool size.
+    pub db_max_connections: u32,
+    /// SQLite write-contention timeout, in seconds.
+    pub db_busy_timeout_secs: u64,
+    /// Wait for a pooled SQLite connection before a request fails, in seconds.
+    pub db_acquire_timeout_secs: u64,
 }
 
 #[derive(Debug, Deserialize)]

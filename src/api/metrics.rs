@@ -831,6 +831,39 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         &[],
         free_pages.saturating_mul(page_size),
     );
+    metric_header(
+        &mut body,
+        "openllm_db_pool_connections",
+        "Open SQLite pool connections",
+    );
+    push_metric(
+        &mut body,
+        "openllm_db_pool_connections",
+        &[],
+        state.pool.size() as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_db_pool_idle",
+        "Idle SQLite pool connections",
+    );
+    push_metric(
+        &mut body,
+        "openllm_db_pool_idle",
+        &[],
+        state.pool.num_idle() as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_db_pool_max_connections",
+        "Configured SQLite pool size",
+    );
+    push_metric(
+        &mut body,
+        "openllm_db_pool_max_connections",
+        &[],
+        crate::db::db_max_connections() as i64,
+    );
 
     Response::builder()
         .status(StatusCode::OK)

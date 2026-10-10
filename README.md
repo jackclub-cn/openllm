@@ -61,6 +61,9 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - `OPENLLM_BODY_READ_TIMEOUT_SECS`：读取完整请求体的最长时间，默认 `600` 秒；设为 `0` 关闭。它防止慢速或恶意客户端通过持续缓慢发送请求体一直占住准入名额；超时后该请求会以错误结束。若确有超大文件在慢速链路上传，可适当调大。
 - `OPENLLM_MEMORY_LIMIT_MIB`：进程内存上限（MiB）。留空时（默认）网关会自动读取容器 cgroup 内存限制作为上限，因此在受限容器中开箱即用；显式填 `0` 可关闭该保护，填正整数则手动指定上限。达到上限的指定比例时，网关会采样本进程常驻内存并对新的代理请求返回 `503` 与 `Retry-After`，把内存留给已在途的请求，避免被 OOM 杀掉。采样在 Linux 与 Windows 上可用，cgroup 自动读取仅 Linux，其它平台该保护保持不生效，除非手动指定上限。
 - `OPENLLM_MEMORY_SHED_RATIO`：触发内存压力保护的用量比例，默认 `0.9`（即用满 90% 上限时开始拒绝新请求）；取值范围 `(0, 1]`。
+- `OPENLLM_DB_MAX_CONNECTIONS`：SQLite 连接池大小，默认 `10`，上限 `256`。高并发读取场景可适当调大；SQLite 单库写入仍会串行化，写入压力下应结合 `busy_timeout` 一起评估。
+- `OPENLLM_DB_BUSY_TIMEOUT_SECS`：SQLite 写入竞争时的等待时间，默认 `10` 秒。多个写入并发时，等待超过该值才会返回 `SQLITE_BUSY`。
+- `OPENLLM_DB_ACQUIRE_TIMEOUT_SECS`：从连接池获取连接的等待时间，默认 `15` 秒；连接池被占满且超过该时间时，该请求会以错误结束。以上三项都在启动时读取，修改后需重启。
 - `OPENLLM_MAX_UPSTREAM_BODY_MIB`：非流式上游响应的缓冲上限，默认 `64`（MiB）。这是内存保护值，超过后网关会以错误结束该请求，避免异常上游把整个响应读进内存。
 - `OPENLLM_SHUTDOWN_GRACE_SECS`：收到退出信号后等待在途请求结束的时间，默认 `30` 秒；设为 `0` 表示一直等待。超时后网关会关闭剩余连接，避免个别长流把重启或升级一直卡住。
 

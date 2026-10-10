@@ -332,6 +332,11 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="版本">
               {settings?.version || '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="数据库连接池">
+              {limits
+                ? `${limits.db_max_connections} 连接 / 等待 ${limits.db_acquire_timeout_secs} 秒 / 忙等 ${limits.db_busy_timeout_secs} 秒`
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="上游空闲超时">
               {limits ? `${limits.upstream_idle_timeout_secs} 秒` : '-'}
             </Descriptions.Item>

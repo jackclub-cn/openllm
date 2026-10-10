@@ -939,6 +939,9 @@ impl AppState {
                 .unwrap_or(0),
             memory_limit_source: self.memory_limit_source.to_string(),
             memory_shed_ratio_pct: (self.memory_shed_ratio * 100.0).round() as u64,
+            db_max_connections: crate::db::db_max_connections(),
+            db_busy_timeout_secs: crate::db::db_busy_timeout_secs(),
+            db_acquire_timeout_secs: crate::db::db_acquire_timeout_secs(),
         }
     }
 }

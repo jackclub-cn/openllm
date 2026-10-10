@@ -87,3 +87,28 @@ async fn shutdown_returns_promptly_when_drained() {
         "the server must not wait out the full grace period when idle"
     );
 }
+
+#[test]
+fn database_pool_size_parsing_clamps_to_a_sane_range() {
+    use crate::db::parse_db_max_connections;
+    assert_eq!(parse_db_max_connections(None), 10);
+    assert_eq!(parse_db_max_connections(Some("")), 10);
+    assert_eq!(parse_db_max_connections(Some("oops")), 10);
+    assert_eq!(parse_db_max_connections(Some("0")), 1, "at least one connection");
+    assert_eq!(parse_db_max_connections(Some("24")), 24);
+    assert_eq!(
+        parse_db_max_connections(Some("100000")),
+        256,
+        "an oversized value is clamped instead of exhausting the host"
+    );
+}
+
+#[test]
+fn database_timeout_parsing_keeps_a_positive_default() {
+    use crate::db::parse_db_timeout_secs;
+    assert_eq!(parse_db_timeout_secs(None, 15), 15);
+    assert_eq!(parse_db_timeout_secs(Some(""), 15), 15);
+    assert_eq!(parse_db_timeout_secs(Some("0"), 15), 15, "zero is not a timeout");
+    assert_eq!(parse_db_timeout_secs(Some("nope"), 15), 15);
+    assert_eq!(parse_db_timeout_secs(Some("30"), 15), 30);
+}

@@ -163,6 +163,9 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_memory_pressure gauge"));
     assert!(body.contains("openllm_memory_pressure 0"));
     assert!(body.contains("openllm_memory_shed_total 0"));
+    assert!(body.contains("# TYPE openllm_db_pool_connections gauge"));
+    assert!(body.contains("# TYPE openllm_db_pool_idle gauge"));
+    assert!(body.contains("# TYPE openllm_db_pool_max_connections gauge"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(
@@ -3663,6 +3666,15 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.memory_limit_mib, expected_memory_limit_mib);
     assert_eq!(view.limits.memory_limit_source, expected_memory_source);
     assert_eq!(view.limits.memory_shed_ratio_pct, expected_memory_ratio_pct);
+    assert_eq!(view.limits.db_max_connections, crate::db::db_max_connections());
+    assert_eq!(
+        view.limits.db_busy_timeout_secs,
+        crate::db::db_busy_timeout_secs()
+    );
+    assert_eq!(
+        view.limits.db_acquire_timeout_secs,
+        crate::db::db_acquire_timeout_secs()
+    );
 }
 
 #[tokio::test]

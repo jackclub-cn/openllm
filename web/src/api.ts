@@ -596,6 +596,9 @@ export type RuntimeLimits = {
   memory_limit_mib: number
   memory_limit_source: string
   memory_shed_ratio_pct: number
+  db_max_connections: number
+  db_busy_timeout_secs: number
+  db_acquire_timeout_secs: number
 }
 
 export type GuardrailSettings = {
