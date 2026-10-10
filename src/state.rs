@@ -90,6 +90,14 @@ pub type CatalogCache = (Instant, Arc<crate::models_dev::Catalog>);
 /// with `OPENLLM_MAX_BODY_MIB` when larger bodies are expected.
 pub(crate) const DEFAULT_MAX_BODY_MIB: usize = 32;
 
+/// Default cap on a buffered (non-streaming) upstream response in MiB.
+///
+/// LLM responses are small JSON documents, so this is a memory-safety guard
+/// against a broken or hostile upstream streaming an unbounded body into
+/// memory, not a protocol limit. Raise it with `OPENLLM_MAX_UPSTREAM_BODY_MIB`
+/// on the rare endpoint that legitimately returns more.
+pub(crate) const DEFAULT_MAX_UPSTREAM_BODY_MIB: usize = 64;
+
 /// Default idle gap allowed between bytes from an upstream.
 ///
 /// A total-request timeout would abort long generations (reasoning models
@@ -108,9 +116,15 @@ pub(crate) const DEFAULT_SSE_KEEPALIVE_SECS: u64 = 15;
 /// Parses an operator-provided request-body cap, falling back to the default
 /// for empty, unparsable, or non-positive values.
 pub(crate) fn parse_max_body_mib(value: Option<&str>) -> usize {
+    parse_body_mib(value, DEFAULT_MAX_BODY_MIB)
+}
+
+/// Parses a MiB cap, falling back to `default` for empty, unparsable, or
+/// non-positive values so a typo can never remove the guard.
+pub(crate) fn parse_body_mib(value: Option<&str>, default: usize) -> usize {
     parse_positive(value)
         .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(DEFAULT_MAX_BODY_MIB)
+        .unwrap_or(default)
 }
 
 /// Parses an operator-provided idle timeout in seconds, falling back to
@@ -154,6 +168,15 @@ fn parse_positive(value: Option<&str>) -> Option<u64> {
 /// Resolves the configured request-body cap in bytes.
 pub(crate) fn max_request_body_bytes() -> usize {
     parse_max_body_mib(std::env::var("OPENLLM_MAX_BODY_MIB").ok().as_deref())
+        .saturating_mul(1024 * 1024)
+}
+
+/// Resolves the configured buffered-upstream-response cap in bytes.
+pub(crate) fn max_upstream_body_bytes() -> usize {
+    parse_body_mib(
+        std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB").ok().as_deref(),
+        DEFAULT_MAX_UPSTREAM_BODY_MIB,
+    )
         .saturating_mul(1024 * 1024)
 }
 

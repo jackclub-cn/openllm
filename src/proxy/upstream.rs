@@ -48,11 +48,7 @@ impl UpstreamResponse {
     }
 
     pub(crate) async fn bytes(mut self) -> Result<Bytes, std::io::Error> {
-        let mut body = Vec::new();
-        while let Some(chunk) = self.stream.next().await {
-            body.extend_from_slice(&chunk?);
-        }
-        Ok(Bytes::from(body))
+        collect_bytes_limited(&mut self.stream, crate::state::max_upstream_body_bytes()).await
     }
 
     pub(crate) fn into_stream(self) -> UpstreamByteStream {
@@ -127,6 +123,30 @@ impl UpstreamResponse {
             stream: prefix.chain(stream).boxed(),
         }
     }
+}
+
+/// Reads an upstream body into memory, refusing to grow past `limit`.
+///
+/// A non-streaming call buffers the whole response, so an upstream that never
+/// ends (or a hostile one) would otherwise grow the buffer without bound. When
+/// the cap is crossed the read stops and the caller sees an upstream error
+/// instead of the process running out of memory.
+pub(crate) async fn collect_bytes_limited(
+    stream: &mut UpstreamByteStream,
+    limit: usize,
+) -> Result<Bytes, std::io::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(std::io::Error::other(format!(
+                "upstream response exceeded the {} byte limit",
+                limit
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 fn stream_has_terminal_marker(bytes: &[u8]) -> bool {
