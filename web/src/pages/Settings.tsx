@@ -59,6 +59,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [requestPreviewMaxChars, setRequestPreviewMaxChars] = useState(4000)
   const [savingInspector, setSavingInspector] = useState(false)
   const [streamRecoveryEnabled, setStreamRecoveryEnabled] = useState(false)
+  const [streamRecoveryMaxRetries, setStreamRecoveryMaxRetries] = useState(2)
   const [maxRetries, setMaxRetries] = useState(1)
   const [retryBackoffMs, setRetryBackoffMs] = useState(200)
   const [retryMaxBackoffMs, setRetryMaxBackoffMs] = useState(2000)
@@ -100,6 +101,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       .get<ResilienceSettings>('/api/settings/resilience')
       .then((resilience) => {
         setStreamRecoveryEnabled(resilience.stream_recovery_enabled)
+        setStreamRecoveryMaxRetries(resilience.stream_recovery_max_retries)
         setMaxRetries(resilience.max_retries)
         setRetryBackoffMs(resilience.retry_backoff_ms)
         setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
@@ -257,11 +259,13 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
     try {
       const resilience = await api.put<ResilienceSettings>('/api/settings/resilience', {
         stream_recovery_enabled: streamRecoveryEnabled,
+        stream_recovery_max_retries: streamRecoveryMaxRetries,
         max_retries: maxRetries,
         retry_backoff_ms: retryBackoffMs,
         retry_max_backoff_ms: retryMaxBackoffMs,
       })
       setStreamRecoveryEnabled(resilience.stream_recovery_enabled)
+      setStreamRecoveryMaxRetries(resilience.stream_recovery_max_retries)
       setMaxRetries(resilience.max_retries)
       setRetryBackoffMs(resilience.retry_backoff_ms)
       setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
@@ -525,6 +529,21 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Switch
               checked={streamRecoveryEnabled}
               onChange={setStreamRecoveryEnabled}
+            />
+          </Form.Item>
+          <Form.Item
+            label="首包恢复重试次数"
+            extra="仅在上面的开关开启时生效，范围 0 到 4，与“同目标重试次数”相互独立，因此关闭普通重试时首包恢复仍然可用。"
+          >
+            <InputNumber
+              min={0}
+              max={4}
+              precision={0}
+              disabled={!streamRecoveryEnabled}
+              value={streamRecoveryMaxRetries}
+              onChange={(value) => setStreamRecoveryMaxRetries(value ?? 0)}
+              addonAfter="次"
+              style={{ width: 220 }}
             />
           </Form.Item>
           <Form.Item

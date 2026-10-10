@@ -91,6 +91,12 @@ pub struct ResilienceSettings {
     /// stream headers by up to the holdback duration.
     #[serde(default)]
     pub stream_recovery_enabled: bool,
+    /// Extra attempts for a stream that ended before any content reached the
+    /// client. Kept separate from `max_retries` so the recovery toggle works on
+    /// its own instead of silently doing nothing when same-target retries are
+    /// turned off.
+    #[serde(default = "default_stream_recovery_max_retries")]
+    pub stream_recovery_max_retries: i64,
     /// Extra attempts against the same target. `0` disables same-target retry.
     #[serde(default = "default_max_retries")]
     pub max_retries: i64,
@@ -106,6 +112,14 @@ fn default_max_retries() -> i64 {
     1
 }
 
+/// Upper bound for `ResilienceSettings::stream_recovery_max_retries`; also used
+/// by the settings validator and the data path.
+pub const STREAM_RECOVERY_MAX_RETRIES: i64 = 4;
+
+fn default_stream_recovery_max_retries() -> i64 {
+    2
+}
+
 fn default_retry_backoff_ms() -> i64 {
     200
 }
@@ -118,6 +132,7 @@ impl Default for ResilienceSettings {
     fn default() -> Self {
         Self {
             stream_recovery_enabled: false,
+            stream_recovery_max_retries: default_stream_recovery_max_retries(),
             max_retries: default_max_retries(),
             retry_backoff_ms: default_retry_backoff_ms(),
             retry_max_backoff_ms: default_retry_max_backoff_ms(),

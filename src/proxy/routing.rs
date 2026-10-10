@@ -1433,8 +1433,8 @@ where
     let mut retries_used = 0u32;
     let mut stream_retries_left = if streamed && resilience.stream_recovery_enabled {
         resilience
-            .max_retries
-            .clamp(0, MAX_STREAM_RECOVERY_RETRIES) as u32
+            .stream_recovery_max_retries
+            .clamp(0, crate::models::STREAM_RECOVERY_MAX_RETRIES) as u32
     } else {
         0
     };

@@ -2640,6 +2640,7 @@ fn same_target_retry_skips_rate_limits_and_client_errors() {
 fn retry_backoff_is_exponential_and_capped() {
     let settings = crate::models::ResilienceSettings {
         stream_recovery_enabled: false,
+        stream_recovery_max_retries: 2,
         max_retries: 3,
         retry_backoff_ms: 100,
         retry_max_backoff_ms: 400,
@@ -2667,6 +2668,7 @@ fn retry_backoff_is_exponential_and_capped() {
 
     let disabled = crate::models::ResilienceSettings {
         stream_recovery_enabled: false,
+        stream_recovery_max_retries: 2,
         max_retries: 0,
         retry_backoff_ms: 0,
         retry_max_backoff_ms: 0,
@@ -3188,7 +3190,10 @@ async fn stream_recovery_retries_an_empty_200_before_committing() {
         .bind(
             json!({
                 "stream_recovery_enabled": true,
-                "max_retries": 1,
+                "stream_recovery_max_retries": 1,
+                // Same-target retries stay off: the recovery budget must stand
+                // on its own, otherwise the toggle silently does nothing.
+                "max_retries": 0,
                 "retry_backoff_ms": 1,
                 "retry_max_backoff_ms": 5
             })

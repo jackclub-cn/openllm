@@ -1413,6 +1413,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
         State(state.clone()),
         Json(ResilienceSettings {
             stream_recovery_enabled: true,
+            stream_recovery_max_retries: 3,
             max_retries: 3,
             retry_backoff_ms: 250,
             retry_max_backoff_ms: 4_000,
@@ -1421,6 +1422,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
     .await
     .unwrap();
     assert!(updated.stream_recovery_enabled);
+    assert_eq!(updated.stream_recovery_max_retries, 3);
     assert_eq!(updated.max_retries, 3);
     // The stale cache must be invalidated so the new policy takes effect.
     assert_eq!(state.resilience_settings().await.unwrap(), updated);
@@ -1442,6 +1444,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
         State(state.clone()),
         Json(ResilienceSettings {
             stream_recovery_enabled: false,
+            stream_recovery_max_retries: 2,
             max_retries: 2,
             retry_backoff_ms: 5_000,
             retry_max_backoff_ms: 100,
@@ -1450,6 +1453,38 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
     .await
     .unwrap_err();
     assert!(matches!(inverted, AppError::BadRequest(_)));
+
+    let out_of_range = update_resilience_settings(
+        State(state.clone()),
+        Json(ResilienceSettings {
+            stream_recovery_enabled: true,
+            stream_recovery_max_retries: STREAM_RECOVERY_MAX_RETRIES + 1,
+            ..ResilienceSettings::default()
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(out_of_range, AppError::BadRequest(_)));
+
+    // Turning recovery off drops its budget back to the default so the stored
+    // row does not keep a stale value for a disabled feature.
+    let Json(off) = update_resilience_settings(
+        State(state.clone()),
+        Json(ResilienceSettings {
+            stream_recovery_enabled: false,
+            stream_recovery_max_retries: 4,
+            max_retries: 1,
+            retry_backoff_ms: 200,
+            retry_max_backoff_ms: 2_000,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        off.stream_recovery_max_retries,
+        ResilienceSettings::default().stream_recovery_max_retries
+    );
+    assert!(!off.stream_recovery_enabled);
 
     // Disabling retries falls back to the default backoff values and clears the
     // stored row so a fresh start uses defaults.

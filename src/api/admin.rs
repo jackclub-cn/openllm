@@ -349,6 +349,7 @@ pub async fn update_resilience_settings(
         },
         Some(json!({
             "stream_recovery_enabled": settings.stream_recovery_enabled,
+            "stream_recovery_max_retries": settings.stream_recovery_max_retries,
             "max_retries": settings.max_retries,
             "retry_backoff_ms": settings.retry_backoff_ms,
             "retry_max_backoff_ms": settings.retry_max_backoff_ms,
@@ -361,6 +362,11 @@ pub async fn update_resilience_settings(
 fn normalize_resilience_settings(mut input: ResilienceSettings) -> AppResult<ResilienceSettings> {
     const MAX_RETRIES: i64 = 5;
     const MAX_BACKOFF_MS: i64 = 60_000;
+    if !(0..=STREAM_RECOVERY_MAX_RETRIES).contains(&input.stream_recovery_max_retries) {
+        return Err(AppError::BadRequest(format!(
+            "stream_recovery_max_retries must be between 0 and {STREAM_RECOVERY_MAX_RETRIES}"
+        )));
+    }
     if !(0..=MAX_RETRIES).contains(&input.max_retries) {
         return Err(AppError::BadRequest(format!(
             "max_retries must be between 0 and {MAX_RETRIES}"
@@ -385,6 +391,10 @@ fn normalize_resilience_settings(mut input: ResilienceSettings) -> AppResult<Res
         let defaults = ResilienceSettings::default();
         input.retry_backoff_ms = defaults.retry_backoff_ms;
         input.retry_max_backoff_ms = defaults.retry_max_backoff_ms;
+    }
+    if !input.stream_recovery_enabled {
+        input.stream_recovery_max_retries =
+            ResilienceSettings::default().stream_recovery_max_retries;
     }
     Ok(input)
 }
