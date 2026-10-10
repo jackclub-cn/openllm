@@ -2660,6 +2660,8 @@ async fn updates_model_cost_overrides() {
                 context_limit: None,
                 input_limit: None,
                 output_limit: None,
+                max_concurrency: Some(4),
+                queue_timeout_seconds: Some(0),
                 cost_input_override: Some(1.25),
                 cost_output_override: Some(5.0),
                 cost_cache_read_override: Some(0.1),
@@ -2675,6 +2677,8 @@ async fn updates_model_cost_overrides() {
     assert_eq!(rows[0].cost_cache_read, Some(0.1));
     assert_eq!(rows[0].cost_cache_write, Some(2.0));
     assert_eq!(rows[0].cost_input_override, Some(1.25));
+    assert_eq!(rows[0].max_concurrency, Some(4));
+    assert_eq!(rows[0].queue_timeout_seconds, Some(0));
 }
 
 #[tokio::test]

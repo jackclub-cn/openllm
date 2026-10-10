@@ -230,6 +230,8 @@ export type ProviderModelLimit = {
   context_override?: number | null
   input_override?: number | null
   output_override?: number | null
+  max_concurrency?: number | null
+  queue_timeout_seconds?: number | null
   cost_input?: number | null
   cost_output?: number | null
   cost_cache_read?: number | null
@@ -247,6 +249,8 @@ export type ProviderModelLimitInput = {
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
+  max_concurrency?: number | null
+  queue_timeout_seconds?: number | null
   cost_input_override?: number | null
   cost_output_override?: number | null
   cost_cache_read_override?: number | null

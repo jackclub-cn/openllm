@@ -302,6 +302,10 @@ pub struct ProviderModelLimitView {
     pub context_override: Option<i64>,
     pub input_override: Option<i64>,
     pub output_override: Option<i64>,
+    /// Optional cap on concurrent upstream requests for this exact model.
+    pub max_concurrency: Option<i64>,
+    /// Queue wait before a model-concurrency-limited request falls back.
+    pub queue_timeout_seconds: Option<i64>,
     /// Effective USD-per-million-token prices after applying overrides.
     pub cost_input: Option<f64>,
     pub cost_output: Option<f64>,
@@ -327,6 +331,10 @@ pub struct ProviderModelLimitInput {
     pub input_limit: Option<i64>,
     #[serde(default)]
     pub output_limit: Option<i64>,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub queue_timeout_seconds: Option<i64>,
     #[serde(default)]
     pub cost_input_override: Option<f64>,
     #[serde(default)]

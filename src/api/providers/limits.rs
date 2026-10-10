@@ -57,6 +57,7 @@ pub async fn update_provider_model_limits(
     ensure_provider_exists(&state, id).await?;
     let mut seen = HashSet::new();
     let mut endpoint_overrides = Vec::with_capacity(input.models.len());
+    let mut concurrency_limits = Vec::with_capacity(input.models.len());
     for model in &input.models {
         let name = model.model_name.trim();
         if name.is_empty() {
@@ -70,6 +71,9 @@ pub async fn update_provider_model_limits(
         validate_limit("context", model.context_limit)?;
         validate_limit("input", model.input_limit)?;
         validate_limit("output", model.output_limit)?;
+        let max_concurrency = normalize_provider_concurrency(model.max_concurrency)?;
+        let queue_timeout_seconds =
+            normalize_provider_queue_timeout(model.queue_timeout_seconds)?;
         validate_cost_override("input cost", model.cost_input_override)?;
         validate_cost_override("output cost", model.cost_output_override)?;
         validate_cost_override("cache read cost", model.cost_cache_read_override)?;
@@ -84,13 +88,20 @@ pub async fn update_provider_model_limits(
         endpoint_overrides.push(serialize_endpoint_override(
             model.supported_endpoints_override.as_deref(),
         )?);
+        concurrency_limits.push((max_concurrency, queue_timeout_seconds));
     }
 
     let mut tx = state.pool.begin().await?;
-    for (model, endpoint_override) in input.models.iter().zip(&endpoint_overrides) {
+    for ((model, endpoint_override), (max_concurrency, queue_timeout_seconds)) in input
+        .models
+        .iter()
+        .zip(&endpoint_overrides)
+        .zip(&concurrency_limits)
+    {
         let result = sqlx::query(
             "UPDATE provider_models \
              SET enabled = ?, context_override = ?, input_override = ?, output_override = ?, \
+                 max_concurrency = ?, queue_timeout_seconds = ?, \
                  supported_endpoints_override = ?, cost_input_override = ?, \
                  cost_output_override = ?, cost_cache_read_override = ?, \
                  cost_cache_write_override = ? \
@@ -100,6 +111,8 @@ pub async fn update_provider_model_limits(
         .bind(model.context_limit)
         .bind(model.input_limit)
         .bind(model.output_limit)
+        .bind(max_concurrency)
+        .bind(queue_timeout_seconds)
         .bind(endpoint_override)
         .bind(model.cost_input_override)
         .bind(model.cost_output_override)
@@ -117,6 +130,11 @@ pub async fn update_provider_model_limits(
         }
     }
     tx.commit().await?;
+    state
+        .model_concurrency
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
 
     Ok(Json(provider_model_limits(&state, id).await?))
 }
@@ -155,6 +173,8 @@ pub(crate) async fn provider_model_limits(
                context_override,
                input_override,
                output_override,
+               max_concurrency,
+               queue_timeout_seconds,
                COALESCE(supported_endpoints_override, supported_endpoints)
                    AS supported_endpoints,
                supported_endpoints_override,
@@ -184,6 +204,8 @@ pub(crate) struct ProviderModelLimitRow {
     context_override: Option<i64>,
     input_override: Option<i64>,
     output_override: Option<i64>,
+    max_concurrency: Option<i64>,
+    queue_timeout_seconds: Option<i64>,
     supported_endpoints: Option<String>,
     supported_endpoints_override: Option<String>,
     cost: Option<String>,
@@ -224,6 +246,8 @@ impl From<ProviderModelLimitRow> for ProviderModelLimitView {
             context_override: value.context_override,
             input_override: value.input_override,
             output_override: value.output_override,
+            max_concurrency: value.max_concurrency,
+            queue_timeout_seconds: value.queue_timeout_seconds,
             cost_input: effective_cost
                 .as_ref()
                 .and_then(|cost| crate::models::cost_base_price(cost, "input")),

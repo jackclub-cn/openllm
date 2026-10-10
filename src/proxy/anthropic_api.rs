@@ -353,10 +353,14 @@ pub(crate) async fn proxy_anthropic_inner(
         .await;
         mark_provider_api_key_used(state, target_provider_key_id).await;
         last_target = Some((target_provider_id, target_upstream_model.clone()));
-        let provider_slot = match acquire_provider_slot(state, &target).await {
-            Ok(slot) => slot,
+        let upstream_slots = match acquire_upstream_slots(state, &target).await {
+            Ok(slots) => slots,
             Err(error) => {
-                capacity_exhausted_providers.insert(target_provider_id);
+                let provider_exhausted = error.provider_exhausted();
+                let error = error.into_error();
+                if provider_exhausted {
+                    capacity_exhausted_providers.insert(target_provider_id);
+                }
                 last_rate_limit = match &error {
                     AppError::UpstreamStatus {
                         message,
@@ -421,7 +425,7 @@ pub(crate) async fn proxy_anthropic_inner(
                 );
                 apply_budget_headers(&mut response, budget_usd, budget_excluded_targets);
                 apply_override_headers(&mut response, &routing_overrides);
-                return Ok(attach_provider_slot(response, provider_slot));
+                return Ok(attach_provider_slot(response, upstream_slots));
             }
             Err(error) => {
                 last_rate_limit = match &error {

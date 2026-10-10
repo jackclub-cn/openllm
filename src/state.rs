@@ -37,6 +37,8 @@ pub struct AppState {
     pub provider_key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
     /// Shared semaphores enforcing each provider's concurrency cap.
     pub provider_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
+    /// Shared semaphores enforcing each provider model's concurrency cap.
+    pub model_concurrency: Arc<Mutex<HashMap<(i64, String), Arc<Semaphore>>>>,
     pub events: broadcast::Sender<UsageEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
@@ -155,6 +157,7 @@ impl AppState {
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
             provider_concurrency: Arc::new(Mutex::new(HashMap::new())),
+            model_concurrency: Arc::new(Mutex::new(HashMap::new())),
             events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),

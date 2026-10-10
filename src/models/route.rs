@@ -111,6 +111,12 @@ pub struct RouteTarget {
     /// Per-provider queue wait before a concurrency-limited request falls back.
     #[sqlx(default)]
     pub queue_timeout_seconds: Option<i64>,
+    /// Per-model upstream concurrency cap.
+    #[sqlx(default)]
+    pub model_max_concurrency: Option<i64>,
+    /// Per-model queue wait before a concurrency-limited request falls back.
+    #[sqlx(default)]
+    pub model_queue_timeout_seconds: Option<i64>,
     /// Most recent provider health result; `Some(0)` means explicitly failed.
     pub provider_health: Option<i64>,
     pub upstream_model: String,

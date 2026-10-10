@@ -110,6 +110,18 @@ export default function ProviderLimitsModal({
     )
   }
 
+  const updateConcurrency = (
+    modelName: string,
+    field: 'max_concurrency' | 'queue_timeout_seconds',
+    value: number | null,
+  ) => {
+    setRows((current) =>
+      current.map((row) =>
+        row.model_name === modelName ? { ...row, [field]: value ?? undefined } : row,
+      ),
+    )
+  }
+
   const toggleLimitRow = (modelName: string, enabled: boolean) => {
     setRows((current) =>
       current.map((row) => (row.model_name === modelName ? { ...row, enabled } : row)),
@@ -140,6 +152,8 @@ export default function ProviderLimitsModal({
               context_override: undefined,
               input_override: undefined,
               output_override: undefined,
+              max_concurrency: undefined,
+              queue_timeout_seconds: undefined,
               supported_endpoints_override: undefined,
               cost_input_override: undefined,
               cost_output_override: undefined,
@@ -160,6 +174,8 @@ export default function ProviderLimitsModal({
       context_limit: row.context_override ?? null,
       input_limit: row.input_override ?? null,
       output_limit: row.output_override ?? null,
+      max_concurrency: row.max_concurrency ?? null,
+      queue_timeout_seconds: row.queue_timeout_seconds ?? null,
       cost_input_override: row.cost_input_override ?? null,
       cost_output_override: row.cost_output_override ?? null,
       cost_cache_read_override: row.cost_cache_read_override ?? null,
@@ -255,7 +271,7 @@ export default function ProviderLimitsModal({
           showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
           onChange: setPage,
         }}
-        scroll={{ x: 1690, y: 520 }}
+        scroll={{ x: 1930, y: 520 }}
         locale={{ emptyText: '暂无模型' }}
         columns={[
           {
@@ -384,6 +400,41 @@ export default function ProviderLimitsModal({
             ),
           },
           {
+            title: '模型并发',
+            width: 240,
+            render: (_, record) => (
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                <InputNumber
+                  min={0}
+                  max={1000}
+                  precision={0}
+                  disabled={!record.enabled}
+                  value={record.max_concurrency}
+                  placeholder="不限"
+                  addonBefore="并发"
+                  onChange={(value) =>
+                    updateConcurrency(record.model_name, 'max_concurrency', value)
+                  }
+                  style={{ width: '100%' }}
+                />
+                <InputNumber
+                  min={0}
+                  max={300}
+                  precision={0}
+                  disabled={!record.enabled || !record.max_concurrency}
+                  value={record.queue_timeout_seconds}
+                  placeholder="30"
+                  addonBefore="等待"
+                  addonAfter="秒"
+                  onChange={(value) =>
+                    updateConcurrency(record.model_name, 'queue_timeout_seconds', value)
+                  }
+                  style={{ width: '100%' }}
+                />
+              </Space>
+            ),
+          },
+          {
             title: '价格覆盖（USD / 1M）',
             width: 320,
             render: (_, record) => (
@@ -448,6 +499,8 @@ export default function ProviderLimitsModal({
               ) : record.context_override != null ||
                 record.input_override != null ||
                 record.output_override != null ||
+                record.max_concurrency != null ||
+                record.queue_timeout_seconds != null ||
                 record.supported_endpoints_override != null ||
                 record.cost_input_override != null ||
                 record.cost_output_override != null ||

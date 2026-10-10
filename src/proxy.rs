@@ -72,6 +72,31 @@ const MAX_PROVIDER_KEY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const PROVIDER_MODEL_COOLDOWN_THRESHOLD: usize = 2;
 
 #[derive(Debug)]
+pub(super) enum AcquireSlotError {
+    Provider(AppError),
+    Model(AppError),
+}
+
+impl AcquireSlotError {
+    pub(super) fn provider_exhausted(&self) -> bool {
+        matches!(self, Self::Provider(_))
+    }
+
+    pub(super) fn into_error(self) -> AppError {
+        match self {
+            Self::Provider(error) | Self::Model(error) => error,
+        }
+    }
+}
+
+/// Permits held until the upstream response body has been fully consumed.
+#[derive(Debug)]
+pub(super) struct UpstreamSlots {
+    pub(super) provider: Option<OwnedSemaphorePermit>,
+    pub(super) model: Option<OwnedSemaphorePermit>,
+}
+
+#[derive(Debug)]
 struct ResolvedRoute {
     route_id: Option<i64>,
     strategy: String,

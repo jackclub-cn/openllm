@@ -269,6 +269,11 @@ pub async fn update_provider(
     if concurrency_changed {
         state.provider_concurrency.lock().await.remove(&id);
     }
+    state
+        .model_concurrency
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
 
     if api_keys_changed {
         let current_key_ids =
@@ -321,6 +326,11 @@ pub async fn delete_provider(
     }
     state.provider_cooldown.lock().await.remove(&id);
     state.provider_concurrency.lock().await.remove(&id);
+    state
+        .model_concurrency
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
     record_audit(
         &state,
         "delete",

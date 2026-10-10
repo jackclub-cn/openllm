@@ -563,6 +563,8 @@ fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) 
         cooldown_seconds: None,
         max_concurrency: None,
         queue_timeout_seconds: None,
+        model_max_concurrency: None,
+        model_queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "model".to_string(),
         weight: 100,
@@ -1550,7 +1552,9 @@ async fn prefix_matching_is_literal_and_case_sensitive() {
                 cost_input_override REAL,
                 cost_output_override REAL,
                 cost_cache_read_override REAL,
-                cost_cache_write_override REAL
+                cost_cache_write_override REAL,
+                max_concurrency INTEGER,
+                queue_timeout_seconds INTEGER
             )",
     )
     .execute(&pool)
@@ -1654,7 +1658,9 @@ async fn disabled_provider_model_is_skipped_by_explicit_routes() {
                 cost_input_override REAL,
                 cost_output_override REAL,
                 cost_cache_read_override REAL,
-                cost_cache_write_override REAL
+                cost_cache_write_override REAL,
+                max_concurrency INTEGER,
+                queue_timeout_seconds INTEGER
             )",
     )
     .execute(&pool)
@@ -3716,7 +3722,7 @@ async fn provider_concurrency_gate_queues_then_releases_slots() {
     target.max_concurrency = Some(1);
     target.queue_timeout_seconds = Some(1);
 
-    let first = acquire_provider_slot(&state, &target)
+    let first = acquire_upstream_slots(&state, &target)
         .await
         .unwrap()
         .unwrap();
@@ -3732,7 +3738,7 @@ async fn provider_concurrency_gate_queues_then_releases_slots() {
     let state_for_waiter = state.clone();
     let target_for_waiter = target.clone();
     let waiter = tokio::spawn(async move {
-        acquire_provider_slot(&state_for_waiter, &target_for_waiter).await
+        acquire_upstream_slots(&state_for_waiter, &target_for_waiter).await
     });
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!waiter.is_finished());
@@ -3762,11 +3768,14 @@ async fn provider_concurrency_zero_queue_timeout_rejects_immediately() {
     target.max_concurrency = Some(1);
     target.queue_timeout_seconds = Some(0);
 
-    let first = acquire_provider_slot(&state, &target)
+    let first = acquire_upstream_slots(&state, &target)
         .await
         .unwrap()
         .unwrap();
-    let error = acquire_provider_slot(&state, &target).await.unwrap_err();
+    let error = acquire_upstream_slots(&state, &target)
+        .await
+        .unwrap_err()
+        .into_error();
     assert!(matches!(
         error,
         AppError::UpstreamStatus {
@@ -3775,6 +3784,129 @@ async fn provider_concurrency_zero_queue_timeout_rejects_immediately() {
         }
     ));
     drop(first);
+}
+
+#[tokio::test]
+async fn saturated_model_falls_back_to_healthy_provider_sibling() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-model-sibling",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "sibling-ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (
+            id, name, provider_type, base_url, enabled, max_concurrency, queue_timeout_seconds
+         ) VALUES (1, 'model-concurrency', 'openai', ?, 1, 2, 0)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (
+            provider_id, model_name, enabled, max_concurrency, queue_timeout_seconds
+         ) VALUES
+            (1, 'model-a', 1, 1, 0),
+            (1, 'model-b', 1, 1, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'model concurrency route', 'public-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+            (1, 1, 'model-a', 0),
+            (1, 1, 'model-b', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let mut hot_target = endpoint_test_target("openai", None);
+    hot_target.provider_id = 1;
+    hot_target.provider_name = "model-concurrency".to_string();
+    hot_target.upstream_model = "model-a".to_string();
+    hot_target.max_concurrency = Some(2);
+    hot_target.queue_timeout_seconds = Some(0);
+    hot_target.model_max_concurrency = Some(1);
+    hot_target.model_queue_timeout_seconds = Some(0);
+    let held = acquire_upstream_slots(&state, &hot_target)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let body = Bytes::from(
+        json!({
+            "model": "public-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "model-concurrency-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert_eq!(response.headers()["x-openllm-routed-model"], "model-b");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert!(
+        !state.provider_cooldown.lock().await.contains_key(&1),
+        "local model backpressure must not open the provider circuit"
+    );
+
+    drop(held);
+    server.abort();
 }
 
 #[tokio::test]
@@ -3790,7 +3922,7 @@ async fn provider_slot_is_held_until_streamed_body_completes() {
     target.max_concurrency = Some(1);
     target.queue_timeout_seconds = Some(0);
 
-    let permit = acquire_provider_slot(&state, &target)
+    let slots = acquire_upstream_slots(&state, &target)
         .await
         .unwrap()
         .unwrap();
@@ -3806,7 +3938,7 @@ async fn provider_slot_is_held_until_streamed_body_completes() {
         Ok::<_, std::convert::Infallible>(Bytes::from_static(b"second")),
     ]);
     let response = Response::new(Body::from_stream(stream));
-    let response = attach_provider_slot(response, Some(permit));
+    let response = attach_provider_slot(response, Some(slots));
 
     assert_eq!(semaphore.available_permits(), 0);
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -4639,6 +4771,8 @@ async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() 
             cooldown_seconds: None,
             max_concurrency: None,
             queue_timeout_seconds: None,
+            model_max_concurrency: None,
+            model_queue_timeout_seconds: None,
             provider_health: None,
             upstream_model: "upstream".to_string(),
             weight: 100,
@@ -4796,6 +4930,8 @@ async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
         cooldown_seconds: None,
         max_concurrency: None,
         queue_timeout_seconds: None,
+        model_max_concurrency: None,
+        model_queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "deepseek/deepseek-v4.1-flash".to_string(),
         weight: 100,
@@ -4944,6 +5080,8 @@ async fn anthropic_forward_repairs_orphan_tool_calls_for_openai_upstream() {
         cooldown_seconds: None,
         max_concurrency: None,
         queue_timeout_seconds: None,
+        model_max_concurrency: None,
+        model_queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,
@@ -5102,6 +5240,8 @@ async fn anthropic_forward_retries_openai_upstream_without_tool_search() {
         cooldown_seconds: None,
         max_concurrency: None,
         queue_timeout_seconds: None,
+        model_max_concurrency: None,
+        model_queue_timeout_seconds: None,
         provider_health: None,
         upstream_model: "upstream".to_string(),
         weight: 100,

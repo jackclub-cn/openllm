@@ -557,19 +557,21 @@ pub(crate) async fn forward_to_target(
     Ok(response)
 }
 
-/// Keeps a provider concurrency permit alive until the outbound response body
-/// completes, including translated and pass-through streams.
+/// Keeps model and provider concurrency permits alive until the outbound
+/// response body completes, including translated and pass-through streams.
 pub(crate) fn attach_provider_slot(
     response: Response,
-    permit: Option<OwnedSemaphorePermit>,
+    slots: Option<UpstreamSlots>,
 ) -> Response {
-    let Some(permit) = permit else {
+    let Some(slots) = slots else {
         return response;
     };
+    let UpstreamSlots { provider, model } = slots;
     let (parts, body) = response.into_parts();
     let mut stream = body.into_data_stream();
     let guarded = async_stream::stream! {
-        let _permit = permit;
+        let _provider_slot = provider;
+        let _model_slot = model;
         while let Some(chunk) = stream.next().await {
             yield chunk;
         }
