@@ -1238,9 +1238,29 @@ async fn resilience_policy(state: &AppState) -> crate::models::ResilienceSetting
     }
 }
 
+/// The result of one upstream send attempt, before retry decisions.
+enum SendError {
+    /// The transport itself failed (connect, reset, timeout, body).
+    Http(reqwest::Error),
+    /// A streaming call did not receive response headers within its budget.
+    HeaderTimeout(Duration),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(error) => write!(formatter, "{error}"),
+            Self::HeaderTimeout(budget) => {
+                write!(formatter, "no response headers within {}s", budget.as_secs())
+            }
+        }
+    }
+}
+
 pub(super) async fn send_provider_request(
     state: &AppState,
     target: &RouteTarget,
+    streamed: bool,
     build: impl Fn() -> AppResult<RequestBuilder>,
 ) -> AppResult<reqwest::Response> {
     let resilience = resilience_policy(state).await;
@@ -1248,21 +1268,35 @@ pub(super) async fn send_provider_request(
     let mut retries_used = 0u32;
 
     loop {
-        // A provider may cap how long one call may take; without an override the
-        // shared client's idle timeout applies.
         let request = build()?;
-        let request = match target.timeout_seconds {
-            Some(seconds) if seconds > 0 => {
-                request.timeout(Duration::from_secs(seconds.unsigned_abs()))
-            }
-            _ => request,
+        let budget = target
+            .timeout_seconds
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(seconds.unsigned_abs()));
+        // A total-request timeout would abort a long streaming generation, so a
+        // streamed call only gets its provider budget on the wait for response
+        // headers; the shared client's idle read timeout governs the body. A
+        // buffered call keeps the total timeout because it has no stream to
+        // protect and an unbounded body read would be a memory risk.
+        let outcome = match budget {
+            Some(budget) if streamed => match tokio::time::timeout(budget, request.send()).await {
+                Ok(result) => result.map_err(SendError::Http),
+                Err(_) => Err(SendError::HeaderTimeout(budget)),
+            },
+            Some(budget) => request.timeout(budget).send().await.map_err(SendError::Http),
+            None => request.send().await.map_err(SendError::Http),
         };
-        match request.send().await {
+
+        match outcome {
             Ok(response) => return Ok(response),
             Err(error) => {
+                let retryable = match &error {
+                    SendError::Http(error) => retryable_transport_error(error),
+                    SendError::HeaderTimeout(_) => true,
+                };
                 // Transport faults are worth one more attempt: a reset socket or
                 // a slow upstream often recovers without the caller noticing.
-                if retries_left > 0 && retryable_transport_error(&error) {
+                if retries_left > 0 && retryable {
                     retries_left -= 1;
                     let delay = retry_backoff(&resilience, retries_used);
                     retries_used += 1;
@@ -1271,7 +1305,7 @@ pub(super) async fn send_provider_request(
                         model = %target.upstream_model,
                         retry = retries_used,
                         delay_ms = delay.as_millis() as u64,
-                        %error,
+                        error = %error,
                         "upstream transport error; retrying the same target"
                     );
                     tokio::time::sleep(delay).await;
@@ -1440,8 +1474,9 @@ where
     };
     let mut stream_retries_used = 0u32;
 
-    let mut response =
-        UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
+    let mut response = UpstreamResponse::new(
+        send_provider_request(state, target, streamed, || build(body)).await?,
+    );
     let mut transient_retry_used = false;
 
     loop {
@@ -1466,7 +1501,7 @@ where
                         );
                         tokio::time::sleep(delay).await;
                         response = UpstreamResponse::new(
-                            send_provider_request(state, target, || build(body)).await?,
+                            send_provider_request(state, target, streamed, || build(body)).await?,
                         );
                         continue;
                     }
@@ -1512,8 +1547,9 @@ where
                 "upstream returned a transient status; retrying the same target"
             );
             tokio::time::sleep(delay).await;
-            response =
-                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
+            response = UpstreamResponse::new(
+                send_provider_request(state, target, streamed, || build(body)).await?,
+            );
             continue;
         }
 
@@ -1531,8 +1567,9 @@ where
                 has_tool_search = strip_tool_search_tools(body).is_some(),
                 "upstream returned an opaque 4xx; retrying once"
             );
-            response =
-                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
+            response = UpstreamResponse::new(
+                send_provider_request(state, target, streamed, || build(body)).await?,
+            );
             continue;
         }
 
@@ -1551,8 +1588,9 @@ where
             );
             mark_provider_tool_search_unsupported(state, target.provider_id).await;
             *body = compat_body;
-            response =
-                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
+            response = UpstreamResponse::new(
+                send_provider_request(state, target, streamed, || build(body)).await?,
+            );
             continue;
         }
 

@@ -4050,7 +4050,7 @@ async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
 
     let url = format!("http://{address}/v1/chat/completions");
     assert!(
-        send_provider_request(&state, &target, || Ok(state.client.post(&url)))
+        send_provider_request(&state, &target, false, || Ok(state.client.post(&url)))
             .await
             .is_err()
     );
@@ -4091,10 +4091,88 @@ async fn unreadable_resilience_settings_do_not_break_the_data_path() {
     target.base_url = format!("http://{address}");
 
     let url = format!("http://{address}/v1/chat/completions");
-    let response = send_provider_request(&state, &target, || Ok(state.client.post(&url)))
+    let response = send_provider_request(&state, &target, false, || Ok(state.client.post(&url)))
         .await
         .expect("a settings read failure must not fail the request");
     assert_eq!(response.status(), StatusCode::OK);
+
+    server.abort();
+}
+
+/// A provider request timeout must not become a total timeout for a stream:
+/// it bounds only the wait for response headers, so a generation that runs
+/// longer than the budget is still delivered in full.
+#[tokio::test]
+async fn provider_timeout_does_not_truncate_a_stream() {
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post(|| async {
+            let stream = async_stream::stream! {
+                yield Ok::<_, std::convert::Infallible>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"early\"}}]}\n\n",
+                ));
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                yield Ok(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"late\"}}]}\n\ndata: [DONE]\n\n",
+                ));
+            };
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                .body(Body::from_stream(stream))
+                .unwrap()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers \
+             (id, name, provider_type, base_url, model_prefix, enabled, timeout_seconds) \
+             VALUES (1, 'slow-stream', 'openai', ?, '', 1, 1)",
+    )
+    .bind(format!("http://{address}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled) \
+             VALUES (1, 'slow-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+
+    let uri: Uri = OPENAI_CHAT_COMPLETIONS.parse().unwrap();
+    let body = Bytes::from(
+        json!({
+            "model": "slow-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai(State(state), HeaderMap::new(), uri, body).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let text = String::from_utf8_lossy(&body);
+    assert!(text.contains("early"), "{text}");
+    assert!(
+        text.contains("late"),
+        "the provider total timeout must not cut a stream: {text}"
+    );
 
     server.abort();
 }

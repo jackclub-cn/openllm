@@ -899,6 +899,11 @@ pub(super) fn normalize_health_interval(value: Option<i64>) -> AppResult<Option<
 
 /// Per-provider request timeout. `None`/`0` keeps the gateway-wide idle
 /// timeout; anything else bounds one upstream call, capped at one hour.
+///
+/// For a buffered call the budget covers the whole request and body. For a
+/// streamed call it bounds only the wait for response headers, because the
+/// shared client's idle read timeout already guards the body and a total cap
+/// would cut long generations.
 pub(super) fn normalize_provider_timeout(value: Option<i64>) -> AppResult<Option<i64>> {
     const MAX_TIMEOUT_SECONDS: i64 = 3600;
     match value {

@@ -204,7 +204,7 @@ export default function ProviderEditorModal({
           <Form.Item
             name="timeout_seconds"
             label="请求超时（秒）"
-            extra="0 或留空沿用全局空闲超时；设置后限制单次上游请求总时长，最长 3600 秒。"
+            extra="0 或留空沿用全局空闲超时；设置后限制单次上游请求，流式请求只限制等待响应头的时间，长时间生成仍由空闲超时保护，最长 3600 秒。"
           >
             <InputNumber min={0} max={3600} precision={0} style={{ width: '100%' }} />
           </Form.Item>
