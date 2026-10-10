@@ -34,6 +34,15 @@ impl UpstreamResponse {
         self.status
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_stream(status: StatusCode, stream: UpstreamByteStream) -> Self {
+        Self {
+            status,
+            headers: HeaderMap::new(),
+            stream,
+        }
+    }
+
     pub(crate) fn headers(&self) -> &HeaderMap {
         &self.headers
     }
@@ -53,21 +62,14 @@ impl UpstreamResponse {
     /// Holds the opening stream window long enough to retry a cutoff that
     /// happened before any bytes reached the client. A terminal SSE marker,
     /// the byte cap, or the holdback deadline commits the buffered prefix.
+    ///
+    /// The window is released the moment it carries usable assistant output so
+    /// a healthy stream pays no extra time-to-first-token: the holdback is only
+    /// spent while the turn is still content-free, which is exactly the state a
+    /// transparent retry is allowed to discard.
     pub(crate) async fn recover_prefix(mut self) -> Result<Self, String> {
-        let first = match self.stream.next().await {
-            Some(Ok(chunk)) => chunk,
-            Some(Err(error)) => return Err(error.to_string()),
-            None => return Err("upstream stream ended before sending any data".to_string()),
-        };
-        let mut chunks = Vec::new();
+        let mut chunks = Vec::<Bytes>::new();
         let mut raw = Vec::new();
-        raw.extend_from_slice(&first);
-        let mut size = first.len();
-        chunks.push(first);
-
-        if size >= STREAM_RECOVERY_MAX_BYTES || stream_has_terminal_marker(&raw) {
-            return Ok(self.prepend_prefix(chunks));
-        }
 
         let deadline = tokio::time::sleep(STREAM_RECOVERY_HOLDBACK);
         tokio::pin!(deadline);
@@ -76,18 +78,29 @@ impl UpstreamResponse {
                 chunk = self.stream.next() => {
                     match chunk {
                         Some(Ok(chunk)) => {
-                            size = size.saturating_add(chunk.len());
                             raw.extend_from_slice(&chunk);
                             chunks.push(chunk);
-                            if size >= STREAM_RECOVERY_MAX_BYTES || stream_has_terminal_marker(&raw) {
+                            if raw.len() >= STREAM_RECOVERY_MAX_BYTES
+                                || stream_has_terminal_marker(&raw)
+                                || stream_has_usable_content(&raw)
+                            {
                                 break;
                             }
                         }
                         Some(Err(error)) => return Err(error.to_string()),
                         None => {
-                            if !stream_has_terminal_marker(&raw) {
+                            // A provider that closes the connection without a
+                            // terminal marker is only treated as truncated when
+                            // the window never carried usable content. Closing
+                            // after delivering content is a legitimate end for
+                            // several OpenAI-compatible servers, and replaying
+                            // such a turn would burn a whole extra generation
+                            // and then fail if it happened again.
+                            if !stream_has_terminal_marker(&raw)
+                                && !stream_has_usable_content(&raw)
+                            {
                                 return Err(
-                                    "upstream stream ended before a terminal event".to_string()
+                                    "upstream stream ended without any content".to_string()
                                 );
                             }
                             break;
@@ -127,6 +140,102 @@ fn stream_has_terminal_marker(bytes: &[u8]) -> bool {
     ]
     .iter()
     .any(|marker| text.contains(marker))
+}
+
+/// Whether the held window already carries assistant output worth keeping.
+///
+/// The check spans every protocol the gateway translates between, because the
+/// holdback runs before the shape is known: an OpenAI chat chunk, a Responses
+/// event, or a native Anthropic event all have to release the window.
+pub(crate) fn stream_has_usable_content(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    let mut saw_sse_field = false;
+    let mut saw_bare_payload = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with(':') {
+            continue;
+        }
+        if let Some(data) = line.strip_prefix("data:") {
+            saw_sse_field = true;
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            if data == "[DONE]" {
+                return true;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(data)
+                && event_has_usable_content(&value)
+            {
+                return true;
+            }
+        } else if line.starts_with("event:") {
+            saw_sse_field = true;
+        } else {
+            saw_bare_payload = true;
+        }
+    }
+    // A 200 that is not an event stream is a complete body, whatever the client
+    // asked for, so there is nothing to recover by holding it.
+    !saw_sse_field && saw_bare_payload
+}
+
+fn event_has_usable_content(value: &Value) -> bool {
+    let non_empty_str = |value: Option<&Value>| {
+        value
+            .and_then(Value::as_str)
+            .is_some_and(|text| !text.is_empty())
+    };
+
+    // OpenAI chat-completions and legacy completions chunks.
+    if let Some(delta) = value.pointer("/choices/0/delta") {
+        if non_empty_str(delta.get("content")) || non_empty_str(delta.get("reasoning_content")) {
+            return true;
+        }
+        if delta.get("tool_calls").is_some_and(|calls| !calls.is_null()) {
+            return true;
+        }
+        if delta
+            .get("function_call")
+            .is_some_and(|call| !call.is_null())
+        {
+            return true;
+        }
+    }
+    if non_empty_str(value.pointer("/choices/0/text")) {
+        return true;
+    }
+
+    match value.get("type").and_then(Value::as_str) {
+        // Responses API events.
+        Some("response.output_text.delta")
+        | Some("response.reasoning_summary_text.delta")
+        | Some("response.function_call_arguments.delta") => {
+            return non_empty_str(value.get("delta"));
+        }
+        Some("response.output_item.added") => {
+            return value.pointer("/item/type").and_then(Value::as_str) == Some("function_call");
+        }
+        // Anthropic Messages events.
+        Some("content_block_start") => {
+            return value
+                .pointer("/content_block/type")
+                .and_then(Value::as_str)
+                == Some("tool_use");
+        }
+        Some("content_block_delta") => {
+            let delta = value.get("delta").unwrap_or(&Value::Null);
+            return match delta.get("type").and_then(Value::as_str) {
+                Some("text_delta") => non_empty_str(delta.get("text")),
+                Some("thinking_delta") => non_empty_str(delta.get("thinking")),
+                Some("input_json_delta") => non_empty_str(delta.get("partial_json")),
+                _ => false,
+            };
+        }
+        _ => {}
+    }
+    false
 }
 
 /// Builds the error used when a retryable upstream failure should move on to

@@ -450,6 +450,51 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         "openllm_provider_inflight",
         "Current upstream requests holding a per-provider concurrency slot",
     );
+    metric_header(
+        &mut body,
+        "openllm_provider_cooling",
+        "Whether a provider is currently excluded from routing by a runtime cooldown",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_models",
+        "Enabled upstream models per provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_models_disabled",
+        "Disabled upstream models per provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_requests_total",
+        "Lifetime upstream requests per provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_successes_total",
+        "Lifetime successful upstream requests per provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_prompt_tokens_total",
+        "Lifetime prompt tokens attributed to each provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_completion_tokens_total",
+        "Lifetime completion tokens attributed to each provider",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_average_latency_ms",
+        "Mean upstream latency per provider over retained requests",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_last_test_latency_ms",
+        "Latency of the most recent provider health probe",
+    );
     for provider in &providers {
         let state = if provider.enabled == 0 {
             "disabled"

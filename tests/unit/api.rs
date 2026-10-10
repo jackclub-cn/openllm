@@ -11,6 +11,45 @@ async fn provider_key_test_state() -> AppState {
     AppState::new(pool, None)
 }
 
+/// Every exported sample must belong to a family that declared its type.
+///
+/// Prometheus tolerates a missing declaration by treating the family as
+/// untyped, which silently breaks `rate()` / `increase()` semantics on counters
+/// and drops the family's meaning in dashboards. Keeping the whole exposition
+/// self-consistent is cheap; relying on reviewers to spot one missing header is
+/// not.
+fn assert_every_metric_family_declares_a_type(body: &str) {
+    let declared = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("# TYPE "))
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<HashSet<_>>();
+    for line in body.lines() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let family = line
+            .split(['{', ' '])
+            .next()
+            .unwrap_or_default();
+        assert!(
+            declared.contains(family),
+            "metric family '{family}' is exported without a # TYPE declaration"
+        );
+    }
+}
+
+#[test]
+#[should_panic(expected = "without a # TYPE declaration")]
+fn metric_family_guard_detects_a_missing_type() {
+    assert_every_metric_family_declares_a_type(
+        "# HELP openllm_declared Declared family\n\
+         # TYPE openllm_declared gauge\n\
+         openllm_declared 1\n\
+         openllm_undeclared 2\n",
+    );
+}
+
 #[tokio::test]
 async fn prometheus_metrics_render_and_require_admin_token() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
@@ -155,6 +194,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));
     assert!(body.contains("openllm_audit_logs 0"));
     assert!(body.contains("openllm_database_size_bytes"));
+    assert!(body.contains("# TYPE openllm_provider_cooling gauge"));
+    assert!(body.contains("# TYPE openllm_provider_requests_total counter"));
+    assert!(body.contains("# TYPE openllm_provider_average_latency_ms gauge"));
+    assert_every_metric_family_declares_a_type(&body);
 }
 
 fn provider_input(api_key: Option<&str>, api_keys: Vec<ProviderApiKeyInput>) -> ProviderInput {

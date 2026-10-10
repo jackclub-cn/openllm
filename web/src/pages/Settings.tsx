@@ -520,7 +520,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
         <Form layout="vertical">
           <Form.Item
             label="流式首包恢复"
-            extra="开启后最多保留首个流式窗口 750ms；若上游在响应头之后、任何内容送达客户端之前断开，会按同目标重试次数重新请求。关闭可避免额外首包延迟。"
+            extra="开启后网关只在上游尚未送出任何内容时保留首包窗口（最多 750ms 或 64KiB）；一旦有内容就立即放行，所以正常流式请求不会增加首包延迟。只有 200 之后、内容送达之前就断开的上游才会按同目标重试次数重新请求。"
           >
             <Switch
               checked={streamRecoveryEnabled}
