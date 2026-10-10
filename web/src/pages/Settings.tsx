@@ -58,6 +58,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [captureRequestPreviews, setCaptureRequestPreviews] = useState(false)
   const [requestPreviewMaxChars, setRequestPreviewMaxChars] = useState(4000)
   const [savingInspector, setSavingInspector] = useState(false)
+  const [streamRecoveryEnabled, setStreamRecoveryEnabled] = useState(false)
   const [maxRetries, setMaxRetries] = useState(1)
   const [retryBackoffMs, setRetryBackoffMs] = useState(200)
   const [retryMaxBackoffMs, setRetryMaxBackoffMs] = useState(2000)
@@ -98,6 +99,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
     api
       .get<ResilienceSettings>('/api/settings/resilience')
       .then((resilience) => {
+        setStreamRecoveryEnabled(resilience.stream_recovery_enabled)
         setMaxRetries(resilience.max_retries)
         setRetryBackoffMs(resilience.retry_backoff_ms)
         setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
@@ -254,10 +256,12 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
     setSavingResilience(true)
     try {
       const resilience = await api.put<ResilienceSettings>('/api/settings/resilience', {
+        stream_recovery_enabled: streamRecoveryEnabled,
         max_retries: maxRetries,
         retry_backoff_ms: retryBackoffMs,
         retry_max_backoff_ms: retryMaxBackoffMs,
       })
+      setStreamRecoveryEnabled(resilience.stream_recovery_enabled)
       setMaxRetries(resilience.max_retries)
       setRetryBackoffMs(resilience.retry_backoff_ms)
       setRetryMaxBackoffMs(resilience.retry_max_backoff_ms)
@@ -514,6 +518,15 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
         bordered={false}
       >
         <Form layout="vertical">
+          <Form.Item
+            label="流式首包恢复"
+            extra="开启后最多保留首个流式窗口 750ms；若上游在响应头之后、任何内容送达客户端之前断开，会按同目标重试次数重新请求。关闭可避免额外首包延迟。"
+          >
+            <Switch
+              checked={streamRecoveryEnabled}
+              onChange={setStreamRecoveryEnabled}
+            />
+          </Form.Item>
           <Form.Item
             label="同目标重试次数"
             extra="连接错误、超时和可重试 5xx 会先按指数退避重试当前目标，再切换到下一个目标；0 表示关闭。"

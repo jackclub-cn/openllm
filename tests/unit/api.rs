@@ -1369,6 +1369,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
     let Json(updated) = update_resilience_settings(
         State(state.clone()),
         Json(ResilienceSettings {
+            stream_recovery_enabled: true,
             max_retries: 3,
             retry_backoff_ms: 250,
             retry_max_backoff_ms: 4_000,
@@ -1376,6 +1377,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
     )
     .await
     .unwrap();
+    assert!(updated.stream_recovery_enabled);
     assert_eq!(updated.max_retries, 3);
     // The stale cache must be invalidated so the new policy takes effect.
     assert_eq!(state.resilience_settings().await.unwrap(), updated);
@@ -1396,6 +1398,7 @@ async fn resilience_settings_round_trip_validate_and_invalidate_cache() {
     let inverted = update_resilience_settings(
         State(state.clone()),
         Json(ResilienceSettings {
+            stream_recovery_enabled: false,
             max_retries: 2,
             retry_backoff_ms: 5_000,
             retry_max_backoff_ms: 100,

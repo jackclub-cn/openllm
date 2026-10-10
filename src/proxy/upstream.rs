@@ -1,4 +1,133 @@
 use super::*;
+use futures_util::TryStreamExt;
+
+const STREAM_RECOVERY_HOLDBACK: Duration = Duration::from_millis(750);
+const STREAM_RECOVERY_MAX_BYTES: usize = 65_536;
+
+pub(crate) type UpstreamByteStream =
+    futures_util::stream::BoxStream<'static, Result<Bytes, std::io::Error>>;
+
+/// An upstream response whose body can be safely replayed after a bounded
+/// pre-commit stream probe.
+pub(crate) struct UpstreamResponse {
+    status: StatusCode,
+    headers: HeaderMap,
+    stream: UpstreamByteStream,
+}
+
+impl UpstreamResponse {
+    pub(crate) fn new(response: reqwest::Response) -> Self {
+        let status = response.status();
+        let headers = response.headers().clone();
+        let stream = response
+            .bytes_stream()
+            .map_err(std::io::Error::other)
+            .boxed();
+        Self {
+            status,
+            headers,
+            stream,
+        }
+    }
+
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(crate) fn headers(&self) -> &HeaderMap {
+        &self.headers
+    }
+
+    pub(crate) async fn bytes(mut self) -> Result<Bytes, std::io::Error> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.stream.next().await {
+            body.extend_from_slice(&chunk?);
+        }
+        Ok(Bytes::from(body))
+    }
+
+    pub(crate) fn into_stream(self) -> UpstreamByteStream {
+        self.stream
+    }
+
+    /// Holds the opening stream window long enough to retry a cutoff that
+    /// happened before any bytes reached the client. A terminal SSE marker,
+    /// the byte cap, or the holdback deadline commits the buffered prefix.
+    pub(crate) async fn recover_prefix(mut self) -> Result<Self, String> {
+        let first = match self.stream.next().await {
+            Some(Ok(chunk)) => chunk,
+            Some(Err(error)) => return Err(error.to_string()),
+            None => return Err("upstream stream ended before sending any data".to_string()),
+        };
+        let mut chunks = Vec::new();
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&first);
+        let mut size = first.len();
+        chunks.push(first);
+
+        if size >= STREAM_RECOVERY_MAX_BYTES || stream_has_terminal_marker(&raw) {
+            return Ok(self.prepend_prefix(chunks));
+        }
+
+        let deadline = tokio::time::sleep(STREAM_RECOVERY_HOLDBACK);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                chunk = self.stream.next() => {
+                    match chunk {
+                        Some(Ok(chunk)) => {
+                            size = size.saturating_add(chunk.len());
+                            raw.extend_from_slice(&chunk);
+                            chunks.push(chunk);
+                            if size >= STREAM_RECOVERY_MAX_BYTES || stream_has_terminal_marker(&raw) {
+                                break;
+                            }
+                        }
+                        Some(Err(error)) => return Err(error.to_string()),
+                        None => {
+                            if !stream_has_terminal_marker(&raw) {
+                                return Err(
+                                    "upstream stream ended before a terminal event".to_string()
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+
+        Ok(self.prepend_prefix(chunks))
+    }
+
+    fn prepend_prefix(self, chunks: Vec<Bytes>) -> Self {
+        let Self {
+            status,
+            headers,
+            stream,
+        } = self;
+        let prefix = futures_util::stream::iter(chunks.into_iter().map(Ok));
+        Self {
+            status,
+            headers,
+            stream: prefix.chain(stream).boxed(),
+        }
+    }
+}
+
+fn stream_has_terminal_marker(bytes: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(bytes);
+    [
+        "[DONE]",
+        "message_stop",
+        "response.completed",
+        "response.failed",
+        "response.incomplete",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
 
 /// Builds the error used when a retryable upstream failure should move on to
 /// the next route target.
@@ -189,6 +318,7 @@ pub(crate) async fn forward_to_target(
         &target,
         request_id,
         endpoint,
+        streamed,
         &mut request_body,
         |body| build_upstream_request(state, &url, provider_type, &target, body, session_id),
     )
@@ -230,7 +360,7 @@ pub(crate) async fn forward_to_target(
             if endpoint == OPENAI_RESPONSES {
                 return Ok(anthropic_stream_to_responses(
                     state.clone(),
-                    response,
+                    response.into_stream(),
                     request_id.to_string(),
                     requested_model.to_string(),
                     target,
@@ -243,7 +373,7 @@ pub(crate) async fn forward_to_target(
             if endpoint == OPENAI_COMPLETIONS {
                 return Ok(anthropic_stream_to_completions(
                     state.clone(),
-                    response,
+                    response.into_stream(),
                     request_id.to_string(),
                     requested_model.to_string(),
                     target,
@@ -255,7 +385,7 @@ pub(crate) async fn forward_to_target(
             }
             return Ok(anthropic_stream_response(
                 state.clone(),
-                response,
+                response.into_stream(),
                 request_id.to_string(),
                 requested_model.to_string(),
                 target,
@@ -318,7 +448,7 @@ pub(crate) async fn forward_to_target(
         if streamed {
             return Ok(openai_chat_stream_to_responses(
                 state.clone(),
-                response,
+                response.into_stream(),
                 request_id.to_string(),
                 requested_model.to_string(),
                 target,
@@ -375,7 +505,7 @@ pub(crate) async fn forward_to_target(
         if streamed {
             return Ok(responses_stream_to_chat(
                 state.clone(),
-                response,
+                response.into_stream(),
                 request_id.to_string(),
                 requested_model.to_string(),
                 target,
@@ -432,7 +562,7 @@ pub(crate) async fn forward_to_target(
         if streamed {
             return Ok(chat_stream_to_completions(
                 state.clone(),
-                response,
+                response.into_stream(),
                 request_id.to_string(),
                 requested_model.to_string(),
                 target,
@@ -492,7 +622,7 @@ pub(crate) async fn forward_to_target(
     if streamed {
         return Ok(passthrough_stream_response(
             state.clone(),
-            response,
+            response.into_stream(),
             response_content_type,
             endpoint.to_string(),
             request_id.to_string(),

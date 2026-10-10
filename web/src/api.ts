@@ -592,6 +592,7 @@ export type InspectorSettings = {
 }
 
 export type ResilienceSettings = {
+  stream_recovery_enabled: boolean
   max_retries: number
   retry_backoff_ms: number
   retry_max_backoff_ms: number

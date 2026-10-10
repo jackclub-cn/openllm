@@ -1214,7 +1214,7 @@ pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
 /// The outcome of an upstream attempt that may have been resent once.
 pub(super) enum UpstreamAttempt {
     /// The upstream answered successfully; the body has not been consumed.
-    Ok(reqwest::Response),
+    Ok(UpstreamResponse),
     /// The upstream failed; the status, headers and body are already read.
     Error {
         status: StatusCode,
@@ -1421,6 +1421,7 @@ pub(super) async fn send_provider_request_with_compat_retry<F>(
     target: &RouteTarget,
     request_id: &str,
     endpoint: &str,
+    streamed: bool,
     body: &mut Value,
     build: F,
 ) -> AppResult<UpstreamAttempt>
@@ -1430,13 +1431,62 @@ where
     let resilience = resilience_policy(state).await;
     let mut retries_left = resilience.max_retries.clamp(0, MAX_SAME_TARGET_RETRIES) as u32;
     let mut retries_used = 0u32;
+    let mut stream_retries_left = if streamed && resilience.stream_recovery_enabled {
+        resilience
+            .max_retries
+            .clamp(0, MAX_STREAM_RECOVERY_RETRIES) as u32
+    } else {
+        0
+    };
+    let mut stream_retries_used = 0u32;
 
-    let mut response = send_provider_request(state, target, || build(body)).await?;
+    let mut response =
+        UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
     let mut transient_retry_used = false;
 
     loop {
         let status = response.status();
         if status.is_success() {
+            if streamed && resilience.stream_recovery_enabled {
+                match response.recover_prefix().await {
+                    Ok(recovered) => return Ok(UpstreamAttempt::Ok(recovered)),
+                    Err(error) if stream_retries_left > 0 => {
+                        stream_retries_left -= 1;
+                        let delay = retry_backoff(&resilience, stream_retries_used);
+                        stream_retries_used += 1;
+                        tracing::warn!(
+                            provider = %target.provider_name,
+                            model = %target.upstream_model,
+                            request_id,
+                            endpoint,
+                            retry = stream_retries_used,
+                            delay_ms = delay.as_millis() as u64,
+                            %error,
+                            "upstream stream ended before commit; retrying the same target"
+                        );
+                        tokio::time::sleep(delay).await;
+                        response = UpstreamResponse::new(
+                            send_provider_request(state, target, || build(body)).await?,
+                        );
+                        continue;
+                    }
+                    Err(error) => {
+                        mark_provider_error(
+                            state,
+                            target.provider_id,
+                            Some(StatusCode::BAD_GATEWAY),
+                            None,
+                            target.cooldown_seconds,
+                        )
+                        .await;
+                        mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
+                        return Err(AppError::Upstream(format!(
+                            "{} stream ended before commit: {error}",
+                            target.provider_name
+                        )));
+                    }
+                }
+            }
             return Ok(UpstreamAttempt::Ok(response));
         }
         let headers = response.headers().clone();
@@ -1462,7 +1512,8 @@ where
                 "upstream returned a transient status; retrying the same target"
             );
             tokio::time::sleep(delay).await;
-            response = send_provider_request(state, target, || build(body)).await?;
+            response =
+                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
             continue;
         }
 
@@ -1480,7 +1531,8 @@ where
                 has_tool_search = strip_tool_search_tools(body).is_some(),
                 "upstream returned an opaque 4xx; retrying once"
             );
-            response = send_provider_request(state, target, || build(body)).await?;
+            response =
+                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
             continue;
         }
 
@@ -1499,7 +1551,8 @@ where
             );
             mark_provider_tool_search_unsupported(state, target.provider_id).await;
             *body = compat_body;
-            response = send_provider_request(state, target, || build(body)).await?;
+            response =
+                UpstreamResponse::new(send_provider_request(state, target, || build(body)).await?);
             continue;
         }
 

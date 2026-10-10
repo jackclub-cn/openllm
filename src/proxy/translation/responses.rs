@@ -649,7 +649,7 @@ impl ResponsesStreamState {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn openai_chat_stream_to_responses(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -661,7 +661,6 @@ pub(crate) fn openai_chat_stream_to_responses(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut tool_index: Option<i64> = None;
         let mut stream_error = None;
@@ -763,7 +762,7 @@ pub(crate) fn openai_chat_stream_to_responses(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn anthropic_stream_to_responses(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -775,7 +774,6 @@ pub(crate) fn anthropic_stream_to_responses(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut event_name = String::new();
         let mut stream_error = None;

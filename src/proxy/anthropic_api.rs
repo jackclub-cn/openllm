@@ -535,6 +535,7 @@ pub(crate) async fn forward_anthropic_native(
         &target,
         request_id,
         ANTHROPIC_MESSAGES,
+        streamed,
         &mut body,
         build,
     )
@@ -599,7 +600,7 @@ pub(crate) async fn forward_anthropic_native(
             .to_string();
         return Ok(passthrough_stream_response(
             state.clone(),
-            response,
+            response.into_stream(),
             content_type,
             ANTHROPIC_MESSAGES.to_string(),
             request_id.to_string(),
@@ -700,6 +701,7 @@ pub(crate) async fn forward_openai_as_anthropic(
         &target,
         request_id,
         ANTHROPIC_MESSAGES,
+        streamed,
         &mut body,
         build,
     )
@@ -763,7 +765,7 @@ pub(crate) async fn forward_openai_as_anthropic(
         if use_responses {
             return Ok(responses_stream_to_anthropic(
                 state.clone(),
-                response,
+                response.into_stream(),
                 request_id.to_string(),
                 requested_model.to_string(),
                 target,
@@ -775,7 +777,7 @@ pub(crate) async fn forward_openai_as_anthropic(
         }
         return Ok(openai_stream_to_anthropic(
             state.clone(),
-            response,
+            response.into_stream(),
             request_id.to_string(),
             requested_model.to_string(),
             target,

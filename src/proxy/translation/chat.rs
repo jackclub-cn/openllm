@@ -274,7 +274,7 @@ pub(crate) async fn process_chat_chunk_line(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn responses_stream_to_chat(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -286,7 +286,6 @@ pub(crate) fn responses_stream_to_chat(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut event_name = String::new();
         let mut chat_state = ChatStreamState::default();
@@ -617,7 +616,7 @@ pub(crate) async fn process_responses_line_for_chat(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn chat_stream_to_completions(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -629,7 +628,6 @@ pub(crate) fn chat_stream_to_completions(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut text = String::new();
         let mut usage = Usage::default();
@@ -819,7 +817,7 @@ pub(crate) fn completions_stream_chunk(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn anthropic_stream_to_completions(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -831,7 +829,6 @@ pub(crate) fn anthropic_stream_to_completions(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut event_name = String::new();
         let mut usage = Usage::default();

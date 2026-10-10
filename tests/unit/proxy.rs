@@ -2639,6 +2639,7 @@ fn same_target_retry_skips_rate_limits_and_client_errors() {
 #[test]
 fn retry_backoff_is_exponential_and_capped() {
     let settings = crate::models::ResilienceSettings {
+        stream_recovery_enabled: false,
         max_retries: 3,
         retry_backoff_ms: 100,
         retry_max_backoff_ms: 400,
@@ -2665,6 +2666,7 @@ fn retry_backoff_is_exponential_and_capped() {
     );
 
     let disabled = crate::models::ResilienceSettings {
+        stream_recovery_enabled: false,
         max_retries: 0,
         retry_backoff_ms: 0,
         retry_max_backoff_ms: 0,
@@ -2928,6 +2930,121 @@ async fn retries_can_be_disabled_and_then_fall_back() {
 
     flaky_server.abort();
     healthy_server.abort();
+}
+
+#[tokio::test]
+async fn stream_recovery_retries_an_empty_200_before_committing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::empty())
+                            .unwrap()
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header(reqwest::header::CONTENT_TYPE, "text/event-stream")
+                            .body(Body::from(
+                                "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\n\
+                                 data: [DONE]\n\n",
+                            ))
+                            .unwrap()
+                    }
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'flaky stream', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'stream retry route', 'stream-retry-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'stream-retry-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resilience', ?)")
+        .bind(
+            json!({
+                "stream_recovery_enabled": true,
+                "max_retries": 1,
+                "retry_backoff_ms": 1,
+                "retry_max_backoff_ms": 5
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "stream-retry-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "stream-recovery-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "0");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("recovered"));
+    assert!(body.contains("[DONE]"));
+
+    server.abort();
 }
 
 #[test]

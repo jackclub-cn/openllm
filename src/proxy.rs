@@ -68,6 +68,7 @@ const MAX_TARGET_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const MAX_CONFIGURED_PROVIDER_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const DEFAULT_PROVIDER_QUEUE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_SAME_TARGET_RETRIES: i64 = 5;
+const MAX_STREAM_RECOVERY_RETRIES: i64 = 4;
 const MAX_PROVIDER_KEY_COOLDOWN: Duration = Duration::from_secs(60 * 60);
 const PROVIDER_MODEL_COOLDOWN_THRESHOLD: usize = 2;
 

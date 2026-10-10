@@ -86,6 +86,11 @@ fn default_preview_max_chars() -> i64 {
 /// from stalling the request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ResilienceSettings {
+    /// Hold the opening stream window briefly so a cutoff before any client
+    /// bytes can be retried invisibly. Disabled by default because it delays
+    /// stream headers by up to the holdback duration.
+    #[serde(default)]
+    pub stream_recovery_enabled: bool,
     /// Extra attempts against the same target. `0` disables same-target retry.
     #[serde(default = "default_max_retries")]
     pub max_retries: i64,
@@ -112,6 +117,7 @@ fn default_retry_max_backoff_ms() -> i64 {
 impl Default for ResilienceSettings {
     fn default() -> Self {
         Self {
+            stream_recovery_enabled: false,
             max_retries: default_max_retries(),
             retry_backoff_ms: default_retry_backoff_ms(),
             retry_max_backoff_ms: default_retry_max_backoff_ms(),

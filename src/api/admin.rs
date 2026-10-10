@@ -340,12 +340,15 @@ pub async fn update_resilience_settings(
         "update",
         "settings",
         Some(SETTING_RESILIENCE),
-        if settings.max_retries == 0 {
+        if settings.stream_recovery_enabled {
+            "enabled stream recovery and updated retry policy"
+        } else if settings.max_retries == 0 {
             "disabled same-target retries"
         } else {
             "updated same-target retry policy"
         },
         Some(json!({
+            "stream_recovery_enabled": settings.stream_recovery_enabled,
             "max_retries": settings.max_retries,
             "retry_backoff_ms": settings.retry_backoff_ms,
             "retry_max_backoff_ms": settings.retry_max_backoff_ms,

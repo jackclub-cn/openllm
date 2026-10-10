@@ -561,7 +561,7 @@ pub(crate) async fn finish_anthropic_stream(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn openai_stream_to_anthropic(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -579,7 +579,6 @@ pub(crate) fn openai_stream_to_anthropic(
             started,
         };
         let mut stream_state = AnthropicStreamState::default();
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut stream_error = None;
         let mut done = false;
@@ -672,7 +671,7 @@ pub(crate) fn openai_stream_to_anthropic(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn responses_stream_to_anthropic(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -691,7 +690,6 @@ pub(crate) fn responses_stream_to_anthropic(
         };
         let mut stream_state = AnthropicStreamState::default();
         let mut tool_indices = std::collections::HashMap::<String, usize>::new();
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut event_name = String::new();
         let mut stream_error = None;
@@ -964,7 +962,7 @@ pub(crate) async fn process_responses_line_for_anthropic(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn passthrough_stream_response(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     content_type: String,
     endpoint: String,
     request_id: String,
@@ -977,7 +975,6 @@ pub(crate) fn passthrough_stream_response(
 ) -> Response {
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
-        let mut upstream = response.bytes_stream();
         let mut parser = UsageParser::new(started);
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
@@ -1055,7 +1052,7 @@ pub(crate) fn passthrough_stream_response(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn anthropic_stream_response(
     state: AppState,
-    response: reqwest::Response,
+    mut upstream: UpstreamByteStream,
     request_id: String,
     requested_model: String,
     target: RouteTarget,
@@ -1067,7 +1064,6 @@ pub(crate) fn anthropic_stream_response(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut upstream = response.bytes_stream();
         let mut buffer = Vec::<u8>::new();
         let mut event_name = String::new();
         let mut usage = Usage::default();
