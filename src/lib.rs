@@ -44,8 +44,8 @@ use crate::api::{
 use crate::assets::static_handler;
 use crate::db::Database;
 use crate::proxy::{
-    count_tokens_anthropic, proxy_anthropic, proxy_openai, proxy_openai_console, public_model,
-    public_models,
+    admission, count_tokens_anthropic, proxy_anthropic, proxy_openai, proxy_openai_console,
+    public_model, public_models,
 };
 use crate::state::{AppState, parse_shutdown_grace_secs};
 
@@ -221,9 +221,23 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             admin_auth,
         ));
+    // The public proxy routes get the admission check before the body is read;
+    // the model-list routes stay uncapped because they are cheap metadata.
+    let proxy = Router::new()
+        .route("/v1/chat/completions", post(proxy_openai))
+        .route("/v1/completions", post(proxy_openai))
+        .route("/v1/embeddings", post(proxy_openai))
+        .route("/v1/responses", post(proxy_openai))
+        .route("/v1/messages", post(proxy_anthropic))
+        .route("/v1/messages/count_tokens", post(count_tokens_anthropic))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admission,
+        ));
 
     Router::new()
         .merge(metrics)
+        .merge(proxy)
         .route("/api/health", get(health))
         .route("/api/ready", get(ready))
         .route("/api/settings", get(get_settings))
@@ -231,12 +245,6 @@ pub fn build_router(state: AppState) -> Router {
         .nest("/api", admin)
         .route("/v1/models", get(public_models))
         .route("/v1/models/{*model}", get(public_model))
-        .route("/v1/chat/completions", post(proxy_openai))
-        .route("/v1/completions", post(proxy_openai))
-        .route("/v1/embeddings", post(proxy_openai))
-        .route("/v1/responses", post(proxy_openai))
-        .route("/v1/messages", post(proxy_anthropic))
-        .route("/v1/messages/count_tokens", post(count_tokens_anthropic))
         .fallback(static_handler)
         .layer(DefaultBodyLimit::max(crate::state::max_request_body_bytes()))
         .layer(

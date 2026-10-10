@@ -8211,7 +8211,9 @@ async fn global_request_cap_sheds_excess_streams_with_429() {
     state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
     state.request_capacity_limit = 1;
 
-    let uri: Uri = OPENAI_CHAT_COMPLETIONS.parse().unwrap();
+    // The cap is enforced by the router's admission middleware, so drive real
+    // requests through it rather than calling the handler directly.
+    let router = crate::build_router(state);
     let body = Bytes::from(
         json!({
             "model": "stream-model",
@@ -8220,23 +8222,19 @@ async fn global_request_cap_sheds_excess_streams_with_429() {
         })
         .to_string(),
     );
+    let request = || {
+        axum::http::Request::builder()
+            .method("POST")
+            .uri(OPENAI_CHAT_COMPLETIONS)
+            .header("content-type", "application/json")
+            .body(Body::from(body.clone()))
+            .unwrap()
+    };
 
-    let first = proxy_openai(
-        State(state.clone()),
-        HeaderMap::new(),
-        uri.clone(),
-        body.clone(),
-    )
-    .await;
+    let first = router.clone().oneshot(request()).await.unwrap();
     assert_eq!(first.status(), StatusCode::OK, "the first request is admitted");
 
-    let second = proxy_openai(
-        State(state.clone()),
-        HeaderMap::new(),
-        uri.clone(),
-        body.clone(),
-    )
-    .await;
+    let second = router.clone().oneshot(request()).await.unwrap();
     assert_eq!(
         second.status(),
         StatusCode::TOO_MANY_REQUESTS,
@@ -8249,8 +8247,70 @@ async fn global_request_cap_sheds_excess_streams_with_429() {
 
     // Releasing the first body frees the slot for the next request.
     drop(first);
-    let third = proxy_openai(State(state.clone()), HeaderMap::new(), uri, body).await;
+    let third = router.oneshot(request()).await.unwrap();
     assert_eq!(third.status(), StatusCode::OK);
 
     server.abort();
+}
+
+/// Admission must run before the handler buffers the request body: an
+/// over-capacity request with a body that never arrives has to be refused
+/// immediately rather than held until the body is read.
+#[tokio::test]
+async fn admission_rejects_before_reading_the_body() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    // Zero permits: every request is over the cap.
+    state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
+    state.request_capacity_limit = 1;
+    let router = crate::build_router(state);
+
+    // A body that never produces data. If the handler tried to buffer it, this
+    // request would hang instead of being shed.
+    let hanging =
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(OPENAI_CHAT_COMPLETIONS)
+        .header("content-type", "application/json")
+        .body(hanging)
+        .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(2), router.oneshot(request))
+        .await
+        .expect("admission must shed without waiting for the body")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn admission_uses_the_anthropic_envelope_for_message_routes() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
+    state.request_capacity_limit = 2;
+    let router = crate::build_router(state);
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("content-type", "application/json")
+        .body(Body::from("{}"))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["type"], "error");
+    assert_eq!(value["error"]["type"], "overloaded_error");
 }

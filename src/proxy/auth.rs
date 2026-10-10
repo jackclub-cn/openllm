@@ -30,6 +30,31 @@ pub(crate) fn acquire_request_capacity(state: &AppState) -> RequestCapacity {
     }
 }
 
+/// Admission middleware for the public proxy routes.
+///
+/// Reserves a global request slot before the handler buffers the body, so an
+/// over-capacity request is refused without reading a potentially large body
+/// into memory. The permit is attached to the response body and released only
+/// once that body has been fully written, so a long stream keeps its slot for
+/// its whole lifetime.
+pub(crate) async fn admission(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let anthropic = request.uri().path().starts_with("/v1/messages");
+    match acquire_request_capacity(&state) {
+        RequestCapacity::Overloaded => {
+            overloaded_response(state.request_capacity_limit, anthropic)
+        }
+        RequestCapacity::Disabled => next.run(request).await,
+        RequestCapacity::Acquired(permit) => {
+            let response = next.run(request).await;
+            attach_request_capacity(response, Some(permit))
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn selected_console_api_key(
     state: &AppState,
