@@ -1107,9 +1107,11 @@ pub(super) async fn record_upstream_failure(
     let retry_after = retry_after_from_headers(response_headers);
     if retryable_status(status) {
         let active_model_cooldowns = mark_target_error(state, target, status, retry_after).await;
-        if status != StatusCode::TOO_MANY_REQUESTS
-            || active_model_cooldowns >= PROVIDER_RATE_LIMIT_MODEL_THRESHOLD
-        {
+        // A model-level error must not remove every healthy sibling model on
+        // the provider. Only escalate to provider-wide isolation after enough
+        // distinct models have failed; transport errors take the direct path
+        // in `send_provider_request` because they are provider-wide by nature.
+        if provider_circuit_should_open(status, active_model_cooldowns) {
             mark_provider_error(
                 state,
                 target.provider_id,
@@ -1130,6 +1132,16 @@ pub(super) async fn record_upstream_failure(
         )
         .await;
     }
+}
+
+pub(super) fn provider_circuit_should_open(
+    status: StatusCode,
+    active_model_cooldowns: usize,
+) -> bool {
+    // A 409 usually describes this request's resource state, not the
+    // provider's health, so it should fall through without opening a circuit.
+    status != StatusCode::CONFLICT
+        && active_model_cooldowns >= PROVIDER_MODEL_COOLDOWN_THRESHOLD
 }
 
 pub(super) async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Option<i64>) {
