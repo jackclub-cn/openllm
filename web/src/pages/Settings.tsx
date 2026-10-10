@@ -349,6 +349,13 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
                 ? `${limits.stream_max_secs != null ? `${limits.stream_max_secs} 秒` : '不限'} / ${limits.body_read_timeout_secs != null ? `${limits.body_read_timeout_secs} 秒` : '不限'}`
                 : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="内存压力保护">
+              {limits
+                ? limits.memory_limit_mib > 0
+                  ? `${limits.memory_limit_mib} MiB（达 ${limits.memory_shed_ratio_pct}% 时拒绝新请求）`
+                  : '未开启'
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="SSE 心跳">
               {limits
                 ? limits.sse_keepalive_secs != null

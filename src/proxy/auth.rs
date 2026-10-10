@@ -55,6 +55,18 @@ pub(crate) async fn admission(
 ) -> Response {
     let anthropic = request.uri().path().starts_with("/v1/messages");
     let wait = state.admission_wait;
+    // Shed before reserving anything when the process is low on memory: the
+    // point is to keep headroom for the work already in flight.
+    if state
+        .memory_pressure
+        .as_ref()
+        .is_some_and(|pressure| pressure.is_shedding())
+    {
+        state
+            .memory_shed
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return memory_pressure_response(anthropic);
+    }
     // Refuse an over-capacity request before the body is read: a hanging or
     // huge body must not consume a slot or any memory first.
     let capacity = acquire_request_capacity(&state, wait).await;

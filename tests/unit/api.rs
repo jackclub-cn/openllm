@@ -159,6 +159,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_request_bytes_shed_total counter"));
     assert!(body.contains("openllm_inflight_request_bytes 0"));
     assert!(body.contains("openllm_request_bytes_shed_total 0"));
+    assert!(body.contains("# TYPE openllm_memory_limit_bytes gauge"));
+    assert!(body.contains("# TYPE openllm_memory_pressure gauge"));
+    assert!(body.contains("openllm_memory_pressure 0"));
+    assert!(body.contains("openllm_memory_shed_total 0"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(
@@ -3637,6 +3641,12 @@ async fn runtime_settings_expose_effective_limits() {
     let expected_inflight_mib = state.request_bytes_limit / (1024 * 1024);
     let expected_admission_wait_ms = state.admission_wait.as_millis() as u64;
     let expected_body_read_timeout = state.body_read_timeout.map(|timeout| timeout.as_secs());
+    let expected_memory_limit_mib = state
+        .memory_pressure
+        .as_ref()
+        .map(|pressure| pressure.limit_bytes() / (1024 * 1024))
+        .unwrap_or(0);
+    let expected_memory_ratio_pct = (state.memory_shed_ratio * 100.0).round() as u64;
     let Json(view) = get_runtime_settings(State(state)).await.unwrap();
     assert!(view.limits.max_request_body_mib >= 1);
     assert!(view.limits.max_upstream_body_mib >= 1);
@@ -3649,6 +3659,8 @@ async fn runtime_settings_expose_effective_limits() {
         view.limits.stream_max_secs,
         crate::state::max_stream_lifetime().map(|lifetime| lifetime.as_secs())
     );
+    assert_eq!(view.limits.memory_limit_mib, expected_memory_limit_mib);
+    assert_eq!(view.limits.memory_shed_ratio_pct, expected_memory_ratio_pct);
 }
 
 #[tokio::test]

@@ -103,6 +103,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         admission_wait_ms = %limits.admission_wait_ms,
         stream_max_secs = ?limits.stream_max_secs,
         body_read_timeout_secs = ?limits.body_read_timeout_secs,
+        memory_limit_mib = %limits.memory_limit_mib,
+        memory_shed_ratio_pct = %limits.memory_shed_ratio_pct,
         "OpenLLM Gateway started"
     );
 

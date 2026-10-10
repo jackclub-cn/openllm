@@ -394,6 +394,70 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_memory_limit_bytes",
+        "Configured process-memory ceiling for the pressure guard; zero means disabled",
+    );
+    push_metric(
+        &mut body,
+        "openllm_memory_limit_bytes",
+        &[],
+        state
+            .memory_pressure
+            .as_ref()
+            .map(|pressure| pressure.limit_bytes() as i64)
+            .unwrap_or(0),
+    );
+    metric_header(
+        &mut body,
+        "openllm_memory_threshold_bytes",
+        "Memory usage at which new requests are shed; zero when disabled",
+    );
+    push_metric(
+        &mut body,
+        "openllm_memory_threshold_bytes",
+        &[],
+        state
+            .memory_pressure
+            .as_ref()
+            .map(|pressure| pressure.threshold_bytes() as i64)
+            .unwrap_or(0),
+    );
+    metric_header(
+        &mut body,
+        "openllm_memory_used_bytes",
+        "Latest sampled process memory usage; zero when unavailable",
+    );
+    let memory_used = state
+        .memory_pressure
+        .as_ref()
+        .and_then(|pressure| pressure.used_bytes())
+        .unwrap_or(0) as i64;
+    push_metric(&mut body, "openllm_memory_used_bytes", &[], memory_used);
+    metric_header(
+        &mut body,
+        "openllm_memory_pressure",
+        "One while new requests are shed under memory pressure",
+    );
+    let memory_pressure_active = state
+        .memory_pressure
+        .as_ref()
+        .is_some_and(|pressure| pressure.is_shedding()) as i64;
+    push_metric(&mut body, "openllm_memory_pressure", &[], memory_pressure_active);
+    metric_header(
+        &mut body,
+        "openllm_memory_shed_total",
+        "Requests shed by the memory-pressure guard since startup",
+    );
+    push_metric(
+        &mut body,
+        "openllm_memory_shed_total",
+        &[],
+        state
+            .memory_shed
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
+    metric_header(
+        &mut body,
         "openllm_tokens_total",
         "Retained token counts by type",
     );

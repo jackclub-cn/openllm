@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::RequestByteBudget;
+use crate::state::{MemoryPressure, RequestByteBudget};
 use tower::ServiceExt;
 
 #[test]
@@ -8613,5 +8613,70 @@ async fn admission_bounds_a_hanging_request_body() {
         response.status().is_client_error(),
         "a body that never arrives must be rejected, got {}",
         response.status()
+    );
+}
+
+#[test]
+fn memory_pressure_threshold_math() {
+    let pressure = MemoryPressure::with_usage(1_000, 0.9, 0);
+    assert_eq!(pressure.limit_bytes(), 1_000);
+    assert_eq!(pressure.threshold_bytes(), 900);
+    assert!(!pressure.is_shedding_at(899));
+    assert!(pressure.is_shedding_at(900));
+    assert!(pressure.is_shedding_at(1_000));
+}
+
+#[test]
+fn memory_pressure_uses_the_sampled_usage() {
+    let calm = MemoryPressure::with_usage(1_000, 0.9, 500);
+    assert_eq!(calm.used_bytes(), Some(500));
+    assert!(!calm.is_shedding());
+
+    let critical = MemoryPressure::with_usage(1_000, 0.9, 950);
+    assert!(critical.is_shedding());
+}
+
+/// Under memory pressure the gateway must refuse new proxied work with a
+/// retryable `503` while the probes that keep it in rotation stay reachable.
+#[tokio::test]
+async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    state.memory_pressure = Some(std::sync::Arc::new(MemoryPressure::with_usage(1_000, 0.9, 950)));
+    let shed = state.memory_shed.clone();
+    let router = crate::build_router(state);
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(OPENAI_CHAT_COMPLETIONS)
+        .header("content-type", "application/json")
+        .body(Body::from("{\"model\":\"m\",\"messages\":[]}"))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        "5"
+    );
+    assert_eq!(
+        shed.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a pressure shed is counted for metrics"
+    );
+
+    let probe = axum::http::Request::builder()
+        .method("GET")
+        .uri("/api/health")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(probe).await.unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "probes must stay reachable while proxied work is shed"
     );
 }
