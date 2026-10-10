@@ -1,81 +1,18 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { Alert, App } from 'antd'
+import { api, formatError, getAdminToken, type ApiKey } from '../api'
+import PlaygroundChat from './playground/PlaygroundChat'
+import PlaygroundSettings from './playground/PlaygroundSettings'
+import PlaygroundToolbar from './playground/PlaygroundToolbar'
 import {
-  ClearOutlined,
-  CopyOutlined,
-  HistoryOutlined,
-  ReloadOutlined,
-  RobotOutlined,
-  SendOutlined,
-  StopOutlined,
-  UserOutlined,
-} from '@ant-design/icons'
-import {
-  Alert,
-  App,
-  Button,
-  Card,
-  Empty,
-  Input,
-  InputNumber,
-  Select,
-  Slider,
-  Space,
-  Tag,
-  Tooltip,
-  Typography,
-} from 'antd'
-import { api, formatError, getAdminToken, type ApiKey, type ModelInfo } from '../api'
-import PageHeader from '../components/PageHeader'
-import { formatCompact, formatExact } from '../format'
-
-const GATEWAY_KEY_ID = 'openllm-gateway-key-id'
-const SETTINGS_KEY = 'openllm-playground-settings'
-
-type PersistedSettings = {
-  model?: string
-  temperature: number
-  maxTokens: number | null
-}
-
-function readSettings(): PersistedSettings {
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY)
-    if (raw) {
-      const parsed = JSON.parse(raw) as Partial<PersistedSettings>
-      return {
-        model: parsed.model,
-        temperature: typeof parsed.temperature === 'number' ? parsed.temperature : 0.7,
-        maxTokens: parsed.maxTokens ?? 4096,
-      }
-    }
-  } catch {
-    // Fall through to defaults on malformed storage.
-  }
-  return { temperature: 0.7, maxTokens: 4096 }
-}
-
-type ModelOption = ModelInfo
-
-type ChatMessage = {
-  id: string
-  role: 'user' | 'assistant'
-  content: string
-  error?: boolean
-  streaming?: boolean
-  toolCalls?: ToolCallSummary[]
-}
-
-type ToolCallSummary = {
-  id: string
-  name: string
-  arguments: string
-}
-
-type Usage = {
-  prompt_tokens: number
-  completion_tokens: number
-  total_tokens: number
-}
+  GATEWAY_KEY_ID,
+  SETTINGS_KEY,
+  readSettings,
+  type ChatMessage,
+  type ModelOption,
+  type PlaygroundUsage,
+  type ToolCallSummary,
+} from './playground/types'
 
 export default function Playground() {
   const { message } = App.useApp()
@@ -92,11 +29,11 @@ export default function Playground() {
   const [running, setRunning] = useState(false)
   const [temperature, setTemperature] = useState(initial.current.temperature)
   const [maxTokens, setMaxTokens] = useState<number | null>(initial.current.maxTokens)
-  const [usage, setUsage] = useState<Usage>()
+  const [budgetUsd, setBudgetUsd] = useState<number | null>(initial.current.budgetUsd)
+  const [usage, setUsage] = useState<PlaygroundUsage>()
   const [latency, setLatency] = useState<number>()
   const [loadError, setLoadError] = useState('')
   const abortRef = useRef<AbortController | undefined>(undefined)
-  const scrollRef = useRef<HTMLDivElement>(null)
   const selected = models.find((item) => item.id === model)
   const capabilities = selected?.capabilities
   const selectableApiKeys = apiKeys.filter(
@@ -123,7 +60,8 @@ export default function Playground() {
       setGatewayKeyId((current) => {
         const selectable = keyResult.filter(
           (key) =>
-            key.enabled && (!key.expires_at || new Date(key.expires_at).getTime() > Date.now()),
+            key.enabled &&
+            (!key.expires_at || new Date(key.expires_at).getTime() > Date.now()),
         )
         if (current && selectable.some((key) => key.id === current)) return current
         return selectable[0]?.id
@@ -142,9 +80,9 @@ export default function Playground() {
   useEffect(() => {
     localStorage.setItem(
       SETTINGS_KEY,
-      JSON.stringify({ model, temperature, maxTokens } satisfies PersistedSettings),
+      JSON.stringify({ model, temperature, maxTokens, budgetUsd }),
     )
-  }, [maxTokens, model, temperature])
+  }, [budgetUsd, maxTokens, model, temperature])
 
   useEffect(() => {
     if (gatewayKeyId) localStorage.setItem(GATEWAY_KEY_ID, String(gatewayKeyId))
@@ -164,11 +102,6 @@ export default function Playground() {
     setInput(lastUser.content)
     message.info('已载入上一条问题，确认后可重新发送')
   }
-
-  useEffect(() => {
-    const element = scrollRef.current
-    if (element) element.scrollTop = element.scrollHeight
-  }, [messages])
 
   const updateAssistant = (
     content: string,
@@ -231,6 +164,9 @@ export default function Playground() {
       const adminToken = getAdminToken()
       if (adminToken) headers.set('x-admin-token', adminToken)
       if (selectedApiKey) headers.set('x-openllm-api-key-id', String(selectedApiKey.id))
+      if (budgetUsd && budgetUsd > 0) {
+        headers.set('x-openllm-budget-usd', String(budgetUsd))
+      }
       const response = await fetch('/api/playground/chat/completions', {
         method: 'POST',
         headers,
@@ -282,7 +218,11 @@ export default function Playground() {
             if (Array.isArray(deltas)) {
               for (const item of deltas) {
                 const index = typeof item?.index === 'number' ? item.index : 0
-                const existing = toolCalls.get(index) ?? { id: '', name: '', arguments: '' }
+                const existing = toolCalls.get(index) ?? {
+                  id: '',
+                  name: '',
+                  arguments: '',
+                }
                 toolCalls.set(index, {
                   id: item?.id || existing.id,
                   name: item?.function?.name || existing.name,
@@ -290,7 +230,10 @@ export default function Playground() {
                 })
               }
             }
-            updateAssistant(answer, { streaming: true, toolCalls: [...toolCalls.values()] })
+            updateAssistant(answer, {
+              streaming: true,
+              toolCalls: [...toolCalls.values()],
+            })
             if (payload?.usage) setUsage(payload.usage)
           } catch {
             // Ignore keep-alive or non-JSON SSE frames.
@@ -316,10 +259,10 @@ export default function Playground() {
       }
 
       const finalToolCalls = [...toolCalls.values()]
-      updateAssistant(
-        answer || (finalToolCalls.length ? '' : '（空响应）'),
-        { streaming: false, toolCalls: finalToolCalls },
-      )
+      updateAssistant(answer || (finalToolCalls.length ? '' : '（空响应）'), {
+        streaming: false,
+        toolCalls: finalToolCalls,
+      })
       setLatency(Math.round(performance.now() - started))
     } catch (error) {
       if (controller.signal.aborted) {
@@ -350,188 +293,54 @@ export default function Playground() {
 
   return (
     <>
-      <PageHeader
-        title="模型调试"
-        description="直接验证路由、鉴权和流式响应"
-        extra={
-          <>
-            {latency !== undefined && <Tag>{latency} ms</Tag>}
-            {usage && <Tag color="blue">{formatCompact(usage.total_tokens)} tokens</Tag>}
-            <Button
-              icon={<HistoryOutlined />}
-              onClick={() => void regenerate()}
-              disabled={running || !messages.some((item) => item.role === 'user')}
-            >
-              重发上一条
-            </Button>
-            <Button icon={<ReloadOutlined />} onClick={() => void loadModels()}>刷新模型</Button>
-            <Button icon={<ClearOutlined />} onClick={clear} disabled={!messages.length}>清空</Button>
-          </>
-        }
+      <PlaygroundToolbar
+        latency={latency}
+        usage={usage}
+        running={running}
+        hasUserMessage={messages.some((item) => item.role === 'user')}
+        hasMessages={messages.length > 0}
+        onRegenerate={() => void regenerate()}
+        onReloadModels={() => void loadModels()}
+        onClear={clear}
       />
-      {loadError && <Alert className="page-alert" type="warning" showIcon message="无法读取模型列表" description={loadError} />}
+      {loadError && (
+        <Alert
+          className="page-alert"
+          type="warning"
+          showIcon
+          message="无法读取模型列表"
+          description={loadError}
+        />
+      )}
       <div className="playground-grid">
-        <Card className="playground-card" bordered={false}>
-          <div className="chat-scroll" ref={scrollRef}>
-            {messages.length === 0 ? (
-              <div className="chat-empty">
-                <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="输入消息开始测试" />
-              </div>
-            ) : (
-              messages.map((item) => (
-                <div className={`chat-message chat-message-${item.role}`} key={item.id}>
-                  <div className="chat-avatar">
-                    {item.role === 'assistant' ? <RobotOutlined /> : <UserOutlined />}
-                  </div>
-                  <div className={`chat-bubble ${item.error ? 'chat-bubble-error' : ''}`}>
-                    {item.content || (item.streaming ? <span className="stream-cursor" /> : '')}
-                    {item.streaming && item.content && <span className="stream-cursor" />}
-                    {item.toolCalls?.map((call, index) => (
-                      <div className="tool-call" key={`${call.id || index}-${index}`}>
-                        <div className="tool-call-head">
-                          <Tag color="geekblue">工具调用 {index + 1}</Tag>
-                          <Typography.Text strong>{call.name || '(未命名)'}</Typography.Text>
-                        </div>
-                        {call.arguments && (
-                          <pre className="tool-call-args">{call.arguments}</pre>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                  {item.role === 'assistant' && item.content && !item.streaming && (
-                    <Tooltip title="复制">
-                      <Button
-                        className="chat-copy"
-                        type="text"
-                        size="small"
-                        icon={<CopyOutlined />}
-                        onClick={() => {
-                          void navigator.clipboard.writeText(item.content)
-                          message.success('已复制')
-                        }}
-                      />
-                    </Tooltip>
-                  )}
-                </div>
-              ))
-            )}
-          </div>
-          <div className="chat-composer">
-            <Input.TextArea
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey)) {
-                  event.preventDefault()
-                  void send()
-                }
-              }}
-              placeholder="输入消息"
-              autoSize={{ minRows: 2, maxRows: 8 }}
-              disabled={!model}
-            />
-            <div className="composer-actions">
-              <Typography.Text type="secondary">
-                {model || '尚未选择模型'}
-              </Typography.Text>
-              {running ? (
-                <Button danger icon={<StopOutlined />} onClick={stop}>停止</Button>
-              ) : (
-                <Button
-                  type="primary"
-                  icon={<SendOutlined />}
-                  disabled={!input.trim() || !model || (apiKeys.length > 0 && !selectedApiKey)}
-                  onClick={() => void send()}
-                >
-                  发送
-                </Button>
-              )}
-            </div>
-          </div>
-        </Card>
-
-        <Card title="请求参数" bordered={false} className="playground-settings">
-          <Space direction="vertical" size={20} style={{ width: '100%' }}>
-            <div>
-              <Typography.Text strong>模型</Typography.Text>
-              <Select
-                className="settings-control"
-                showSearch
-                value={model}
-                onChange={setModel}
-                placeholder="选择模型"
-                options={models.map((item) => ({ value: item.id, label: item.id }))}
-              />
-            </div>
-            <div>
-              <Typography.Text strong>网关 API Key</Typography.Text>
-              <Select
-                className="settings-control"
-                showSearch
-                optionFilterProp="label"
-                value={gatewayKeyId}
-                onChange={setGatewayKeyId}
-                placeholder={apiKeys.length ? '选择网关 API Key' : '未启用网关鉴权'}
-                disabled={!apiKeys.length}
-                options={apiKeys.map((key) => {
-                  const expired =
-                    Boolean(key.expires_at) &&
-                    new Date(key.expires_at as string).getTime() <= Date.now()
-                  return {
-                    value: key.id,
-                    label: `${key.name} (${key.key_suffix})${key.enabled && !expired ? '' : ' · 不可用'}`,
-                    disabled: !key.enabled || expired,
-                  }
-                })}
-              />
-            </div>
-            <div>
-              <Typography.Text strong>Temperature</Typography.Text>
-              <Slider min={0} max={2} step={0.1} value={temperature} onChange={setTemperature} />
-              <Typography.Text type="secondary">{temperature.toFixed(1)}</Typography.Text>
-            </div>
-            <div>
-              <Typography.Text strong>最大输出 tokens</Typography.Text>
-              <InputNumber
-                className="settings-control"
-                min={1}
-                max={outputLimit ?? 131072}
-                value={maxTokens && outputLimit ? Math.min(maxTokens, outputLimit) : maxTokens}
-                onChange={setMaxTokens}
-              />
-            </div>
-            {capabilities && (
-              <div>
-                <Typography.Text strong>模型能力</Typography.Text>
-                <div className="capability-tags">
-                  {capabilities.context_limit != null && (
-                    <Tooltip title={formatExact(capabilities.context_limit)}>
-                      <Tag>上下文 {formatCompact(capabilities.context_limit)}</Tag>
-                    </Tooltip>
-                  )}
-                  {capabilities.output_limit != null && (
-                    <Tooltip title={formatExact(capabilities.output_limit)}>
-                      <Tag>输出上限 {formatCompact(capabilities.output_limit)}</Tag>
-                    </Tooltip>
-                  )}
-                  {capabilities.reasoning && <Tag color="geekblue">推理</Tag>}
-                  {capabilities.tool_call && <Tag color="green">工具调用</Tag>}
-                  {capabilities.attachment && <Tag color="orange">附件</Tag>}
-                  {capabilities.structured_output && <Tag>结构化输出</Tag>}
-                  {capabilities.input_modalities && (
-                    <Tag>输入 {capabilities.input_modalities.join('/')}</Tag>
-                  )}
-                </div>
-                {selected?.target_count != null && (
-                  <Typography.Text type="secondary">
-                    路由 {selected.target_count} 个目标，能力为共同下限
-                    {selected.limits_verified === false ? '（部分目标缺少元数据）' : ''}
-                  </Typography.Text>
-                )}
-              </div>
-            )}
-          </Space>
-        </Card>
+        <PlaygroundChat
+          messages={messages}
+          input={input}
+          model={model}
+          running={running}
+          hasApiKeys={apiKeys.length > 0}
+          hasSelectedApiKey={Boolean(selectedApiKey)}
+          onInputChange={setInput}
+          onSend={() => void send()}
+          onStop={stop}
+        />
+        <PlaygroundSettings
+          models={models}
+          apiKeys={apiKeys}
+          model={model}
+          gatewayKeyId={gatewayKeyId}
+          temperature={temperature}
+          maxTokens={maxTokens}
+          budgetUsd={budgetUsd}
+          outputLimit={outputLimit}
+          capabilities={capabilities}
+          selected={selected}
+          onModelChange={setModel}
+          onGatewayKeyChange={setGatewayKeyId}
+          onTemperatureChange={setTemperature}
+          onMaxTokensChange={setMaxTokens}
+          onBudgetUsdChange={setBudgetUsd}
+        />
       </div>
     </>
   )

@@ -287,7 +287,13 @@ export type GatewayRoute = {
   id: number
   name: string
   model_pattern: string
-  strategy: 'priority' | 'weighted' | 'round_robin'
+  strategy:
+    | 'priority'
+    | 'weighted'
+    | 'round_robin'
+    | 'cost_optimized'
+    | 'latency_optimized'
+    | 'least_used'
   enabled: boolean
   context_limit?: number | null
   input_limit?: number | null
@@ -314,6 +320,11 @@ export type RouteDiagnoseRuntimeTarget = {
   provider_id: number
   provider_name: string
   upstream_model: string
+  input_cost_per_million?: number | null
+  output_cost_per_million?: number | null
+  avg_latency_ms?: number | null
+  recent_requests?: number | null
+  decision_reason: string
   provider_api_key_id?: number | null
   provider_api_key_name?: string | null
   provider_health?: boolean | null
@@ -363,6 +374,43 @@ export type ApiKey = {
   current_in_flight: number
   allowed_models: string[]
   expires_at?: string | null
+}
+
+export type Webhook = {
+  id: number
+  name: string
+  url: string
+  secret_set: boolean
+  headers: Record<string, string>
+  event_types: string[]
+  enabled: boolean
+  created_at: string
+  updated_at: string
+  last_delivery_at?: string | null
+  last_delivery_status?: number | null
+  recent_failures: number
+}
+
+export type WebhookInput = {
+  name: string
+  url: string
+  secret?: string
+  headers?: Record<string, string>
+  clear_secret?: boolean
+  event_types: string[]
+  enabled: boolean
+}
+
+export type WebhookDelivery = {
+  id: number
+  webhook_id: number
+  event_type: string
+  request_id?: string | null
+  status_code?: number | null
+  attempts: number
+  error?: string | null
+  duration_ms: number
+  created_at: string
 }
 
 export type UsageLog = {
@@ -490,6 +538,8 @@ export type DatabaseStats = {
   provider_api_keys: number
   routes: number
   access_keys: number
+  webhooks: number
+  webhook_deliveries: number
   usage_logs: number
   in_flight_requests: number
 }

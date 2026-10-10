@@ -7,6 +7,7 @@ mod models_dev;
 mod proxy;
 mod registry;
 mod state;
+mod webhooks;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -21,13 +22,15 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::{
     admin_auth, backup_database, cleanup_usage, create_api_key, create_provider, create_route,
-    delete_api_key, delete_provider, delete_route, diagnose_route, event_stream, export_usage,
-    get_runtime_settings, get_settings, get_usage_detail, health, list_api_keys,
-    list_model_inventory, list_models, list_provider_model_limits, list_providers, list_routes,
-    list_usage, overview, preview_provider_model_sync, provider_quota, rotate_api_key,
+    create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
+    event_stream, export_usage, get_runtime_settings, get_settings, get_usage_detail, health,
+    list_api_keys, list_model_inventory, list_models, list_provider_model_limits, list_providers,
+    list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
+    preview_provider_model_sync, prometheus_metrics, provider_quota, rotate_api_key,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
-    test_provider_keys, update_api_key, update_provider, update_provider_model_limits,
-    update_route, update_runtime_settings, vacuum_database,
+    test_provider_keys, test_webhook, update_api_key, update_provider,
+    update_provider_model_limits, update_route, update_runtime_settings, update_webhook,
+    vacuum_database,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -67,6 +70,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             crate::api::run_due_usage_retention(health_state.clone()).await;
         }
     });
+    let webhook_state = state.clone();
+    tokio::spawn(async move {
+        crate::webhooks::run_dispatcher(webhook_state).await;
+    });
 
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind)
@@ -86,6 +93,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let metrics = Router::new()
+        .route("/metrics", get(prometheus_metrics))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_auth,
+        ));
     let admin = Router::new()
         .route("/overview", get(overview))
         .route("/database/backup", get(backup_database))
@@ -126,12 +139,17 @@ pub fn build_router(state: AppState) -> Router {
             "/settings/runtime",
             get(get_runtime_settings).put(update_runtime_settings),
         )
+        .route("/webhooks", get(list_webhooks).post(create_webhook))
+        .route("/webhooks/{id}", put(update_webhook).delete(delete_webhook))
+        .route("/webhooks/{id}/test", post(test_webhook))
+        .route("/webhooks/{id}/deliveries", get(list_webhook_deliveries))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth,
         ));
 
     Router::new()
+        .merge(metrics)
         .route("/api/health", get(health))
         .route("/api/settings", get(get_settings))
         .route("/api/events", get(event_stream))
@@ -145,7 +163,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/messages", post(proxy_anthropic))
         .route("/v1/messages/count_tokens", post(count_tokens_anthropic))
         .fallback(static_handler)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(crate::state::max_request_body_bytes()))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)

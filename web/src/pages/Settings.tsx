@@ -199,6 +199,8 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
               <Tag>上游密钥 {formatCompact(settings.database_stats.provider_api_keys)}</Tag>
               <Tag>路由 {formatCompact(settings.database_stats.routes)}</Tag>
               <Tag>访问密钥 {formatCompact(settings.database_stats.access_keys)}</Tag>
+              <Tag>Webhook {formatCompact(settings.database_stats.webhooks)}</Tag>
+              <Tag>投递记录 {formatCompact(settings.database_stats.webhook_deliveries)}</Tag>
               <Tag>请求日志 {formatCompact(settings.database_stats.usage_logs)}</Tag>
               <Tag color={settings.database_stats.in_flight_requests ? 'processing' : 'default'}>
                 请求中 {formatCompact(settings.database_stats.in_flight_requests)}

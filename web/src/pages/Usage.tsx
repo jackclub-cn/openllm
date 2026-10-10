@@ -1,38 +1,6 @@
 import { useCallback, useEffect, useEffectEvent, useRef, useState } from 'react'
-import {
-  CheckCircleOutlined,
-  ClearOutlined,
-  CloseCircleOutlined,
-  CopyOutlined,
-  DownloadOutlined,
-  ExperimentOutlined,
-  LoadingOutlined,
-  PauseCircleOutlined,
-  PlayCircleOutlined,
-  ReloadOutlined,
-  WarningOutlined,
-} from '@ant-design/icons'
-import {
-  Alert,
-  App,
-  Button,
-  Card,
-  DatePicker,
-  Descriptions,
-  Drawer,
-  Input,
-  InputNumber,
-  Modal,
-  Select,
-  Space,
-  Switch,
-  Table,
-  Tag,
-  Tooltip,
-  Typography,
-} from 'antd'
-import type { Dayjs } from 'dayjs'
-import dayjs from 'dayjs'
+import { App } from 'antd'
+import dayjs, { type Dayjs } from 'dayjs'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import {
   api,
@@ -42,29 +10,19 @@ import {
   type Provider,
   type UsageLog,
 } from '../api'
-import { formatCompact, formatCostMicros, formatExact } from '../format'
-import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
-
-type UsagePageResponse = {
-  items: UsageLog[]
-  total: number
-  page: number
-  page_size: number
-}
-
-function positiveIntegerParam(value: string | null) {
-  const parsed = Number(value)
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
-}
-
-function statusParam(searchParams: URLSearchParams): 'all' | 'success' | 'failed' | 'pending' {
-  if (searchParams.get('success') === 'true') return 'success'
-  if (searchParams.get('success') === 'false') return 'failed'
-  if (searchParams.get('in_flight') === 'true') return 'pending'
-  return 'all'
-}
+import UsageCleanupModal from './usage/UsageCleanupModal'
+import UsageDetailDrawer from './usage/UsageDetailDrawer'
+import UsageFilters from './usage/UsageFilters'
+import UsageTable from './usage/UsageTable'
+import UsageToolbar from './usage/UsageToolbar'
+import {
+  positiveIntegerParam,
+  statusParam,
+  type UsagePageResponse,
+  type UsageStatusFilter,
+} from './usage/types'
 
 export default function Usage() {
   const { message } = App.useApp()
@@ -82,20 +40,20 @@ export default function Usage() {
   const [requestId, setRequestId] = useState(() => searchParams.get('request_id') || '')
   const [sessionId, setSessionId] = useState(() => searchParams.get('session_id') || '')
   const [endpoint, setEndpoint] = useState(() => searchParams.get('endpoint') || '')
-  const [providerId, setProviderId] = useState<number | undefined>(
-    () => positiveIntegerParam(searchParams.get('provider_id')),
+  const [providerId, setProviderId] = useState<number | undefined>(() =>
+    positiveIntegerParam(searchParams.get('provider_id')),
   )
-  const [providerApiKeyId, setProviderApiKeyId] = useState<number | undefined>(
-    () => positiveIntegerParam(searchParams.get('provider_api_key_id')),
+  const [providerApiKeyId, setProviderApiKeyId] = useState<number | undefined>(() =>
+    positiveIntegerParam(searchParams.get('provider_api_key_id')),
   )
-  const [apiKeyId, setApiKeyId] = useState<number | undefined>(
-    () => positiveIntegerParam(searchParams.get('api_key_id')),
+  const [apiKeyId, setApiKeyId] = useState<number | undefined>(() =>
+    positiveIntegerParam(searchParams.get('api_key_id')),
   )
-  const [routeId, setRouteId] = useState<number | undefined>(
-    () => positiveIntegerParam(searchParams.get('route_id')),
+  const [routeId, setRouteId] = useState<number | undefined>(() =>
+    positiveIntegerParam(searchParams.get('route_id')),
   )
-  const [statusFilter, setStatusFilter] = useState<'all' | 'success' | 'failed' | 'pending'>(
-    () => statusParam(searchParams),
+  const [statusFilter, setStatusFilter] = useState<UsageStatusFilter>(() =>
+    statusParam(searchParams),
   )
   const [onlyAdjusted, setOnlyAdjusted] = useState(
     () => searchParams.get('gateway_adjusted') === 'true',
@@ -114,8 +72,38 @@ export default function Usage() {
   const [cleaning, setCleaning] = useState(false)
   const [exporting, setExporting] = useState(false)
   const known = useRef<{ filter: string; total: number } | undefined>(undefined)
-  const queryRef = useRef({ page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, onlyAdjusted, dates, autoScroll })
-  queryRef.current = { page, pageSize, model, requestId, sessionId, endpoint, providerId, providerApiKeyId, apiKeyId, routeId, statusFilter, onlyAdjusted, dates, autoScroll }
+  const queryRef = useRef({
+    page,
+    pageSize,
+    model,
+    requestId,
+    sessionId,
+    endpoint,
+    providerId,
+    providerApiKeyId,
+    apiKeyId,
+    routeId,
+    statusFilter,
+    onlyAdjusted,
+    dates,
+    autoScroll,
+  })
+  queryRef.current = {
+    page,
+    pageSize,
+    model,
+    requestId,
+    sessionId,
+    endpoint,
+    providerId,
+    providerApiKeyId,
+    apiKeyId,
+    routeId,
+    statusFilter,
+    onlyAdjusted,
+    dates,
+    autoScroll,
+  }
   const filterKey = JSON.stringify([
     model,
     requestId,
@@ -172,84 +160,104 @@ export default function Usage() {
     statusFilter,
   ])
 
-  const load = useCallback(async (
-    nextPage = page,
-    nextPageSize = pageSize,
-    mode: 'manual' | 'auto' = 'manual',
-  ) => {
-    if (mode === 'manual') setLoading(true)
-    const params = new URLSearchParams({
-      page: String(nextPage),
-      page_size: String(nextPageSize),
-    })
-    if (model) params.set('model', model)
-    if (requestId) params.set('request_id', requestId)
-    if (sessionId) params.set('session_id', sessionId)
-    if (endpoint) params.set('endpoint', endpoint)
-    if (providerId) params.set('provider_id', String(providerId))
-    if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
-    if (apiKeyId) params.set('api_key_id', String(apiKeyId))
-    if (routeId) params.set('route_id', String(routeId))
-    if (statusFilter === 'success') params.set('success', 'true')
-    if (statusFilter === 'failed') params.set('success', 'false')
-    if (statusFilter === 'pending') params.set('in_flight', 'true')
-    if (onlyAdjusted) params.set('gateway_adjusted', 'true')
-    if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
-    if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
-    try {
-      const result = await api.get<UsagePageResponse>(`/api/usage?${params}`)
-      const currentFilter = JSON.stringify([
-        model,
-        requestId,
-        sessionId,
-        endpoint,
-        providerId,
-        providerApiKeyId,
-        apiKeyId,
-        routeId,
-        statusFilter,
-        onlyAdjusted,
-        dates?.[0]?.toISOString(),
-        dates?.[1]?.toISOString(),
-      ])
-      const previous = known.current
-      const sameFilter = previous?.filter === currentFilter
-      if (mode === 'auto') {
-        // Compare the filtered row count instead of the current page's max id:
-        // on any page other than the first, new rows never appear in the
-        // fetched window, so an id-based check silently misses them.
-        // Only rows added under the *same* filter are genuine new requests.
-        const added = sameFilter && previous
-          ? Math.max(0, result.total - previous.total)
-          : 0
-        if (added > 0) {
-          if (autoScroll && nextPage === 1) {
-            setNewRequests(0)
-          } else {
-            // Freeze the visible rows and surface a banner instead of
-            // swapping content out from under the user.
-            setNewRequests((value) => value + added)
-            known.current = { filter: currentFilter, total: result.total }
-            return
+  const load = useCallback(
+    async (
+      nextPage = page,
+      nextPageSize = pageSize,
+      mode: 'manual' | 'auto' = 'manual',
+    ) => {
+      if (mode === 'manual') setLoading(true)
+      const params = new URLSearchParams({
+        page: String(nextPage),
+        page_size: String(nextPageSize),
+      })
+      if (model) params.set('model', model)
+      if (requestId) params.set('request_id', requestId)
+      if (sessionId) params.set('session_id', sessionId)
+      if (endpoint) params.set('endpoint', endpoint)
+      if (providerId) params.set('provider_id', String(providerId))
+      if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
+      if (apiKeyId) params.set('api_key_id', String(apiKeyId))
+      if (routeId) params.set('route_id', String(routeId))
+      if (statusFilter === 'success') params.set('success', 'true')
+      if (statusFilter === 'failed') params.set('success', 'false')
+      if (statusFilter === 'pending') params.set('in_flight', 'true')
+      if (onlyAdjusted) params.set('gateway_adjusted', 'true')
+      if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
+      if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
+      try {
+        const result = await api.get<UsagePageResponse>(`/api/usage?${params}`)
+        const currentFilter = JSON.stringify([
+          model,
+          requestId,
+          sessionId,
+          endpoint,
+          providerId,
+          providerApiKeyId,
+          apiKeyId,
+          routeId,
+          statusFilter,
+          onlyAdjusted,
+          dates?.[0]?.toISOString(),
+          dates?.[1]?.toISOString(),
+        ])
+        const previous = known.current
+        const sameFilter = previous?.filter === currentFilter
+        if (mode === 'auto') {
+          // Compare the filtered row count instead of the current page's max id:
+          // on any page other than the first, new rows never appear in the
+          // fetched window, so an id-based check silently misses them.
+          // Only rows added under the *same* filter are genuine new requests.
+          const added =
+            sameFilter && previous ? Math.max(0, result.total - previous.total) : 0
+          if (added > 0) {
+            if (autoScroll && nextPage === 1) {
+              setNewRequests(0)
+            } else {
+              // Freeze the visible rows and surface a banner instead of
+              // swapping content out from under the user.
+              setNewRequests((value) => value + added)
+              known.current = { filter: currentFilter, total: result.total }
+              return
+            }
           }
         }
+        known.current = { filter: currentFilter, total: result.total }
+        setItems(result.items)
+        setTotal(result.total)
+        setPage(result.page)
+        setPageSize(result.page_size)
+      } catch (error) {
+        message.error(formatError(error))
+      } finally {
+        if (mode === 'manual') setLoading(false)
       }
-      known.current = { filter: currentFilter, total: result.total }
-      setItems(result.items)
-      setTotal(result.total)
-      setPage(result.page)
-      setPageSize(result.page_size)
-    } catch (error) {
-      message.error(formatError(error))
-    } finally {
-      if (mode === 'manual') setLoading(false)
-    }
-  }, [apiKeyId, autoScroll, dates, endpoint, model, onlyAdjusted, page, pageSize, providerApiKeyId, providerId, requestId, routeId, sessionId, statusFilter])
+    },
+    [
+      apiKeyId,
+      autoScroll,
+      dates,
+      endpoint,
+      model,
+      onlyAdjusted,
+      page,
+      pageSize,
+      providerApiKeyId,
+      providerId,
+      requestId,
+      routeId,
+      sessionId,
+      statusFilter,
+    ],
+  )
 
-  const loadFromRef = useCallback(async (mode: 'manual' | 'auto' = 'auto') => {
-    const current = queryRef.current
-    await load(current.page, current.pageSize, mode)
-  }, [load])
+  const loadFromRef = useCallback(
+    async (mode: 'manual' | 'auto' = 'auto') => {
+      const current = queryRef.current
+      await load(current.page, current.pageSize, mode)
+    },
+    [load],
+  )
   const reloadFiltered = useEffectEvent(() => {
     void load(1, pageSize, 'manual')
   })
@@ -284,9 +292,12 @@ export default function Usage() {
     onRefresh: () => loadFromRef('auto'),
   })
   const { connected: realtimeConnected } = useRealtime()
-  useCoalescedUsageEvents(() => {
-    void loadFromRef('auto')
-  }, { enabled: !autoRefresh.paused })
+  useCoalescedUsageEvents(
+    () => {
+      void loadFromRef('auto')
+    },
+    { enabled: !autoRefresh.paused },
+  )
 
   const showLatest = async () => {
     setNewRequests(0)
@@ -395,600 +406,92 @@ export default function Usage() {
 
   return (
     <>
-      <PageHeader
-        title="请求日志"
-        description="查询每一次模型调用、令牌用量、总用时与错误"
-        extra={
-          <>
-            {autoRefresh.lastUpdated && (
-              <Typography.Text type="secondary">
-                更新于 {dayjs(autoRefresh.lastUpdated).format('HH:mm:ss')}
-              </Typography.Text>
-            )}
-            <Tag color={realtimeConnected ? 'success' : 'default'}>
-              {realtimeConnected ? '实时' : '轮询'}
-            </Tag>
-            <Tooltip title="第一页时自动切换为最新记录">
-              <Space size={6}>
-                <Switch
-                  size="small"
-                  checked={autoScroll}
-                  onChange={(value) => {
-                    setAutoScroll(value)
-                    if (value && page === 1) setNewRequests(0)
-                  }}
-                />
-                <Typography.Text type="secondary">自动置顶</Typography.Text>
-              </Space>
-            </Tooltip>
-            <Tooltip title={autoRefresh.paused ? '恢复自动刷新' : '暂停自动刷新'}>
-              <Button
-                icon={autoRefresh.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
-                onClick={() => autoRefresh.setPaused((value) => !value)}
-              >
-                {autoRefresh.paused ? '已暂停' : '自动刷新'}
-              </Button>
-            </Tooltip>
-            <Button
-              icon={<ReloadOutlined spin={autoRefresh.refreshing} />}
-              loading={autoRefresh.refreshing}
-              onClick={() => void autoRefresh.manualRefresh()}
-            >
-              刷新
-            </Button>
-            <Button
-              icon={<DownloadOutlined />}
-              loading={exporting}
-              onClick={() => void exportCsv()}
-            >
-              导出 CSV
-            </Button>
-            <Button onClick={() => setCleanupOpen(true)}>清理历史</Button>
-          </>
-        }
+      <UsageToolbar
+        lastUpdated={autoRefresh.lastUpdated}
+        refreshing={autoRefresh.refreshing}
+        paused={autoRefresh.paused}
+        realtimeConnected={realtimeConnected}
+        autoScroll={autoScroll}
+        newRequests={newRequests}
+        exporting={exporting}
+        onAutoScrollChange={(value) => {
+          setAutoScroll(value)
+          if (value && page === 1) setNewRequests(0)
+        }}
+        onTogglePaused={() => autoRefresh.setPaused((value) => !value)}
+        onRefresh={() => void autoRefresh.manualRefresh()}
+        onExport={() => void exportCsv()}
+        onCleanup={() => setCleanupOpen(true)}
+        onShowLatest={() => void showLatest()}
+        onDismissNew={() => setNewRequests(0)}
       />
-      {newRequests > 0 && (
-        <Alert
-          className="new-records-alert"
-          type="info"
-          showIcon
-          message={`有 ${newRequests} 条新请求`}
-          action={<Button size="small" type="primary" onClick={showLatest}>查看最新</Button>}
-          closable
-          onClose={() => setNewRequests(0)}
-        />
-      )}
-      <Card bordered={false} className="filter-card">
-        <Space wrap>
-          <Input.Search
-            allowClear
-            placeholder="模型名称"
-            value={model}
-            onChange={(event) => setModel(event.target.value)}
-            onSearch={reloadFiltered}
-            style={{ width: 220 }}
-          />
-          <Input.Search
-            allowClear
-            placeholder="请求 ID"
-            value={requestId}
-            onChange={(event) => setRequestId(event.target.value)}
-            onSearch={reloadFiltered}
-            style={{ width: 240 }}
-          />
-          <Input.Search
-            allowClear
-            placeholder="会话 ID"
-            value={sessionId}
-            onChange={(event) => setSessionId(event.target.value)}
-            onSearch={reloadFiltered}
-            style={{ width: 220 }}
-          />
-          <Input.Search
-            allowClear
-            placeholder="接口路径"
-            value={endpoint}
-            onChange={(event) => setEndpoint(event.target.value)}
-            onSearch={reloadFiltered}
-            style={{ width: 220 }}
-          />
-          <Select
-            allowClear
-            placeholder="提供商"
-            value={providerId}
-            onChange={changeProvider}
-            options={providers.map((provider) => ({ value: provider.id, label: provider.name }))}
-            style={{ width: 180 }}
-          />
-          <Select
-            allowClear
-            showSearch
-            optionFilterProp="label"
-            placeholder="上游密钥"
-            value={providerApiKeyId}
-            onChange={changeProviderApiKey}
-            options={providers
-              .filter((provider) => !providerId || provider.id === providerId)
-              .flatMap((provider) =>
-                provider.api_keys.map((key) => ({
-                  value: key.id,
-                  label: `${provider.name} · ${key.name || `Key ${key.id}`} (${key.api_key_suffix})`,
-                })),
-              )}
-            style={{ width: 220 }}
-          />
-          <Select
-            allowClear
-            showSearch
-            optionFilterProp="label"
-            placeholder="访问密钥"
-            value={apiKeyId}
-            onChange={setApiKeyId}
-            options={apiKeys.map((item) => ({ value: item.id, label: item.name }))}
-            style={{ width: 180 }}
-          />
-          <Select
-            allowClear
-            showSearch
-            optionFilterProp="label"
-            placeholder="路由"
-            value={routeId}
-            onChange={setRouteId}
-            options={routes.map((item) => ({ value: item.id, label: item.name }))}
-            style={{ width: 180 }}
-          />
-          <Select
-            placeholder="调用结果"
-            value={statusFilter}
-            onChange={setStatusFilter}
-            options={[
-              { value: 'all', label: '全部状态' },
-              { value: 'success', label: '成功' },
-              { value: 'failed', label: '失败' },
-              { value: 'pending', label: '请求中' },
-            ]}
-            style={{ width: 140 }}
-          />
-          <Space size={6}>
-            <Switch checked={onlyAdjusted} onChange={setOnlyAdjusted} />
-            <Typography.Text>网关调整</Typography.Text>
-          </Space>
-          <DatePicker.RangePicker
-            value={dates}
-            onChange={(value) => setDates(value as [Dayjs, Dayjs] | undefined)}
-            showTime
-          />
-          <Button icon={<ClearOutlined />} onClick={resetFilters}>重置</Button>
-          <Button type="primary" onClick={reloadFiltered}>查询</Button>
-        </Space>
-      </Card>
-      <Card bordered={false} className="table-card">
-        <Table
-          rowKey="id"
-          loading={loading}
-          dataSource={items}
-          scroll={{ x: 2000 }}
-          onRow={(record) => ({
-            onClick: () => void openDetail(record),
-            style: { cursor: 'pointer' },
-          })}
-          pagination={{
-            current: page,
-            pageSize,
-            total,
-            showSizeChanger: true,
-            showTotal: (value) => `共 ${value} 条`,
-            onChange: (nextPage, nextPageSize) => load(nextPage, nextPageSize),
-          }}
-          columns={[
-            {
-              title: '时间',
-              dataIndex: 'created_at',
-              width: 170,
-              render: (value: string) => dayjs(value).format('YYYY-MM-DD HH:mm:ss'),
-            },
-            {
-              title: '模型',
-              dataIndex: 'requested_model',
-              width: 170,
-              render: (value: string, record) => (
-                <div>
-                  <Typography.Text strong>{value}</Typography.Text>
-                  {record.upstream_model && <div><Typography.Text type="secondary">{record.upstream_model}</Typography.Text></div>}
-                </div>
-              ),
-            },
-            {
-              title: '提供商 / 路由',
-              width: 170,
-              render: (_, record) => (
-                <div>
-                  <Space size={4}>
-                    <span>{record.provider_name || (record.provider_id ? `#${record.provider_id}` : '-')}</span>
-                    {record.provider_api_key_name && (
-                      <Tooltip title={`上游密钥 #${record.provider_api_key_id ?? '-'}`}>
-                        <Tag color="blue">{record.provider_api_key_name}</Tag>
-                      </Tooltip>
-                    )}
-                  </Space>
-                  <Typography.Text type="secondary">
-                    {record.route_name || (record.route_id ? `#${record.route_id}` : '自动路由')}
-                  </Typography.Text>
-                </div>
-              ),
-            },
-            {
-              title: '访问密钥',
-              dataIndex: 'api_key_name',
-              width: 140,
-              render: (value: string | undefined, record) =>
-                value ? (
-                  <Tag color="geekblue">{value}</Tag>
-                ) : (
-                  <Typography.Text type="secondary">
-                    {record.api_key_id ? `#${record.api_key_id}` : '匿名调用'}
-                  </Typography.Text>
-                ),
-            },
-            { title: '接口', dataIndex: 'endpoint', width: 180, render: (value: string) => <Typography.Text code>{value}</Typography.Text> },
-            {
-              title: '状态',
-              dataIndex: 'success',
-              width: 100,
-              render: (value: boolean, record) => (
-                <Space size={4}>
-                  {record.in_flight ? (
-                    <Tag color="processing">请求中</Tag>
-                  ) : (
-                    <Tag color={value ? 'success' : 'error'}>
-                      {value ? '成功' : record.status_code}
-                    </Tag>
-                  )}
-                  {record.warning_message && (
-                    <Tooltip title={record.warning_message}>
-                      <WarningOutlined style={{ color: '#d48806' }} />
-                    </Tooltip>
-                  )}
-                </Space>
-              ),
-            },
-            {
-              title: 'tokens',
-              key: 'tokens',
-              width: 150,
-              render: (_, record) => {
-                if (record.in_flight) {
-                  return <Typography.Text type="secondary">-</Typography.Text>
-                }
-                const cached = (record.cache_read_tokens || 0) + (record.cache_write_tokens || 0)
-                return (
-                  <div>
-                    <Tooltip
-                      title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)} / 总 tokens ${formatExact(record.total_tokens)}`}
-                    >
-                      <div>
-                        <Typography.Text type="secondary">输入 </Typography.Text>
-                        {formatCompact(record.prompt_tokens)}
-                      </div>
-                      <div>
-                        <Typography.Text type="secondary">输出 </Typography.Text>
-                        {formatCompact(record.completion_tokens)}
-                      </div>
-                    </Tooltip>
-                    {cached > 0 && (
-                      <div>
-                        <Tooltip
-                          title={`缓存读取 ${formatExact(record.cache_read_tokens)} / 缓存写入 ${formatExact(record.cache_write_tokens)}`}
-                        >
-                          <Typography.Text type="success" style={{ fontSize: 12 }}>
-                            缓存 {formatCompact(record.cache_read_tokens)}
-                          </Typography.Text>
-                        </Tooltip>
-                      </div>
-                    )}
-                  </div>
-                )
-              },
-            },
-            {
-              title: '总用时',
-              dataIndex: 'latency_ms',
-              width: 100,
-              render: (value: number, record) =>
-                record.in_flight ? <Typography.Text type="secondary">-</Typography.Text> : `${value} ms`,
-            },
-            {
-              title: '费用',
-              dataIndex: 'estimated_cost_micros',
-              width: 90,
-              render: (value: number | null, record) =>
-                record.in_flight ? <Typography.Text type="secondary">-</Typography.Text> : formatCostMicros(value),
-            },
-            {
-              title: '首 token 用时',
-              dataIndex: 'first_token_ms',
-              width: 130,
-              render: (value: number | undefined, record) =>
-                record.in_flight ? (
-                  <Typography.Text type="secondary">-</Typography.Text>
-                ) : value != null ? (
-                  <Tooltip
-                    title={
-                      record.streamed
-                        ? '从请求开始到收到首个输出片段'
-                        : '标准响应没有增量时间戳，按完整响应总用时记录'
-                    }
-                  >
-                    <span>{value} ms</span>
-                  </Tooltip>
-                ) : (
-                  <Typography.Text type="secondary">不适用</Typography.Text>
-                ),
-            },
-            {
-              title: 'TPS',
-              dataIndex: 'output_tps',
-              width: 100,
-              render: (value: number | undefined, record) => (
-                <Tooltip
-                  title={
-                    record.streamed
-                      ? '生成阶段速度（已排除首 token 等待）'
-                      : '含等待时间的整体速度'
-                  }
-                >
-                  <span>{record.in_flight || value == null ? '-' : `${value.toFixed(1)} tok/s`}</span>
-                </Tooltip>
-              ),
-            },
-            {
-              title: '类型',
-              dataIndex: 'streamed',
-              width: 90,
-              render: (value: boolean) => <Tag>{value ? '流式' : '标准'}</Tag>,
-            },
-            {
-              title: '请求 ID',
-              dataIndex: 'request_id',
-              width: 170,
-              render: (value: string) => <Typography.Text copyable={{ text: value }}>{value.slice(0, 12)}…</Typography.Text>,
-            },
-            {
-              title: '错误',
-              dataIndex: 'error_message',
-              width: 150,
-              render: (value: string | undefined, record) =>
-                value ? (
-                  <Tooltip title={value}>
-                    <Button
-                      type="link"
-                      size="small"
-                      danger
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        void openDetail(record)
-                      }}
-                    >
-                      查看错误
-                    </Button>
-                  </Tooltip>
-                ) : (
-                  '-'
-                ),
-            },
-          ]}
-        />
-      </Card>
-      <Drawer
-        title="请求详情"
-        width={520}
-        open={Boolean(detail)}
-        onClose={() => setDetail(undefined)}
+      <UsageFilters
+        values={{
+          model,
+          requestId,
+          sessionId,
+          endpoint,
+          providerId,
+          providerApiKeyId,
+          apiKeyId,
+          routeId,
+          statusFilter,
+          onlyAdjusted,
+          dates,
+        }}
+        providers={providers}
+        apiKeys={apiKeys}
+        routes={routes}
+        onChange={(patch) => {
+          if ('model' in patch) setModel(patch.model ?? '')
+          if ('requestId' in patch) setRequestId(patch.requestId ?? '')
+          if ('sessionId' in patch) setSessionId(patch.sessionId ?? '')
+          if ('endpoint' in patch) setEndpoint(patch.endpoint ?? '')
+          if ('apiKeyId' in patch) setApiKeyId(patch.apiKeyId)
+          if ('routeId' in patch) setRouteId(patch.routeId)
+          if ('statusFilter' in patch && patch.statusFilter) {
+            setStatusFilter(patch.statusFilter)
+          }
+          if ('onlyAdjusted' in patch) setOnlyAdjusted(Boolean(patch.onlyAdjusted))
+          if ('dates' in patch) setDates(patch.dates)
+        }}
+        onProviderChange={changeProvider}
+        onProviderApiKeyChange={changeProviderApiKey}
+        onReset={resetFilters}
+        onSearch={reloadFiltered}
+      />
+      <UsageTable
+        items={items}
+        loading={loading}
+        page={page}
+        pageSize={pageSize}
+        total={total}
+        onPageChange={(nextPage, nextPageSize) => void load(nextPage, nextPageSize)}
+        onOpenDetail={(record) => void openDetail(record)}
+      />
+      <UsageDetailDrawer
+        detail={detail}
         loading={detailLoading}
-      >
-        {detail && (
-          <Space direction="vertical" size={16} style={{ width: '100%' }}>
-            <div
-              className={`detail-status ${
-                detail.in_flight
-                  ? 'detail-status-pending'
-                  : detail.success
-                    ? 'detail-status-success'
-                    : 'detail-status-error'
-              }`}
-            >
-              {detail.in_flight ? (
-                <LoadingOutlined spin />
-              ) : detail.success ? (
-                <CheckCircleOutlined />
-              ) : (
-                <CloseCircleOutlined />
-              )}
-              <span>
-                {detail.in_flight
-                  ? '请求处理中'
-                  : detail.success
-                    ? '请求成功'
-                    : `请求失败 · HTTP ${detail.status_code}`}
-              </span>
-            </div>
-            <Button
-              icon={<ExperimentOutlined />}
-              onClick={() => {
-                const params = new URLSearchParams({
-                  diagnose_model: detail.requested_model,
-                  diagnose_endpoint: detail.endpoint,
-                })
-                if (detail.session_id) {
-                  params.set('diagnose_session_id', detail.session_id)
-                }
-                navigate(`/routes?${params}`)
-              }}
-            >
-              诊断此请求路由
-            </Button>
-            <Descriptions column={1} size="small" bordered>
-              <Descriptions.Item label="请求 ID">
-                <Typography.Text copyable={{ text: detail.request_id }}>{detail.request_id}</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="会话 ID">
-                {detail.session_id ? (
-                  <Typography.Text copyable={{ text: detail.session_id }}>
-                    {detail.session_id}
-                  </Typography.Text>
-                ) : (
-                  '-'
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="时间">
-                {dayjs(detail.created_at).format('YYYY-MM-DD HH:mm:ss.SSS')}
-              </Descriptions.Item>
-              <Descriptions.Item label="接口">
-                <Typography.Text code>{detail.endpoint}</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="请求模型">
-                <Typography.Text code>{detail.requested_model}</Typography.Text>
-              </Descriptions.Item>
-              <Descriptions.Item label="上游模型">
-                {detail.upstream_model || '-'}
-              </Descriptions.Item>
-              <Descriptions.Item label="提供商">
-                {detail.provider_name || (detail.provider_id ? `#${detail.provider_id}` : '-')}
-              </Descriptions.Item>
-              <Descriptions.Item label="上游密钥">
-                {detail.provider_api_key_name || (detail.provider_api_key_id ? `#${detail.provider_api_key_id}` : '-')}
-              </Descriptions.Item>
-              <Descriptions.Item label="路由">
-                {detail.route_name || (detail.route_id ? `#${detail.route_id}` : '自动路由')}
-              </Descriptions.Item>
-              <Descriptions.Item label="访问密钥">
-                {detail.api_key_name || (detail.api_key_id ? `#${detail.api_key_id}` : '匿名调用')}
-              </Descriptions.Item>
-              <Descriptions.Item label="流式">
-                <Tag>{detail.streamed ? '是' : '否'}</Tag>
-              </Descriptions.Item>
-              <Descriptions.Item label="总用时">
-                {detail.latency_ms} ms
-              </Descriptions.Item>
-              <Descriptions.Item label="首 token 用时">
-                {detail.first_token_ms != null ? (
-                  <Tooltip
-                    title={
-                      detail.streamed
-                        ? '从请求开始到收到首个输出片段'
-                        : '标准响应没有增量时间戳，按完整响应总用时记录'
-                    }
-                  >
-                    <span>{detail.first_token_ms} ms</span>
-                  </Tooltip>
-                ) : (
-                  '不适用'
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="生成速度 (TPS)">
-                {detail.output_tps != null ? `${detail.output_tps.toFixed(1)} tok/s` : '-'}
-              </Descriptions.Item>
-              <Descriptions.Item label="输入 tokens">
-                <Tooltip title={formatExact(detail.prompt_tokens)}>
-                  {formatCompact(detail.prompt_tokens)}
-                </Tooltip>
-              </Descriptions.Item>
-              <Descriptions.Item label="缓存读取 tokens">
-                {detail.cache_read_tokens > 0 ? (
-                  <Tooltip title={formatExact(detail.cache_read_tokens)}>
-                    {formatCompact(detail.cache_read_tokens)}
-                  </Tooltip>
-                ) : (
-                  '-'
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="缓存写入 tokens">
-                {detail.cache_write_tokens > 0 ? (
-                  <Tooltip title={formatExact(detail.cache_write_tokens)}>
-                    {formatCompact(detail.cache_write_tokens)}
-                  </Tooltip>
-                ) : (
-                  '-'
-                )}
-              </Descriptions.Item>
-              <Descriptions.Item label="输出 tokens">
-                <Tooltip title={formatExact(detail.completion_tokens)}>
-                  {formatCompact(detail.completion_tokens)}
-                </Tooltip>
-              </Descriptions.Item>
-              <Descriptions.Item label="总 tokens">
-                <Tooltip title={formatExact(detail.total_tokens)}>
-                  {formatCompact(detail.total_tokens)}
-                </Tooltip>
-              </Descriptions.Item>
-              <Descriptions.Item label="预估费用">
-                {formatCostMicros(detail.estimated_cost_micros)}
-              </Descriptions.Item>
-            </Descriptions>
-            {detail.warning_message && (
-              <Alert
-                type="warning"
-                showIcon
-                message="网关请求调整"
-                description={<pre className="response-block">{detail.warning_message}</pre>}
-              />
-            )}
-            {detail.error_message && (
-              <div>
-                <Typography.Text strong>错误信息</Typography.Text>
-                <pre className="error-block">{detail.error_message}</pre>
-              </div>
-            )}
-            {detail.response_preview && (
-              <div>
-                <Space style={{ width: '100%', justifyContent: 'space-between' }}>
-                  <Typography.Text strong>响应内容预览</Typography.Text>
-                  <Button
-                    type="link"
-                    size="small"
-                    icon={<CopyOutlined />}
-                    onClick={() => {
-                      void navigator.clipboard.writeText(detail.response_preview || '')
-                      message.success('已复制')
-                    }}
-                  >
-                    复制
-                  </Button>
-                </Space>
-                <pre className="response-block">{detail.response_preview}</pre>
-              </div>
-            )}
-          </Space>
-        )}
-      </Drawer>
-      <Modal
-        title="清理历史日志"
+        onClose={() => setDetail(undefined)}
+        onDiagnose={(record) => {
+          const params = new URLSearchParams({
+            diagnose_model: record.requested_model,
+            diagnose_endpoint: record.endpoint,
+          })
+          if (record.session_id) {
+            params.set('diagnose_session_id', record.session_id)
+          }
+          navigate(`/routes?${params}`)
+        }}
+      />
+      <UsageCleanupModal
         open={cleanupOpen}
+        days={cleanupDays}
+        cleaning={cleaning}
+        onDaysChange={setCleanupDays}
         onCancel={() => setCleanupOpen(false)}
-        onOk={() => void runCleanup()}
-        confirmLoading={cleaning}
-        okText="开始清理"
-        okButtonProps={{ danger: true }}
-        destroyOnHidden
-      >
-        <Alert
-          type="warning"
-          showIcon
-          message="此操作不可撤销"
-          description="将永久删除早于指定天数的用量记录，仪表盘的历史统计也会随之减少。"
-          style={{ marginBottom: 16 }}
-        />
-        <Space>
-          <Typography.Text>保留最近</Typography.Text>
-          <InputNumber
-            min={1}
-            max={3650}
-            value={cleanupDays}
-            onChange={setCleanupDays}
-            addonAfter="天"
-          />
-        </Space>
-      </Modal>
+        onConfirm={() => void runCleanup()}
+      />
     </>
   )
 }

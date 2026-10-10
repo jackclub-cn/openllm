@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   ApiOutlined,
   AppstoreOutlined,
+  BellOutlined,
   DashboardOutlined,
   KeyOutlined,
   MessageOutlined,
@@ -23,6 +24,7 @@ const Providers = lazy(() => import('./pages/Providers'))
 const RoutesPage = lazy(() => import('./pages/Routes'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
 const Usage = lazy(() => import('./pages/Usage'))
+const Webhooks = lazy(() => import('./pages/Webhooks'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const Playground = lazy(() => import('./pages/Playground'))
 
@@ -34,6 +36,7 @@ const navigation = [
   { key: '/playground', icon: <MessageOutlined />, label: '模型调试' },
   { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
   { key: '/usage', icon: <DashboardOutlined />, label: '请求日志' },
+  { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
   { key: '/settings', icon: <SettingOutlined />, label: '设置' },
 ]
 
@@ -150,6 +153,7 @@ function AppLayout({
               <Route path="/playground" element={<Playground />} />
               <Route path="/keys" element={<ApiKeys />} />
               <Route path="/usage" element={<Usage />} />
+              <Route path="/webhooks" element={<Webhooks />} />
               <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

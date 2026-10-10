@@ -1,53 +1,25 @@
 import { useCallback, useEffect, useState } from 'react'
-import {
-  ApiOutlined,
-  ClockCircleOutlined,
-  DatabaseOutlined,
-  DollarOutlined,
-  NodeIndexOutlined,
-  PauseCircleOutlined,
-  PlayCircleOutlined,
-  ReloadOutlined,
-  ThunderboltOutlined,
-} from '@ant-design/icons'
-import {
-  Alert,
-  Button,
-  Card,
-  Col,
-  DatePicker,
-  Empty,
-  Progress,
-  Row,
-  Segmented,
-  Skeleton,
-  Space,
-  Table,
-  Tag,
-  Tooltip,
-  Typography,
-} from 'antd'
+import { Alert, Skeleton } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
-import { Area } from '@ant-design/plots'
-import { useNavigate } from 'react-router-dom'
 import { api, formatError, type Overview } from '../api'
-import PageHeader from '../components/PageHeader'
-import MetricCard from '../components/MetricCard'
-import { formatCompact, formatCostMicros, formatExact } from '../format'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
+import DashboardCharts, {
+  type DashboardChartMetric,
+} from './dashboard/DashboardCharts'
+import DashboardDetails from './dashboard/DashboardDetails'
+import DashboardMetrics from './dashboard/DashboardMetrics'
+import DashboardModelUsage from './dashboard/DashboardModelUsage'
+import DashboardToolbar from './dashboard/DashboardToolbar'
 
 export default function Dashboard() {
-  const navigate = useNavigate()
   const [data, setData] = useState<Overview>()
   const [error, setError] = useState('')
   const [dates, setDates] = useState<[Dayjs, Dayjs]>(() => [
     dayjs().subtract(13, 'day').startOf('day'),
     dayjs().endOf('day'),
   ])
-  const [chartMetric, setChartMetric] = useState<
-    'requests' | 'tokens' | 'prompt_tokens' | 'completion_tokens'
-  >('requests')
+  const [chartMetric, setChartMetric] = useState<DashboardChartMetric>('requests')
 
   const load = useCallback(async () => {
     try {
@@ -76,542 +48,38 @@ export default function Dashboard() {
     onRefresh: load,
   })
   const { connected: realtimeConnected } = useRealtime()
-  useCoalescedUsageEvents(() => {
-    void autoRefresh.manualRefresh()
-  }, { enabled: !autoRefresh.paused })
+  useCoalescedUsageEvents(
+    () => {
+      void autoRefresh.manualRefresh()
+    },
+    { enabled: !autoRefresh.paused },
+  )
 
-  if (error) return <Alert type="error" showIcon message="无法加载仪表盘" description={error} />
+  if (error) {
+    return <Alert type="error" showIcon message="无法加载仪表盘" description={error} />
+  }
   if (!data) return <Skeleton active paragraph={{ rows: 10 }} />
-
-  const rangePresets = [
-    { label: '今天', value: [dayjs().startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs] },
-    {
-      label: '近 7 天',
-      value: [dayjs().subtract(6, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
-    },
-    {
-      label: '近 14 天',
-      value: [dayjs().subtract(13, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
-    },
-    {
-      label: '近 30 天',
-      value: [dayjs().subtract(29, 'day').startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs],
-    },
-  ]
 
   return (
     <>
-      <PageHeader
-        title="运行概览"
-        description="网关请求、模型令牌与提供商健康状态"
-        extra={
-          <>
-            <DatePicker.RangePicker
-              allowClear={false}
-              value={dates}
-              presets={rangePresets}
-              disabledDate={(current) => current && current > dayjs().endOf('day')}
-              onChange={(value) => {
-                if (value?.[0] && value[1]) setDates(value as [Dayjs, Dayjs])
-              }}
-            />
-            {autoRefresh.lastUpdated && (
-              <Typography.Text type="secondary">
-                更新于 {dayjs(autoRefresh.lastUpdated).format('HH:mm:ss')}
-              </Typography.Text>
-            )}
-            <Tag color={realtimeConnected ? 'success' : 'default'}>
-              {realtimeConnected ? '实时' : '轮询'}
-            </Tag>
-            <Tooltip title={autoRefresh.paused ? '恢复自动刷新' : '暂停自动刷新'}>
-              <Button
-                icon={autoRefresh.paused ? <PlayCircleOutlined /> : <PauseCircleOutlined />}
-                onClick={() => autoRefresh.setPaused((value) => !value)}
-              >
-                {autoRefresh.paused ? '已暂停' : '自动刷新'}
-              </Button>
-            </Tooltip>
-            <Button
-              icon={<ReloadOutlined spin={autoRefresh.refreshing} />}
-              loading={autoRefresh.refreshing}
-              onClick={() => void autoRefresh.manualRefresh()}
-            >
-              刷新
-            </Button>
-          </>
-        }
+      <DashboardToolbar
+        dates={dates}
+        lastUpdated={autoRefresh.lastUpdated}
+        refreshing={autoRefresh.refreshing}
+        paused={autoRefresh.paused}
+        realtimeConnected={realtimeConnected}
+        onDatesChange={setDates}
+        onTogglePaused={() => autoRefresh.setPaused((value) => !value)}
+        onRefresh={() => void autoRefresh.manualRefresh()}
       />
-      <Row gutter={[16, 16]}>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard label="请求" value={data.range_requests} icon={<ThunderboltOutlined />} tone="blue" />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="总 tokens"
-            value={data.range_tokens}
-            compact
-            icon={<ApiOutlined />}
-            tone="cyan"
-            hint={`输入 ${formatCompact(data.range_prompt_tokens)} · 输出 ${formatCompact(data.range_completion_tokens)}`}
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="成功率"
-            value={data.range_success_rate}
-            precision={1}
-            suffix="%"
-            icon={<NodeIndexOutlined />}
-            tone="green"
-            hint={
-              data.range_gateway_adjusted > 0 ? (
-                <Tooltip title="兼容层自动修复工具历史或调整上游请求参数的次数">
-                  <Typography.Link
-                    onClick={() => navigate('/usage?gateway_adjusted=true')}
-                  >
-                    网关调整 {data.range_gateway_adjusted} 次
-                  </Typography.Link>
-                </Tooltip>
-              ) : (
-                '无兼容调整'
-              )
-            }
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="平均总用时"
-            value={data.range_avg_latency_ms}
-            precision={0}
-            suffix="ms"
-            icon={<ClockCircleOutlined />}
-            tone="orange"
-          />
-        </Col>
-      </Row>
-      <Row gutter={[16, 16]} className="section-row">
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="缓存命中率"
-            value={data.range_cache_hit_rate}
-            precision={1}
-            suffix="%"
-            icon={<DollarOutlined />}
-            tone="purple"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="缓存读取"
-            value={data.range_cache_read}
-            compact
-            icon={<DatabaseOutlined />}
-            tone="green"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="缓存写入"
-            value={data.range_cache_write}
-            compact
-            icon={<DatabaseOutlined />}
-            tone="cyan"
-          />
-        </Col>
-        <Col xs={24} sm={12} xl={6}>
-          <MetricCard
-            label="费用"
-            value={data.range_cost_micros / 1_000_000}
-            precision={4}
-            suffix="USD"
-            icon={<DatabaseOutlined />}
-            tone="blue"
-          />
-        </Col>
-      </Row>
-
-      <Row gutter={[16, 16]} className="section-row">
-        <Col xs={24} xl={15}>
-          <Card title="用量趋势" bordered={false}>
-            <Segmented
-              block
-              size="small"
-              value={chartMetric}
-              onChange={(value) =>
-                setChartMetric(
-                  value as 'requests' | 'tokens' | 'prompt_tokens' | 'completion_tokens',
-                )
-              }
-              options={[
-                { label: '请求数', value: 'requests' },
-                { label: '总 tokens', value: 'tokens' },
-                { label: '输入 tokens', value: 'prompt_tokens' },
-                { label: '输出 tokens', value: 'completion_tokens' },
-              ]}
-              style={{ marginBottom: 16 }}
-            />
-            {data.daily_usage.length ? (
-              <Area
-                data={data.daily_usage}
-                xField="day"
-                yField={chartMetric}
-                height={260}
-                axis={{ x: { title: false }, y: { title: false } }}
-                style={{ fill: 'linear-gradient(-90deg, white 0%, #1677ff 100%)' }}
-                line={{ style: { stroke: '#1677ff', strokeWidth: 2 } }}
-              />
-            ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无请求数据" />
-            )}
-          </Card>
-        </Col>
-        <Col xs={24} xl={9}>
-          <Card title="提供商使用分布" bordered={false} className="full-height-card">
-            {data.provider_usage.length ? (
-              <Table
-                rowKey="provider_id"
-                size="small"
-                pagination={false}
-                dataSource={data.provider_usage}
-                onRow={(record) => ({
-                  onClick: () => navigate(`/usage?provider_id=${record.provider_id}`),
-                  style: { cursor: 'pointer' },
-                })}
-                columns={[
-                  {
-                    title: '提供商',
-                    dataIndex: 'provider_name',
-                    ellipsis: true,
-                  },
-                  { title: '请求', dataIndex: 'requests', width: 70 },
-                  {
-                    title: 'tokens',
-                    dataIndex: 'tokens',
-                    width: 82,
-                    render: (value: number, record) => (
-                      <Tooltip
-                        title={`输入 ${formatExact(record.prompt_tokens)} / 输出 ${formatExact(record.completion_tokens)}`}
-                      >
-                        <span>{formatCompact(value)}</span>
-                      </Tooltip>
-                    ),
-                  },
-                  {
-                    title: '费用',
-                    dataIndex: 'cost_micros',
-                    width: 86,
-                    render: (value: number | null) => formatCostMicros(value),
-                  },
-                  {
-                    title: '成功率',
-                    dataIndex: 'success_rate',
-                    width: 90,
-                    render: (value: number, record) =>
-                      record.requests === 0 ? (
-                        <Typography.Text type="secondary">无调用</Typography.Text>
-                      ) : (
-                        <Tag color={value >= 99 ? 'success' : value >= 90 ? 'warning' : 'error'}>
-                          {value.toFixed(1)}%
-                        </Tag>
-                      ),
-                  },
-                  {
-                    title: '平均总用时',
-                    dataIndex: 'avg_latency_ms',
-                    width: 90,
-                    render: (value: number, record) =>
-                      record.requests === 0 ? '-' : `${Math.round(value)} ms`,
-                  },
-                ]}
-              />
-            ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="请先添加上游提供商" />
-            )}
-          </Card>
-        </Col>
-      </Row>
-
-      <Row gutter={[16, 16]} className="section-row">
-        <Col xs={24} xl={16}>
-          <Card title="最近请求" bordered={false} className="full-height-card">
-            <Table
-              rowKey="id"
-              size="middle"
-              pagination={false}
-              dataSource={data.recent_requests}
-              onRow={(record) => ({
-                onClick: () => navigate(`/usage?request_id=${encodeURIComponent(record.request_id)}`),
-                style: { cursor: 'pointer' },
-              })}
-              locale={{ emptyText: '暂无请求' }}
-              columns={[
-                {
-                  title: '模型',
-                  dataIndex: 'requested_model',
-                  render: (value: string, record) => (
-                    <div>
-                      <Typography.Text strong>{value}</Typography.Text>
-                      {record.upstream_model && (
-                        <div><Typography.Text type="secondary">{record.upstream_model}</Typography.Text></div>
-                      )}
-                    </div>
-                  ),
-                },
-                {
-                  title: '状态',
-                  dataIndex: 'success',
-                  width: 92,
-                  render: (value: boolean, record) =>
-                    record.in_flight ? (
-                      <Tag color="processing">请求中</Tag>
-                    ) : (
-                      <Tag color={value ? 'success' : 'error'}>
-                        {value ? '成功' : record.status_code}
-                      </Tag>
-                    ),
-                },
-                {
-                  title: '输入',
-                  dataIndex: 'prompt_tokens',
-                  width: 80,
-                  render: (value: number, record) =>
-                    record.in_flight ? (
-                      <Typography.Text type="secondary">-</Typography.Text>
-                    ) : (
-                      <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-                    ),
-                },
-                {
-                  title: '输出',
-                  dataIndex: 'completion_tokens',
-                  width: 80,
-                  render: (value: number, record) =>
-                    record.in_flight ? (
-                      <Typography.Text type="secondary">-</Typography.Text>
-                    ) : (
-                      <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-                    ),
-                },
-                {
-                  title: '费用',
-                  dataIndex: 'estimated_cost_micros',
-                  width: 90,
-                  render: (value: number | null, record) =>
-                    record.in_flight ? (
-                      <Typography.Text type="secondary">-</Typography.Text>
-                    ) : (
-                      formatCostMicros(value)
-                    ),
-                },
-                {
-                  title: '总用时',
-                  dataIndex: 'latency_ms',
-                  width: 100,
-                  render: (value: number, record) =>
-                    record.in_flight ? (
-                      <Typography.Text type="secondary">-</Typography.Text>
-                    ) : (
-                      `${value} ms`
-                    ),
-                },
-                {
-                  title: '时间',
-                  dataIndex: 'created_at',
-                  width: 170,
-                  render: (value: string) => dayjs(value).format('MM-DD HH:mm:ss'),
-                },
-              ]}
-            />
-          </Card>
-        </Col>
-        <Col xs={24} xl={8}>
-          <Card title="网关配置" bordered={false} className="full-height-card">
-            <Space direction="vertical" size={24} style={{ width: '100%' }}>
-              <div>
-                <Typography.Text type="secondary">活跃提供商</Typography.Text>
-                <div className="stat-line"><strong>{data.active_providers}</strong> 个</div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">活跃路由</Typography.Text>
-                <div className="stat-line"><strong>{data.active_routes}</strong> 条</div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">当前请求</Typography.Text>
-                <div className="stat-line"><strong>{data.in_flight_requests}</strong> 条</div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">提供商健康</Typography.Text>
-                <div className="stat-line">
-                  正常{' '}
-                  <Typography.Link onClick={() => navigate('/providers?health=healthy')}>
-                    <strong>{data.healthy_providers}</strong>
-                  </Typography.Link>{' '}
-                  · 异常{' '}
-                  <Typography.Link onClick={() => navigate('/providers?health=failed')}>
-                    <strong>{data.failed_providers}</strong>
-                  </Typography.Link>{' '}
-                  · 未检测{' '}
-                  <Typography.Link onClick={() => navigate('/providers?health=untested')}>
-                    <strong>{data.untested_providers}</strong>
-                  </Typography.Link>
-                </div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">上游密钥健康</Typography.Text>
-                <div className="stat-line">
-                  {data.provider_keys_total > 0 ? (
-                    <>
-                      正常 <strong>{data.healthy_provider_keys}</strong> · 异常{' '}
-                      <Typography.Link onClick={() => navigate('/providers?health=key_error')}>
-                        <strong>{data.failed_provider_keys}</strong>
-                      </Typography.Link>{' '}
-                      · 未检测{' '}
-                      <Typography.Link onClick={() => navigate('/providers?health=key_untested')}>
-                        <strong>{data.untested_provider_keys}</strong>
-                      </Typography.Link>
-                      {data.runtime_error_provider_keys > 0 && (
-                        <>
-                          {' '}· 运行错误{' '}
-                          <Typography.Link
-                            onClick={() => navigate('/providers?health=key_error')}
-                          >
-                            <strong>{data.runtime_error_provider_keys}</strong>
-                          </Typography.Link>
-                        </>
-                      )}
-                    </>
-                  ) : (
-                    '未配置'
-                  )}
-                </div>
-              </div>
-              {data.cooling_provider_keys > 0 && (
-                <div>
-                  <Typography.Text type="secondary">冷却中的上游密钥</Typography.Text>
-                  <div className="stat-line"><strong>{data.cooling_provider_keys}</strong> 把</div>
-                </div>
-              )}
-              {data.cooling_providers > 0 && (
-                <div>
-                  <Typography.Text type="secondary">冷却中的提供商</Typography.Text>
-                  <div className="stat-line"><strong>{data.cooling_providers}</strong> 个</div>
-                </div>
-              )}
-              <div>
-                <Typography.Text type="secondary">累计请求</Typography.Text>
-                <div className="stat-line"><strong>{data.requests_total}</strong> 次</div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">累计输入 tokens</Typography.Text>
-                <div className="stat-line">
-                  <Tooltip title={formatExact(data.prompt_tokens_total)}>
-                    <strong>{formatCompact(data.prompt_tokens_total)}</strong>
-                  </Tooltip>
-                </div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">累计输出 tokens</Typography.Text>
-                <div className="stat-line">
-                  <Tooltip title={formatExact(data.completion_tokens_total)}>
-                    <strong>{formatCompact(data.completion_tokens_total)}</strong>
-                  </Tooltip>
-                </div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">累计缓存读取</Typography.Text>
-                <div className="stat-line">
-                  <Tooltip title={formatExact(data.cache_read_total)}>
-                    <strong>{formatCompact(data.cache_read_total)}</strong>
-                  </Tooltip>
-                </div>
-              </div>
-              <div>
-                <Typography.Text type="secondary">累计费用</Typography.Text>
-                <div className="stat-line">
-                  <strong>{formatCostMicros(data.cost_total_micros)}</strong>
-                  {data.unpriced_total > 0 && (
-                    <Typography.Text type="secondary">
-                      {' '}
-                      {data.unpriced_total} 条未定价
-                    </Typography.Text>
-                  )}
-                </div>
-              </div>
-              <Progress
-                percent={Math.round(data.range_success_rate)}
-                status="active"
-                strokeColor="#52c41a"
-              />
-            </Space>
-          </Card>
-        </Col>
-      </Row>
-
-      <Card title="模型用量" bordered={false} className="section-row">
-        <Table
-          rowKey="model"
-          size="middle"
-          pagination={false}
-          dataSource={data.model_usage}
-          onRow={(record) => ({
-            onClick: () => navigate(`/usage?model=${encodeURIComponent(record.model)}`),
-            style: { cursor: 'pointer' },
-          })}
-          locale={{ emptyText: '暂无模型用量' }}
-          scroll={{ x: 900 }}
-          columns={[
-            {
-              title: '模型',
-              dataIndex: 'model',
-              render: (value: string) => <Typography.Text strong>{value}</Typography.Text>,
-            },
-            { title: '请求数', dataIndex: 'requests', width: 100 },
-            {
-              title: '输入 tokens',
-              dataIndex: 'prompt_tokens',
-              width: 120,
-              sorter: (a, b) => a.prompt_tokens - b.prompt_tokens,
-              render: (value: number) => (
-                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-              ),
-            },
-            {
-              title: '输出 tokens',
-              dataIndex: 'completion_tokens',
-              width: 120,
-              sorter: (a, b) => a.completion_tokens - b.completion_tokens,
-              render: (value: number) => (
-                <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
-              ),
-            },
-            {
-              title: '费用',
-              dataIndex: 'cost_micros',
-              width: 100,
-              render: (value: number | null) => formatCostMicros(value),
-            },
-            {
-              title: '成功率',
-              dataIndex: 'success_rate',
-              width: 160,
-              render: (value: number) => (
-                <Progress
-                  percent={Math.round(value)}
-                  size="small"
-                  status={value >= 99 ? 'success' : value >= 90 ? 'normal' : 'exception'}
-                />
-              ),
-            },
-            {
-              title: '平均总用时',
-              dataIndex: 'avg_latency_ms',
-              width: 120,
-              sorter: (a, b) => a.avg_latency_ms - b.avg_latency_ms,
-              render: (value: number) => `${Math.round(value)} ms`,
-            },
-          ]}
-        />
-      </Card>
+      <DashboardMetrics data={data} />
+      <DashboardCharts
+        data={data}
+        metric={chartMetric}
+        onMetricChange={setChartMetric}
+      />
+      <DashboardDetails data={data} />
+      <DashboardModelUsage data={data} />
     </>
   )
 }
