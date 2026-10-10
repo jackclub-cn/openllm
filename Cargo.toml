@@ -1,6 +1,6 @@
 [package]
 name = "openllm"
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 description = "A self-hosted, single-binary LLM gateway with custom routing and usage analytics."
 license = "MIT"
