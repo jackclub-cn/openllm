@@ -354,6 +354,46 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_inflight_request_bytes_limit",
+        "Configured in-flight request-body budget in bytes; zero means unlimited",
+    );
+    push_metric(
+        &mut body,
+        "openllm_inflight_request_bytes_limit",
+        &[],
+        state.request_bytes_limit as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_inflight_request_bytes",
+        "Request-body bytes currently held by in-flight requests",
+    );
+    let inflight_request_bytes = state
+        .inflight_request_bytes
+        .as_ref()
+        .map(|budget| budget.used() as i64)
+        .unwrap_or(0);
+    push_metric(
+        &mut body,
+        "openllm_inflight_request_bytes",
+        &[],
+        inflight_request_bytes,
+    );
+    metric_header(
+        &mut body,
+        "openllm_request_bytes_shed_total",
+        "Requests refused by the in-flight request-byte budget since startup",
+    );
+    push_metric(
+        &mut body,
+        "openllm_request_bytes_shed_total",
+        &[],
+        state
+            .request_bytes_shed
+            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+    );
+    metric_header(
+        &mut body,
         "openllm_tokens_total",
         "Retained token counts by type",
     );

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -48,6 +48,15 @@ pub struct AppState {
     pub request_capacity_limit: usize,
     /// Requests refused by the global admission cap since startup.
     pub requests_shed: Arc<AtomicU64>,
+    /// Opt-in global budget on the total bytes of in-flight request bodies.
+    /// `None` disables the byte budget (see `OPENLLM_MAX_INFLIGHT_REQUEST_MIB`).
+    pub inflight_request_bytes: Option<Arc<RequestByteBudget>>,
+    /// Configured in-flight request-byte budget in bytes, `0` when disabled.
+    /// Kept separately from the budget so metrics can report the limit even
+    /// while it is disabled.
+    pub request_bytes_limit: usize,
+    /// Requests refused by the in-flight byte budget since startup.
+    pub request_bytes_shed: Arc<AtomicU64>,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
@@ -104,6 +113,15 @@ pub(crate) const DEFAULT_MAX_BODY_MIB: usize = 32;
 /// memory, not a protocol limit. Raise it with `OPENLLM_MAX_UPSTREAM_BODY_MIB`
 /// on the rare endpoint that legitimately returns more.
 pub(crate) const DEFAULT_MAX_UPSTREAM_BODY_MIB: usize = 64;
+
+/// Default in-flight request-byte budget in MiB.
+///
+/// The gateway buffers every request body in memory, so a burst of large
+/// coding-agent payloads can exhaust RAM long before the request-count cap
+/// trips. This is an opt-in budget: `0` disables it, matching the request-count
+/// cap. Set `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` to a positive value to shed
+/// requests whose combined buffered bodies would exceed it.
+pub(crate) const DEFAULT_MAX_INFLIGHT_REQUEST_MIB: usize = 0;
 
 /// Default idle gap allowed between bytes from an upstream.
 ///
@@ -172,6 +190,14 @@ pub(crate) fn parse_concurrency_limit(value: Option<&str>) -> Option<usize> {
         .filter(|limit| *limit > 0)
 }
 
+/// Parses an operator-provided in-flight request-byte budget in MiB.
+///
+/// Empty, zero, and unparsable values all disable the budget, matching the
+/// opt-in default so an upgrade never starts shedding bodies by surprise.
+pub(crate) fn parse_inflight_bytes_mib(value: Option<&str>) -> Option<usize> {
+    parse_concurrency_limit(value).map(|mib| mib.saturating_mul(1024 * 1024))
+}
+
 /// Parses the post-signal drain grace period.
 ///
 /// A missing or unparsable value keeps the default; an explicit `0` waits
@@ -213,6 +239,130 @@ pub struct UsageEvent {
     pub streamed: bool,
 }
 
+/// Opt-in global budget on the total bytes of in-flight request bodies.
+///
+/// The gateway buffers each request body in memory, so the number of requests
+/// is a poor proxy for memory pressure: a handful of large coding-agent
+/// payloads can use more RAM than hundreds of small ones. This budget charges
+/// the actual bytes of every admitted body and releases them once the response
+/// finishes, so the process can shed over-budget requests at admission instead
+/// of buffering past its memory headroom.
+pub struct RequestByteBudget {
+    limit: usize,
+    used: AtomicUsize,
+}
+
+impl RequestByteBudget {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn limit(&self) -> usize {
+        self.limit
+    }
+
+    /// Bytes currently reserved by admitted requests.
+    pub fn used(&self) -> usize {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// Headroom left in the budget, saturating at zero.
+    pub fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.used())
+    }
+
+    /// Adds `bytes` when the budget still has room, returning `false` otherwise.
+    ///
+    /// The compare-and-swap loop keeps concurrent admissions from racing past
+    /// the limit; a zero-length add always succeeds so empty bodies never trip
+    /// the guard.
+    fn try_add(&self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current.checked_add(bytes) else {
+                return false;
+            };
+            if next > self.limit {
+                return false;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn release(&self, bytes: usize) {
+        if bytes > 0 {
+            self.used.fetch_sub(bytes, Ordering::AcqRel);
+        }
+    }
+
+    /// Reserves `bytes` against the budget, returning a guard that releases
+    /// them on drop. Returns `None` when the reservation would exceed the limit.
+    pub fn reserve(self: &Arc<Self>, bytes: usize) -> Option<RequestByteGuard> {
+        let mut guard = RequestByteGuard {
+            budget: Arc::clone(self),
+            reserved: 0,
+        };
+        guard.extend(bytes).then_some(guard)
+    }
+}
+
+/// Holds reserved bytes against a [`RequestByteBudget`] until it is dropped.
+///
+/// A single guard accumulates every charge for one request, so it can be moved
+/// into the response body and released only once the whole request (body read,
+/// upstream work, and any streamed response) has finished.
+pub struct RequestByteGuard {
+    budget: Arc<RequestByteBudget>,
+    reserved: usize,
+}
+
+impl RequestByteGuard {
+    /// Bytes currently reserved by this guard.
+    pub fn reserved(&self) -> usize {
+        self.reserved
+    }
+
+    /// Charges `bytes` more against the budget, returning `false` when the
+    /// request would exceed the limit (leaving the reservation unchanged).
+    pub fn extend(&mut self, bytes: usize) -> bool {
+        if self.budget.try_add(bytes) {
+            self.reserved += bytes;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Releases any reservation above `bytes`, keeping the accounting exact
+    /// when a declared `Content-Length` overstates the actual body size.
+    pub fn shrink_to(&mut self, bytes: usize) {
+        if bytes < self.reserved {
+            self.budget.release(self.reserved - bytes);
+            self.reserved = bytes;
+        }
+    }
+}
+
+impl Drop for RequestByteGuard {
+    fn drop(&mut self) {
+        self.budget.release(self.reserved);
+    }
+}
+
 impl AppState {
     pub fn new(pool: SqlitePool, admin_token: Option<String>) -> Self {
         let idle_timeout = parse_positive_secs(
@@ -241,6 +391,14 @@ impl AppState {
         .unwrap_or(0);
         let request_capacity = (request_capacity_limit > 0)
             .then(|| Arc::new(Semaphore::new(request_capacity_limit)));
+        let request_bytes_limit = parse_inflight_bytes_mib(
+            std::env::var("OPENLLM_MAX_INFLIGHT_REQUEST_MIB")
+                .ok()
+                .as_deref(),
+        )
+        .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUEST_MIB * 1024 * 1024);
+        let inflight_request_bytes =
+            (request_bytes_limit > 0).then(|| Arc::new(RequestByteBudget::new(request_bytes_limit)));
 
         Self {
             pool,
@@ -259,6 +417,9 @@ impl AppState {
             request_capacity,
             request_capacity_limit,
             requests_shed: Arc::new(AtomicU64::new(0)),
+            inflight_request_bytes,
+            request_bytes_limit,
+            request_bytes_shed: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -393,6 +554,7 @@ impl AppState {
             ),
             sse_keepalive_secs: self.sse_keepalive.map(|interval| interval.as_secs()),
             max_concurrent_requests: self.request_capacity_limit,
+            max_inflight_request_mib: self.request_bytes_limit / (1024 * 1024),
         }
     }
 }

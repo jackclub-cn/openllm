@@ -43,16 +43,84 @@ pub(crate) async fn admission(
     next: axum::middleware::Next,
 ) -> Response {
     let anthropic = request.uri().path().starts_with("/v1/messages");
-    match acquire_request_capacity(&state) {
-        RequestCapacity::Overloaded => {
-            overloaded_response(state.request_capacity_limit, anthropic)
-        }
-        RequestCapacity::Disabled => next.run(request).await,
-        RequestCapacity::Acquired(permit) => {
-            let response = next.run(request).await;
-            attach_request_capacity(response, Some(permit))
-        }
+    // Refuse an over-capacity request before the body is read: a hanging or
+    // huge body must not consume a slot or any memory first.
+    let capacity = acquire_request_capacity(&state);
+    if let RequestCapacity::Overloaded = capacity {
+        return overloaded_response(state.request_capacity_limit, anthropic);
     }
+
+    let (parts, body) = request.into_parts();
+    let (body, byte_guard) = match state.inflight_request_bytes.clone() {
+        None => (body, None),
+        Some(budget) => match charge_request_body(&budget, &parts.headers, body).await {
+            Ok(charged) => charged,
+            Err(BodyCharge::OverBudget) => {
+                state
+                    .request_bytes_shed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return body_budget_response(budget.limit(), anthropic);
+            }
+            Err(BodyCharge::Read) => {
+                return AppError::BadRequest("failed to read request body".to_string())
+                    .into_response();
+            }
+        },
+    };
+
+    let permit = match capacity {
+        RequestCapacity::Acquired(permit) => Some(permit),
+        _ => None,
+    };
+    let request = axum::extract::Request::from_parts(parts, body);
+    let response = next.run(request).await;
+    attach_request_guards(response, permit, byte_guard)
+}
+
+/// Why a request body could not be admitted against the in-flight byte budget.
+enum BodyCharge {
+    /// The buffered body would exceed the in-flight byte budget.
+    OverBudget,
+    /// The client's body stream failed before it was fully read.
+    Read,
+}
+
+/// Buffers the request body while charging its bytes against the budget.
+///
+/// Reads the body itself so an over-budget request is refused mid-stream
+/// instead of after the `Bytes` extractor has already buffered it. The returned
+/// body is re-inserted for the handler, and the guard keeps the reservation
+/// alive for the whole request (see [`attach_request_guards`]).
+async fn charge_request_body(
+    budget: &std::sync::Arc<crate::state::RequestByteBudget>,
+    headers: &HeaderMap,
+    body: Body,
+) -> Result<(Body, Option<crate::state::RequestByteGuard>), BodyCharge> {
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    // Reserve the declared size up front so a known-large body is shed before
+    // any of it is read, and concurrent requests count their size immediately.
+    let mut guard = budget
+        .reserve(declared.unwrap_or(0))
+        .ok_or(BodyCharge::OverBudget)?;
+
+    let mut stream = body.into_data_stream();
+    let mut buffer: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(64 * 1024));
+    let mut total = guard.reserved();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|_| BodyCharge::Read)?;
+        total += chunk.len();
+        if total > guard.reserved() && !guard.extend(total - guard.reserved()) {
+            return Err(BodyCharge::OverBudget);
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    // A dishonest `Content-Length` may overstate the body; release the slack so
+    // the budget tracks bytes that actually exist.
+    guard.shrink_to(total);
+    Ok((Body::from(Bytes::from(buffer)), Some(guard)))
 }
 
 #[allow(clippy::too_many_arguments)]

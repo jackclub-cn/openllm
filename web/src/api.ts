@@ -589,6 +589,7 @@ export type RuntimeLimits = {
   max_upstream_body_mib: number
   sse_keepalive_secs?: number | null
   max_concurrent_requests: number
+  max_inflight_request_mib: number
 }
 
 export type GuardrailSettings = {

@@ -154,6 +154,11 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_requests_in_flight gauge"));
     assert!(body.contains("# TYPE openllm_uptime_seconds gauge"));
     assert!(body.contains("# TYPE openllm_start_time_seconds gauge"));
+    assert!(body.contains("# TYPE openllm_inflight_request_bytes gauge"));
+    assert!(body.contains("# TYPE openllm_inflight_request_bytes_limit gauge"));
+    assert!(body.contains("# TYPE openllm_request_bytes_shed_total counter"));
+    assert!(body.contains("openllm_inflight_request_bytes 0"));
+    assert!(body.contains("openllm_request_bytes_shed_total 0"));
     assert!(body.contains("openllm_providers{state=\"healthy\"} 1"));
     assert!(body.contains("openllm_providers{state=\"disabled\"} 1"));
     assert!(
@@ -3629,11 +3634,13 @@ async fn stale_reconciliation_uses_last_activity_for_long_streams() {
 async fn runtime_settings_expose_effective_limits() {
     let state = provider_key_test_state().await;
     let expected_concurrency = state.request_capacity_limit;
+    let expected_inflight_mib = state.request_bytes_limit / (1024 * 1024);
     let Json(view) = get_runtime_settings(State(state)).await.unwrap();
     assert!(view.limits.max_request_body_mib >= 1);
     assert!(view.limits.max_upstream_body_mib >= 1);
     assert!(view.limits.upstream_idle_timeout_secs >= 1);
     assert_eq!(view.limits.max_concurrent_requests, expected_concurrency);
+    assert_eq!(view.limits.max_inflight_request_mib, expected_inflight_mib);
 }
 
 #[tokio::test]

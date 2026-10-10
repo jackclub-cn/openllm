@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::RequestByteBudget;
 use tower::ServiceExt;
 
 #[test]
@@ -8313,4 +8314,97 @@ async fn admission_uses_the_anthropic_envelope_for_message_routes() {
     let value: Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["type"], "error");
     assert_eq!(value["error"]["type"], "overloaded_error");
+}
+
+#[test]
+fn request_byte_budget_tracks_and_releases_reservations() {
+    let budget = std::sync::Arc::new(RequestByteBudget::new(100));
+    assert!(budget.reserve(0).is_some(), "empty bodies never trip the guard");
+
+    let first = budget.reserve(60).expect("60 fits in the 100-byte budget");
+    assert_eq!(budget.used(), 60);
+    assert_eq!(budget.remaining(), 40);
+    assert!(
+        budget.reserve(60).is_none(),
+        "a reservation past the limit is refused"
+    );
+    assert_eq!(budget.used(), 60, "a refused reservation must not charge");
+
+    let mut second = budget.reserve(40).expect("the remaining 40 fits");
+    assert_eq!(budget.used(), 100);
+    second.shrink_to(10);
+    assert_eq!(budget.used(), 70, "shrinking releases the slack");
+
+    drop(first);
+    assert_eq!(budget.used(), 10);
+    drop(second);
+    assert_eq!(budget.used(), 0, "dropping the guard frees every reserved byte");
+}
+
+#[tokio::test]
+async fn inflight_byte_guard_is_held_until_the_response_body_completes() {
+    let budget = std::sync::Arc::new(RequestByteBudget::new(64));
+    let guard = budget.reserve(64).expect("the whole budget is available");
+    let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+    let response = attach_request_guards(
+        Response::new(Body::from_stream(stream)),
+        None,
+        Some(guard),
+    );
+    assert_eq!(
+        budget.used(),
+        64,
+        "a live body must keep holding its bytes"
+    );
+    drop(response);
+    assert_eq!(budget.used(), 0, "completing the body releases the bytes");
+}
+
+/// The byte budget must shed a declared-oversize body before reading any of it,
+/// the same way the concurrency cap refuses before buffering.
+#[tokio::test]
+async fn admission_sheds_bodies_over_the_inflight_byte_budget() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let mut state = AppState::new(pool, None);
+    let budget = std::sync::Arc::new(RequestByteBudget::new(16));
+    state.inflight_request_bytes = Some(budget.clone());
+    state.request_bytes_limit = 16;
+    let shed = state.request_bytes_shed.clone();
+    let router = crate::build_router(state);
+
+    // A body that never produces data. If admission tried to read it, this
+    // request would hang instead of being shed.
+    let hanging =
+        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(OPENAI_CHAT_COMPLETIONS)
+        .header("content-type", "application/json")
+        .header("content-length", "1024")
+        .body(hanging)
+        .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(2), router.oneshot(request))
+        .await
+        .expect("the byte budget must shed without waiting for the body")
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        "5"
+    );
+    assert_eq!(
+        shed.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "a byte-budget refusal is counted for metrics"
+    );
+    assert_eq!(
+        budget.used(),
+        0,
+        "a shed request must not leak a byte reservation"
+    );
 }

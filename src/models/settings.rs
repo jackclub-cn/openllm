@@ -54,6 +54,8 @@ pub struct RuntimeLimits {
     pub sse_keepalive_secs: Option<u64>,
     /// Global concurrent request cap; `0` means unlimited.
     pub max_concurrent_requests: usize,
+    /// In-flight request-body byte budget in MiB; `0` means unlimited.
+    pub max_inflight_request_mib: usize,
 }
 
 #[derive(Debug, Deserialize)]

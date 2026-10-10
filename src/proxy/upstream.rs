@@ -897,13 +897,27 @@ pub(crate) fn attach_request_capacity(
     response: Response,
     permit: Option<OwnedSemaphorePermit>,
 ) -> Response {
-    let Some(permit) = permit else {
+    attach_request_guards(response, permit, None)
+}
+
+/// Keeps the global admission guards alive until the outbound body completes.
+///
+/// Both the request-count permit and the in-flight byte guard are moved into
+/// the response body, so a long stream holds its slot and its byte reservation
+/// for its whole lifetime rather than just until the headers are returned.
+pub(crate) fn attach_request_guards(
+    response: Response,
+    permit: Option<OwnedSemaphorePermit>,
+    bytes: Option<crate::state::RequestByteGuard>,
+) -> Response {
+    if permit.is_none() && bytes.is_none() {
         return response;
-    };
+    }
     let (parts, body) = response.into_parts();
     let mut stream = body.into_data_stream();
     let guarded = async_stream::stream! {
         let _permit = permit;
+        let _bytes = bytes;
         while let Some(chunk) = stream.next().await {
             yield chunk;
         }
@@ -920,8 +934,28 @@ pub(crate) fn overloaded_response(limit: usize, anthropic: bool) -> Response {
     let message = format!(
         "gateway is at its concurrency limit ({limit}); retry after {RETRY_AFTER_SECS}s"
     );
+    shed_response(&message, anthropic, Some(limit.to_string()))
+}
+
+/// Builds the `429` returned when the in-flight request-byte budget is full.
+///
+/// Separate from [`overloaded_response`] so the message and the advertised
+/// limit (bytes, not slots) point an operator at the knob that actually shed
+/// the request.
+pub(crate) fn body_budget_response(limit_bytes: usize, anthropic: bool) -> Response {
+    const RETRY_AFTER_SECS: u64 = 5;
+    let message = format!(
+        "gateway is at its in-flight request-body budget ({} MiB); retry after {RETRY_AFTER_SECS}s",
+        limit_bytes / (1024 * 1024)
+    );
+    shed_response(&message, anthropic, Some(limit_bytes.to_string()))
+}
+
+/// Renders a retryable `429` refusal in the client's expected envelope.
+fn shed_response(message: &str, anthropic: bool, limit_header: Option<String>) -> Response {
+    const RETRY_AFTER_SECS: u64 = 5;
     let body = if anthropic {
-        anthropic_error_body("overloaded_error", &message)
+        anthropic_error_body("overloaded_error", message)
     } else {
         json!({"error": {"message": message, "type": "rate_limit_error", "code": 429}})
     };
@@ -930,7 +964,9 @@ pub(crate) fn overloaded_response(limit: usize, anthropic: bool) -> Response {
     if let Ok(value) = HeaderValue::from_str(&RETRY_AFTER_SECS.to_string()) {
         headers.insert(reqwest::header::RETRY_AFTER, value);
     }
-    if let Ok(value) = HeaderValue::from_str(&limit.to_string()) {
+    if let Some(limit_header) = limit_header
+        && let Ok(value) = HeaderValue::from_str(&limit_header)
+    {
         headers.insert(HeaderName::from_static("x-ratelimit-limit"), value);
     }
     headers.insert(
