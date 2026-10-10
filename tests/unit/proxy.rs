@@ -632,6 +632,117 @@ async fn auto_route_ignores_models_that_do_not_support_the_requested_endpoint() 
     assert_eq!(resolved.targets[0].provider_id, 2);
 }
 
+async fn virtual_auto_state() -> AppState {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, model_prefix) VALUES
+            (1, 'fast', 'openai', 'https://fast.example/v1', 'fast/'),
+            (2, 'cheap', 'openai', 'https://cheap.example/v1', 'cheap/'),
+            (3, 'responses', 'openai', 'https://responses.example/v1', 'responses/'),
+            (4, 'embeddings', 'openai', 'https://embeddings.example/v1', 'embed/')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (
+            provider_id, model_name, supported_endpoints, cost
+         ) VALUES
+            (1, 'small', '[\"/chat/completions\"]', '{\"input\":1,\"output\":2}'),
+            (2, 'tiny', '[\"/chat/completions\"]', '{\"input\":0.1,\"output\":0.2}'),
+            (3, 'only', '[\"/responses\"]', '{\"input\":0.5,\"output\":0.5}'),
+            (4, 'vector', '[\"/embeddings\"]', '{\"input\":0.01,\"output\":0}')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    AppState::new(pool, None)
+}
+
+#[tokio::test]
+async fn virtual_auto_routes_across_providers_and_respects_api_key_target_patterns() {
+    let state = virtual_auto_state().await;
+
+    let resolved = resolve_route_with_patterns(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.strategy, "latency_optimized");
+    assert_eq!(resolved.targets.len(), 3);
+    assert!(
+        resolved
+            .targets
+            .iter()
+            .all(|target| target.upstream_model != "vector"),
+        "embeddings-only models must not enter the chat auto pool"
+    );
+
+    let patterns = vec!["auto/fast".to_string(), "fast/*".to_string()];
+    let restricted = resolve_route_with_patterns(
+        &state,
+        "auto/fast",
+        OPENAI_CHAT_COMPLETIONS,
+        Some(&patterns),
+    )
+    .await
+    .unwrap();
+    assert_eq!(restricted.targets.len(), 1);
+    assert_eq!(restricted.targets[0].provider_id, 1);
+    assert_eq!(restricted.targets[0].upstream_model, "small");
+
+    let denied = vec!["auto/fast".to_string()];
+    let error =
+        resolve_route_with_patterns(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, Some(&denied))
+            .await
+            .unwrap_err();
+    assert!(matches!(error, AppError::Forbidden(_)));
+}
+
+#[tokio::test]
+async fn virtual_auto_models_are_public_and_diagnosable() {
+    let state = virtual_auto_state().await;
+    let models = openai_public_models(&state, None).await.unwrap();
+    for (id, display_name, _) in crate::registry::AUTO_MODELS {
+        let model = models.iter().find(|model| model.id == id).unwrap();
+        assert_eq!(model.display_name.as_deref(), Some(display_name));
+        assert_eq!(model.target_count, Some(3));
+        assert_eq!(model.limits_verified, Some(false));
+    }
+
+    let patterns = vec!["auto/cheap".to_string(), "cheap/*".to_string()];
+    let models = openai_public_models(&state, Some(&patterns)).await.unwrap();
+    let ids = models
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(ids.contains(&"auto/cheap"));
+    assert!(ids.contains(&"cheap/tiny"));
+    assert!(!ids.contains(&"auto/fast"));
+    assert!(!ids.contains(&"fast/small"));
+
+    let diagnosis = diagnose_route(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, None)
+        .await
+        .unwrap();
+    assert!(diagnosis.matched);
+    assert!(diagnosis.resolved);
+    assert_eq!(diagnosis.match_type, "auto");
+    assert_eq!(diagnosis.route_name.as_deref(), Some("Auto"));
+    assert_eq!(diagnosis.strategy.as_deref(), Some("latency_optimized"));
+    assert_eq!(
+        diagnosis
+            .targets
+            .iter()
+            .filter(|target| target.eligible)
+            .count(),
+        3
+    );
+    assert_eq!(diagnosis.targets.len(), 4);
+}
+
 #[tokio::test]
 async fn endpoint_override_controls_routing_and_public_metadata() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()

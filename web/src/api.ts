@@ -335,7 +335,7 @@ export type RouteDiagnose = {
   endpoint: string
   matched: boolean
   resolved: boolean
-  match_type: 'explicit_route' | 'prefix' | 'direct' | 'conflict' | 'none'
+  match_type: 'explicit_route' | 'prefix' | 'direct' | 'conflict' | 'auto' | 'none'
   route_id?: number
   route_name?: string
   strategy?: GatewayRoute['strategy']

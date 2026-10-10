@@ -12,6 +12,27 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use crate::error::AppResult;
 use crate::models::ModelCapabilities;
 
+/// Virtual models resolved from every enabled provider model rather than from
+/// an explicit route. The tuple is `(id, display name, ordering strategy)`.
+///
+/// The ordering strategy reuses the route strategies, so auto variants inherit
+/// the same health filtering, cooldowns and session affinity as explicit
+/// routes.
+pub const AUTO_MODELS: [(&str, &str, &str); 4] = [
+    ("auto", "Auto", "least_used"),
+    ("auto/cheap", "Auto Cheap", "cost_optimized"),
+    ("auto/fast", "Auto Fast", "latency_optimized"),
+    ("auto/reliable", "Auto Reliable", "priority"),
+];
+
+/// The ordering strategy for a virtual auto model, or `None` when `model` is
+/// an ordinary route or synced model id.
+pub fn auto_model_strategy(model: &str) -> Option<&'static str> {
+    AUTO_MODELS
+        .iter()
+        .find_map(|(id, _, strategy)| (*id == model).then_some(*strategy))
+}
+
 /// A model exposed by a provider, addressed as `prefix + upstream model`.
 #[derive(Debug, Clone)]
 pub struct SyncedModel {
@@ -213,6 +234,48 @@ pub async fn synced_models(pool: &SqlitePool) -> AppResult<Vec<SyncedModel>> {
             ),
         })
         .collect())
+}
+
+/// Aggregate metadata for the virtual auto models exposed by the gateway.
+#[derive(Debug, Clone)]
+pub struct AutoModelSummary {
+    pub target_count: usize,
+    pub supported_endpoints: Option<Vec<String>>,
+}
+
+/// Summarizes every enabled model that can serve at least one message
+/// endpoint. Auto uses one shared candidate universe for all of its variants.
+pub async fn auto_model_summary(pool: &SqlitePool) -> AppResult<Option<AutoModelSummary>> {
+    let models = synced_models(pool).await?;
+    let mut target_count = 0usize;
+    let mut supported_endpoints = std::collections::BTreeSet::new();
+    for model in models {
+        let message_capable = match model.supported_endpoints.as_ref() {
+            Some(endpoints) => endpoints.iter().any(|endpoint| {
+                let endpoint = normalize_endpoint(endpoint);
+                REQUEST_ENDPOINTS
+                    .iter()
+                    .any(|request| normalize_endpoint(request) == endpoint)
+            }),
+            None => true,
+        };
+        if !message_capable {
+            continue;
+        }
+        target_count += 1;
+        match model.supported_endpoints {
+            Some(endpoints) => supported_endpoints.extend(endpoints),
+            None => supported_endpoints.extend(REQUEST_ENDPOINTS.map(ToOwned::to_owned)),
+        }
+    }
+    if target_count == 0 {
+        return Ok(None);
+    }
+    Ok(Some(AutoModelSummary {
+        target_count,
+        supported_endpoints: (!supported_endpoints.is_empty())
+            .then(|| supported_endpoints.into_iter().collect()),
+    }))
 }
 
 /// Barrel envelope for a set of concrete targets: the strictest common

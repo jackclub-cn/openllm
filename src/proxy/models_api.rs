@@ -46,6 +46,7 @@ pub(crate) async fn openai_public_models(
         crate::registry::synced_models(&state.pool).await?,
         |model| model.id.as_str(),
     );
+    let auto_summary = crate::registry::auto_model_summary(&state.pool).await?;
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
@@ -78,6 +79,33 @@ pub(crate) async fn openai_public_models(
             }
             .with_flat_limits(),
         );
+    }
+    if let Some(summary) = auto_summary {
+        for (id, display_name, _) in crate::registry::AUTO_MODELS {
+            if !model_matches_patterns(model_patterns, id) {
+                continue;
+            }
+            by_id.entry(id.to_string()).or_insert(
+                PublicModel {
+                    id: id.to_string(),
+                    object: "model",
+                    created,
+                    owned_by: "openllm",
+                    provider: None,
+                    upstream_model: None,
+                    capabilities: None,
+                    target_count: Some(summary.target_count),
+                    limits_verified: Some(false),
+                    context_length: None,
+                    max_input_tokens: None,
+                    max_output_tokens: None,
+                    max_completion_tokens: None,
+                    display_name: Some(display_name.to_string()),
+                    supported_endpoints: summary.supported_endpoints.clone(),
+                }
+                .with_flat_limits(),
+            );
+        }
     }
     for model in synced {
         by_id.entry(model.id.clone()).or_insert(
@@ -188,6 +216,7 @@ pub(crate) async fn anthropic_model_values(
         crate::registry::synced_models(&state.pool).await?,
         |model| model.id.as_str(),
     );
+    let auto_summary = crate::registry::auto_model_summary(&state.pool).await?;
     let mut models = Vec::new();
     // Routes first, matching the precedence used by the OpenAI-shaped list.
     for model in routes {
@@ -199,6 +228,25 @@ pub(crate) async fn anthropic_model_values(
             "display_name": model.display_name,
             "created_at": model.created_at,
         }));
+    }
+    if auto_summary.is_some() {
+        for (id, display_name, _) in crate::registry::AUTO_MODELS {
+            if !model_matches_patterns(model_patterns, id) {
+                continue;
+            }
+            if models
+                .iter()
+                .any(|model| model.get("id").and_then(Value::as_str) == Some(id))
+            {
+                continue;
+            }
+            models.push(json!({
+                "type": "model",
+                "id": id,
+                "display_name": display_name,
+                "created_at": serde_json::Value::Null,
+            }));
+        }
     }
     for model in synced {
         // Prefer the provider's own label, then the upstream id, and only then

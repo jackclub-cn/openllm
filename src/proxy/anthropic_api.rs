@@ -33,7 +33,14 @@ pub(crate) async fn count_tokens_inner(
     let requested_model = requested_model_of(&inbound)?;
     let api_key = authenticate_gateway(state, headers).await?;
     enforce_api_key_model_access(api_key.as_ref(), &requested_model)?;
-    resolve_route(state, &requested_model, ANTHROPIC_MESSAGES).await?;
+    let model_patterns = api_key_model_patterns(api_key.as_ref())?;
+    resolve_route_with_patterns(
+        state,
+        &requested_model,
+        ANTHROPIC_MESSAGES,
+        model_patterns.as_deref(),
+    )
+    .await?;
 
     let input_tokens = estimate_request_tokens(&inbound);
     Ok(Json(json!({"input_tokens": input_tokens})).into_response())

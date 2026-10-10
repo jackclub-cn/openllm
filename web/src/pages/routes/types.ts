@@ -21,6 +21,7 @@ export const matchTypeLabels = {
   explicit_route: '显式路由',
   prefix: '模型前缀',
   direct: '直接模型',
+  auto: '自动路由',
   conflict: '同名冲突',
   none: '未匹配',
 }

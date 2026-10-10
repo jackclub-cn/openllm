@@ -34,10 +34,20 @@ pub(super) fn filter_targets_for_endpoint(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) async fn resolve_route(
     state: &AppState,
     model: &str,
     endpoint: &str,
+) -> AppResult<ResolvedRoute> {
+    resolve_route_with_patterns(state, model, endpoint, None).await
+}
+
+pub(super) async fn resolve_route_with_patterns(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+    model_patterns: Option<&[String]>,
 ) -> AppResult<ResolvedRoute> {
     if let Some(route) = find_explicit_route(state, model).await? {
         let targets = filter_targets_for_endpoint(load_targets(state, route.id).await?, endpoint);
@@ -56,6 +66,19 @@ pub(super) async fn resolve_route(
             strategy: route.strategy,
             targets,
             barrel: Some(barrel),
+        });
+    }
+
+    if let Some(strategy) = crate::registry::auto_model_strategy(model) {
+        let targets = find_auto_targets(state, endpoint, model_patterns).await?;
+        return Ok(ResolvedRoute {
+            route_id: None,
+            strategy: strategy.to_string(),
+            targets,
+            // Auto spans heterogeneous models. A common barrel would clamp
+            // every request to the smallest model in the catalog, defeating
+            // the purpose of automatic selection.
+            barrel: None,
         });
     }
 
@@ -124,6 +147,9 @@ pub async fn diagnose_route(
         }
         disabled_match.get_or_insert(route);
     }
+    if let Some(strategy) = crate::registry::auto_model_strategy(model) {
+        return diagnose_auto_route(state, model, endpoint, strategy, session_id.as_deref()).await;
+    }
     let direct = diagnose_direct_route(state, model, endpoint, session_id.as_deref()).await?;
     if direct.matched {
         return Ok(direct);
@@ -140,6 +166,70 @@ pub async fn diagnose_route(
         .await;
     }
     Ok(direct)
+}
+
+async fn diagnose_auto_route(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+    strategy: &str,
+    session_id: Option<&str>,
+) -> AppResult<RouteDiagnoseView> {
+    let rows = sqlx::query_as::<_, DiagnosticTargetRow>(
+        r#"
+        SELECT p.id AS provider_id, p.name AS provider_name,
+               p.provider_type, 0 AS target_id,
+               pm.model_name AS upstream_model,
+               100 AS target_weight, 0 AS target_priority,
+               1 AS target_enabled, p.enabled AS provider_enabled,
+               1 AS model_exists, pm.enabled AS model_enabled,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               pm.cost,
+               pm.cost_input_override,
+               pm.cost_output_override,
+               pm.cost_cache_read_override,
+               pm.cost_cache_write_override,
+               p.last_test_ok AS provider_health
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
+        WHERE p.enabled = 1
+        ORDER BY p.id, pm.model_name
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    let diagnosed = rows
+        .iter()
+        .map(|row| row.diagnose(endpoint, true))
+        .collect::<Vec<_>>();
+    let eligible = diagnosed.iter().filter(|(_, eligible)| *eligible).count();
+    let resolved = eligible > 0;
+    let runtime_targets = if resolved {
+        diagnostic_runtime_targets(state, None, strategy, &rows, &diagnosed, session_id).await?
+    } else {
+        None
+    };
+    Ok(RouteDiagnoseView {
+        model: model.to_string(),
+        endpoint: endpoint.to_string(),
+        matched: true,
+        resolved,
+        match_type: "auto".to_string(),
+        route_id: None,
+        route_name: Some("Auto".to_string()),
+        strategy: Some(strategy.to_string()),
+        message: if resolved {
+            format!("{eligible} auto target(s) can serve {endpoint}")
+        } else {
+            format!("auto has no eligible target for {endpoint}")
+        },
+        barrel: None,
+        barrel_incomplete: false,
+        session_id: session_id.map(ToOwned::to_owned),
+        runtime_targets,
+        targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
+    })
 }
 
 pub(super) async fn diagnose_explicit_route(
@@ -577,7 +667,8 @@ pub(super) async fn resolve_route_or_log(
     streamed: bool,
     started: Instant,
 ) -> AppResult<ResolvedRoute> {
-    match resolve_route(state, model, endpoint).await {
+    let model_patterns = api_key_model_patterns(api_key)?;
+    match resolve_route_with_patterns(state, model, endpoint, model_patterns.as_deref()).await {
         Ok(route) => Ok(route),
         Err(error) => {
             let status_code = match &error {
@@ -721,6 +812,85 @@ pub(super) async fn find_prefixed_targets(
         )));
     }
     Ok(unprefixed)
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct AutoTargetRow {
+    public_id: String,
+    #[sqlx(flatten)]
+    target: RouteTarget,
+}
+
+/// Loads every enabled provider model that can serve the requested endpoint.
+///
+/// Auto is intentionally catalog-wide rather than backed by a route row. API
+/// key model permissions still apply to the concrete target IDs and upstream
+/// model names, so `auto` cannot be used to escape a restricted key.
+pub(super) async fn find_auto_targets(
+    state: &AppState,
+    endpoint: &str,
+    model_patterns: Option<&[String]>,
+) -> AppResult<Vec<RouteTarget>> {
+    let rows = sqlx::query_as::<_, AutoTargetRow>(
+        r#"
+        SELECT p.model_prefix || pm.model_name AS public_id,
+               NULL AS id, NULL AS route_id, p.id AS provider_id,
+               p.name AS provider_name, p.provider_type, p.base_url,
+               p.model_prefix, p.api_key, p.headers AS provider_headers,
+               COALESCE(pm.supported_endpoints_override, pm.supported_endpoints)
+                   AS supported_endpoints,
+               pm.cost,
+               pm.cost_input_override,
+               pm.cost_output_override,
+               pm.cost_cache_read_override,
+               pm.cost_cache_write_override,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               COALESCE(pm.input_override, pm.input_limit) AS input_limit,
+               COALESCE(pm.output_override, pm.output_limit) AS output_limit,
+               p.enabled AS provider_enabled,
+               pm.enabled AS model_enabled,
+               p.tool_search_supported,
+               p.last_test_ok AS provider_health,
+               pm.model_name AS upstream_model,
+               100 AS weight, 0 AS priority, 1 AS enabled
+        FROM providers p
+        JOIN provider_models pm ON pm.provider_id = p.id AND pm.enabled = 1
+        WHERE p.enabled = 1
+        ORDER BY p.id, pm.model_name
+        "#,
+    )
+    .fetch_all(&state.pool)
+    .await?;
+
+    let all_targets = rows
+        .iter()
+        .map(|row| row.target.clone())
+        .collect::<Vec<_>>();
+    let all_targets = filter_targets_for_endpoint(all_targets, endpoint);
+    if all_targets.is_empty() {
+        return Err(AppError::NotFound(format!(
+            "no enabled provider model can serve endpoint '{endpoint}'"
+        )));
+    }
+    if model_patterns.is_none() {
+        return Ok(all_targets);
+    }
+
+    let targets = rows
+        .into_iter()
+        .filter(|row| {
+            model_matches_patterns(model_patterns, &row.public_id)
+                || model_matches_patterns(model_patterns, &row.target.upstream_model)
+        })
+        .map(|row| row.target)
+        .collect::<Vec<_>>();
+    let targets = filter_targets_for_endpoint(targets, endpoint);
+    if targets.is_empty() {
+        return Err(AppError::Forbidden(
+            "API key model permissions do not allow any auto target".to_string(),
+        ));
+    }
+    Ok(targets)
 }
 
 pub(super) async fn load_targets(state: &AppState, route_id: i64) -> AppResult<Vec<RouteTarget>> {
