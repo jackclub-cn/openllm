@@ -229,6 +229,29 @@ pub(crate) async fn proxy_anthropic_inner(
         requested_output_tokens,
         clamped_output_tokens,
     );
+    let routing_overrides = match request_routing_overrides(headers).and_then(|overrides| {
+        apply_routing_overrides(&mut resolved, &requested_model, &overrides)?;
+        Ok(overrides)
+    }) {
+        Ok(overrides) => overrides,
+        Err(error) => {
+            let message = error.to_string();
+            log_request_rejection(
+                state,
+                api_key.as_ref(),
+                request_id,
+                session_id.as_deref(),
+                &requested_model,
+                &endpoint,
+                streamed,
+                started,
+                400,
+                &message,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let ordering_key = route_id.unwrap_or(-1);
     let ordered_targets = order_targets(
         state,
@@ -347,6 +370,7 @@ pub(crate) async fn proxy_anthropic_inner(
                     &target_upstream_model,
                 );
                 apply_budget_headers(&mut response, budget_usd, budget_excluded_targets);
+                apply_override_headers(&mut response, &routing_overrides);
                 return Ok(response);
             }
             Err(error) => {

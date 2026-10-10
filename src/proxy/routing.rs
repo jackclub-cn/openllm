@@ -1507,6 +1507,150 @@ fn target_cost_score(target: &RouteTarget) -> Option<f64> {
 /// Hard per-request cost ceiling supplied by the caller.
 pub(super) const BUDGET_USD_HEADER: &str = "x-openllm-budget-usd";
 
+/// Per-request routing controls. Each is optional; when absent the route's own
+/// configuration decides.
+pub(super) const STRATEGY_HEADER: &str = "x-openllm-strategy";
+pub(super) const PROVIDER_HEADER: &str = "x-openllm-provider";
+pub(super) const EXCLUDE_PROVIDERS_HEADER: &str = "x-openllm-exclude-providers";
+
+/// The routing controls a caller supplied for one request.
+#[derive(Debug, Default, Clone)]
+pub(super) struct RequestRoutingOverrides {
+    /// Ordered strategy name that replaced the route's configured strategy.
+    pub strategy: Option<String>,
+    /// Provider selector the caller pinned the request to, as supplied.
+    pub provider: Option<String>,
+    /// Providers the caller excluded, as supplied.
+    pub excluded_providers: Vec<String>,
+}
+
+impl RequestRoutingOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.strategy.is_none() && self.provider.is_none() && self.excluded_providers.is_empty()
+    }
+}
+
+fn header_text(headers: &HeaderMap, name: &str) -> AppResult<Option<String>> {
+    let Some(value) = headers.get(name) else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| AppError::BadRequest(format!("{name} must be valid ASCII")))?;
+    let value = value.trim();
+    Ok((!value.is_empty()).then(|| value.to_string()))
+}
+
+/// Parses the optional per-request routing headers.
+///
+/// A malformed value is rejected rather than ignored: silently dropping a
+/// caller's routing instruction could send traffic to a provider they meant to
+/// avoid.
+pub(super) fn request_routing_overrides(headers: &HeaderMap) -> AppResult<RequestRoutingOverrides> {
+    let strategy = header_text(headers, STRATEGY_HEADER)?
+        .map(|value| {
+            RouteStrategy::from_str(&value)
+                .map(|strategy| strategy.as_str().to_string())
+                .map_err(AppError::BadRequest)
+        })
+        .transpose()?;
+    let provider = header_text(headers, PROVIDER_HEADER)?;
+    let excluded_providers = header_text(headers, EXCLUDE_PROVIDERS_HEADER)?
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim())
+                .filter(|item| !item.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(RequestRoutingOverrides {
+        strategy,
+        provider,
+        excluded_providers,
+    })
+}
+
+/// Whether a selector names this target's provider, by numeric id or by name
+/// (case-insensitive).
+fn selector_matches(selector: &str, target: &RouteTarget) -> bool {
+    if let Ok(id) = selector.parse::<i64>() {
+        return id == target.provider_id;
+    }
+    selector.eq_ignore_ascii_case(target.provider_name.trim())
+}
+
+/// Applies per-request routing controls to a resolved route.
+///
+/// Returns how many targets the filters removed. Pinning and excluding can
+/// leave nothing behind; that is a client error, not a routing fallback.
+pub(super) fn apply_routing_overrides(
+    resolved: &mut ResolvedRoute,
+    model: &str,
+    overrides: &RequestRoutingOverrides,
+) -> AppResult<usize> {
+    if overrides.is_empty() {
+        return Ok(0);
+    }
+    if let Some(strategy) = &overrides.strategy {
+        resolved.strategy = strategy.clone();
+    }
+    if let Some(provider) = &overrides.provider {
+        resolved
+            .targets
+            .retain(|target| selector_matches(provider, target));
+        if resolved.targets.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "{PROVIDER_HEADER} '{provider}' does not match any target of model '{}'",
+                model
+            )));
+        }
+    }
+    if !overrides.excluded_providers.is_empty() {
+        let before = resolved.targets.len();
+        resolved.targets.retain(|target| {
+            !overrides
+                .excluded_providers
+                .iter()
+                .any(|selector| selector_matches(selector, target))
+        });
+        if resolved.targets.is_empty() {
+            return Err(AppError::BadRequest(format!(
+                "{EXCLUDE_PROVIDERS_HEADER} removed every target of model '{}'",
+                model
+            )));
+        }
+        return Ok(before - resolved.targets.len());
+    }
+    Ok(0)
+}
+
+/// Echoes the routing controls that took effect so a caller can attribute the
+/// response to the provider they asked for.
+pub(super) fn apply_override_headers(response: &mut Response, overrides: &RequestRoutingOverrides) {
+    if overrides.is_empty() {
+        return;
+    }
+    let mut insert = |name: &'static str, value: String| {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    };
+    if let Some(strategy) = &overrides.strategy {
+        insert(STRATEGY_HEADER, strategy.clone());
+    }
+    if let Some(provider) = &overrides.provider {
+        insert(PROVIDER_HEADER, provider.clone());
+    }
+    if !overrides.excluded_providers.is_empty() {
+        insert(
+            EXCLUDE_PROVIDERS_HEADER,
+            overrides.excluded_providers.join(","),
+        );
+    }
+}
+
 /// Parses the optional per-request budget header.
 ///
 /// The value is a USD ceiling for one request. A malformed or non-positive

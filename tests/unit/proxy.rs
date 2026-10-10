@@ -744,6 +744,213 @@ async fn virtual_auto_models_are_public_and_diagnosable() {
 }
 
 #[tokio::test]
+async fn per_request_routing_overrides_apply_and_echo() {
+    let state = virtual_auto_state().await;
+    let mut resolved = resolve_route_with_patterns(&state, "auto", OPENAI_CHAT_COMPLETIONS, None)
+        .await
+        .unwrap();
+    assert_eq!(resolved.strategy, "least_used");
+    assert_eq!(resolved.targets.len(), 3);
+
+    // A strategy override replaces the route's configured strategy.
+    let overrides = RequestRoutingOverrides {
+        strategy: Some("cost_optimized".to_string()),
+        ..Default::default()
+    };
+    apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
+    assert_eq!(resolved.strategy, "cost_optimized");
+
+    // Excluding one provider removes exactly its target.
+    let overrides = RequestRoutingOverrides {
+        excluded_providers: vec!["cheap".to_string()],
+        ..Default::default()
+    };
+    let removed = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
+    assert_eq!(removed, 1);
+    assert_eq!(resolved.targets.len(), 2);
+    assert!(
+        resolved
+            .targets
+            .iter()
+            .all(|target| target.provider_name != "cheap")
+    );
+
+    // Pinning by numeric id keeps only that provider.
+    let overrides = RequestRoutingOverrides {
+        provider: Some("3".to_string()),
+        ..Default::default()
+    };
+    apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
+    assert_eq!(resolved.targets.len(), 1);
+    assert_eq!(resolved.targets[0].provider_id, 3);
+
+    // An unmatched pin is a client error, not a silent fallback.
+    let overrides = RequestRoutingOverrides {
+        provider: Some("nope".to_string()),
+        ..Default::default()
+    };
+    let error = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+
+    // Excluding everything is rejected too.
+    let overrides = RequestRoutingOverrides {
+        excluded_providers: vec!["3".to_string()],
+        ..Default::default()
+    };
+    let error = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+}
+
+#[tokio::test]
+async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    async fn spawn_chat_upstream() -> (
+        std::net::SocketAddr,
+        Arc<Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new().route(
+            OPENAI_CHAT_COMPLETIONS,
+            axum::routing::post({
+                let requests = requests.clone();
+                move |Json(body): Json<Value>| {
+                    let requests = requests.clone();
+                    async move {
+                        requests.lock().await.push(body);
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "id": "chatcmpl-routing-override",
+                                "object": "chat.completion",
+                                "choices": [{
+                                    "index": 0,
+                                    "message": {"role": "assistant", "content": "ok"},
+                                    "finish_reason": "stop"
+                                }],
+                                "usage": {
+                                    "prompt_tokens": 3,
+                                    "completion_tokens": 1,
+                                    "total_tokens": 4
+                                }
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (address, requests, server)
+    }
+
+    let (fast_address, fast_requests, fast_server) = spawn_chat_upstream().await;
+    let (cheap_address, cheap_requests, cheap_server) = spawn_chat_upstream().await;
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, model_prefix) VALUES
+            (1, 'fast', 'openai', ?, 'fast/'),
+            (2, 'cheap', 'openai', ?, 'cheap/')",
+    )
+    .bind(format!("http://{fast_address}"))
+    .bind(format!("http://{cheap_address}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+            (1, 'small', '[\"/chat/completions\"]'),
+            (2, 'tiny', '[\"/chat/completions\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let mut headers = HeaderMap::new();
+    headers.insert(STRATEGY_HEADER, HeaderValue::from_static("cost_optimized"));
+    headers.insert(PROVIDER_HEADER, HeaderValue::from_static("cheap"));
+    headers.insert(EXCLUDE_PROVIDERS_HEADER, HeaderValue::from_static("fast"));
+    let response = proxy_openai_inner(
+        &state,
+        &headers,
+        &OPENAI_CHAT_COMPLETIONS.parse().unwrap(),
+        &Bytes::from(
+            json!({
+                "model": "auto",
+                "messages": [{"role": "user", "content": "hi"}]
+            })
+            .to_string(),
+        ),
+        "routing-override-e2e",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(STRATEGY_HEADER).unwrap(),
+        "cost_optimized"
+    );
+    assert_eq!(response.headers().get(PROVIDER_HEADER).unwrap(), "cheap");
+    assert_eq!(
+        response.headers().get(EXCLUDE_PROVIDERS_HEADER).unwrap(),
+        "fast"
+    );
+    assert_eq!(
+        response.headers().get("x-openllm-routed-provider").unwrap(),
+        "cheap"
+    );
+
+    let cheap_requests = cheap_requests.lock().await;
+    assert_eq!(cheap_requests.len(), 1);
+    assert_eq!(cheap_requests[0]["model"], "tiny");
+    assert!(fast_requests.lock().await.is_empty());
+
+    fast_server.abort();
+    cheap_server.abort();
+}
+
+#[test]
+fn per_request_routing_headers_are_parsed_and_validated() {
+    let mut headers = HeaderMap::new();
+    assert!(request_routing_overrides(&headers).unwrap().is_empty());
+
+    headers.insert(STRATEGY_HEADER, HeaderValue::from_static("least_used"));
+    headers.insert(PROVIDER_HEADER, HeaderValue::from_static("openai"));
+    headers.insert(
+        EXCLUDE_PROVIDERS_HEADER,
+        HeaderValue::from_static(" a , b ,, "),
+    );
+    let overrides = request_routing_overrides(&headers).unwrap();
+    assert_eq!(overrides.strategy.as_deref(), Some("least_used"));
+    assert_eq!(overrides.provider.as_deref(), Some("openai"));
+    assert_eq!(overrides.excluded_providers, vec!["a", "b"]);
+
+    // An unknown strategy would silently change behavior, so it is rejected.
+    let mut headers = HeaderMap::new();
+    headers.insert(STRATEGY_HEADER, HeaderValue::from_static("telepathy"));
+    assert!(request_routing_overrides(&headers).is_err());
+
+    // Blank values mean "not supplied" rather than an empty selector.
+    let mut headers = HeaderMap::new();
+    headers.insert(PROVIDER_HEADER, HeaderValue::from_static("   "));
+    assert!(request_routing_overrides(&headers).unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn endpoint_override_controls_routing_and_public_metadata() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
