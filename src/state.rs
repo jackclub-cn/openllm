@@ -116,6 +116,12 @@ pub(crate) const DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS: u64 = 300;
 /// Override with `OPENLLM_SSE_KEEPALIVE_SECS`.
 pub(crate) const DEFAULT_SSE_KEEPALIVE_SECS: u64 = 15;
 
+/// Default grace period to let in-flight requests finish after a shutdown
+/// signal before the remaining connections are dropped. Zero waits forever.
+///
+/// Override with `OPENLLM_SHUTDOWN_GRACE_SECS`.
+pub(crate) const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
+
 /// Parses an operator-provided request-body cap, falling back to the default
 /// for empty, unparsable, or non-positive values.
 pub(crate) fn parse_max_body_mib(value: Option<&str>) -> usize {
@@ -160,6 +166,18 @@ pub(crate) fn parse_concurrency_limit(value: Option<&str>) -> Option<usize> {
     value
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
+}
+
+/// Parses the post-signal drain grace period.
+///
+/// A missing or unparsable value keeps the default; an explicit `0` waits
+/// indefinitely, preserving the pre-deadline behavior for operators who want
+/// every stream to finish.
+pub(crate) fn parse_shutdown_grace_secs(value: Option<&str>) -> u64 {
+    match value.map(str::trim) {
+        None | Some("") => DEFAULT_SHUTDOWN_GRACE_SECS,
+        Some(raw) => raw.parse::<u64>().unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS),
+    }
 }
 
 fn parse_positive(value: Option<&str>) -> Option<u64> {

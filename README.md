@@ -56,6 +56,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 - `OPENLLM_SSE_KEEPALIVE_SECS`：下游 SSE 流在静默时发送心跳注释的间隔，默认 `15` 秒；设为 `0` 可关闭。模型长时间思考、上游暂未吐字节时，心跳可避免反向代理或客户端因空闲而断开连接。
 - `OPENLLM_MAX_CONCURRENT_REQUESTS`：全局在途请求上限，默认 `0`（不限）。设为正整数后，网关在准入阶段拒绝超出上限的请求并返回 `429` 与 `Retry-After`，避免突发的长流把内存或连接耗尽；它独立于按 API Key、按提供商和按模型的并发限制。
 - `OPENLLM_MAX_UPSTREAM_BODY_MIB`：非流式上游响应的缓冲上限，默认 `64`（MiB）。这是内存保护值，超过后网关会以错误结束该请求，避免异常上游把整个响应读进内存。
+- `OPENLLM_SHUTDOWN_GRACE_SECS`：收到退出信号后等待在途请求结束的时间，默认 `30` 秒；设为 `0` 表示一直等待。超时后网关会关闭剩余连接，避免个别长流把重启或升级一直卡住。
 
 ## 核心能力
 

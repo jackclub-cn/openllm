@@ -7771,6 +7771,25 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
     );
     assert_eq!(parse_body_mib(Some("0"), DEFAULT_MAX_UPSTREAM_BODY_MIB), 64);
     assert_eq!(parse_body_mib(Some("128"), DEFAULT_MAX_UPSTREAM_BODY_MIB), 128);
+
+    // The shutdown grace defaults to 30s; an explicit 0 means "wait forever".
+    use crate::state::{
+        DEFAULT_SHUTDOWN_GRACE_SECS, parse_shutdown_grace_secs,
+    };
+    assert_eq!(
+        parse_shutdown_grace_secs(None),
+        DEFAULT_SHUTDOWN_GRACE_SECS
+    );
+    assert_eq!(
+        parse_shutdown_grace_secs(Some("  ")),
+        DEFAULT_SHUTDOWN_GRACE_SECS
+    );
+    assert_eq!(
+        parse_shutdown_grace_secs(Some("soon")),
+        DEFAULT_SHUTDOWN_GRACE_SECS
+    );
+    assert_eq!(parse_shutdown_grace_secs(Some("0")), 0);
+    assert_eq!(parse_shutdown_grace_secs(Some(" 45 ")), 45);
 }
 
 #[tokio::test]

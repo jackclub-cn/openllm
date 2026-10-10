@@ -9,6 +9,11 @@ mod registry;
 mod state;
 mod webhooks;
 
+#[cfg(test)]
+#[path = "../tests/unit/lib.rs"]
+mod tests;
+
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
@@ -42,7 +47,7 @@ use crate::proxy::{
     count_tokens_anthropic, proxy_anthropic, proxy_openai, proxy_openai_console, public_model,
     public_models,
 };
-use crate::state::AppState;
+use crate::state::{AppState, parse_shutdown_grace_secs};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -90,10 +95,57 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         "OpenLLM Gateway started"
     );
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")
+    let grace_secs =
+        parse_shutdown_grace_secs(std::env::var("OPENLLM_SHUTDOWN_GRACE_SECS").ok().as_deref());
+    serve_until_shutdown(listener, app, grace_secs, shutdown_signal()).await
+}
+
+/// Serves until a shutdown signal, then drains in-flight work for a bounded
+/// grace period before closing whatever is left.
+///
+/// A bare graceful shutdown waits for every connection, so one long-lived
+/// stream can hold a restart open indefinitely. The deadline keeps deploys and
+/// restarts predictable while still giving healthy requests a chance to finish.
+async fn serve_until_shutdown<F>(
+    listener: TcpListener,
+    app: Router,
+    grace_secs: u64,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if grace_secs == 0 {
+        return axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+            .context("server error");
+    }
+
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown = async move {
+        shutdown.await;
+        tracing::info!(grace_secs, "shutdown signal received; draining in-flight requests");
+        let _ = signal_tx.send(());
+    };
+    let serve = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .into_future();
+    tokio::pin!(serve);
+    tokio::select! {
+        result = &mut serve => result.context("server error"),
+        _ = async move {
+            // The countdown only starts once the signal actually arrives.
+            let _ = signal_rx.await;
+            tokio::time::sleep(std::time::Duration::from_secs(grace_secs)).await;
+        } => {
+            tracing::warn!(
+                grace_secs,
+                "shutdown grace period elapsed; closing remaining connections"
+            );
+            Ok(())
+        }
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {

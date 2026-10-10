@@ -1,0 +1,89 @@
+use super::*;
+
+/// A stalled stream must not hold shutdown open past the configured grace
+/// period: the server future has to resolve once the deadline elapses even
+/// though the connection is still open.
+#[tokio::test]
+async fn shutdown_deadline_drops_a_stalled_stream() {
+    use axum::body::{Body, Bytes};
+    use axum::response::Response;
+    use axum::routing::get;
+    use std::time::{Duration, Instant};
+
+    let app = Router::new().route(
+        "/hang",
+        get(|| async {
+            let stream =
+                futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+            Response::new(Body::from_stream(stream))
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, app, 1, async move {
+            let _ = signal_rx.await;
+        })
+        .await
+    });
+
+    // Hold the only connection open with a body that never completes.
+    let client = reqwest::Client::new();
+    let held = client
+        .get(format!("http://{address}/hang"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(held.status(), 200);
+
+    let started = Instant::now();
+    signal_tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the drain deadline must end the serve future")
+        .unwrap();
+    assert!(result.is_ok(), "the deadline closes cleanly");
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "the connection is kept draining for the grace period, took {:?}",
+        started.elapsed()
+    );
+
+    drop(held);
+}
+
+/// With no stalled connection the server still exits promptly once the signal
+/// arrives, without waiting for the full grace period.
+#[tokio::test]
+async fn shutdown_returns_promptly_when_drained() {
+    use std::time::{Duration, Instant};
+
+    let app = Router::new().route("/ok", axum::routing::get(|| async { "ok" }));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, app, 30, async move {
+            let _ = signal_rx.await;
+        })
+        .await
+    });
+
+    let response = reqwest::get(format!("http://{address}/ok")).await.unwrap();
+    assert_eq!(response.text().await.unwrap(), "ok");
+
+    let started = Instant::now();
+    signal_tx.send(()).unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("an idle server finishes draining immediately")
+        .unwrap();
+    assert!(result.is_ok());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the server must not wait out the full grace period when idle"
+    );
+}
