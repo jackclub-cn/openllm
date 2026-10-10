@@ -112,3 +112,34 @@ fn database_timeout_parsing_keeps_a_positive_default() {
     assert_eq!(parse_db_timeout_secs(Some("nope"), 15), 15);
     assert_eq!(parse_db_timeout_secs(Some("30"), 15), 30);
 }
+
+/// A panicking background worker must come back: maintenance and webhook
+/// delivery are spawned once, so an unsupervised panic would silently disable
+/// them for the rest of the process's life.
+#[tokio::test]
+async fn supervised_worker_restarts_after_a_panic() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::{Duration, Instant};
+
+    let runs = Arc::new(AtomicU32::new(0));
+    let counter = runs.clone();
+    spawn_supervised("test-worker", move || {
+        let counter = counter.clone();
+        async move {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("boom");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while runs.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        runs.load(Ordering::SeqCst) >= 2,
+        "the worker must be restarted after it panics"
+    );
+}

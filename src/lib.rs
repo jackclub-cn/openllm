@@ -90,6 +90,36 @@ async fn monitor_runtime_lag(state: AppState) {
     }
 }
 
+/// How long to wait before restarting a background worker that stopped.
+const WORKER_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Runs a long-lived background worker, restarting it if it ever stops.
+///
+/// Maintenance and webhook delivery are spawned once at startup and loop
+/// forever. Without supervision a single panic would take that worker down for
+/// the rest of the process's life — maintenance would stop running and webhooks
+/// would stop delivering, with only a one-off panic message as a clue. This
+/// catches the panic (or an unexpected early return), logs it, and starts the
+/// worker again after a short backoff. `make` must build a fresh future per
+/// attempt because a future cannot be polled after it completes.
+pub(crate) fn spawn_supervised<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(make()).await {
+                Ok(()) => tracing::warn!(worker = name, "background worker exited; restarting"),
+                Err(error) => {
+                    tracing::error!(worker = name, %error, "background worker panicked; restarting")
+                }
+            }
+            tokio::time::sleep(WORKER_RESTART_BACKOFF).await;
+        }
+    });
+}
+
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let database = Database::connect(&config).await?;
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
@@ -103,18 +133,21 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tracing::warn!(%error, "failed to reconcile interrupted provider model syncs on startup");
     }
     let health_state = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            crate::api::run_due_provider_health_checks(health_state.clone()).await;
-            crate::api::run_due_provider_model_syncs(health_state.clone()).await;
-            crate::api::reconcile_stale_usage_requests(health_state.clone()).await;
-            crate::api::run_due_usage_retention(health_state.clone()).await;
+    spawn_supervised("maintenance", move || {
+        let state = health_state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                crate::api::run_due_provider_health_checks(state.clone()).await;
+                crate::api::run_due_provider_model_syncs(state.clone()).await;
+                crate::api::reconcile_stale_usage_requests(state.clone()).await;
+                crate::api::run_due_usage_retention(state.clone()).await;
+            }
         }
     });
     let webhook_state = state.clone();
-    tokio::spawn(async move {
-        crate::webhooks::run_dispatcher(webhook_state).await;
+    spawn_supervised("webhook-dispatcher", move || {
+        crate::webhooks::run_dispatcher(webhook_state.clone())
     });
     let lag_state = state.clone();
     tokio::spawn(async move {
