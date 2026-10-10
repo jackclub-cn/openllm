@@ -34,7 +34,7 @@ use crate::api::{
     list_api_keys, list_audit_logs, list_cooldowns, list_model_inventory, list_models,
     list_provider_model_limits,
     list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
-    preview_provider_model_sync, prometheus_metrics, provider_quota, rotate_api_key,
+    preview_provider_model_sync, prometheus_metrics, provider_quota, ready, rotate_api_key,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
     update_inspector_settings, update_provider, update_provider_model_limits,
@@ -225,6 +225,7 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .merge(metrics)
         .route("/api/health", get(health))
+        .route("/api/ready", get(ready))
         .route("/api/settings", get(get_settings))
         .route("/api/events", get(event_stream))
         .nest("/api", admin)

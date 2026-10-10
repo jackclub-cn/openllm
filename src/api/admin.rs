@@ -8,6 +8,44 @@ pub async fn health() -> Json<Value> {
     }))
 }
 
+/// Readiness probe for a load balancer.
+///
+/// Unlike [`health`], this reflects whether the instance can actually serve:
+/// it touches the database with a short timeout, and a `503` tells a proxy to
+/// stop routing traffic here instead of returning errors for every request.
+pub async fn ready(State(state): State<AppState>) -> Response {
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),
+    )
+    .await;
+    let failure = match probe {
+        Ok(Ok(_)) => None,
+        Ok(Err(error)) => Some(error.to_string()),
+        Err(_) => Some("database probe timed out".to_string()),
+    };
+    match failure {
+        None => Json(json!({
+            "status": "ready",
+            "service": "openllm",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .into_response(),
+        Some(error) => {
+            tracing::warn!(%error, "readiness probe failed");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "status": "not_ready",
+                    "service": "openllm",
+                    "error": error
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub async fn admin_auth(
     State(state): State<AppState>,
     request: Request,

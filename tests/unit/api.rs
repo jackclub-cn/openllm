@@ -3622,3 +3622,29 @@ async fn stale_reconciliation_uses_last_activity_for_long_streams() {
         vec![("active".to_string(), 1, 0), ("stale".to_string(), 0, 499)]
     );
 }
+
+#[tokio::test]
+async fn readiness_reports_ready_when_the_database_answers() {
+    let state = provider_key_test_state().await;
+    let response = ready(State(state)).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "ready");
+}
+
+#[tokio::test]
+async fn readiness_reports_unavailable_when_the_database_is_unreachable() {
+    let state = provider_key_test_state().await;
+    state.pool.close().await;
+    let response = ready(State(state)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "not_ready");
+    assert!(value["error"].is_string());
+}
