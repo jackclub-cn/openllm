@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
 
 use crate::error::AppResult;
-use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings};
+use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings, RuntimeLimits};
 
 pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
 pub(crate) const SETTING_INSPECTOR: &str = "inspector";
@@ -358,5 +358,32 @@ impl AppState {
             .unwrap_or_default();
         *self.resilience.write().await = Some(settings.clone());
         Ok(settings)
+    }
+
+    /// Reports the effective environment-derived runtime limits.
+    ///
+    /// Re-derives the same values the process parsed at startup so the console
+    /// and operators can confirm them without reading the environment.
+    pub(crate) fn runtime_limits(&self) -> RuntimeLimits {
+        RuntimeLimits {
+            upstream_idle_timeout_secs: parse_positive_secs(
+                std::env::var("OPENLLM_UPSTREAM_IDLE_TIMEOUT_SECS")
+                    .ok()
+                    .as_deref(),
+                DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS,
+            ),
+            shutdown_grace_secs: parse_shutdown_grace_secs(
+                std::env::var("OPENLLM_SHUTDOWN_GRACE_SECS").ok().as_deref(),
+            ),
+            max_request_body_mib: parse_max_body_mib(
+                std::env::var("OPENLLM_MAX_BODY_MIB").ok().as_deref(),
+            ),
+            max_upstream_body_mib: parse_body_mib(
+                std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB").ok().as_deref(),
+                DEFAULT_MAX_UPSTREAM_BODY_MIB,
+            ),
+            sse_keepalive_secs: self.sse_keepalive.map(|interval| interval.as_secs()),
+            max_concurrent_requests: self.request_capacity_limit,
+        }
     }
 }

@@ -579,6 +579,16 @@ export type Settings = {
 
 export type RuntimeSettings = {
   usage_retention_days?: number | null
+  limits: RuntimeLimits
+}
+
+export type RuntimeLimits = {
+  upstream_idle_timeout_secs: number
+  shutdown_grace_secs: number
+  max_request_body_mib: number
+  max_upstream_body_mib: number
+  sse_keepalive_secs?: number | null
+  max_concurrent_requests: number
 }
 
 export type GuardrailSettings = {

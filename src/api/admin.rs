@@ -144,6 +144,7 @@ pub async fn get_runtime_settings(
     let usage_retention_days = raw.and_then(|value| value.parse::<i64>().ok());
     Ok(Json(RuntimeSettingsView {
         usage_retention_days,
+        limits: state.runtime_limits(),
     }))
 }
 
@@ -183,6 +184,7 @@ pub async fn update_runtime_settings(
     .await;
     Ok(Json(RuntimeSettingsView {
         usage_retention_days,
+        limits: state.runtime_limits(),
     }))
 }
 

@@ -37,6 +37,7 @@ import {
   type GuardrailSettings,
   type InspectorSettings,
   type ResilienceSettings,
+  type RuntimeLimits,
   type RuntimeSettings,
   type Settings,
 } from '../api'
@@ -52,6 +53,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
   const [vacuuming, setVacuuming] = useState(false)
   const [retentionDays, setRetentionDays] = useState<number | null>(null)
   const [savingRetention, setSavingRetention] = useState(false)
+  const [limits, setLimits] = useState<RuntimeLimits>()
   const [blockedTerms, setBlockedTerms] = useState('')
   const [maxPromptTokens, setMaxPromptTokens] = useState<number | null>(null)
   const [savingGuardrails, setSavingGuardrails] = useState(false)
@@ -81,7 +83,10 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
     api.get<Settings>('/api/settings').then(setSettings).catch(() => undefined)
     api
       .get<RuntimeSettings>('/api/settings/runtime')
-      .then((runtime) => setRetentionDays(runtime.usage_retention_days ?? null))
+      .then((runtime) => {
+        setRetentionDays(runtime.usage_retention_days ?? null)
+        setLimits(runtime.limits)
+      })
       .catch(() => undefined)
     api
       .get<GuardrailSettings>('/api/settings/guardrails')
@@ -326,6 +331,29 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             </Descriptions.Item>
             <Descriptions.Item label="版本">
               {settings?.version || '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="上游空闲超时">
+              {limits ? `${limits.upstream_idle_timeout_secs} 秒` : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="全局并发上限">
+              {limits ? (limits.max_concurrent_requests > 0 ? limits.max_concurrent_requests : '不限') : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="SSE 心跳">
+              {limits
+                ? limits.sse_keepalive_secs != null
+                  ? `${limits.sse_keepalive_secs} 秒`
+                  : '关闭'
+                : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="请求体 / 上游响应上限">
+              {limits ? `${limits.max_request_body_mib} MiB / ${limits.max_upstream_body_mib} MiB` : '-'}
+            </Descriptions.Item>
+            <Descriptions.Item label="退出等待">
+              {limits
+                ? limits.shutdown_grace_secs > 0
+                  ? `${limits.shutdown_grace_secs} 秒`
+                  : '一直等待'
+                : '-'}
             </Descriptions.Item>
             <Descriptions.Item label="数据库备份">
               <Button

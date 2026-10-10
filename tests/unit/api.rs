@@ -3624,6 +3624,17 @@ async fn stale_reconciliation_uses_last_activity_for_long_streams() {
 }
 
 #[tokio::test]
+async fn runtime_settings_expose_effective_limits() {
+    let state = provider_key_test_state().await;
+    let expected_concurrency = state.request_capacity_limit;
+    let Json(view) = get_runtime_settings(State(state)).await.unwrap();
+    assert!(view.limits.max_request_body_mib >= 1);
+    assert!(view.limits.max_upstream_body_mib >= 1);
+    assert!(view.limits.upstream_idle_timeout_secs >= 1);
+    assert_eq!(view.limits.max_concurrent_requests, expected_concurrency);
+}
+
+#[tokio::test]
 async fn readiness_reports_ready_when_the_database_answers() {
     let state = provider_key_test_state().await;
     let response = ready(State(state)).await;

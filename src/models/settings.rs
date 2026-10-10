@@ -34,6 +34,26 @@ pub struct DatabaseVacuumResult {
 #[derive(Debug, Serialize)]
 pub struct RuntimeSettingsView {
     pub usage_retention_days: Option<i64>,
+    /// Effective, environment-derived limits. Read-only; reported so an
+    /// operator can confirm what the running process actually picked up.
+    pub limits: RuntimeLimits,
+}
+
+/// Effective, environment-derived runtime limits.
+#[derive(Debug, Serialize)]
+pub struct RuntimeLimits {
+    /// Idle gap allowed between upstream bytes.
+    pub upstream_idle_timeout_secs: u64,
+    /// Post-signal drain grace; `0` waits forever.
+    pub shutdown_grace_secs: u64,
+    /// Buffered request-body cap.
+    pub max_request_body_mib: usize,
+    /// Buffered upstream-response cap.
+    pub max_upstream_body_mib: usize,
+    /// Downstream SSE keep-alive interval; `None` disables it.
+    pub sse_keepalive_secs: Option<u64>,
+    /// Global concurrent request cap; `0` means unlimited.
+    pub max_concurrent_requests: usize,
 }
 
 #[derive(Debug, Deserialize)]
