@@ -59,6 +59,7 @@ export default function ApiKeys() {
           .map((value) => value.trim())
           .filter(Boolean),
         expires_at: values.expires_at ? values.expires_at.toISOString() : '',
+        routing_policy: routingPolicyOf(values),
       })
       setCreatedKey(result.key)
       form.resetFields()
@@ -121,6 +122,11 @@ export default function ApiKeys() {
       max_concurrency: record.max_concurrency ?? null,
       allowed_models_text: record.allowed_models.join('\n'),
       expires_at: record.expires_at ? dayjs(record.expires_at) : null,
+      routing_strategy: record.routing_policy?.strategy ?? null,
+      routing_provider: record.routing_policy?.provider ?? null,
+      routing_exclude_providers_text: (
+        record.routing_policy?.exclude_providers ?? []
+      ).join('\n'),
     })
     setLimitsOpen(true)
   }
@@ -144,6 +150,7 @@ export default function ApiKeys() {
           .map((value) => value.trim())
           .filter(Boolean),
         expires_at: values.expires_at ? values.expires_at.toISOString() : '',
+        routing_policy: routingPolicyOf(values),
       })
       message.success('访问策略已保存')
       setLimitsOpen(false)
@@ -221,4 +228,15 @@ export default function ApiKeys() {
       />
     </>
   )
+}
+
+function routingPolicyOf(values: ApiKeyForm) {
+  return {
+    strategy: values.routing_strategy || null,
+    provider: (values.routing_provider || '').trim() || null,
+    exclude_providers: (values.routing_exclude_providers_text || '')
+      .split('\n')
+      .map((value) => value.trim())
+      .filter(Boolean),
+  }
 }

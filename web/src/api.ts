@@ -374,6 +374,13 @@ export type ApiKey = {
   current_in_flight: number
   allowed_models: string[]
   expires_at?: string | null
+  routing_policy: ApiKeyRoutingPolicy
+}
+
+export type ApiKeyRoutingPolicy = {
+  strategy?: string | null
+  provider?: string | null
+  exclude_providers: string[]
 }
 
 export type Webhook = {

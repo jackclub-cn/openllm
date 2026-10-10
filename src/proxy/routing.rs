@@ -1530,6 +1530,39 @@ impl RequestRoutingOverrides {
     }
 }
 
+/// Builds request routing overrides from an API key's stored policy.
+///
+/// A malformed or absent policy yields no overrides so a bad row can never
+/// block traffic; write-time validation is what keeps stored values clean.
+pub(super) fn routing_overrides_from_key(api_key: Option<&ApiKeyRecord>) -> RequestRoutingOverrides {
+    let policy = crate::models::parse_routing_policy(
+        api_key.and_then(|api_key| api_key.routing_policy.as_deref()),
+    );
+    RequestRoutingOverrides {
+        strategy: policy.strategy,
+        provider: policy.provider,
+        excluded_providers: policy.exclude_providers,
+    }
+}
+
+/// Layers per-request overrides on top of a key's policy. Each field is
+/// independent: a request may override just the strategy and keep the key's
+/// provider pin.
+pub(super) fn merge_routing_overrides(
+    policy: RequestRoutingOverrides,
+    request: RequestRoutingOverrides,
+) -> RequestRoutingOverrides {
+    RequestRoutingOverrides {
+        strategy: request.strategy.or(policy.strategy),
+        provider: request.provider.or(policy.provider),
+        excluded_providers: if request.excluded_providers.is_empty() {
+            policy.excluded_providers
+        } else {
+            request.excluded_providers
+        },
+    }
+}
+
 fn header_text(headers: &HeaderMap, name: &str) -> AppResult<Option<String>> {
     let Some(value) = headers.get(name) else {
         return Ok(None);

@@ -12,6 +12,7 @@ import {
   type FormInstance,
 } from 'antd'
 import type { ApiKeyForm } from './types'
+import ApiKeyRoutingFields from './ApiKeyRoutingFields'
 
 type ApiKeyCreateModalProps = {
   open: boolean
@@ -116,6 +117,7 @@ export default function ApiKeyCreateModal({
           <Form.Item name="expires_at" label="到期时间" extra="留空表示永不过期。">
             <DatePicker showTime style={{ width: '100%' }} />
           </Form.Item>
+          <ApiKeyRoutingFields />
         </Form>
       )}
     </Modal>

@@ -21,6 +21,7 @@ pub async fn list_api_keys(State(state): State<AppState>) -> AppResult<Json<Vec<
             k.daily_token_limit, k.daily_cost_limit_micros,
             k.requests_per_minute, k.max_concurrency,
             k.allowed_models, k.expires_at,
+            k.routing_policy,
             (
                 SELECT COUNT(*) FROM usage_logs rate
                 WHERE rate.api_key_id = k.id AND rate.created_at >= ?
@@ -97,6 +98,7 @@ pub async fn create_api_key(
     let max_concurrency = normalize_api_key_limit("max concurrency", input.max_concurrency)?;
     let allowed_models = normalize_allowed_models(input.allowed_models)?;
     let expires_at = normalize_expiration(input.expires_at)?;
+    let routing_policy = normalize_api_key_routing_policy(input.routing_policy)?;
 
     let (raw, key_hash, key_prefix, key_suffix) = generate_api_key_material();
 
@@ -104,8 +106,8 @@ pub async fn create_api_key(
         "INSERT INTO api_keys (
             name, key_hash, key_prefix, key_suffix, enabled,
             daily_token_limit, daily_cost_limit_micros, requests_per_minute,
-            max_concurrency, allowed_models, expires_at
-         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+            max_concurrency, allowed_models, expires_at, routing_policy
+         ) VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(key_hash)
@@ -117,6 +119,7 @@ pub async fn create_api_key(
     .bind(max_concurrency)
     .bind(allowed_models)
     .bind(expires_at)
+    .bind(routing_policy)
     .execute(&state.pool)
     .await?;
 
@@ -135,6 +138,7 @@ pub async fn create_api_key(
         Some(json!({
             "allowed_models": record.allowed_models.clone(),
             "expires_at": record.expires_at.clone(),
+            "routing_policy": record.routing_policy.clone(),
         })),
     )
     .await;
@@ -243,11 +247,15 @@ pub async fn update_api_key(
         Some(value) => normalize_expiration(Some(value))?,
         None => current.expires_at,
     };
+    let routing_policy = match input.routing_policy {
+        Some(value) => normalize_api_key_routing_policy(Some(value))?,
+        None => current.routing_policy,
+    };
     let result = sqlx::query(
         "UPDATE api_keys \
              SET enabled = ?, daily_token_limit = ?, daily_cost_limit_micros = ?, \
              requests_per_minute = ?, max_concurrency = ?, allowed_models = ?, \
-             expires_at = ? \
+             expires_at = ?, routing_policy = ? \
          WHERE id = ?",
     )
     .bind(input.enabled as i64)
@@ -257,6 +265,7 @@ pub async fn update_api_key(
     .bind(max_concurrency)
     .bind(allowed_models)
     .bind(expires_at)
+    .bind(routing_policy)
     .bind(id)
     .execute(&state.pool)
     .await?;
@@ -331,6 +340,69 @@ pub(super) fn normalize_allowed_models(value: Option<Vec<String>>) -> AppResult<
         return Ok(None);
     }
     Ok(Some(serde_json::to_string(&models).unwrap_or_default()))
+}
+
+/// Validates and serializes a key's routing policy. An effectively empty policy
+/// is stored as `NULL` so "no policy" has one representation.
+pub(super) fn normalize_api_key_routing_policy(
+    value: Option<ApiKeyRoutingPolicy>,
+) -> AppResult<Option<String>> {
+    const MAX_EXCLUDED_PROVIDERS: usize = 100;
+    const MAX_SELECTOR_CHARS: usize = 200;
+
+    let Some(mut policy) = value else {
+        return Ok(None);
+    };
+    policy.strategy = match policy.strategy {
+        Some(strategy) => {
+            let strategy = strategy.trim();
+            if strategy.is_empty() {
+                None
+            } else {
+                Some(
+                    RouteStrategy::from_str(strategy)
+                        .map_err(AppError::BadRequest)?
+                        .as_str()
+                        .to_string(),
+                )
+            }
+        }
+        None => None,
+    };
+    policy.provider = policy.provider.and_then(|provider| {
+        let provider = provider.trim().to_string();
+        (!provider.is_empty()).then_some(provider)
+    });
+
+    if policy.exclude_providers.len() > MAX_EXCLUDED_PROVIDERS {
+        return Err(AppError::BadRequest(format!(
+            "an API key can exclude at most {MAX_EXCLUDED_PROVIDERS} providers"
+        )));
+    }
+    let mut seen = HashSet::new();
+    let mut excluded = Vec::new();
+    for selector in policy.exclude_providers {
+        let selector = selector.trim();
+        if selector.is_empty() {
+            continue;
+        }
+        if selector.chars().count() > MAX_SELECTOR_CHARS {
+            return Err(AppError::BadRequest(
+                "provider selectors must be at most 200 characters".to_string(),
+            ));
+        }
+        if seen.insert(selector.to_lowercase()) {
+            excluded.push(selector.to_string());
+        }
+    }
+    policy.exclude_providers = excluded;
+
+    if policy.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&policy)
+        .map(Some)
+        .map_err(|error| AppError::Internal(anyhow::anyhow!("failed to store routing policy: {error}")))
 }
 
 pub(super) fn normalize_expiration(value: Option<String>) -> AppResult<Option<String>> {

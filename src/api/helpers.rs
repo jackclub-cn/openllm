@@ -1067,6 +1067,7 @@ impl From<ApiKeyRecord> for ApiKeyView {
             current_in_flight: 0,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
             expires_at: value.expires_at,
+            routing_policy: parse_routing_policy(value.routing_policy.as_deref()),
         }
     }
 }
@@ -1100,6 +1101,7 @@ impl From<ApiKeyStatsRow> for ApiKeyView {
             current_in_flight: value.current_in_flight,
             allowed_models: parse_allowed_models(value.allowed_models.as_deref()),
             expires_at: value.expires_at,
+            routing_policy: parse_routing_policy(value.routing_policy.as_deref()),
         }
     }
 }

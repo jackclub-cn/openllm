@@ -363,6 +363,7 @@ async fn persists_and_reports_api_key_rate_limits() {
             max_concurrency: Some(5),
             allowed_models: None,
             expires_at: None,
+            routing_policy: None,
         }),
     )
     .await
@@ -448,6 +449,7 @@ async fn persists_and_reports_api_key_rate_limits() {
             max_concurrency: Some(2),
             allowed_models: None,
             expires_at: None,
+            routing_policy: None,
         }),
     )
     .await
@@ -1213,6 +1215,92 @@ async fn inspector_settings_round_trip_validate_and_invalidate_cache() {
     .await
     .unwrap();
     assert_eq!(defaults, InspectorSettings::default());
+}
+
+#[tokio::test]
+async fn api_key_routing_policy_round_trips_and_validates() {
+    let state = provider_key_test_state().await;
+    let (_, Json(created)) = create_api_key(
+        State(state.clone()),
+        Json(ApiKeyInput {
+            name: "policy".to_string(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+            routing_policy: Some(ApiKeyRoutingPolicy {
+                strategy: Some("least_used".to_string()),
+                provider: Some("  beta  ".to_string()),
+                exclude_providers: vec!["alpha".to_string(), "ALPHA".to_string()],
+            }),
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        created.item.routing_policy,
+        ApiKeyRoutingPolicy {
+            strategy: Some("least_used".to_string()),
+            provider: Some("beta".to_string()),
+            exclude_providers: vec!["alpha".to_string()],
+        }
+    );
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT routing_policy FROM api_keys WHERE id = ?")
+            .bind(created.item.id)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert!(stored.unwrap().contains("least_used"));
+
+    // The list view decodes the stored policy back into a typed object.
+    let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
+    let listed = items.iter().find(|item| item.id == created.item.id).unwrap();
+    assert_eq!(listed.routing_policy, created.item.routing_policy);
+
+    // An unknown strategy is rejected instead of being stored and ignored.
+    let error = update_api_key(
+        State(state.clone()),
+        Path(created.item.id),
+        Json(ApiKeyUpdate {
+            enabled: true,
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+            routing_policy: Some(ApiKeyRoutingPolicy {
+                strategy: Some("telepathy".to_string()),
+                ..Default::default()
+            }),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+
+    // An empty policy clears the stored value.
+    let Json(cleared) = update_api_key(
+        State(state.clone()),
+        Path(created.item.id),
+        Json(ApiKeyUpdate {
+            enabled: true,
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+            routing_policy: Some(ApiKeyRoutingPolicy::default()),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(cleared.routing_policy.is_empty());
 }
 
 #[tokio::test]

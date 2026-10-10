@@ -219,9 +219,13 @@ pub(crate) async fn proxy_openai_inner(
         requested_output_tokens,
         clamped_output_tokens,
     );
-    let routing_overrides = match request_routing_overrides(headers).and_then(|overrides| {
+    // The API key's stored policy is the default; per-request headers override
+    // individual fields. Only the request's own headers are echoed back.
+    let routing_overrides = match request_routing_overrides(headers).and_then(|request| {
+        let overrides =
+            merge_routing_overrides(routing_overrides_from_key(api_key.as_ref()), request.clone());
         apply_routing_overrides(&mut resolved, &requested_model, &overrides)?;
-        Ok(overrides)
+        Ok(request)
     }) {
         Ok(overrides) => overrides,
         Err(error) => {

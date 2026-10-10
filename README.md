@@ -190,6 +190,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 - `/v1/models` 返回的 `supported_endpoints` 是网关实际能承接的集合，而不是上游声明的原始集合：只要上游支持其中一种消息协议，其余消息协议都会标注为可用。
 - 推理内容会尽力透传：Anthropic `thinking` 和 chat `reasoning_content` 会转成 Responses `reasoning` 摘要，Responses 的 reasoning summary 也会转成 chat `reasoning_content`。跨提供商无法重建 Anthropic 的 thinking 签名或 OpenAI 的加密内容，因此转换到 Anthropic Messages 时不会伪造 `thinking` 块；原生协议仍保持原样透传。
 - 可选的请求级路由控制支持 `x-openllm-strategy`、`x-openllm-provider` 和 `x-openllm-exclude-providers`。策略可取 `priority`、`weighted`、`round_robin`、`cost_optimized`、`latency_optimized` 或 `least_used`；提供商可用数字 ID 或提供商名称（大小写不敏感），排除多个提供商时用逗号分隔，例如 `x-openllm-exclude-providers: provider-a, 3`。这些控制会在访问权限、能力收敛和预算过滤之后、目标排序之前生效。无效策略、pinned 提供商不匹配或排除后没有剩余目标时返回 `400`，不会静默回退；成功响应会回显实际生效的三个请求头。
+- 同样的三项控制可以固化到访问密钥上，在控制台“访问密钥”的创建或访问策略弹窗中配置，或直接写入 `POST /api/api-keys`、`PUT /api/api-keys/{id}` 的 `routing_policy` 字段。密钥策略是默认值，请求头按字段逐个覆盖：请求只带 `x-openllm-strategy` 时会保留密钥上的提供商固定与排除。密钥策略不会通过响应头回显，避免把调用方没有发送的配置伪装成请求头；实际命中结果仍由 `x-openllm-routed-provider` 反映。
 - 可选的请求级成本上限：在 OpenAI 或 Anthropic 请求上带 `x-openllm-budget-usd`（正数，单位美元），网关会按目标的输入/输出价格与本次请求的输入估算、输出上限计算预估价，过滤掉超过上限的目标，再按路由策略排序。全部目标超预算、或没有任何目标公布价格时请求以 `400` 拒绝，并说明最便宜的已知估价；成功响应会回传 `x-openllm-budget-usd` 与 `x-openllm-budget-excluded-targets`，被过滤的次数也会写入该请求的网关告警中。
 - 上游返回只带 trace id、没有明确参数的临时 4xx 时，网关会先重试一次，再决定是否切换到下一个路由目标。
 - 上游返回临时失败时会优先读取 `Retry-After` / `retry-after-ms`；模型级 429 先隔离具体模型，同类供应商有多个模型同时冷却后才升级为供应商级熔断，连续失败会按指数退避并封顶。

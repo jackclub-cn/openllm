@@ -8,6 +8,7 @@ import {
 } from 'antd'
 import type { ApiKey } from '../../api'
 import type { ApiKeyForm } from './types'
+import ApiKeyRoutingFields from './ApiKeyRoutingFields'
 
 type ApiKeyLimitsModalProps = {
   open: boolean
@@ -75,6 +76,7 @@ export default function ApiKeyLimitsModal({
         >
           <InputNumber min={0} precision={0} style={{ width: '100%' }} />
         </Form.Item>
+        <ApiKeyRoutingFields />
       </Form>
     </Modal>
   )

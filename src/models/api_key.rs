@@ -15,6 +15,28 @@ pub struct ApiKeyRecord {
     pub max_concurrency: Option<i64>,
     pub allowed_models: Option<String>,
     pub expires_at: Option<String>,
+    /// JSON-encoded [`ApiKeyRoutingPolicy`]; `None` means no stored policy.
+    pub routing_policy: Option<String>,
+}
+
+/// Routing constraints an API key enforces on every request it authenticates.
+///
+/// These act as defaults: a request may still override any single field with
+/// the matching `x-openllm-*` header.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyRoutingPolicy {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strategy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude_providers: Vec<String>,
+}
+
+impl ApiKeyRoutingPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.strategy.is_none() && self.provider.is_none() && self.exclude_providers.is_empty()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -45,6 +67,7 @@ pub struct ApiKeyView {
     pub current_in_flight: i64,
     pub allowed_models: Vec<String>,
     pub expires_at: Option<String>,
+    pub routing_policy: ApiKeyRoutingPolicy,
 }
 
 #[derive(Debug, FromRow)]
@@ -75,6 +98,14 @@ pub struct ApiKeyStatsRow {
     pub current_in_flight: i64,
     pub allowed_models: Option<String>,
     pub expires_at: Option<String>,
+    pub routing_policy: Option<String>,
+}
+
+/// Parses a stored routing policy, falling back to "no policy" when the column
+/// is empty or holds malformed JSON so a bad row cannot break routing.
+pub fn parse_routing_policy(raw: Option<&str>) -> ApiKeyRoutingPolicy {
+    raw.and_then(|raw| serde_json::from_str::<ApiKeyRoutingPolicy>(raw).ok())
+        .unwrap_or_default()
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,6 +123,8 @@ pub struct ApiKeyInput {
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub routing_policy: Option<ApiKeyRoutingPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -109,6 +142,8 @@ pub struct ApiKeyUpdate {
     pub allowed_models: Option<Vec<String>>,
     #[serde(default)]
     pub expires_at: Option<String>,
+    #[serde(default)]
+    pub routing_policy: Option<ApiKeyRoutingPolicy>,
 }
 
 #[derive(Debug, Serialize)]
