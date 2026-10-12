@@ -4,12 +4,24 @@ import {
   EditOutlined,
   HistoryOutlined,
   KeyOutlined,
+  ReloadOutlined,
   SettingOutlined,
   SyncOutlined,
   ThunderboltOutlined,
   WalletOutlined,
 } from '@ant-design/icons'
-import { Button, Card, Popconfirm, Space, Switch, Table, Tag, Tooltip, Typography } from 'antd'
+import {
+  Button,
+  Card,
+  Grid,
+  Popconfirm,
+  Space,
+  Switch,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+} from 'antd'
 import dayjs from 'dayjs'
 import { useNavigate } from 'react-router-dom'
 import type { Provider } from '../../api'
@@ -23,9 +35,11 @@ type ProviderTableProps = {
   page: number
   togglingProviderId?: number
   testingProviderId?: number
+  resettingProviderId?: number
   onPageChange: (page: number) => void
   onToggleEnabled: (provider: Provider, enabled: boolean) => void
   onTest: (id: number) => void
+  onResetCircuit: (provider: Provider) => void
   onTestKeys: (provider: Provider) => void
   onOpenQuota: (provider: Provider) => void
   onManageModels: (provider: Provider) => void
@@ -41,9 +55,11 @@ export default function ProviderTable({
   page,
   togglingProviderId,
   testingProviderId,
+  resettingProviderId,
   onPageChange,
   onToggleEnabled,
   onTest,
+  onResetCircuit,
   onTestKeys,
   onOpenQuota,
   onManageModels,
@@ -52,10 +68,13 @@ export default function ProviderTable({
   onPreviewSync,
 }: ProviderTableProps) {
   const navigate = useNavigate()
+  const screens = Grid.useBreakpoint()
+  const compact = !screens.md
 
   return (
     <Card bordered={false}>
       <Table
+        className="provider-table"
         rowKey="id"
         loading={loading}
         dataSource={providers}
@@ -70,11 +89,12 @@ export default function ProviderTable({
         locale={{
           emptyText: providerCount ? '没有符合筛选条件的提供商' : '暂无提供商',
         }}
-        scroll={{ x: 1190 }}
+        scroll={{ x: compact ? 630 : 1420 }}
         columns={[
           {
             title: '提供商',
             dataIndex: 'name',
+            width: 170,
             render: (value: string, record) => (
               <Space>
                 <ApiOutlined />
@@ -92,6 +112,8 @@ export default function ProviderTable({
           {
             title: 'API 地址',
             dataIndex: 'base_url',
+            width: 240,
+            responsive: ['md'],
             render: (value: string) => (
               <Typography.Text copyable={{ text: value }}>{value}</Typography.Text>
             ),
@@ -99,7 +121,8 @@ export default function ProviderTable({
           {
             title: '凭证',
             dataIndex: 'api_keys',
-            width: 130,
+            width: 120,
+            responsive: ['lg'],
             render: (keys: Provider['api_keys']) => {
               if (!keys?.length) {
                 return <Tag color="default">无需密钥</Tag>
@@ -143,7 +166,8 @@ export default function ProviderTable({
           },
           {
             title: '健康',
-            width: 160,
+            width: 150,
+            responsive: ['md'],
             render: (_, record) => {
               const state =
                 record.last_test_ok == null
@@ -187,7 +211,8 @@ export default function ProviderTable({
           {
             title: '模型',
             dataIndex: 'models',
-            width: 190,
+            width: 170,
+            responsive: ['md'],
             render: (models: string[], record) => {
               const syncing =
                 !record.models_sync_error &&
@@ -226,7 +251,8 @@ export default function ProviderTable({
           {
             title: '前缀',
             dataIndex: 'model_prefix',
-            width: 120,
+            width: 110,
+            responsive: ['xl'],
             render: (value: string) =>
               value ? (
                 <Typography.Text code>{value}</Typography.Text>
@@ -264,8 +290,8 @@ export default function ProviderTable({
           },
           {
             title: '操作',
-            width: 360,
-            fixed: 'right',
+            width: 340,
+            fixed: compact ? undefined : 'right',
             render: (_, record) => (
               <Space>
                 <Tooltip title="查看请求日志">
@@ -290,6 +316,26 @@ export default function ProviderTable({
                     onClick={() => onTest(record.id)}
                   />
                 </Tooltip>
+                {(record.circuit_state === 'open' ||
+                  record.circuit_state === 'half_open' ||
+                  Boolean(record.cooldown_seconds)) && (
+                  <Tooltip title="清除冷却并恢复路由">
+                    <span>
+                      <Popconfirm
+                        title="恢复此提供商的冷却与熔断状态？"
+                        description="会清除提供商冷却、失败计数和探测租约，并解除其全部模型冷却。"
+                        onConfirm={() => onResetCircuit(record)}
+                      >
+                        <Button
+                          type="text"
+                          icon={<ReloadOutlined />}
+                          loading={resettingProviderId === record.id}
+                          aria-label="恢复路由"
+                        />
+                      </Popconfirm>
+                    </span>
+                  </Tooltip>
+                )}
                 {record.api_keys.length > 0 && (
                   <Tooltip title="逐个测试全部启用密钥">
                     <Button

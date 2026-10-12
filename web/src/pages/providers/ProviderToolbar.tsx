@@ -4,14 +4,15 @@ import {
   SearchOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import { Button, Input, Popconfirm, Select, Space, Tag } from 'antd'
+import { Button, Input, Popconfirm, Select, Tag } from 'antd'
 import PageHeader from '../../components/PageHeader'
-import type { ProviderHealth, ProviderStatus } from './types'
+import type { ProviderCircuit, ProviderHealth, ProviderStatus } from './types'
 
 type ProviderToolbarProps = {
   providerSearch: string
   providerStatus: ProviderStatus
   providerHealth: ProviderHealth
+  providerCircuit: ProviderCircuit
   providerCount: number
   filteredCount: number
   testingAll: boolean
@@ -20,6 +21,7 @@ type ProviderToolbarProps = {
   onSearchChange: (value: string) => void
   onStatusChange: (value: ProviderStatus) => void
   onHealthChange: (value: ProviderHealth) => void
+  onCircuitChange: (value: ProviderCircuit) => void
   onTestAll: () => void
   onTestAllKeys: () => void
   onAdd: () => void
@@ -29,6 +31,7 @@ export default function ProviderToolbar({
   providerSearch,
   providerStatus,
   providerHealth,
+  providerCircuit,
   providerCount,
   filteredCount,
   testingAll,
@@ -37,6 +40,7 @@ export default function ProviderToolbar({
   onSearchChange,
   onStatusChange,
   onHealthChange,
+  onCircuitChange,
   onTestAll,
   onTestAllKeys,
   onAdd,
@@ -46,7 +50,7 @@ export default function ProviderToolbar({
       title="提供商"
       description="管理 OpenAI、Anthropic、Ollama 及任意兼容 API"
       extra={
-        <Space>
+        <>
           <Input
             allowClear
             prefix={<SearchOutlined />}
@@ -78,6 +82,17 @@ export default function ProviderToolbar({
               { value: 'key_untested', label: '密钥未检测' },
             ]}
           />
+          <Select
+            value={providerCircuit}
+            onChange={onCircuitChange}
+            style={{ width: 132 }}
+            options={[
+              { value: 'all', label: '全部熔断' },
+              { value: 'closed', label: '路由正常' },
+              { value: 'open', label: '已熔断' },
+              { value: 'half_open', label: '待探测' },
+            ]}
+          />
           <Tag>
             {filteredCount}/{providerCount}
           </Tag>
@@ -105,7 +120,7 @@ export default function ProviderToolbar({
           <Button type="primary" icon={<PlusOutlined />} onClick={onAdd}>
             添加提供商
           </Button>
-        </Space>
+        </>
       }
     />
   )

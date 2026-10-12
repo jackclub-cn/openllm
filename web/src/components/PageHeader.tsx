@@ -10,11 +10,15 @@ type Props = {
 export default function PageHeader({ title, description, extra }: Props) {
   return (
     <div className="page-header">
-      <div>
+      <div className="page-header-title">
         <Typography.Title level={3}>{title}</Typography.Title>
         <Typography.Text type="secondary">{description}</Typography.Text>
       </div>
-      {extra && <Space wrap>{extra}</Space>}
+      {extra && (
+        <div className="page-header-extra">
+          <Space wrap>{extra}</Space>
+        </div>
+      )}
     </div>
   )
 }

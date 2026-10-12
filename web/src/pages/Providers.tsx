@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router-dom'
 import {
   api,
   formatError,
+  type ClearCooldownsResult,
   type Provider,
   type ProviderApiKeyInput,
   type ProviderInput,
@@ -19,6 +20,7 @@ import ProviderTable from './providers/ProviderTable'
 import ProviderTemplateModal from './providers/ProviderTemplateModal'
 import ProviderToolbar from './providers/ProviderToolbar'
 import type {
+  ProviderCircuit,
   ProviderForm,
   ProviderHealth,
   ProviderStatus,
@@ -31,6 +33,7 @@ export default function Providers() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [togglingProviderId, setTogglingProviderId] = useState<number>()
+  const [resettingProviderId, setResettingProviderId] = useState<number>()
   const [testingAll, setTestingAll] = useState(false)
   const [testingAllKeys, setTestingAllKeys] = useState(false)
   const [testingProviderId, setTestingProviderId] = useState<number>()
@@ -47,6 +50,12 @@ export default function Providers() {
       health === 'key_error' ||
       health === 'key_untested'
       ? health
+      : 'all'
+  })
+  const [providerCircuit, setProviderCircuit] = useState<ProviderCircuit>(() => {
+    const circuit = searchParams.get('circuit')
+    return circuit === 'closed' || circuit === 'open' || circuit === 'half_open'
+      ? circuit
       : 'all'
   })
   const [providerPage, setProviderPage] = useState(1)
@@ -66,8 +75,9 @@ export default function Providers() {
     if (providerSearch.trim()) next.set('q', providerSearch.trim())
     if (providerStatus !== 'all') next.set('status', providerStatus)
     if (providerHealth !== 'all') next.set('health', providerHealth)
+    if (providerCircuit !== 'all') next.set('circuit', providerCircuit)
     setSearchParams(next, { replace: true })
-  }, [providerHealth, providerSearch, providerStatus, setSearchParams])
+  }, [providerCircuit, providerHealth, providerSearch, providerStatus, setSearchParams])
 
   const load = async () => {
     setLoading(true)
@@ -296,6 +306,21 @@ export default function Providers() {
     }
   }
 
+  const resetProviderCircuit = async (provider: Provider) => {
+    setResettingProviderId(provider.id)
+    try {
+      await api.post<ClearCooldownsResult>('/api/resilience/cooldowns/clear', {
+        provider_id: provider.id,
+      })
+      message.success(`已恢复 ${provider.name} 的路由`)
+      await load()
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setResettingProviderId(undefined)
+    }
+  }
+
   const filteredProviders = items.filter((provider) => {
     const query = providerSearch.trim().toLowerCase()
     if (query) {
@@ -316,6 +341,12 @@ export default function Providers() {
     }
     if (providerStatus === 'enabled' && !provider.enabled) return false
     if (providerStatus === 'disabled' && provider.enabled) return false
+    if (
+      providerCircuit !== 'all' &&
+      (provider.circuit_state ?? 'closed') !== providerCircuit
+    ) {
+      return false
+    }
     if (providerHealth === 'healthy' && provider.last_test_ok !== true) return false
     if (providerHealth === 'failed' && provider.last_test_ok !== false) return false
     if (providerHealth === 'untested' && provider.last_test_ok != null) return false
@@ -343,6 +374,7 @@ export default function Providers() {
         providerSearch={providerSearch}
         providerStatus={providerStatus}
         providerHealth={providerHealth}
+        providerCircuit={providerCircuit}
         providerCount={items.length}
         filteredCount={filteredProviders.length}
         testingAll={testingAll}
@@ -362,6 +394,10 @@ export default function Providers() {
           setProviderHealth(value)
           setProviderPage(1)
         }}
+        onCircuitChange={(value) => {
+          setProviderCircuit(value)
+          setProviderPage(1)
+        }}
         onTestAll={() => void testAll()}
         onTestAllKeys={() => void testAllKeys()}
         onAdd={() => openEditor()}
@@ -373,9 +409,11 @@ export default function Providers() {
         page={providerPage}
         togglingProviderId={togglingProviderId}
         testingProviderId={testingProviderId}
+        resettingProviderId={resettingProviderId}
         onPageChange={setProviderPage}
         onToggleEnabled={(provider, enabled) => void toggleEnabled(provider, enabled)}
         onTest={(id) => void test(id)}
+        onResetCircuit={(provider) => void resetProviderCircuit(provider)}
         onTestKeys={setKeyTestProvider}
         onOpenQuota={setQuotaProvider}
         onManageModels={setLimitProvider}

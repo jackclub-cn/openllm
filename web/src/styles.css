@@ -87,10 +87,26 @@ body {
 .page-header {
   min-height: 58px;
   display: flex;
+  flex-wrap: wrap;
   justify-content: space-between;
   align-items: flex-start;
   gap: 16px;
   margin-bottom: 20px;
+}
+
+.page-header-title {
+  flex: 1 1 240px;
+  min-width: 240px;
+}
+
+.page-header-extra {
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+}
+
+.page-header-extra .ant-space {
+  max-width: 100%;
 }
 
 .page-header h3 {
@@ -631,6 +647,21 @@ body {
 
   .page-header {
     flex-direction: column;
+  }
+
+  .page-header-title {
+    flex-basis: auto;
+    min-width: 0;
+  }
+
+  .page-header-extra {
+    width: 100%;
+    margin-left: 0;
+  }
+
+  .page-header-extra .ant-space {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .form-grid,

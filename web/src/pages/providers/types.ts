@@ -1,6 +1,7 @@
 import type { ProviderApiKeyInput, ProviderInput } from '../../api'
 
 export type ProviderStatus = 'all' | 'enabled' | 'disabled'
+export type ProviderCircuit = 'all' | 'closed' | 'open' | 'half_open'
 export type ProviderHealth =
   | 'all'
   | 'healthy'
