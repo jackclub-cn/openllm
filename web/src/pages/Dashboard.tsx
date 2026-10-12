@@ -10,6 +10,7 @@ import DashboardCharts, {
 import DashboardDetails from './dashboard/DashboardDetails'
 import DashboardMetrics from './dashboard/DashboardMetrics'
 import DashboardModelUsage from './dashboard/DashboardModelUsage'
+import DashboardRuntimeStatus from './dashboard/DashboardRuntimeStatus'
 import DashboardToolbar from './dashboard/DashboardToolbar'
 
 export default function Dashboard() {
@@ -73,6 +74,7 @@ export default function Dashboard() {
         onRefresh={() => void autoRefresh.manualRefresh()}
       />
       <DashboardMetrics data={data} />
+      <DashboardRuntimeStatus />
       <DashboardCharts
         data={data}
         metric={chartMetric}

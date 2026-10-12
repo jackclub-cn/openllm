@@ -668,6 +668,43 @@ export type ClearCooldownsResult = {
   cleared_provider_key_cooldowns: number
 }
 
+export type RuntimeStatus = {
+  version: string
+  uptime_seconds: number
+  draining: boolean
+  runtime_lag_millis: number
+  memory: {
+    limit_mib: number
+    used_mib?: number | null
+    used_ratio?: number | null
+    pressure: boolean
+    source: string
+    shed_total: number
+  }
+  admission: {
+    in_flight: number
+    max_concurrent_requests: number
+    in_flight_request_mib: number
+    max_inflight_request_mib: number
+    requests_shed_total: number
+    request_bytes_shed_total: number
+  }
+  database: {
+    connections: number
+    idle: number
+    max_connections: number
+  }
+  maintenance: {
+    runs_total: number
+    last_run_unix: number
+  }
+  circuits: {
+    open: number
+    half_open: number
+    threshold: number
+  }
+}
+
 export type ModelCapabilities = {
   context_limit?: number
   output_limit?: number
