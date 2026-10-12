@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { ReloadOutlined } from '@ant-design/icons'
+import { DownloadOutlined, ReloadOutlined } from '@ant-design/icons'
 import { App, Button, Card, Input, Select, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import dayjs from 'dayjs'
 import { api, formatError } from '../api'
@@ -59,6 +59,7 @@ export default function AuditLogsPage() {
   const [action, setAction] = useState<string>()
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
+  const [exporting, setExporting] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -84,15 +85,46 @@ export default function AuditLogsPage() {
     void load()
   }, [page, pageSize, entity, action, search])
 
+  const exportCsv = async () => {
+    setExporting(true)
+    try {
+      const params = new URLSearchParams()
+      if (entity) params.set('entity', entity)
+      if (action) params.set('action', action)
+      if (search.trim()) params.set('search', search.trim())
+      const blob = await api.download(`/api/audit-logs/export?${params.toString()}`)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `openllm-audit-logs-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
+      link.click()
+      URL.revokeObjectURL(url)
+      message.success('CSV 已导出')
+    } catch (error) {
+      message.error(formatError(error))
+    } finally {
+      setExporting(false)
+    }
+  }
+
   return (
     <>
       <PageHeader
         title="审计日志"
         description="配置变更历史，记录每次创建、更新、删除和操作"
         extra={
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
-            刷新
-          </Button>
+          <Space>
+            <Button
+              icon={<DownloadOutlined />}
+              loading={exporting}
+              onClick={() => void exportCsv()}
+            >
+              导出
+            </Button>
+            <Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>
+              刷新
+            </Button>
+          </Space>
         }
       />
       <Card bordered={false}>

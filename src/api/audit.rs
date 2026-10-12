@@ -115,6 +115,92 @@ pub async fn list_audit_logs(
     }))
 }
 
+/// Largest number of audit rows returned by one export.
+///
+/// The table is pruned to `AUDIT_HISTORY_LIMIT` rows after every write, so this
+/// still returns the entire retained trail; the truncation header is kept for
+/// safety in case that retention ever grows past this cap.
+const AUDIT_EXPORT_LIMIT: i64 = AUDIT_HISTORY_LIMIT;
+
+/// Streams the retained audit trail as CSV so an operator can archive it or
+/// pull it into a spreadsheet for review.
+///
+/// It reuses the same filters as the paged listing (`entity`, `action`,
+/// `search`) so what you see in the console is what you export.
+pub async fn export_audit_logs(
+    State(state): State<AppState>,
+    Query(query): Query<AuditLogQuery>,
+) -> AppResult<Response> {
+    let entity = query
+        .entity
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let action = query
+        .action
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let search = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", value.replace('%', "\\%").replace('_', "\\_")));
+
+    let mut items = QueryBuilder::<Sqlite>::new(
+        "SELECT id, created_at, action, entity, entity_id, summary, detail, actor \
+         FROM audit_logs WHERE 1 = 1",
+    );
+    apply_audit_filters(&mut items, entity, action, search.as_deref());
+    items
+        .push(" ORDER BY id DESC LIMIT ")
+        .push_bind(AUDIT_EXPORT_LIMIT);
+    let rows = items
+        .build_query_as::<AuditLog>()
+        .fetch_all(&state.pool)
+        .await?;
+    let truncated = rows.len() as i64 == AUDIT_EXPORT_LIMIT;
+
+    let mut csv = String::from(
+        "\u{feff}created_at,id,action,entity,entity_id,actor,summary,detail\r\n",
+    );
+    for row in rows {
+        let fields = [
+            row.created_at,
+            row.id.to_string(),
+            row.action,
+            row.entity,
+            row.entity_id.unwrap_or_default(),
+            row.actor,
+            row.summary,
+            row.detail.unwrap_or_default(),
+        ];
+        csv.push_str(
+            &fields
+                .into_iter()
+                .map(|value| csv_field(&value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        csv.push_str("\r\n");
+    }
+
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/csv; charset=utf-8")
+        .header(
+            header::CONTENT_DISPOSITION,
+            "attachment; filename=\"openllm-audit-logs.csv\"",
+        );
+    if truncated {
+        response = response.header("x-openllm-export-truncated", "true");
+    }
+    Ok(response
+        .body(Body::from(csv))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
 fn apply_audit_filters(
     query: &mut QueryBuilder<'_, Sqlite>,
     entity: Option<&str>,

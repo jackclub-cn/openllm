@@ -2110,6 +2110,33 @@ async fn audit_log_records_mutations_and_supports_filters() {
     .unwrap();
     assert_eq!(page.total, 1);
 
+    // The CSV export honours the same filters and carries a header row.
+    let response = export_audit_logs(
+        State(state.clone()),
+        Query(AuditLogQuery {
+            page: None,
+            page_size: None,
+            entity: Some("route".to_string()),
+            action: None,
+            search: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[header::CONTENT_TYPE],
+        "text/csv; charset=utf-8"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let csv = String::from_utf8(body.to_vec()).unwrap();
+    assert!(csv.starts_with('\u{feff}'));
+    assert!(csv.contains("created_at,id,action,entity,entity_id,actor,summary,detail"));
+    assert!(csv.contains("created route 'Audited route'"));
+    assert!(!csv.contains("provider"), "the filter must exclude other entities");
+
     let Json(page) = list_audit_logs(
         State(state),
         Query(AuditLogQuery {

@@ -29,7 +29,7 @@ use crate::api::{
     admin_auth, backup_database, cleanup_usage, clear_cooldowns, create_api_key, create_provider,
     create_route,
     create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
-    event_stream, export_usage, get_guardrails_settings, get_inspector_settings,
+    event_stream, export_audit_logs, export_usage, get_guardrails_settings, get_inspector_settings,
     get_resilience_settings, get_runtime_settings, get_settings, get_status, get_usage_detail, health,
     list_api_keys, list_audit_logs, list_cooldowns, list_model_inventory, list_models,
     list_provider_model_limits,
@@ -253,6 +253,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/status", get(get_status))
         .route("/overview", get(overview))
         .route("/audit-logs", get(list_audit_logs))
+        .route("/audit-logs/export", get(export_audit_logs))
         .route("/database/backup", get(backup_database))
         .route("/database/vacuum", post(vacuum_database))
         .route("/maintenance/run", post(run_maintenance))
