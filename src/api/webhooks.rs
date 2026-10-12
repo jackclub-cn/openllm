@@ -35,7 +35,7 @@ fn validate_webhook_url(raw: &str) -> AppResult<String> {
 fn normalize_event_types(values: Option<Vec<String>>) -> AppResult<(Vec<String>, String)> {
     let mut event_types = Vec::new();
     for value in values.unwrap_or_else(|| {
-        WEBHOOK_EVENT_TYPES
+        WEBHOOK_DEFAULT_EVENT_TYPES
             .iter()
             .map(|value| (*value).to_string())
             .collect()

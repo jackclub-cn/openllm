@@ -1103,7 +1103,9 @@ pub(super) async fn mark_provider_error(
         *failures
     };
     let threshold = provider_open_threshold();
-    if threshold > 0 && failures >= threshold && (failures - 1 < threshold || probe_was_in_flight) {
+    let opened =
+        threshold > 0 && failures >= threshold && (failures - 1 < threshold || probe_was_in_flight);
+    if opened {
         *state
             .provider_circuit_trips
             .lock()
@@ -1116,11 +1118,24 @@ pub(super) async fn mark_provider_error(
             "provider circuit opened after repeated failures; short-circuiting until it recovers"
         );
     }
+    let cooldown = provider_cooldown(status, failures, retry_after, configured_cooldown_seconds);
     state.provider_cooldown.lock().await.insert(
         provider_id,
-        Instant::now()
-            + provider_cooldown(status, failures, retry_after, configured_cooldown_seconds),
+        Instant::now() + cooldown,
     );
+    if opened {
+        let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
+            provider_id,
+            state: "open",
+            reason: if probe_was_in_flight {
+                "probe_failed"
+            } else {
+                "failure_threshold"
+            },
+            failure_streak: failures,
+            cooldown_seconds: cooldown.as_secs(),
+        });
+    }
 }
 
 pub(super) async fn mark_target_error(
@@ -1261,6 +1276,13 @@ pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
             provider_id,
             "provider circuit closed after a successful request"
         );
+        let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
+            provider_id,
+            state: "closed",
+            reason: "successful_request",
+            failure_streak: 0,
+            cooldown_seconds: 0,
+        });
     }
 }
 

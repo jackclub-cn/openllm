@@ -8996,6 +8996,7 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
 #[tokio::test]
 async fn provider_circuit_trip_counter_registers_hard_opens() {
     let state = virtual_auto_state().await;
+    let mut circuit_events = state.circuit_events.subscribe();
     let failure = StatusCode::SERVICE_UNAVAILABLE;
 
     // Two failures sit below the default threshold of three.
@@ -9027,6 +9028,14 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         1,
         "crossing the threshold must register a trip"
     );
+    let opened = circuit_events
+        .try_recv()
+        .expect("crossing the threshold must publish a circuit event");
+    assert_eq!(opened.provider_id, 1);
+    assert_eq!(opened.state, "open");
+    assert_eq!(opened.reason, "failure_threshold");
+    assert_eq!(opened.failure_streak, 3);
+    assert!(opened.cooldown_seconds > 0);
 
     // A further failure on the already-open circuit is not a new trip.
     mark_provider_error(&state, 1, Some(failure), None, None).await;
@@ -9044,6 +9053,13 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
 
     // Recovery resets the streak, so a fresh streak trips the circuit again.
     mark_provider_success(&state, 1).await;
+    let closed = circuit_events
+        .try_recv()
+        .expect("recovery must publish a circuit event");
+    assert_eq!(closed.provider_id, 1);
+    assert_eq!(closed.state, "closed");
+    assert_eq!(closed.reason, "successful_request");
+    assert_eq!(closed.failure_streak, 0);
     for _ in 0..3 {
         mark_provider_error(&state, 1, Some(failure), None, None).await;
     }
@@ -9058,6 +9074,14 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         2,
         "a fresh streak after recovery trips the circuit again"
     );
+    assert_eq!(
+        circuit_events
+            .try_recv()
+            .expect("the fresh streak must publish another event")
+            .state,
+        "open"
+    );
+    assert!(circuit_events.try_recv().is_err());
 }
 
 /// A hard-open provider with no healthy alternative must fail fast with a 503

@@ -1,7 +1,14 @@
 use super::*;
 
+/// Event types selected when a webhook does not specify any.
+pub const WEBHOOK_DEFAULT_EVENT_TYPES: [&str; 2] = ["request.completed", "request.failed"];
 /// Event types a webhook can subscribe to.
-pub const WEBHOOK_EVENT_TYPES: [&str; 2] = ["request.completed", "request.failed"];
+pub const WEBHOOK_EVENT_TYPES: [&str; 4] = [
+    "request.completed",
+    "request.failed",
+    "provider.circuit_open",
+    "provider.circuit_closed",
+];
 
 #[derive(Debug, Clone, FromRow)]
 pub struct Webhook {

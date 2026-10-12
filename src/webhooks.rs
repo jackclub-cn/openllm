@@ -16,7 +16,7 @@ use sqlx::Row;
 use tokio::sync::Semaphore;
 
 use crate::models::Webhook;
-use crate::state::{AppState, UsageEvent};
+use crate::state::{AppState, ProviderCircuitEvent, UsageEvent};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -54,24 +54,47 @@ impl DeliveryOutcome {
 /// sender. Delivery is therefore best-effort: the dispatcher logs lag and keeps
 /// going, while each completed attempt is still visible in delivery history.
 pub async fn run_dispatcher(state: AppState) {
-    let mut receiver = state.events.subscribe();
+    let mut usage_receiver = state.events.subscribe();
+    let mut circuit_receiver = state.circuit_events.subscribe();
     let event_slots = Arc::new(Semaphore::new(MAX_CONCURRENT_EVENT_DELIVERIES));
     loop {
-        match receiver.recv().await {
-            Ok(event) => {
-                let Ok(permit) = event_slots.clone().acquire_owned().await else {
-                    break;
-                };
-                let state = state.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    deliver_usage_event(&state, event).await;
-                });
+        tokio::select! {
+            event = usage_receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        let Ok(permit) = event_slots.clone().acquire_owned().await else {
+                            break;
+                        };
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            deliver_usage_event(&state, event).await;
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "webhook dispatcher lagged behind usage events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                tracing::warn!(skipped, "webhook dispatcher lagged behind usage events");
+            event = circuit_receiver.recv() => {
+                match event {
+                    Ok(event) => {
+                        let Ok(permit) = event_slots.clone().acquire_owned().await else {
+                            break;
+                        };
+                        let state = state.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            deliver_circuit_event(&state, event).await;
+                        });
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(skipped, "webhook dispatcher lagged behind circuit events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
@@ -108,6 +131,46 @@ pub(crate) async fn deliver_usage_event(state: &AppState, event: UsageEvent) {
             async move {
                 let outcome = deliver(&state, &webhook, &event_type, &data).await;
                 record_delivery(&state, &webhook, &event_type, Some(&request_id), &outcome).await;
+            }
+        });
+    futures_util::future::join_all(deliveries).await;
+}
+
+/// Delivers one provider circuit transition to every subscribed webhook.
+pub(crate) async fn deliver_circuit_event(state: &AppState, event: ProviderCircuitEvent) {
+    let event_type = match event.state {
+        "open" => "provider.circuit_open",
+        "closed" => "provider.circuit_closed",
+        _ => return,
+    };
+    let data = match circuit_payload(state, &event).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                provider_id = event.provider_id,
+                "failed to build circuit webhook payload"
+            );
+            return;
+        }
+    };
+    let webhooks = match enabled_webhooks(state).await {
+        Ok(webhooks) => webhooks,
+        Err(error) => {
+            tracing::warn!(%error, "failed to load webhooks");
+            return;
+        }
+    };
+    let deliveries = webhooks
+        .into_iter()
+        .filter(|webhook| webhook.subscribes_to(event_type))
+        .map(|webhook| {
+            let state = state.clone();
+            let event_type = event_type.to_string();
+            let data = data.clone();
+            async move {
+                let outcome = deliver(&state, &webhook, &event_type, &data).await;
+                record_delivery(&state, &webhook, &event_type, None, &outcome).await;
             }
         });
     futures_util::future::join_all(deliveries).await;
@@ -166,6 +229,25 @@ async fn usage_payload(state: &AppState, event: &UsageEvent) -> Result<Value, sq
         "warning_message": row.get::<Option<String>, _>("warning_message"),
         "created_at": row.get::<String, _>("created_at"),
         "event_id": event.id,
+    }))
+}
+
+async fn circuit_payload(
+    state: &AppState,
+    event: &ProviderCircuitEvent,
+) -> Result<Value, sqlx::Error> {
+    let provider_name = sqlx::query_scalar::<_, String>("SELECT name FROM providers WHERE id = ?")
+        .bind(event.provider_id)
+        .fetch_optional(&state.pool)
+        .await?;
+    Ok(json!({
+        "provider_id": event.provider_id,
+        "provider_name": provider_name,
+        "state": event.state,
+        "reason": event.reason,
+        "failure_streak": event.failure_streak,
+        "cooldown_seconds": event.cooldown_seconds,
+        "threshold": crate::state::provider_open_threshold(),
     }))
 }
 

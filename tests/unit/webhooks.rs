@@ -38,6 +38,11 @@ fn webhook_event_types_are_validated_and_stored_as_json() {
     // An unknown event would silently never fire, so it is rejected instead.
     assert!(normalize_event_types(Some(vec!["request.exploded".to_string()])).is_err());
     assert!(normalize_event_types(Some(Vec::new())).is_err());
+
+    // Circuit events are opt-in and do not silently expand the default set.
+    let (events, _) =
+        normalize_event_types(Some(vec!["provider.circuit_open".to_string()])).unwrap();
+    assert_eq!(events, vec!["provider.circuit_open"]);
 }
 
 #[test]
@@ -88,6 +93,8 @@ fn webhook_event_subscription_matching() {
     };
     assert!(corrupted.subscribes_to("request.completed"));
     assert!(corrupted.subscribes_to("request.failed"));
+    assert!(corrupted.subscribes_to("provider.circuit_open"));
+    assert!(corrupted.subscribes_to("provider.circuit_closed"));
 }
 
 #[test]
@@ -393,6 +400,121 @@ async fn usage_event_is_delivered_signed_and_recorded() {
     assert_eq!(status, Some(200), "{error:?}");
     assert_eq!(attempts, 1);
     assert_eq!(error, None);
+}
+
+#[tokio::test]
+async fn provider_circuit_event_is_delivered_and_recorded() {
+    let state = webhook_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (url, mut receiver, server) = spawn_receiver(200).await;
+    sqlx::query(
+        "INSERT INTO webhooks (id, name, url, secret, event_types, enabled)
+         VALUES (1, 'circuit alerts', ?, '', '[\"provider.circuit_open\"]', 1)",
+    )
+    .bind(&url)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    crate::webhooks::deliver_circuit_event(
+        &state,
+        crate::state::ProviderCircuitEvent {
+            provider_id: 1,
+            state: "open",
+            reason: "failure_threshold",
+            failure_streak: 3,
+            cooldown_seconds: 60,
+        },
+    )
+    .await;
+
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("circuit webhook delivery timed out")
+        .expect("webhook receiver closed before receiving a request");
+    server.abort();
+
+    assert_eq!(captured.event, "provider.circuit_open");
+    let payload: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+    assert_eq!(payload["event"], "provider.circuit_open");
+    assert_eq!(payload["webhook_id"], 1);
+    assert_eq!(payload["data"]["provider_id"], 1);
+    assert_eq!(payload["data"]["provider_name"], "alpha");
+    assert_eq!(payload["data"]["state"], "open");
+    assert_eq!(payload["data"]["reason"], "failure_threshold");
+    assert_eq!(payload["data"]["failure_streak"], 3);
+    assert_eq!(payload["data"]["cooldown_seconds"], 60);
+
+    let (request_id, status): (Option<String>, Option<i64>) = sqlx::query_as(
+        "SELECT request_id, status_code FROM webhook_deliveries
+         WHERE webhook_id = 1 ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(request_id, None);
+    assert_eq!(status, Some(200));
+}
+
+#[tokio::test]
+async fn dispatcher_delivers_provider_circuit_events() {
+    let state = webhook_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let (url, mut receiver, server) = spawn_receiver(200).await;
+    sqlx::query(
+        "INSERT INTO webhooks (id, name, url, secret, event_types, enabled)
+         VALUES (1, 'circuit alerts', ?, '', '[\"provider.circuit_closed\"]', 1)",
+    )
+    .bind(&url)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let dispatcher = tokio::spawn(crate::webhooks::run_dispatcher(state.clone()));
+    for _ in 0..50 {
+        if state.circuit_events.receiver_count() > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        state.circuit_events.receiver_count() > 0,
+        "webhook dispatcher did not subscribe to circuit events"
+    );
+    state
+        .circuit_events
+        .send(crate::state::ProviderCircuitEvent {
+            provider_id: 1,
+            state: "closed",
+            reason: "successful_request",
+            failure_streak: 0,
+            cooldown_seconds: 0,
+        })
+        .unwrap();
+
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("dispatcher circuit webhook timed out")
+        .expect("webhook receiver closed before receiving a request");
+    server.abort();
+    dispatcher.abort();
+
+    assert_eq!(captured.event, "provider.circuit_closed");
+    let payload: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+    assert_eq!(payload["data"]["provider_name"], "alpha");
+    assert_eq!(payload["data"]["state"], "closed");
 }
 
 #[tokio::test]

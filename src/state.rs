@@ -103,6 +103,8 @@ pub struct AppState {
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
     pub started_unix: i64,
     pub events: broadcast::Sender<UsageEvent>,
+    /// Provider circuit transitions, consumed by the webhook dispatcher.
+    pub circuit_events: broadcast::Sender<ProviderCircuitEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
     pub auth_required: Arc<RwLock<Option<bool>>>,
@@ -487,6 +489,16 @@ pub struct UsageEvent {
     pub streamed: bool,
 }
 
+/// One provider circuit transition, delivered to subscribed webhooks.
+#[derive(Debug, Clone)]
+pub struct ProviderCircuitEvent {
+    pub provider_id: i64,
+    pub state: &'static str,
+    pub reason: &'static str,
+    pub failure_streak: u32,
+    pub cooldown_seconds: u64,
+}
+
 /// Opt-in global budget on the total bytes of in-flight request bodies.
 ///
 /// The gateway buffers each request body in memory, so the number of requests
@@ -838,6 +850,7 @@ impl AppState {
             .expect("failed to build HTTP client");
 
         let (events, _) = broadcast::channel(128);
+        let (circuit_events, _) = broadcast::channel(128);
         let request_capacity_limit = parse_concurrency_limit(
             std::env::var("OPENLLM_MAX_CONCURRENT_REQUESTS")
                 .ok()
@@ -917,6 +930,7 @@ impl AppState {
                 .map(|elapsed| elapsed.as_secs() as i64)
                 .unwrap_or(0),
             events,
+            circuit_events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),
             inspector: Arc::new(RwLock::new(None)),

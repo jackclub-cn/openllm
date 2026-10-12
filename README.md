@@ -156,6 +156,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 - `request.completed`：请求成功完成，身份、路由、提供商、Token、费用、延迟和状态码等字段会写入 `data`。
 - `request.failed`：请求最终失败，`data.error_message` 和 `data.status_code` 可用于告警。
+- `provider.circuit_open`：提供商连续失败达到熔断阈值，或半开探测再次失败时触发；`data.reason` 为 `failure_threshold` 或 `probe_failed`，同时包含提供商、连续失败次数、冷却秒数和阈值。
+- `provider.circuit_closed`：提供商通过成功请求或健康检查恢复、熔断关闭时触发；`data.reason` 为 `successful_request`，此时 `data.failure_streak` 为 `0`。
 
 投递请求为 JSON `POST`，包含以下头：
 
