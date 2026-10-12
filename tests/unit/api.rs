@@ -178,6 +178,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     );
     assert!(body.contains("openllm_provider_models{provider=\"Healthy provider\"} 1"));
     assert!(body.contains("openllm_provider_models_disabled{provider=\"Healthy provider\"} 1"));
+    assert!(body.contains(
+        "openllm_provider_circuit_state{provider=\"Healthy provider\",state=\"closed\"} 1"
+    ));
+    assert!(body.contains("openllm_provider_failure_streak{provider=\"Healthy provider\"} 0"));
     assert!(
         body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3")
     );
@@ -214,6 +218,8 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("openllm_audit_logs 0"));
     assert!(body.contains("openllm_database_size_bytes"));
     assert!(body.contains("# TYPE openllm_provider_cooling gauge"));
+    assert!(body.contains("# TYPE openllm_provider_circuit_state gauge"));
+    assert!(body.contains("# TYPE openllm_provider_failure_streak gauge"));
     assert!(body.contains("# TYPE openllm_provider_requests_total counter"));
     assert!(body.contains("# TYPE openllm_provider_average_latency_ms gauge"));
     assert_every_metric_family_declares_a_type(&body);
@@ -1579,6 +1585,7 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
     );
     assert_eq!(snapshot.provider_cooldowns[0].failure_streak, 3);
     assert_eq!(snapshot.provider_cooldowns[0].remaining_seconds, 60);
+    assert_eq!(snapshot.provider_cooldowns[0].state, "open");
     assert_eq!(snapshot.model_cooldowns.len(), 2);
     assert_eq!(snapshot.provider_key_cooldowns.len(), 1);
     assert_eq!(
@@ -1661,6 +1668,43 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
     assert!(snapshot.model_cooldowns.is_empty());
     assert!(snapshot.provider_cooldowns.is_empty());
     assert!(snapshot.provider_key_cooldowns.is_empty());
+}
+
+/// A provider whose cooldown elapsed but whose failure streak still trips the
+/// breaker is half-open: no active cooldown, yet it must not be invisible to an
+/// operator wondering why it keeps failing fast.
+#[tokio::test]
+async fn cooldown_snapshot_surfaces_half_open_circuits() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    let now = std::time::Instant::now();
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, now - std::time::Duration::from_secs(5));
+
+    let Json(snapshot) = list_cooldowns(State(state)).await.unwrap();
+    assert_eq!(snapshot.provider_cooldowns.len(), 1);
+    assert_eq!(snapshot.provider_cooldowns[0].state, "half_open");
+    assert_eq!(snapshot.provider_cooldowns[0].remaining_seconds, 0);
+    assert_eq!(
+        snapshot.provider_open_threshold,
+        crate::state::provider_open_threshold()
+    );
 }
 
 #[tokio::test]

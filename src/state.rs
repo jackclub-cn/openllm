@@ -454,6 +454,23 @@ pub(crate) fn parse_provider_open_threshold(value: Option<&str>) -> u32 {
     }
 }
 
+/// Derives a provider's circuit-breaker state from its failure streak and
+/// whether a cooldown is currently active.
+///
+/// Matches `admit_provider_attempt`: below the threshold the circuit is closed
+/// (the cooldown only deprioritises the provider), at or above it the provider
+/// is `open` while cooling and `half_open` once the cooldown has elapsed and a
+/// recovery probe is allowed.
+pub(crate) fn provider_circuit_state(streak: u32, cooling: bool, threshold: u32) -> &'static str {
+    if threshold == 0 || streak < threshold {
+        "closed"
+    } else if cooling {
+        "open"
+    } else {
+        "half_open"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct UsageEvent {
     pub id: i64,

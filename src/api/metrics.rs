@@ -215,6 +215,8 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .map(|(provider_id, _)| *provider_id)
             .collect::<HashSet<_>>()
     };
+    let failure_streaks = state.provider_failure_streak.lock().await.clone();
+    let provider_open_threshold = crate::state::provider_open_threshold();
     let concurrency_available = {
         let semaphores = state.provider_concurrency.lock().await;
         semaphores
@@ -623,6 +625,16 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_provider_circuit_state",
+        "Per-provider circuit breaker state as a one-hot label (closed, open, half_open)",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_failure_streak",
+        "Consecutive provider failures counted by the circuit breaker",
+    );
+    metric_header(
+        &mut body,
         "openllm_provider_models",
         "Enabled upstream models per provider",
     );
@@ -690,6 +702,24 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             "openllm_provider_cooling",
             &label,
             cooling.contains(&provider.id) as u8,
+        );
+        let streak = failure_streaks.get(&provider.id).copied().unwrap_or(0);
+        let circuit_state = crate::state::provider_circuit_state(
+            streak,
+            cooling.contains(&provider.id),
+            provider_open_threshold,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_circuit_state",
+            &[("provider", &provider.name), ("state", circuit_state)],
+            1,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_failure_streak",
+            &label,
+            streak,
         );
         push_metric(
             &mut body,

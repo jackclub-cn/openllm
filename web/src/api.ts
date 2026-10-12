@@ -626,6 +626,7 @@ export type ProviderCooldown = {
   provider_name?: string | null
   remaining_seconds: number
   failure_streak: number
+  state: 'closed' | 'open' | 'half_open'
 }
 
 export type ModelCooldown = {
@@ -646,6 +647,7 @@ export type CooldownSnapshot = {
   provider_cooldowns: ProviderCooldown[]
   model_cooldowns: ModelCooldown[]
   provider_key_cooldowns: ProviderKeyCooldown[]
+  provider_open_threshold: number
   generated_at: string
 }
 

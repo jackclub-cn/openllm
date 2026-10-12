@@ -13,6 +13,9 @@ pub struct CooldownSnapshot {
     pub provider_cooldowns: Vec<ProviderCooldownView>,
     pub model_cooldowns: Vec<ModelCooldownView>,
     pub provider_key_cooldowns: Vec<ProviderKeyCooldownView>,
+    /// Consecutive failures that hard-open a provider's circuit; `0` keeps the
+    /// soft cooldown only.
+    pub provider_open_threshold: u32,
     pub generated_at: String,
 }
 
@@ -21,9 +24,12 @@ pub struct ProviderCooldownView {
     pub provider_id: i64,
     pub provider_name: Option<String>,
     /// Whole seconds left before the provider re-enters routing (minimum 1).
+    /// `0` means the cooldown has elapsed and the provider is half-open.
     pub remaining_seconds: i64,
     /// Consecutive failures that produced the current escalated cooldown.
     pub failure_streak: u32,
+    /// Circuit breaker state: `open`, `half_open`, or `closed`.
+    pub state: &'static str,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -209,14 +215,33 @@ async fn clear_provider_scope(
 async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSnapshot> {
     let now = std::time::Instant::now();
 
+    let threshold = crate::state::provider_open_threshold();
+    let failure_streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = {
         let mut cooldowns = state.provider_cooldown.lock().await;
         cooldowns.retain(|_, until| *until > now);
         let mut entries = cooldowns
             .iter()
-            .map(|(provider_id, until)| (*provider_id, remaining_seconds(*until, now)))
+            .map(|(provider_id, until)| {
+                let streak = failure_streaks.get(provider_id).copied().unwrap_or(0);
+                (
+                    *provider_id,
+                    remaining_seconds(*until, now),
+                    crate::state::provider_circuit_state(streak, true, threshold),
+                )
+            })
             .collect::<Vec<_>>();
-        entries.sort_by_key(|(provider_id, _)| *provider_id);
+        // A half-open provider has no active cooldown left but is still
+        // short-circuited, so surface it too, or an operator cannot see why it
+        // keeps failing fast.
+        for (provider_id, streak) in &failure_streaks {
+            if !cooldowns.contains_key(provider_id)
+                && crate::state::provider_circuit_state(*streak, false, threshold) == "half_open"
+            {
+                entries.push((*provider_id, 0, "half_open"));
+            }
+        }
+        entries.sort_by_key(|(provider_id, _, _)| *provider_id);
         entries
     };
     let model_cooldowns = {
@@ -241,20 +266,21 @@ async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSnapshot> {
         entries.sort_by_key(|(key_id, _)| *key_id);
         entries
     };
-    let failure_streaks = state.provider_failure_streak.lock().await.clone();
-
     let provider_names = provider_name_map(state).await?;
     let key_names = provider_key_name_map(state).await?;
 
     Ok(CooldownSnapshot {
         provider_cooldowns: provider_cooldowns
             .into_iter()
-            .map(|(provider_id, remaining_seconds)| ProviderCooldownView {
-                provider_name: provider_names.get(&provider_id).cloned(),
-                failure_streak: failure_streaks.get(&provider_id).copied().unwrap_or(0),
-                provider_id,
-                remaining_seconds,
-            })
+            .map(
+                |(provider_id, remaining_seconds, state)| ProviderCooldownView {
+                    provider_name: provider_names.get(&provider_id).cloned(),
+                    failure_streak: failure_streaks.get(&provider_id).copied().unwrap_or(0),
+                    provider_id,
+                    remaining_seconds,
+                    state,
+                },
+            )
             .collect(),
         model_cooldowns: model_cooldowns
             .into_iter()
@@ -282,6 +308,7 @@ async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSnapshot> {
                 }
             })
             .collect(),
+        provider_open_threshold: threshold,
         generated_at: Utc::now().to_rfc3339(),
     })
 }

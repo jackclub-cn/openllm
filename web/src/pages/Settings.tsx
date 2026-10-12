@@ -142,6 +142,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
     target: string
     detail: string
     remaining: number
+    circuit?: 'closed' | 'open' | 'half_open'
     clear: Record<string, unknown>
   }
   const cooldownRows: CooldownRow[] = [
@@ -149,8 +150,14 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       key: `provider-${item.provider_id}`,
       scope: '提供商',
       target: item.provider_name ?? `#${item.provider_id}`,
-      detail: item.failure_streak ? `连续失败 ${item.failure_streak} 次` : '',
+      detail: [
+        item.failure_streak ? `连续失败 ${item.failure_streak} 次` : '',
+        item.state === 'open' ? '已熔断' : item.state === 'half_open' ? '探测恢复中' : '',
+      ]
+        .filter(Boolean)
+        .join(' · '),
       remaining: item.remaining_seconds,
+      circuit: item.state,
       clear: { provider_id: item.provider_id },
     })),
     ...(cooldowns?.model_cooldowns ?? []).map((item) => ({
@@ -707,7 +714,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
         }
       >
         <Typography.Paragraph type="secondary">
-          冷却只存在于当前进程内，处于冷却的提供商、模型或上游密钥会暂时退出路由。上游已经恢复时可以在这里提前解除。
+          冷却与熔断只存在于当前进程内，处于冷却的提供商、模型或上游密钥会暂时退出路由；连续失败达到熔断阈值的提供商会直接短路，冷却结束后只放行一个探测请求验证恢复。上游已经恢复时可以在这里提前解除。
         </Typography.Paragraph>
         <Table
           rowKey="key"
@@ -715,7 +722,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
           loading={loadingCooldowns}
           dataSource={cooldownRows}
           pagination={false}
-          locale={{ emptyText: '当前没有冷却中的目标' }}
+          locale={{ emptyText: '当前没有冷却或熔断中的目标' }}
           columns={[
             {
               title: '范围',
@@ -738,7 +745,8 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
               title: '剩余',
               dataIndex: 'remaining',
               width: 100,
-              render: (value: number) => `${value}s`,
+              render: (value: number, record: CooldownRow) =>
+                record.circuit === 'half_open' ? '待探测' : `${value}s`,
             },
             {
               title: '操作',
