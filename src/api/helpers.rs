@@ -551,15 +551,24 @@ pub(super) async fn hydrate_provider_view(
         .map(Into::into)
         .collect();
     let now = std::time::Instant::now();
-    view.cooldown_seconds = state
-        .provider_cooldown
+    let open_until = state.provider_cooldown.lock().await.get(&view.id).copied();
+    let cooling = open_until.is_some_and(|until| until > now);
+    view.cooldown_seconds = open_until.and_then(|until| {
+        let remaining = until.saturating_duration_since(now);
+        (!remaining.is_zero()).then(|| (remaining.as_secs_f64().ceil() as i64).max(1))
+    });
+    let streak = state
+        .provider_failure_streak
         .lock()
         .await
         .get(&view.id)
-        .and_then(|until| {
-            let remaining = until.saturating_duration_since(now);
-            (!remaining.is_zero()).then(|| (remaining.as_secs_f64().ceil() as i64).max(1))
-        });
+        .copied()
+        .unwrap_or(0);
+    view.circuit_state = crate::state::provider_circuit_state(
+        streak,
+        cooling,
+        crate::state::provider_open_threshold(),
+    );
     let cooldowns = state.provider_key_cooldown.lock().await;
     for key in &mut view.api_keys {
         if let Some(until) = cooldowns.get(&key.id) {
@@ -613,15 +622,24 @@ pub(super) async fn hydrate_provider_views(
     }
 
     let now = std::time::Instant::now();
+    let threshold = crate::state::provider_open_threshold();
+    let failure_streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = state.provider_cooldown.lock().await;
     let cooldowns = state.provider_key_cooldown.lock().await;
     for view in views {
         view.models = models_by_provider.remove(&view.id).unwrap_or_default();
         view.api_keys = keys_by_provider.remove(&view.id).unwrap_or_default();
-        view.cooldown_seconds = provider_cooldowns.get(&view.id).and_then(|until| {
+        let until = provider_cooldowns.get(&view.id).copied();
+        let cooling = until.is_some_and(|until| until > now);
+        view.cooldown_seconds = until.and_then(|until| {
             let remaining = until.saturating_duration_since(now);
             (!remaining.is_zero()).then(|| (remaining.as_secs_f64().ceil() as i64).max(1))
         });
+        view.circuit_state = crate::state::provider_circuit_state(
+            failure_streaks.get(&view.id).copied().unwrap_or(0),
+            cooling,
+            threshold,
+        );
         for key in &mut view.api_keys {
             if let Some(until) = cooldowns.get(&key.id) {
                 let remaining = until.saturating_duration_since(now);

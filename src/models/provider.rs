@@ -95,6 +95,9 @@ pub struct ProviderView {
     pub health_check_interval_minutes: Option<i64>,
     pub health_check_model: Option<String>,
     pub cooldown_seconds: Option<i64>,
+    /// Circuit breaker state derived from the runtime failure streak and
+    /// cooldown: `closed`, `open`, or `half_open`.
+    pub circuit_state: &'static str,
     pub configured_cooldown_seconds: Option<i64>,
     pub timeout_seconds: Option<i64>,
     pub max_concurrency: Option<i64>,
@@ -572,6 +575,7 @@ impl From<Provider> for ProviderView {
             health_check_interval_minutes: value.health_check_interval_minutes,
             health_check_model: value.health_check_model,
             cooldown_seconds: None,
+            circuit_state: "closed",
             configured_cooldown_seconds: value.cooldown_seconds,
             timeout_seconds: value.timeout_seconds,
             max_concurrency: value.max_concurrency,

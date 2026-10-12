@@ -1709,6 +1709,59 @@ async fn cooldown_snapshot_surfaces_half_open_circuits() {
     );
 }
 
+/// The provider list and detail views must surface the circuit breaker state so
+/// the console can show why a provider is short-circuited, not just that its
+/// cooldown has some seconds left.
+#[tokio::test]
+async fn provider_views_expose_the_circuit_state() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+
+    let Json(providers) = list_providers(State(state.clone())).await.unwrap();
+    assert_eq!(providers[0].circuit_state, "closed");
+
+    let threshold = crate::state::provider_open_threshold();
+    if threshold > 0 {
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .insert(1, threshold);
+        state.provider_cooldown.lock().await.insert(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+        let Json(providers) = list_providers(State(state.clone())).await.unwrap();
+        assert_eq!(providers[0].circuit_state, "open");
+        assert_eq!(providers[0].cooldown_seconds, Some(60));
+
+        // Once the cooldown elapses the provider is half-open, not healthy.
+        state.provider_cooldown.lock().await.insert(
+            1,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let Json(providers) = list_providers(State(state.clone())).await.unwrap();
+        assert_eq!(providers[0].circuit_state, "half_open");
+        assert!(providers[0].cooldown_seconds.is_none());
+
+        // The single-provider hydration path agrees with the batched one.
+        let single = get_provider(&state, 1).await.unwrap();
+        assert_eq!(single.circuit_state, "half_open");
+    }
+}
+
 #[tokio::test]
 async fn api_key_routing_policy_round_trips_and_validates() {
     let state = provider_key_test_state().await;

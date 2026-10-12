@@ -121,6 +121,7 @@ export type Provider = {
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
   cooldown_seconds?: number | null
+  circuit_state?: 'closed' | 'open' | 'half_open'
   configured_cooldown_seconds?: number | null
   timeout_seconds?: number | null
   max_concurrency?: number | null

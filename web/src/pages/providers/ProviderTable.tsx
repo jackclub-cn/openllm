@@ -250,6 +250,15 @@ export default function ProviderTable({
                 {record.cooldown_seconds ? (
                   <Tag color="orange">冷却 {record.cooldown_seconds}s</Tag>
                 ) : null}
+                {record.circuit_state === 'open' ? (
+                  <Tooltip title="连续失败达到阈值，已短路；冷却结束后只放行一个探测请求">
+                    <Tag color="red">已熔断</Tag>
+                  </Tooltip>
+                ) : record.circuit_state === 'half_open' ? (
+                  <Tooltip title="冷却已结束，正在等待一个探测请求验证恢复">
+                    <Tag color="orange">探测恢复中</Tag>
+                  </Tooltip>
+                ) : null}
               </Space>
             ),
           },
