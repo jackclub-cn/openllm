@@ -480,8 +480,20 @@ pub(crate) async fn persist_provider_test(
         // deprioritised (or short-circuited) until the cooldown expired even
         // though this probe just proved it answers again.
         state.provider_cooldown.lock().await.remove(&provider_id);
-        state.provider_failure_streak.lock().await.remove(&provider_id);
+        let streak = state
+            .provider_failure_streak
+            .lock()
+            .await
+            .remove(&provider_id)
+            .unwrap_or(0);
         state.provider_probe.lock().await.remove(&provider_id);
+        let threshold = crate::state::provider_open_threshold();
+        if threshold > 0 && streak >= threshold {
+            tracing::info!(
+                provider_id,
+                "provider circuit closed after a successful health probe"
+            );
+        }
     }
     Ok(())
 }

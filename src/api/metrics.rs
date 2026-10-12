@@ -216,6 +216,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .collect::<HashSet<_>>()
     };
     let failure_streaks = state.provider_failure_streak.lock().await.clone();
+    let circuit_trips = state.provider_circuit_trips.lock().await.clone();
     let provider_open_threshold = crate::state::provider_open_threshold();
     let concurrency_available = {
         let semaphores = state.provider_concurrency.lock().await;
@@ -635,6 +636,11 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_provider_circuit_trips_total",
+        "Provider circuit hard-opens (trips) since startup",
+    );
+    metric_header(
+        &mut body,
         "openllm_provider_models",
         "Enabled upstream models per provider",
     );
@@ -720,6 +726,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             "openllm_provider_failure_streak",
             &label,
             streak,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_circuit_trips_total",
+            &label,
+            circuit_trips.get(&provider.id).copied().unwrap_or(0),
         );
         push_metric(
             &mut body,

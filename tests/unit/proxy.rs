@@ -8991,6 +8991,75 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
     );
 }
 
+/// The trip counter must count each hard-open so a flapping provider stands
+/// out, but must not count failures that stay below the threshold.
+#[tokio::test]
+async fn provider_circuit_trip_counter_registers_hard_opens() {
+    let state = virtual_auto_state().await;
+    let failure = StatusCode::SERVICE_UNAVAILABLE;
+
+    // Two failures sit below the default threshold of three.
+    for _ in 0..2 {
+        mark_provider_error(&state, 1, Some(failure), None, None).await;
+    }
+    assert_eq!(
+        state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .get(&1)
+            .copied()
+            .unwrap_or(0),
+        0,
+        "failures below the threshold must not count as trips"
+    );
+
+    // The third crosses the threshold and trips the circuit.
+    mark_provider_error(&state, 1, Some(failure), None, None).await;
+    assert_eq!(
+        state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .get(&1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "crossing the threshold must register a trip"
+    );
+
+    // A further failure on the already-open circuit is not a new trip.
+    mark_provider_error(&state, 1, Some(failure), None, None).await;
+    assert_eq!(
+        state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .get(&1)
+            .copied()
+            .unwrap_or(0),
+        1,
+        "staying open across failures is not a new trip"
+    );
+
+    // Recovery resets the streak, so a fresh streak trips the circuit again.
+    mark_provider_success(&state, 1).await;
+    for _ in 0..3 {
+        mark_provider_error(&state, 1, Some(failure), None, None).await;
+    }
+    assert_eq!(
+        state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .get(&1)
+            .copied()
+            .unwrap_or(0),
+        2,
+        "a fresh streak after recovery trips the circuit again"
+    );
+}
+
 /// A hard-open provider with no healthy alternative must fail fast with a 503
 /// instead of spending a header timeout on an upstream call.
 #[tokio::test]

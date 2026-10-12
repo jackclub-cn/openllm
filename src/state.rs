@@ -31,6 +31,10 @@ pub struct AppState {
     /// `PROVIDER_PROBE_LEASE` the provider is treated as still open so only one
     /// request tests recovery at a time.
     pub provider_probe: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Provider circuit hard-opens (trips) since startup, by provider id. Used
+    /// for the `openllm_provider_circuit_trips_total` counter so flapping
+    /// providers stand out.
+    pub provider_circuit_trips: Arc<Mutex<HashMap<i64, u64>>>,
     /// In-memory cooldowns for a specific provider model. This keeps one
     /// overloaded model from removing every sibling model on the provider.
     pub target_cooldown: Arc<Mutex<HashMap<(i64, String), Instant>>>,
@@ -873,6 +877,7 @@ impl AppState {
             provider_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_failure_streak: Arc::new(Mutex::new(HashMap::new())),
             provider_probe: Arc::new(Mutex::new(HashMap::new())),
+            provider_circuit_trips: Arc::new(Mutex::new(HashMap::new())),
             target_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),

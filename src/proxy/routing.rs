@@ -1086,15 +1086,36 @@ pub(super) async fn mark_provider_error(
     retry_after: Option<Duration>,
     configured_cooldown_seconds: Option<i64>,
 ) {
+    // A probe that just failed is no longer in flight; the cooldown below
+    // decides when the next recovery probe may be admitted. Whether one was in
+    // flight also tells the trip counter that a HALF_OPEN probe re-opened the
+    // circuit rather than a fresh streak crossing the threshold.
+    let probe_was_in_flight = state
+        .provider_probe
+        .lock()
+        .await
+        .remove(&provider_id)
+        .is_some();
     let failures = {
         let mut streaks = state.provider_failure_streak.lock().await;
         let failures = streaks.entry(provider_id).or_default();
         *failures = failures.saturating_add(1);
         *failures
     };
-    // A probe that just failed is no longer in flight; the cooldown below
-    // decides when the next recovery probe may be admitted.
-    state.provider_probe.lock().await.remove(&provider_id);
+    let threshold = provider_open_threshold();
+    if threshold > 0 && failures >= threshold && (failures - 1 < threshold || probe_was_in_flight) {
+        *state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .entry(provider_id)
+            .or_default() += 1;
+        tracing::warn!(
+            provider_id,
+            failures,
+            "provider circuit opened after repeated failures; short-circuiting until it recovers"
+        );
+    }
     state.provider_cooldown.lock().await.insert(
         provider_id,
         Instant::now()
@@ -1227,12 +1248,20 @@ pub(super) async fn mark_provider_api_key_used(state: &AppState, provider_api_ke
 
 pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
     state.provider_cooldown.lock().await.remove(&provider_id);
-    state
+    let streak = state
         .provider_failure_streak
         .lock()
         .await
-        .remove(&provider_id);
+        .remove(&provider_id)
+        .unwrap_or(0);
     state.provider_probe.lock().await.remove(&provider_id);
+    let threshold = provider_open_threshold();
+    if threshold > 0 && streak >= threshold {
+        tracing::info!(
+            provider_id,
+            "provider circuit closed after a successful request"
+        );
+    }
 }
 
 /// Applies the per-provider circuit breaker to one upstream attempt.

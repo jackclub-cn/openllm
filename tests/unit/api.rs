@@ -182,6 +182,7 @@ async fn prometheus_metrics_render_and_require_admin_token() {
         "openllm_provider_circuit_state{provider=\"Healthy provider\",state=\"closed\"} 1"
     ));
     assert!(body.contains("openllm_provider_failure_streak{provider=\"Healthy provider\"} 0"));
+    assert!(body.contains("openllm_provider_circuit_trips_total{provider=\"Healthy provider\"} 0"));
     assert!(
         body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3")
     );
@@ -220,6 +221,7 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_provider_cooling gauge"));
     assert!(body.contains("# TYPE openllm_provider_circuit_state gauge"));
     assert!(body.contains("# TYPE openllm_provider_failure_streak gauge"));
+    assert!(body.contains("# TYPE openllm_provider_circuit_trips_total counter"));
     assert!(body.contains("# TYPE openllm_provider_requests_total counter"));
     assert!(body.contains("# TYPE openllm_provider_average_latency_ms gauge"));
     assert_every_metric_family_declares_a_type(&body);
