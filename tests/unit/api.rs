@@ -3808,6 +3808,61 @@ async fn readiness_reports_draining_after_the_shutdown_signal() {
     assert_eq!(value["status"], "draining");
 }
 
+/// The consolidated status endpoint must report the live runtime signals an
+/// operator needs in one place: draining, admission, the database pool, and the
+/// circuit summary.
+#[tokio::test]
+async fn runtime_status_reports_circuits_and_runtime_signals() {
+    let state = provider_key_test_state().await;
+    let Json(status) = get_status(State(state.clone())).await;
+    assert_eq!(status.version, env!("CARGO_PKG_VERSION"));
+    assert!(!status.draining);
+    assert_eq!(status.admission.in_flight, 0);
+    assert_eq!(
+        status.database.max_connections,
+        crate::db::db_max_connections()
+    );
+    assert_eq!(
+        status.circuits.threshold,
+        crate::state::provider_open_threshold()
+    );
+    assert_eq!(status.circuits.open, 0);
+    assert_eq!(status.circuits.half_open, 0);
+
+    // A provider that crossed the threshold is reported as open, then as
+    // half-open once its cooldown elapses.
+    let threshold = crate::state::provider_open_threshold();
+    if threshold > 0 {
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .insert(1, threshold);
+        state
+            .provider_cooldown
+            .lock()
+            .await
+            .insert(1, std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let Json(status) = get_status(State(state.clone())).await;
+        assert_eq!(status.circuits.open, 1);
+
+        state.provider_cooldown.lock().await.insert(
+            1,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
+        let Json(status) = get_status(State(state.clone())).await;
+        assert_eq!(status.circuits.open, 0);
+        assert_eq!(status.circuits.half_open, 1);
+    }
+
+    // A shutting-down instance reports draining even before the DB is closed.
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let Json(status) = get_status(State(state)).await;
+    assert!(status.draining);
+}
+
 #[tokio::test]
 async fn readiness_reports_unavailable_when_the_database_is_unreachable() {
     let state = provider_key_test_state().await;

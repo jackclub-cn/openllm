@@ -30,7 +30,7 @@ use crate::api::{
     create_route,
     create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
     event_stream, export_usage, get_guardrails_settings, get_inspector_settings,
-    get_resilience_settings, get_runtime_settings, get_settings, get_usage_detail, health,
+    get_resilience_settings, get_runtime_settings, get_settings, get_status, get_usage_detail, health,
     list_api_keys, list_audit_logs, list_cooldowns, list_model_inventory, list_models,
     list_provider_model_limits,
     list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
@@ -250,6 +250,7 @@ pub fn build_router(state: AppState) -> Router {
             admin_auth,
         ));
     let admin = Router::new()
+        .route("/status", get(get_status))
         .route("/overview", get(overview))
         .route("/audit-logs", get(list_audit_logs))
         .route("/database/backup", get(backup_database))

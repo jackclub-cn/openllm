@@ -62,6 +62,166 @@ pub async fn ready(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Live runtime snapshot for operators and external monitors.
+///
+/// Consolidates the process-local signals that otherwise only exist in the
+/// Prometheus exposition or scattered endpoints, so one request answers "is
+/// this instance healthy right now, and if not, why". Unlike `/api/ready` it
+/// always answers `200` and reports the details rather than a bare status.
+#[derive(Debug, serde::Serialize)]
+pub struct RuntimeStatus {
+    pub version: &'static str,
+    pub uptime_seconds: u64,
+    pub draining: bool,
+    pub runtime_lag_millis: u64,
+    pub memory: MemoryStatus,
+    pub admission: AdmissionStatus,
+    pub database: DatabasePoolStatus,
+    pub maintenance: MaintenanceStatus,
+    pub circuits: CircuitSummary,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MemoryStatus {
+    /// Configured ceiling in MiB; `0` means the pressure guard is off.
+    pub limit_mib: u64,
+    pub used_mib: Option<u64>,
+    pub used_ratio: Option<f64>,
+    pub pressure: bool,
+    /// Where the ceiling came from: `off`, `env`, or `cgroup`.
+    pub source: &'static str,
+    pub shed_total: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct AdmissionStatus {
+    pub in_flight: i64,
+    pub max_concurrent_requests: usize,
+    pub in_flight_request_mib: usize,
+    pub max_inflight_request_mib: usize,
+    pub requests_shed_total: u64,
+    pub request_bytes_shed_total: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct DatabasePoolStatus {
+    pub connections: u32,
+    pub idle: usize,
+    pub max_connections: u32,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct MaintenanceStatus {
+    pub runs_total: u64,
+    pub last_run_unix: u64,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct CircuitSummary {
+    /// Providers currently short-circuited (hard-open).
+    pub open: usize,
+    /// Providers whose cooldown elapsed and are probing recovery.
+    pub half_open: usize,
+    pub threshold: u32,
+}
+
+pub async fn get_status(State(state): State<AppState>) -> Json<RuntimeStatus> {
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let limits = state.runtime_limits();
+    let used_bytes = state
+        .memory_pressure
+        .as_ref()
+        .and_then(|pressure| pressure.used_bytes())
+        .or_else(crate::state::sample_process_memory_bytes);
+    let memory_limit = state
+        .memory_pressure
+        .as_ref()
+        .map(|pressure| pressure.limit_bytes())
+        .unwrap_or(0);
+    let memory_pressure = state
+        .memory_pressure
+        .as_ref()
+        .is_some_and(|pressure| pressure.is_shedding());
+
+    // A failing DB probe must not take the whole status down: report zero and
+    // let the readiness probe be the one that fails loudly.
+    let in_flight = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1",
+    )
+    .fetch_one(&state.pool)
+    .await
+    .unwrap_or(0);
+
+    let threshold = crate::state::provider_open_threshold();
+    let (mut open, mut half_open) = (0usize, 0usize);
+    if threshold > 0 {
+        let now = std::time::Instant::now();
+        let cooling = state
+            .provider_cooldown
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(provider_id, _)| *provider_id)
+            .collect::<HashSet<_>>();
+        for (provider_id, streak) in state.provider_failure_streak.lock().await.iter() {
+            match crate::state::provider_circuit_state(
+                *streak,
+                cooling.contains(provider_id),
+                threshold,
+            ) {
+                "open" => open += 1,
+                "half_open" => half_open += 1,
+                _ => {}
+            }
+        }
+    }
+
+    Json(RuntimeStatus {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        draining: state.shutting_down.load(Relaxed),
+        runtime_lag_millis: state.runtime_lag_millis.load(Relaxed),
+        memory: MemoryStatus {
+            limit_mib: memory_limit / (1024 * 1024),
+            used_mib: used_bytes.map(|bytes| bytes / (1024 * 1024)),
+            used_ratio: used_bytes
+                .filter(|_| memory_limit > 0)
+                .map(|bytes| bytes as f64 / memory_limit as f64),
+            pressure: memory_pressure,
+            source: state.memory_limit_source,
+            shed_total: state.memory_shed.load(Relaxed),
+        },
+        admission: AdmissionStatus {
+            in_flight,
+            max_concurrent_requests: limits.max_concurrent_requests,
+            in_flight_request_mib: state
+                .inflight_request_bytes
+                .as_ref()
+                .map(|budget| budget.used() / (1024 * 1024))
+                .unwrap_or(0),
+            max_inflight_request_mib: limits.max_inflight_request_mib,
+            requests_shed_total: state.requests_shed.load(Relaxed),
+            request_bytes_shed_total: state.request_bytes_shed.load(Relaxed),
+        },
+        database: DatabasePoolStatus {
+            connections: state.pool.size(),
+            idle: state.pool.num_idle(),
+            max_connections: crate::db::db_max_connections(),
+        },
+        maintenance: MaintenanceStatus {
+            runs_total: state.maintenance_runs.load(Relaxed),
+            last_run_unix: state.maintenance_last_run_unix.load(Relaxed),
+        },
+        circuits: CircuitSummary {
+            open,
+            half_open,
+            threshold,
+        },
+    })
+}
+
 pub async fn admin_auth(
     State(state): State<AppState>,
     request: Request,

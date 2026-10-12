@@ -789,6 +789,14 @@ fn read_process_memory_bytes() -> Option<u64> {
     None
 }
 
+/// Samples the process's current resident/working-set size in bytes.
+///
+/// Exposed so the runtime-status endpoint can report memory even when the
+/// pressure guard is disabled; `None` when the platform cannot report it.
+pub(crate) fn sample_process_memory_bytes() -> Option<u64> {
+    read_process_memory_bytes()
+}
+
 /// Discovers the container memory limit where the OS exposes one.
 ///
 /// Reads the cgroup v2 unified hierarchy first, then the cgroup v1 memory
