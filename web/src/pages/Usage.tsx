@@ -389,14 +389,20 @@ export default function Usage() {
       if (onlyAdjusted) params.set('gateway_adjusted', 'true')
       if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
       if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
-      const blob = await api.download(`/api/usage/export?${params}`)
+      const { blob, truncated } = await api.downloadWithMeta(`/api/usage/export?${params}`)
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
       link.download = `openllm-usage-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
       link.click()
       URL.revokeObjectURL(url)
-      message.success('CSV 已导出')
+      if (truncated) {
+        message.warning(
+          'CSV 已导出，但已达到导出行数上限，可能未包含全部记录；请缩小时间范围后重试',
+        )
+      } else {
+        message.success('CSV 已导出')
+      }
     } catch (error) {
       message.error(formatError(error))
     } finally {

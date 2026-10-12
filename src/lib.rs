@@ -348,7 +348,10 @@ pub fn build_router(state: AppState) -> Router {
             CorsLayer::new()
                 .allow_origin(Any)
                 .allow_methods(Any)
-                .allow_headers(Any),
+                .allow_headers(Any)
+                // Let a cross-origin console read the export-truncation header
+                // so a capped download is never silent.
+                .expose_headers(Any),
         )
         .layer(TraceLayer::new_for_http())
         .with_state(state)

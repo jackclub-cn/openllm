@@ -92,14 +92,20 @@ export default function AuditLogsPage() {
       if (entity) params.set('entity', entity)
       if (action) params.set('action', action)
       if (search.trim()) params.set('search', search.trim())
-      const blob = await api.download(`/api/audit-logs/export?${params.toString()}`)
+      const { blob, truncated } = await api.downloadWithMeta(
+        `/api/audit-logs/export?${params.toString()}`,
+      )
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
       link.download = `openllm-audit-logs-${dayjs().format('YYYYMMDD-HHmmss')}.csv`
       link.click()
       URL.revokeObjectURL(url)
-      message.success('CSV 已导出')
+      if (truncated) {
+        message.warning('CSV 已导出，但已达到导出行数上限，可能未包含全部记录')
+      } else {
+        message.success('CSV 已导出')
+      }
     } catch (error) {
       message.error(formatError(error))
     } finally {

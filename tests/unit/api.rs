@@ -2152,6 +2152,48 @@ async fn audit_log_records_mutations_and_supports_filters() {
     assert_eq!(page.total, 0);
 }
 
+/// A capped export must announce the truncation so the console warns instead of
+/// handing the operator a silently incomplete file.
+#[tokio::test]
+async fn audit_export_flags_truncation_at_the_row_cap() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 5001) \
+         INSERT INTO audit_logs (action, entity, summary, actor) \
+         SELECT 'update', 'settings', 'row ' || n, 'local' FROM seq",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+
+    let response = export_audit_logs(
+        State(state),
+        Query(AuditLogQuery {
+            page: None,
+            page_size: None,
+            entity: None,
+            action: None,
+            search: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["x-openllm-export-truncated"], "true");
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let csv = String::from_utf8(body.to_vec()).unwrap();
+    // The header row plus exactly the row cap of data rows.
+    assert_eq!(csv.lines().count(), 1 + 5000);
+}
+
 #[tokio::test]
 async fn settings_expose_database_stats() {
     let state = provider_key_test_state().await;

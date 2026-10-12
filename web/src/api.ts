@@ -39,7 +39,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>
 }
 
-async function requestBlob(path: string): Promise<Blob> {
+export type DownloadedFile = {
+  blob: Blob
+  /// The server capped the export at its row limit; the file is incomplete.
+  truncated: boolean
+}
+
+async function requestBlob(path: string): Promise<DownloadedFile> {
   const headers = new Headers()
   const adminToken = getAdminToken()
   if (adminToken) headers.set('x-admin-token', adminToken)
@@ -54,7 +60,10 @@ async function requestBlob(path: string): Promise<Blob> {
     }
     throw new ApiError(message, response.status)
   }
-  return response.blob()
+  return {
+    blob: await response.blob(),
+    truncated: response.headers.get('x-openllm-export-truncated') === 'true',
+  }
 }
 
 export const api = {
@@ -64,7 +73,8 @@ export const api = {
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
-  download: (path: string) => requestBlob(path),
+  download: async (path: string) => (await requestBlob(path)).blob,
+  downloadWithMeta: (path: string) => requestBlob(path),
 }
 
 export type ProviderApiKey = {
