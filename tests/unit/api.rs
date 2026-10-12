@@ -3786,6 +3786,26 @@ async fn readiness_reports_ready_when_the_database_answers() {
     assert_eq!(value["status"], "ready");
 }
 
+/// Once a shutdown signal arrives the readiness probe must report `not_ready`
+/// so a load balancer drains this instance before its connections close.
+#[tokio::test]
+async fn readiness_reports_draining_after_the_shutdown_signal() {
+    let state = provider_key_test_state().await;
+    let response = ready(State(state.clone())).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let response = ready(State(state)).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(value["status"], "draining");
+}
+
 #[tokio::test]
 async fn readiness_reports_unavailable_when_the_database_is_unreachable() {
     let state = provider_key_test_state().await;

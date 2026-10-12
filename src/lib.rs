@@ -153,6 +153,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     });
 
     let limits = state.runtime_limits();
+    let shutting_down = state.shutting_down.clone();
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind)
         .await
@@ -184,7 +185,13 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let grace_secs =
         parse_shutdown_grace_secs(std::env::var("OPENLLM_SHUTDOWN_GRACE_SECS").ok().as_deref());
-    serve_until_shutdown(listener, app, grace_secs, shutdown_signal()).await
+    let shutdown = async move {
+        shutdown_signal().await;
+        // Flip readiness first: a load balancer then stops sending new requests
+        // here while the drain below lets in-flight work finish.
+        shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
+    };
+    serve_until_shutdown(listener, app, grace_secs, shutdown).await
 }
 
 /// Serves until a shutdown signal, then drains in-flight work for a bounded

@@ -14,6 +14,22 @@ pub async fn health() -> Json<Value> {
 /// it touches the database with a short timeout, and a `503` tells a proxy to
 /// stop routing traffic here instead of returning errors for every request.
 pub async fn ready(State(state): State<AppState>) -> Response {
+    // A shutting-down instance must leave rotation before its connections
+    // close, so the load balancer drains it while in-flight work completes.
+    if state
+        .shutting_down
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({
+                "status": "draining",
+                "service": "openllm",
+                "version": env!("CARGO_PKG_VERSION")
+            })),
+        )
+            .into_response();
+    }
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(&state.pool),

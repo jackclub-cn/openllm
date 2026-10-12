@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use reqwest::Client;
@@ -92,6 +92,10 @@ pub struct AppState {
     pub maintenance_runs: Arc<AtomicU64>,
     /// Wall-clock instant the process state was created, for uptime.
     pub started_at: Instant,
+    /// Set once a shutdown signal arrives. The readiness probe reports
+    /// `not_ready` while this is set so a load balancer drains the instance
+    /// before its connections close.
+    pub shutting_down: Arc<AtomicBool>,
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
     pub started_unix: i64,
     pub events: broadcast::Sender<UsageEvent>,
@@ -894,6 +898,7 @@ impl AppState {
             maintenance_last_run_unix: Arc::new(AtomicU64::new(0)),
             maintenance_runs: Arc::new(AtomicU64::new(0)),
             started_at: Instant::now(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             started_unix: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|elapsed| elapsed.as_secs() as i64)
