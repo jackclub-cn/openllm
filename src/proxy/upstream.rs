@@ -1141,6 +1141,16 @@ pub(crate) fn retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 425 | 429 | 500..=599)
 }
 
+/// Whether a response proves the provider itself is reachable.
+///
+/// Client errors, authentication failures and rate limits all show that the
+/// upstream answered, so they can close a half-open circuit even though they
+/// still fail the current request or cool a specific key/model. Timeouts and
+/// 5xx responses remain provider-level failures.
+pub(crate) fn provider_reachable_status(status: StatusCode) -> bool {
+    !matches!(status.as_u16(), 408 | 500..=599)
+}
+
 /// Statuses worth one more attempt against the *same* target before the request
 /// falls back to another route target.
 ///

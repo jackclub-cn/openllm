@@ -408,6 +408,11 @@ pub(crate) async fn proxy_openai_inner(
                     mark_provider_success(state, target_provider_id).await;
                     mark_target_success(state, target_provider_id, &target_upstream_model).await;
                     mark_provider_api_key_success(state, target_provider_key_id).await;
+                } else {
+                    // A client error still proves the provider is reachable.
+                    // Close a half-open circuit so its probe lease cannot keep
+                    // blocking later requests.
+                    mark_provider_reachable(state, target_provider_id).await;
                 }
                 apply_routing_headers(
                     &mut response,

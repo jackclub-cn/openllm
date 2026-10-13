@@ -1034,6 +1034,9 @@ pub(super) async fn record_upstream_failure(
             .await;
         }
     }
+    if provider_reachable_status(status) {
+        mark_provider_reachable(state, target.provider_id).await;
+    }
     if provider_key_failure(status) {
         mark_provider_api_key_error(
             state,
@@ -1088,6 +1091,26 @@ pub(super) async fn mark_provider_api_key_used(state: &AppState, provider_api_ke
 }
 
 pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
+    close_provider_circuit(state, provider_id, "successful_request").await;
+}
+
+/// A reachable upstream response proves a half-open probe succeeded even when
+/// the status itself is a client error or a rate limit. Close the provider
+/// circuit, but leave model and key cooldowns in place.
+pub(super) async fn mark_provider_reachable(state: &AppState, provider_id: i64) {
+    let probe_was_active = state
+        .provider_probe
+        .lock()
+        .await
+        .remove(&provider_id)
+        .is_some();
+    if !probe_was_active {
+        return;
+    }
+    close_provider_circuit(state, provider_id, "reachable_response").await;
+}
+
+async fn close_provider_circuit(state: &AppState, provider_id: i64, reason: &'static str) {
     state.provider_cooldown.lock().await.remove(&provider_id);
     let streak = state
         .provider_failure_streak
@@ -1098,14 +1121,11 @@ pub(super) async fn mark_provider_success(state: &AppState, provider_id: i64) {
     state.provider_probe.lock().await.remove(&provider_id);
     let threshold = provider_open_threshold();
     if threshold > 0 && streak >= threshold {
-        tracing::info!(
-            provider_id,
-            "provider circuit closed after a successful request"
-        );
+        tracing::info!(provider_id, reason, "provider circuit closed");
         let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
             provider_id,
             state: "closed",
-            reason: "successful_request",
+            reason,
             failure_streak: 0,
             cooldown_seconds: 0,
         });
