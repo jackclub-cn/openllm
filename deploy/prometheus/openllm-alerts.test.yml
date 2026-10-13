@@ -1,0 +1,319 @@
+# Unit tests for openllm-alerts.yml.
+#
+#   cd deploy/prometheus && promtool test rules openllm-alerts.test.yml
+#
+# Every rule is exercised twice: once with the series that must trip it, and
+# once with the series a healthy gateway exports, which must stay silent. The
+# firing test proves the expression and its `for:` duration; the healthy test
+# proves the rule does not page on a normal instance.
+#
+# Some rules cannot be induced on a live box (memory pressure needs Linux
+# sampling, runtime lag needs a blocked worker thread, NotReady exists only
+# during a drain that closes the scrape port), so these synthetic series are the
+# only reproducible way to pin them down. Live firing was verified separately
+# for the induceable rules.
+#
+# Expected alerts are compared in full, including annotations, so the operator
+# facing text is pinned down too. promtool reports a diff when a description
+# changes without the expectation being updated, which is the intended coupling:
+# edit the rule, re-run, copy the new text across.
+rule_files:
+- openllm-alerts.yml
+evaluation_interval: 1m
+tests:
+- name: not ready fires while the gateway is draining or wedged
+  interval: 1m
+  input_series:
+  - series: openllm_ready{instance="gw:8080"}
+    values: '0x8'
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: OpenLlmNotReady
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM gateway is not ready (gw:8080)
+        description: openllm_ready has been 0 for 2 minutes. The instance is draining, shutting down, or has stopped accepting requests. Check /api/status and the process logs; if no upgrade is in flight, the instance is likely down.
+- name: a ready gateway never raises not ready
+  interval: 1m
+  input_series:
+  - series: openllm_ready{instance="gw:8080"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: OpenLlmNotReady
+    exp_alerts: []
+- name: an unscrapable target fires target down
+  interval: 1m
+  input_series:
+  - series: up{job="openllm",instance="gw:8080"}
+    values: '0x8'
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: OpenLlmTargetDown
+    exp_alerts:
+    - exp_labels:
+        severity: critical
+        job: openllm
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM gateway is unreachable (gw:8080)
+        description: Prometheus cannot scrape /metrics. During a drain the port closes immediately, so a short gap around a restart is expected; a sustained gap means the process is gone.
+- name: a scrape that is up never fires target down
+  interval: 1m
+  input_series:
+  - series: up{job="openllm",instance="gw:8080"}
+    values: 1x8
+  alert_rule_test:
+  - eval_time: 8m
+    alertname: OpenLlmTargetDown
+    exp_alerts: []
+- name: a short circuit that lasts pages
+  interval: 1m
+  input_series:
+  - series: openllm_provider_circuit_state{provider="acme",state="open"}
+    values: 1x10
+  - series: openllm_provider_circuit_state{provider="acme",state="closed"}
+    values: '0x10'
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: OpenLlmProviderCircuitOpen
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        provider: acme
+        state: open
+      exp_annotations:
+        summary: 'Provider circuit open: acme'
+        description: Provider acme has been short-circuited for 5 minutes. Requests to it fail fast with 503 until a probe succeeds. Check the provider's upstream status, credentials, and rate limits, or route around it.
+- name: a half open probe is not an open circuit
+  interval: 1m
+  input_series:
+  - series: openllm_provider_circuit_state{provider="acme",state="half_open"}
+    values: 1x10
+  alert_rule_test:
+  - eval_time: 6m
+    alertname: OpenLlmProviderCircuitOpen
+    exp_alerts: []
+- name: three trips in fifteen minutes counts as flapping
+  interval: 1m
+  input_series:
+  - series: openllm_provider_circuit_trips_total{provider="acme"}
+    values: 0 1 2 3 3 3 3 3
+  alert_rule_test:
+  - eval_time: 4m
+    alertname: OpenLlmProviderCircuitTrips
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        provider: acme
+      exp_annotations:
+        summary: 'Provider circuit is flapping: acme'
+        description: Provider acme opened its circuit at least 3 times in 15 minutes. Recovering and immediately failing again usually means an intermittent upstream fault rather than a hard outage.
+- name: two trips in fifteen minutes is normal churn
+  interval: 1m
+  input_series:
+  - series: openllm_provider_circuit_trips_total{provider="acme"}
+    values: 0 1 2 2 2 2 2 2
+  alert_rule_test:
+  - eval_time: 7m
+    alertname: OpenLlmProviderCircuitTrips
+    exp_alerts: []
+- name: a held out provider key pages
+  interval: 1m
+  input_series:
+  - series: openllm_provider_key_cooling{provider="acme",key="primary",key_id="7"}
+    values: 1x14
+  alert_rule_test:
+  - eval_time: 11m
+    alertname: OpenLlmProviderKeyCooling
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        provider: acme
+        key: primary
+        key_id: '7'
+      exp_annotations:
+        summary: 'Provider key cooling: acme/primary'
+        description: Upstream key primary on acme has been held out of rotation for 10 minutes. Repeated 401/403/429 from one key usually means a revoked credential or a per-key quota.
+- name: an in rotation provider key never pages
+  interval: 1m
+  input_series:
+  - series: openllm_provider_key_cooling{provider="acme",key="primary",key_id="7"}
+    values: '0x14'
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmProviderKeyCooling
+    exp_alerts: []
+- name: a pool that keeps refusing pages
+  interval: 1m
+  input_series:
+  - series: openllm_pool_denials_total{pool="shared",provider_id="1"}
+    values: 0+1x14
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: OpenLlmPoolDenials
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        pool: shared
+        provider_id: '1'
+      exp_annotations:
+        summary: 'Quota pool is refusing requests: shared'
+        description: Pool shared denied requests over the last 10 minutes while saturated. Either raise the pool/limit, rebalance weights, or confirm the burst is expected.
+- name: a pool with no denials stays quiet
+  interval: 1m
+  input_series:
+  - series: openllm_pool_denials_total{pool="shared",provider_id="1"}
+    values: '0x14'
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmPoolDenials
+    exp_alerts: []
+- name: shedding requests pages
+  interval: 1m
+  input_series:
+  - series: openllm_requests_shed_total{instance="gw:8080"}
+    values: 0+1x14
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: OpenLlmRequestsShed
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM is shedding requests (gw:8080)
+        description: Requests were rejected by local admission control or memory pressure over the last 10 minutes. Raise OPENLLM_MAX_CONCURRENT_REQUESTS / OPENLLM_MEMORY_LIMIT_MIB, reduce traffic, or add capacity.
+- name: memory pressure pages
+  interval: 1m
+  input_series:
+  - series: openllm_memory_pressure{instance="gw:8080"}
+    values: 0 0 1x12
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: OpenLlmMemoryPressure
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM is under memory pressure (gw:8080)
+        description: Process memory has been at or above the shed threshold for 5 minutes, so the gateway is shedding load. Check openllm_memory_used_bytes against openllm_memory_limit_bytes and the memory_limit_source label on /api/status.
+- name: memory under the threshold stays quiet
+  interval: 1m
+  input_series:
+  - series: openllm_memory_pressure{instance="gw:8080"}
+    values: '0x14'
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmMemoryPressure
+    exp_alerts: []
+- name: a full admission gate pages
+  interval: 1m
+  input_series:
+  - series: openllm_request_capacity_limit{instance="gw:8080"}
+    values: 4x14
+  - series: openllm_request_capacity_available{instance="gw:8080"}
+    values: '0x14'
+  alert_rule_test:
+  - eval_time: 11m
+    alertname: OpenLlmAdmissionSaturated
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM admission gate is full (gw:8080)
+        description: Every global concurrency slot has been held for 10 minutes. Latency will climb and requests will queue on OPENLLM_ADMISSION_WAIT_MS or be shed.
+- name: an uncapped gateway is never admission saturated
+  interval: 1m
+  input_series:
+  - series: openllm_request_capacity_limit{instance="gw:8080"}
+    values: '0x14'
+  - series: openllm_request_capacity_available{instance="gw:8080"}
+    values: '0x14'
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmAdmissionSaturated
+    exp_alerts: []
+- name: a lagging event loop pages
+  interval: 1m
+  input_series:
+  - series: openllm_runtime_lag_millis{instance="gw:8080"}
+    values: 10 10 9000x12
+  alert_rule_test:
+  - eval_time: 9m
+    alertname: OpenLlmRuntimeLag
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM event loop is lagging (gw:8080)
+        description: The async runtime has been blocked for more than 5 seconds. A blocked worker thread is usually a blocking call on the hot path or extreme memory pressure.
+- name: maintenance that has not run for five minutes pages
+  interval: 1m
+  input_series:
+  - series: openllm_maintenance_last_run_timestamp_seconds{instance="gw:8080"}
+    values: 1x14
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: OpenLlmMaintenanceStalled
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM maintenance has not run (gw:8080)
+        description: The 60 second maintenance cycle has not completed in over five minutes. Scheduled provider health recovery, model sync, and interrupted-request reconciliation are all paused.
+- name: a live maintenance cycle stays quiet
+  interval: 1m
+  input_series:
+  - series: openllm_maintenance_last_run_timestamp_seconds{instance="gw:8080"}
+    values: 0+60x14
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmMaintenanceStalled
+    exp_alerts: []
+- name: a process that never ran maintenance pages once it is old enough
+  interval: 1m
+  input_series:
+  - series: openllm_maintenance_runs_total{instance="gw:8080"}
+    values: '0x14'
+  - series: openllm_uptime_seconds{instance="gw:8080"}
+    values: 0+60x14
+  alert_rule_test:
+  - eval_time: 12m
+    alertname: OpenLlmMaintenanceNotRunning
+    exp_alerts:
+    - exp_labels:
+        severity: warning
+        instance: gw:8080
+      exp_annotations:
+        summary: OpenLLM maintenance never ran (gw:8080)
+        description: The process has been up for over five minutes without a single maintenance cycle. The maintenance worker may have failed to start.
+- name: a fresh process gets a grace period before that page
+  interval: 1m
+  input_series:
+  - series: openllm_maintenance_runs_total{instance="gw:8080"}
+    values: '0x14'
+  - series: openllm_uptime_seconds{instance="gw:8080"}
+    values: 0+60x14
+  alert_rule_test:
+  - eval_time: 3m
+    alertname: OpenLlmMaintenanceNotRunning
+    exp_alerts: []
+- name: a process whose maintenance ran never pages
+  interval: 1m
+  input_series:
+  - series: openllm_maintenance_runs_total{instance="gw:8080"}
+    values: 0+1x14
+  - series: openllm_uptime_seconds{instance="gw:8080"}
+    values: 0+60x14
+  alert_rule_test:
+  - eval_time: 13m
+    alertname: OpenLlmMaintenanceNotRunning
+    exp_alerts: []

@@ -384,6 +384,9 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
                   : '关闭（仅软冷却）'
                 : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="熔断状态持久化">
+              {limits ? (limits.resilience_state_persist ? '开启（重启后保留冷却与熔断）' : '关闭（重启后清空）') : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="内存压力保护">
               {limits
                 ? limits.memory_limit_mib > 0

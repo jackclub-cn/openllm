@@ -353,6 +353,26 @@ export type RouteDiagnoseRuntimeTarget = {
   provider_health?: boolean | null
 }
 
+export type RouteDiagnoseFactor = {
+  name: string
+  score?: number | null
+  weight: number
+  contribution: number
+  detail: string
+}
+
+export type RouteDiagnoseCandidate = {
+  order: number
+  provider_id: number
+  provider_name: string
+  upstream_model: string
+  score: number
+  eligible: boolean
+  exclusion?: string | null
+  deprioritized: boolean
+  factors: RouteDiagnoseFactor[]
+}
+
 export type RouteDiagnose = {
   model: string
   endpoint: string
@@ -367,6 +387,7 @@ export type RouteDiagnose = {
   barrel_incomplete: boolean
   session_id?: string
   runtime_targets?: RouteDiagnoseRuntimeTarget[]
+  candidates: RouteDiagnoseCandidate[]
   targets: RouteDiagnoseTarget[]
 }
 
@@ -606,6 +627,7 @@ export type RuntimeLimits = {
   body_read_timeout_secs?: number | null
   request_timeout_secs?: number | null
   provider_open_threshold: number
+  resilience_state_persist: boolean
   memory_limit_mib: number
   memory_limit_source: string
   memory_shed_ratio_pct: number
@@ -740,6 +762,193 @@ export type ModelInfo = {
   max_output_tokens?: number
   max_completion_tokens?: number
   supported_endpoints?: string[]
+}
+
+export type SelfCheckStatus = 'pass' | 'warn' | 'fail'
+
+export type SelfCheckItem = {
+  id: string
+  category: string
+  title: string
+  status: SelfCheckStatus
+  detail: string
+  hint?: string
+}
+
+export type SelfCheckReport = {
+  generated_at: string
+  overall: SelfCheckStatus
+  counts: { pass: number; warn: number; fail: number }
+  checks: SelfCheckItem[]
+}
+
+export type PoolAllocationUsage = {
+  api_key_id: number
+  weight_pct: number
+  policy: 'hard' | 'soft' | 'burst'
+  request_share?: number | null
+  token_share?: number | null
+  key_requests: number
+  key_tokens: number
+}
+
+export type PoolUsage = {
+  pool_id: number
+  provider_id: number
+  name: string
+  window_seconds: number
+  request_limit?: number | null
+  token_limit?: number | null
+  requests: number
+  tokens: number
+  saturated: boolean
+  denials: number
+  allocations: PoolAllocationUsage[]
+}
+
+export type DiagnosticFailure = {
+  request_id: string
+  created_at: string
+  requested_model: string
+  upstream_model?: string | null
+  provider_id?: number | null
+  status_code: number
+  latency_ms: number
+  error_message?: string | null
+  warning_message?: string | null
+}
+
+export type DiagnosticSnapshot = {
+  generated_at: string
+  version: string
+  host: string
+  draining: boolean
+  uptime_seconds: number
+  instance_lease?: {
+    id: string
+    pid: number
+    host: string
+    started_at: string
+    heartbeat_at: string
+    heartbeat_age_seconds: number
+    ours: boolean
+  } | null
+  status: RuntimeStatus
+  settings: Settings
+  self_check: SelfCheckReport
+  resilience: CooldownSnapshot
+  pools: PoolUsage[]
+  providers: Provider[]
+  recent_failures: DiagnosticFailure[]
+  requests_24h: {
+    total: number
+    successful: number
+    failed: number
+    failures_by_status: { status_code: number; count: number }[]
+  }
+  secrets_included: boolean
+  notes: string[]
+}
+
+export type ImportAction = 'create' | 'update' | 'unchanged' | 'skip' | 'error'
+
+export type ImportItem = {
+  kind: string
+  name: string
+  action: ImportAction
+  detail: string
+}
+
+export type ImportCounts = {
+  create: number
+  update: number
+  unchanged: number
+  skip: number
+  error: number
+}
+
+export type ImportPlan = {
+  dry_run: boolean
+  applied: boolean
+  valid: boolean
+  document_version: number
+  secrets_included: boolean
+  counts: ImportCounts
+  items: ImportItem[]
+  problems: string[]
+  /** Caveats about an applied import (per-key identity, item-by-item writes). */
+  notes: string[]
+}
+
+/**
+ * The portable configuration document. It is intentionally loose on the
+ * console side: the page inspects the version and the secret flags, while the
+ * server validates the rest.
+ */
+export type ConfigDocument = {
+  openllm_config_version: number
+  exported_at: string
+  gateway_version: string
+  secrets_included: boolean
+  notes: string[]
+  providers: { name: string }[]
+  routes: { name: string }[]
+  provider_pools: { name: string }[]
+  webhooks: { name: string }[]
+  gateway_keys: { name: string }[]
+  settings: Record<string, unknown>
+}
+
+export type BackupInfo = {
+  name: string
+  path: string
+  size_bytes: number
+  created_at: string
+  kind: string
+}
+
+export type DatabaseFileReport = {
+  file: string
+  ok: boolean
+  size_bytes: number
+  integrity: string
+  tables: string[]
+  missing_tables: string[]
+  applied_migrations: number
+  schema_version: number
+  providers: number
+  routes: number
+  api_keys: number
+  webhooks: number
+  provider_pools: number
+  problems: string[]
+}
+
+export type MigrationEntry = {
+  version: number
+  description: string
+}
+
+export type MigrationReport = {
+  database: string
+  up_to_date: boolean
+  applied: MigrationEntry[]
+  pending: MigrationEntry[]
+  unknown_applied: number[]
+  data_present: boolean
+  backup_would_be_written: boolean
+  problems: string[]
+}
+
+export type UpgradeStatus = {
+  current_version: string
+  latest_version?: string | null
+  update_available: boolean
+  status: 'up_to_date' | 'update_available' | 'ahead' | 'unknown'
+  source: 'query' | 'feed' | 'none'
+  checked_at: string
+  message: string
+  pending_migrations: number
 }
 
 export function formatError(error: unknown) {

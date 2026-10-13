@@ -143,3 +143,102 @@ async fn supervised_worker_restarts_after_a_panic() {
         "the worker must be restarted after it panics"
     );
 }
+
+/// The readiness probe must leave rotation as soon as the drain starts, while
+/// the liveness probe keeps answering so the orchestrator does not kill the
+/// process that is still finishing in-flight work.
+#[tokio::test]
+async fn readiness_probe_reports_draining_before_shutdown() {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+    let router = crate::build_router(state.clone());
+
+    let probe = |router: axum::Router, uri: &str| {
+        let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        async move { router.oneshot(request).await.unwrap() }
+    };
+
+    let healthy = probe(router.clone(), "/api/ready").await;
+    assert_eq!(healthy.status(), StatusCode::OK);
+
+    state
+        .shutting_down
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let draining = probe(router.clone(), "/api/ready").await;
+    assert_eq!(
+        draining.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a draining instance must tell the load balancer to stop sending traffic"
+    );
+    let body = axum::body::to_bytes(draining.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&body).contains("draining"));
+    assert_eq!(
+        probe(router, "/api/health").await.status(),
+        StatusCode::OK,
+        "liveness must stay green while draining, or the process is killed mid-drain"
+    );
+}
+
+/// An upgrade must not cut a request that is already running: the drain lets it
+/// finish and only then closes the listener.
+#[tokio::test]
+async fn in_flight_request_finishes_during_the_drain() {
+    use axum::routing::get;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    let finished = Arc::new(Notify::new());
+    let handler_notify = finished.clone();
+    let app = Router::new().route(
+        "/slow",
+        get(move || {
+            let finished = handler_notify.clone();
+            async move {
+                finished.notify_one();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                "done"
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, app, 5, async move {
+            let _ = signal_rx.await;
+        })
+        .await
+    });
+
+    let request = tokio::spawn(async move {
+        let response = reqwest::get(format!("http://{address}/slow")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        response.text().await.unwrap()
+    });
+    finished.notified().await;
+    // The handler is mid-flight; a rolling upgrade signals shutdown now.
+    signal_tx.send(()).unwrap();
+
+    let body = tokio::time::timeout(Duration::from_secs(5), request)
+        .await
+        .expect("the in-flight request must not be cut by the drain")
+        .unwrap();
+    assert_eq!(body, "done");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server drains and exits")
+        .unwrap()
+        .unwrap();
+}

@@ -153,9 +153,25 @@ pub async fn diagnose_route(
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    Ok(Json(
-        crate::proxy::diagnose_route(&state, model, endpoint, session_id).await?,
-    ))
+    if let Some(api_key_id) = input.api_key_id {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM api_keys WHERE id = ?")
+            .bind(api_key_id)
+            .fetch_optional(&state.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::BadRequest(format!(
+                "gateway API key {api_key_id} does not exist"
+            )));
+        }
+    }
+    let diagnosis = match input.api_key_id {
+        Some(api_key_id) => {
+            crate::proxy::diagnose_route_for_key(&state, model, endpoint, session_id, Some(api_key_id))
+                .await?
+        }
+        None => crate::proxy::diagnose_route(&state, model, endpoint, session_id).await?,
+    };
+    Ok(Json(diagnosis))
 }
 
 pub async fn delete_route(

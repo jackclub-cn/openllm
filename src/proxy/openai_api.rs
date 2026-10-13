@@ -223,6 +223,35 @@ pub(crate) async fn proxy_openai_inner(
         },
         None => 0,
     };
+    // A candidate over its provider-pool allocation is dropped before ordering,
+    // so the request falls back to a provider with headroom instead of failing.
+    // This is a local routing decision: it never marks the provider as failed.
+    let allocation = match crate::allocation::apply_allocation_filter(
+        state,
+        api_key.as_ref(),
+        &mut resolved.targets,
+    )
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            let message = error.to_string();
+            log_request_rejection(
+                state,
+                api_key.as_ref(),
+                request_id,
+                session_id.as_deref(),
+                &requested_model,
+                &endpoint,
+                streamed,
+                started,
+                429,
+                &message,
+            )
+            .await;
+            return Err(error);
+        }
+    };
     let receipt = capability_receipt(
         resolved.barrel.as_ref(),
         requested_output_tokens,
@@ -262,6 +291,7 @@ pub(crate) async fn proxy_openai_inner(
         &resolved.strategy,
         resolved.targets,
         session_id.as_deref(),
+        api_key.as_ref().map(|key| key.id),
     )
     .await?;
     enforce_api_key_rate_limit_or_log(
@@ -305,6 +335,17 @@ pub(crate) async fn proxy_openai_inner(
             request_id,
             &format!(
                 "budget ${budget:.6} excluded {budget_excluded_targets} target(s) whose estimated cost exceeded the ceiling"
+            ),
+        )
+        .await;
+    }
+    if !allocation.notes.is_empty() {
+        log_usage_warning(
+            state,
+            request_id,
+            &format!(
+                "provider pool allocation: {}",
+                allocation.notes.join("; ")
             ),
         )
         .await;

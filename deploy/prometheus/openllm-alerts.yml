@@ -1,0 +1,189 @@
+# Prometheus alerting rules for OpenLLM Gateway.
+#
+# Validate with:
+#   promtool check rules deploy/prometheus/openllm-alerts.yml
+#
+# Scrape the gateway with:
+#   - job_name: openllm
+#     metrics_path: /metrics
+#     static_configs:
+#       - targets: ["127.0.0.1:8080"]
+#     # If OPENLLM_ADMIN_TOKEN is set, /metrics requires the same credential:
+#     authorization:
+#       credentials_file: /etc/prometheus/openllm-admin-token
+#
+# Every metric name below is exported by `GET /metrics`; see docs/OBSERVABILITY.md
+# for the full list and for the meaning of each signal.
+groups:
+  - name: openllm-availability
+    rules:
+      # The gateway sets openllm_ready to 0 as soon as it starts draining. A
+      # sustained 0 means an upgrade or crash is in progress, or the process is
+      # wedged. Page when it lasts longer than a normal restart.
+      - alert: OpenLlmNotReady
+        expr: openllm_ready == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenLLM gateway is not ready ({{ $labels.instance }})"
+          description: >-
+            openllm_ready has been 0 for 2 minutes. The instance is draining,
+            shutting down, or has stopped accepting requests. Check
+            /api/status and the process logs; if no upgrade is in flight, the
+            instance is likely down.
+
+      - alert: OpenLlmTargetDown
+        expr: up{job="openllm"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "OpenLLM gateway is unreachable ({{ $labels.instance }})"
+          description: >-
+            Prometheus cannot scrape /metrics. During a drain the port closes
+            immediately, so a short gap around a restart is expected; a
+            sustained gap means the process is gone.
+
+  - name: openllm-resilience
+    rules:
+      # A provider whose circuit is open is short-circuited with 503 until a
+      # probe succeeds. One provider cooling is normal; several at once means
+      # the upstream fleet is unhealthy or the key pool is exhausted.
+      - alert: OpenLlmProviderCircuitOpen
+        expr: openllm_provider_circuit_state{state="open"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider circuit open: {{ $labels.provider }}"
+          description: >-
+            Provider {{ $labels.provider }} has been short-circuited for 5
+            minutes. Requests to it fail fast with 503 until a probe succeeds.
+            Check the provider's upstream status, credentials, and rate limits,
+            or route around it.
+
+      - alert: OpenLlmProviderCircuitTrips
+        expr: increase(openllm_provider_circuit_trips_total[15m]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider circuit is flapping: {{ $labels.provider }}"
+          description: >-
+            Provider {{ $labels.provider }} opened its circuit at least 3 times
+            in 15 minutes. Recovering and immediately failing again usually
+            means an intermittent upstream fault rather than a hard outage.
+
+      - alert: OpenLlmProviderKeyCooling
+        expr: openllm_provider_key_cooling == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Provider key cooling: {{ $labels.provider }}/{{ $labels.key }}"
+          description: >-
+            Upstream key {{ $labels.key }} on {{ $labels.provider }} has been
+            held out of rotation for 10 minutes. Repeated 401/403/429 from one
+            key usually means a revoked credential or a per-key quota.
+
+      # Fair-share pools: a key being throttled while the pool saturates is the
+      # intended protection, but sustained denials mean the allocation is too
+      # small for the traffic it carries.
+      - alert: OpenLlmPoolDenials
+        expr: increase(openllm_pool_denials_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Quota pool is refusing requests: {{ $labels.pool }}"
+          description: >-
+            Pool {{ $labels.pool }} denied requests over the last 10 minutes
+            while saturated. Either raise the pool/limit, rebalance weights, or
+            confirm the burst is expected.
+
+  - name: openllm-capacity
+    rules:
+      # Local admission control shedding means the gateway is protecting itself.
+      # Sustained shedding is the signal that the box needs more headroom.
+      - alert: OpenLlmRequestsShed
+        expr: increase(openllm_requests_shed_total[10m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM is shedding requests ({{ $labels.instance }})"
+          description: >-
+            Requests were rejected by local admission control or memory
+            pressure over the last 10 minutes. Raise
+            OPENLLM_MAX_CONCURRENT_REQUESTS / OPENLLM_MEMORY_LIMIT_MIB, reduce
+            traffic, or add capacity.
+
+      - alert: OpenLlmMemoryPressure
+        expr: openllm_memory_pressure == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM is under memory pressure ({{ $labels.instance }})"
+          description: >-
+            Process memory has been at or above the shed threshold for 5
+            minutes, so the gateway is shedding load. Check
+            openllm_memory_used_bytes against openllm_memory_limit_bytes and
+            the memory_limit_source label on /api/status.
+
+      - alert: OpenLlmAdmissionSaturated
+        expr: >-
+          openllm_request_capacity_limit > 0
+          and openllm_request_capacity_available == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM admission gate is full ({{ $labels.instance }})"
+          description: >-
+            Every global concurrency slot has been held for 10 minutes. Latency
+            will climb and requests will queue on OPENLLM_ADMISSION_WAIT_MS or
+            be shed.
+
+      - alert: OpenLlmRuntimeLag
+        expr: openllm_runtime_lag_millis > 5000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM event loop is lagging ({{ $labels.instance }})"
+          description: >-
+            The async runtime has been blocked for more than 5 seconds. A
+            blocked worker thread is usually a blocking call on the hot path
+            or extreme memory pressure.
+
+  - name: openllm-maintenance
+    rules:
+      # Maintenance probes provider health and reaps interrupted requests every
+      # 60 seconds. If it stalls, health checks stop healing broken providers
+      # and usage reconciliation drifts.
+      - alert: OpenLlmMaintenanceStalled
+        expr: >-
+          time() - openllm_maintenance_last_run_timestamp_seconds > 300
+          and openllm_maintenance_last_run_timestamp_seconds > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM maintenance has not run ({{ $labels.instance }})"
+          description: >-
+            The 60 second maintenance cycle has not completed in over five
+            minutes. Scheduled provider health recovery, model sync, and
+            interrupted-request reconciliation are all paused.
+
+      - alert: OpenLlmMaintenanceNotRunning
+        expr: >-
+          openllm_maintenance_runs_total == 0
+          and openllm_uptime_seconds > 300
+        labels:
+          severity: warning
+        annotations:
+          summary: "OpenLLM maintenance never ran ({{ $labels.instance }})"
+          description: >-
+            The process has been up for over five minutes without a single
+            maintenance cycle. The maintenance worker may have failed to start.

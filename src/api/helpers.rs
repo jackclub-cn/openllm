@@ -491,9 +491,19 @@ pub(super) async fn clear_provider_key_cooldowns(
     state: &AppState,
     provider_api_key_ids: impl IntoIterator<Item = i64>,
 ) {
-    let mut cooldowns = state.provider_key_cooldown.lock().await;
-    for provider_api_key_id in provider_api_key_ids {
-        cooldowns.remove(&provider_api_key_id);
+    let mut removed = Vec::new();
+    {
+        let mut cooldowns = state.provider_key_cooldown.lock().await;
+        for provider_api_key_id in provider_api_key_ids {
+            if cooldowns.remove(&provider_api_key_id).is_some() {
+                removed.push(provider_api_key_id);
+            }
+        }
+    }
+    // Cleared cooldowns must be removed from the persisted mirror as well, or a
+    // restart would restore a cooldown an operator explicitly lifted.
+    for provider_api_key_id in removed {
+        state.mark_provider_key_resilience_dirty(provider_api_key_id);
     }
 }
 

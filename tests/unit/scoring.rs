@@ -1,0 +1,459 @@
+use super::*;
+
+/// A minimal route target; this file has no access to the proxy test helpers,
+/// so it builds its own to keep the scoring tests self-contained.
+fn scoring_target(provider_id: i64, provider_name: &str) -> RouteTarget {
+    RouteTarget {
+        id: provider_id,
+        route_id: None,
+        provider_id,
+        provider_name: provider_name.to_string(),
+        provider_type: "openai".to_string(),
+        base_url: "http://upstream".to_string(),
+        model_prefix: String::new(),
+        api_key: None,
+        provider_headers: "{}".to_string(),
+        supported_endpoints: None,
+        cost: None,
+        cost_input_override: None,
+        cost_output_override: None,
+        cost_cache_read_override: None,
+        cost_cache_write_override: None,
+        context_limit: None,
+        input_limit: None,
+        output_limit: None,
+        provider_enabled: None,
+        model_enabled: None,
+        tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
+        max_concurrency: None,
+        queue_timeout_seconds: None,
+        model_max_concurrency: None,
+        model_queue_timeout_seconds: None,
+        provider_health: None,
+        upstream_model: "model".to_string(),
+        weight: 100,
+        priority: 0,
+        enabled: 1,
+        provider_api_key_id: None,
+        provider_api_key_name: None,
+        auth_retryable: false,
+    }
+}
+
+/// The diagnostic preview must score every candidate with an explainable factor
+/// breakdown and, above all, do it without touching an upstream.
+#[tokio::test]
+async fn route_diagnosis_scores_candidates_without_an_upstream_call() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    // Provider 1 points at a closed port: any upstream attempt would fail
+    // loudly, which is exactly what this test asserts never happens.
+    sqlx::query(
+        "INSERT INTO providers (
+                id, name, provider_type, base_url, enabled, last_test_ok
+             ) VALUES
+                (1, 'reachable', 'openai', 'http://127.0.0.1:9/v1', 1, 1),
+                (2, 'disabled', 'openai', 'http://127.0.0.1:9/v1', 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+                (1, 'model', '[\"/chat/completions\"]'),
+                (2, 'model', '[\"/chat/completions\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'shared route', 'shared', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority, enabled)
+             VALUES (1, 1, 'model', 0, 1), (1, 2, 'model', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+
+    let diagnosis = diagnose_route(&state, "shared", OPENAI_CHAT_COMPLETIONS, None)
+        .await
+        .unwrap();
+    assert_eq!(diagnosis.candidates.len(), 2);
+
+    let candidate = &diagnosis.candidates[0];
+    assert!(candidate.eligible, "the reachable target must be selectable");
+    assert!(candidate.exclusion.is_none());
+    assert!(!candidate.deprioritized);
+    assert!(
+        candidate.score > 0.0 && candidate.score <= 100.0,
+        "the score must stay inside the documented range, got {}",
+        candidate.score
+    );
+
+    let names = candidate
+        .factors
+        .iter()
+        .map(|factor| factor.name.as_str())
+        .collect::<Vec<_>>();
+    for expected in [
+        "circuit",
+        "capacity",
+        "health",
+        "reliability",
+        "latency",
+        "cost",
+        "strategy",
+    ] {
+        assert!(names.contains(&expected), "missing factor {expected}: {names:?}");
+    }
+    // Health was tested, so it is known; everything unmeasured must stay
+    // neutral instead of quietly penalising the candidate.
+    let health = candidate
+        .factors
+        .iter()
+        .find(|factor| factor.name == "health")
+        .unwrap();
+    assert_eq!(health.score, Some(1.0));
+    let reliability = candidate
+        .factors
+        .iter()
+        .find(|factor| factor.name == "reliability")
+        .unwrap();
+    assert!(reliability.score.is_none(), "an unmeasured success rate is unknown");
+    assert_eq!(reliability.contribution, reliability.weight * 0.5);
+    let latency = candidate
+        .factors
+        .iter()
+        .find(|factor| factor.name == "latency")
+        .unwrap();
+    assert!(latency.score.is_none());
+    let allocation = candidate
+        .factors
+        .iter()
+        .find(|factor| factor.name == "allocation");
+    assert!(
+        allocation.is_none(),
+        "a provider without a pool must not get an allocation factor"
+    );
+
+    // The disabled target is still explained, just not as a candidate.
+    let excluded = &diagnosis.candidates[1];
+    assert!(!excluded.eligible);
+    assert_eq!(excluded.score, 0.0);
+    assert!(
+        excluded
+            .exclusion
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider is disabled")),
+        "got {:?}",
+        excluded.exclusion
+    );
+    assert!(excluded.order > candidate.order);
+
+    // Proof that the preview made no upstream request.
+    let usage: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_logs")
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+    assert_eq!(usage, 0, "the preview must not record any request");
+}
+
+/// A provider at its concurrency cap ranks behind one with headroom, but is
+/// never dropped: a single-target route must still be able to queue for it.
+#[tokio::test]
+async fn saturated_capacity_is_deprioritized_but_not_dropped() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+
+    let busy = {
+        let mut target = scoring_target(1, "busy");
+        target.max_concurrency = Some(1);
+        target
+    };
+    let roomy = scoring_target(2, "roomy");
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let held = semaphore.clone().acquire_owned().await.unwrap();
+    state
+        .provider_concurrency
+        .lock()
+        .await
+        .insert(1, semaphore);
+
+    let ordered = order_targets(
+        &state,
+        1,
+        "priority",
+        vec![busy.clone(), roomy.clone()],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ordered.len(), 2, "a saturated candidate is never dropped");
+    assert_eq!(
+        ordered[0].provider_id, 2,
+        "the candidate with headroom is tried first"
+    );
+
+    let assessments = assess_targets(&state, RouteStrategy::Priority, &ordered, None)
+        .await
+        .unwrap();
+    let busy_assessment = assessments
+        .get(&(1, busy.upstream_model.clone()))
+        .expect("the busy provider is still scored");
+    assert!(busy_assessment.deprioritized);
+    assert!(
+        busy_assessment.exclusion.is_none(),
+        "saturation is a preference, not an exclusion"
+    );
+    let capacity = busy_assessment
+        .factors
+        .iter()
+        .find(|factor| factor.name == "capacity")
+        .unwrap();
+    assert_eq!(capacity.score, Some(0.0));
+    assert!(capacity.detail.contains("并发余量 0/1"));
+
+    drop(held);
+}
+
+/// A candidate over its provider-pool share is excluded with the reason, and it
+/// is ordered after candidates the request path would actually use.
+#[tokio::test]
+async fn diagnosis_excludes_a_candidate_over_its_pool_share() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, enabled, last_test_ok) VALUES
+                (1, 'pooled', 'openai', 'http://127.0.0.1:9/v1', 1, 1),
+                (2, 'plain', 'openai', 'http://127.0.0.1:9/v1', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+                (1, 'model', '[\"/chat/completions\"]'),
+                (2, 'model', '[\"/chat/completions\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'shared route', 'shared', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Provider 1 is the preferred target, provider 2 the fallback.
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority, enabled)
+             VALUES (1, 1, 'model', 0, 1), (1, 2, 'model', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, name, key_prefix, key_suffix, key_hash, enabled)
+             VALUES (1, 'alpha', 'sk-a', 'aaaa', 'hash-a', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    let pool_input = serde_json::from_value::<crate::models::ProviderPoolInput>(json!({
+        "provider_id": 1,
+        "name": "shared",
+        "request_limit": 2,
+        "saturation_threshold_pct": 50,
+        "allocations": [{ "api_key_id": 1, "weight_pct": 50, "policy": "hard" }]
+    }))
+    .unwrap();
+    let created_pool = crate::api::create_provider_pool(
+        axum::extract::State(state.clone()),
+        axum::Json(pool_input),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created_pool.0.provider_id, 1);
+    // One request already used by that key saturates the pool (50% of 2) and
+    // exhausts its single reserved request.
+    crate::allocation::charge_target_attempt(&state, 1, Some(1)).await;
+
+    let diagnosis = diagnose_route_for_key(
+        &state,
+        "shared",
+        OPENAI_CHAT_COMPLETIONS,
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+
+    let denied = diagnosis
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == 1)
+        .unwrap();
+    assert!(!denied.eligible, "the over-share candidate must be excluded");
+    assert!(
+        denied
+            .exclusion
+            .as_deref()
+            .is_some_and(|reason| reason.contains("配额池") && reason.contains("fair share")),
+        "got {:?}",
+        denied.exclusion
+    );
+    let allowed = diagnosis
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == 2)
+        .unwrap();
+    assert!(allowed.eligible);
+    assert!(
+        allowed.order < denied.order,
+        "an excluded candidate is listed after the ones that can serve"
+    );
+    // The exclusion is visible as a zero-scoring allocation factor too.
+    let allocation = denied
+        .factors
+        .iter()
+        .find(|factor| factor.name == "allocation")
+        .unwrap();
+    assert_eq!(allocation.score, Some(0.0));
+
+    // A denyless key that borrows leftover capacity is not excluded.
+    let borrower = diagnose_route_for_key(
+        &state,
+        "shared",
+        OPENAI_CHAT_COMPLETIONS,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let borrowed = borrower
+        .candidates
+        .iter()
+        .find(|candidate| candidate.provider_id == 1)
+        .unwrap();
+    assert!(
+        borrowed.eligible,
+        "a key without an allocation only borrows headroom, so it stays eligible"
+    );
+}
+
+/// A `soft` allocation is only a nudge: the key that is over its own share is
+/// kept but tried last. Regression guard for the request path using the real
+/// gateway key — it used to pass the anonymous id, so a soft over-share was
+/// never deprioritised on a real request while the diagnose preview said it was.
+#[tokio::test]
+async fn a_soft_pool_over_share_moves_the_target_last_for_the_real_key() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, enabled, last_test_ok) VALUES
+                (1, 'pooled', 'openai', 'http://127.0.0.1:9/v1', 1, 1),
+                (2, 'plain', 'openai', 'http://127.0.0.1:9/v1', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+                (1, 'model', '[\"/chat/completions\"]'),
+                (2, 'model', '[\"/chat/completions\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+             VALUES (1, 'shared route', 'shared', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, name, key_prefix, key_suffix, key_hash, enabled)
+             VALUES (1, 'alpha', 'sk-a', 'aaaa', 'hash-a', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    let _ = crate::api::create_provider_pool(
+        axum::extract::State(state.clone()),
+        axum::Json(
+            serde_json::from_value::<crate::models::ProviderPoolInput>(json!({
+                "provider_id": 1,
+                "name": "shared",
+                "request_limit": 2,
+                "saturation_threshold_pct": 50,
+                "allocations": [{ "api_key_id": 1, "weight_pct": 50, "policy": "soft" }]
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    // One request saturates the pool (50% of 2) and puts the key at its share of
+    // one request, which is exactly when a soft allocation starts penalising.
+    crate::allocation::charge_target_attempt(&state, 1, Some(1)).await;
+
+    let preferred = scoring_target(1, "pooled");
+    let fallback = RouteTarget {
+        priority: 1,
+        ..scoring_target(2, "plain")
+    };
+
+    let for_key = order_targets(
+        &state,
+        1,
+        "priority",
+        vec![preferred.clone(), fallback.clone()],
+        None,
+        Some(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        for_key[0].provider_id, 2,
+        "the over-share target must be tried last for the key that is over it"
+    );
+
+    let without_key = order_targets(&state, 1, "priority", vec![preferred, fallback], None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        without_key[0].provider_id, 1,
+        "without a gateway key nothing is over its share"
+    );
+}

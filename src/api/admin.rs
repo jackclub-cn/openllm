@@ -126,6 +126,12 @@ pub struct CircuitSummary {
 }
 
 pub async fn get_status(State(state): State<AppState>) -> Json<RuntimeStatus> {
+    Json(collect_status(&state).await)
+}
+
+/// Gathers the runtime status payload. The diagnostics snapshot embeds the same
+/// value, so an operator's exported file and the console card cannot disagree.
+pub(crate) async fn collect_status(state: &AppState) -> RuntimeStatus {
     use std::sync::atomic::Ordering::Relaxed;
 
     let limits = state.runtime_limits();
@@ -178,7 +184,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<RuntimeStatus> {
         }
     }
 
-    Json(RuntimeStatus {
+    RuntimeStatus {
         version: env!("CARGO_PKG_VERSION"),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         draining: state.shutting_down.load(Relaxed),
@@ -219,7 +225,7 @@ pub async fn get_status(State(state): State<AppState>) -> Json<RuntimeStatus> {
             half_open,
             threshold,
         },
-    })
+    }
 }
 
 pub async fn admin_auth(

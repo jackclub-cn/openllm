@@ -99,6 +99,21 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  monitoring:
+    name: Monitoring artifacts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      # Validates the Prometheus rules and rule unit tests with promtool, the
+      # Grafana dashboard JSON, and that every metric the rules, the rule tests
+      # and the dashboard reference is actually declared by /metrics. It needs
+      # no running gateway, so it runs in seconds.
+      - name: Check alert rules, rule tests and dashboard
+        run: ./scripts/check-monitoring.sh
+
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')

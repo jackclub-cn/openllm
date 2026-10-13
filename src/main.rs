@@ -23,6 +23,28 @@ struct Args {
     /// Protect management APIs. If unset, the console is open and intended for local use.
     #[arg(long, env = "OPENLLM_ADMIN_TOKEN")]
     admin_token: Option<String>,
+
+    /// Print what a restart would do to the database schema, then exit.
+    /// Exit code 0 = up to date, 1 = a problem, 2 = migrations are pending.
+    #[arg(long)]
+    check_migrations: bool,
+
+    /// Write a backup into <data-dir>/backups and exit. Safe while serving.
+    #[arg(long)]
+    backup: bool,
+
+    /// List the backups available for a restore, then exit.
+    #[arg(long)]
+    list_backups: bool,
+
+    /// Restore a backup and exit. Takes a file name from the backups
+    /// directory, or a path. The gateway must not be running.
+    #[arg(long, value_name = "FILE")]
+    restore_backup: Option<String>,
+
+    /// Machine-readable JSON for the operator commands above.
+    #[arg(long)]
+    json: bool,
 }
 
 #[tokio::main]
@@ -30,13 +52,37 @@ async fn main() -> anyhow::Result<()> {
     init_tracing();
 
     let args = Args::parse();
-    run(Config {
+    let config = Config {
         bind: args.bind,
-        data_dir: args.data_dir,
-        database_url: args.database_url,
-        admin_token: args.admin_token,
-    })
-    .await
+        data_dir: args.data_dir.clone(),
+        database_url: args.database_url.clone(),
+        admin_token: args.admin_token.clone(),
+    };
+    if args.check_migrations {
+        return finish(openllm::cli::check_migrations(&config, args.json).await);
+    }
+    if args.backup {
+        return finish(openllm::cli::create_backup(&config, args.json).await);
+    }
+    if args.list_backups {
+        return finish(openllm::cli::list_backups(&config, args.json).await);
+    }
+    if let Some(backup) = args.restore_backup.as_deref() {
+        return finish(openllm::cli::restore_backup(&config, backup, args.json).await);
+    }
+    run(config).await
+}
+
+/// Turn an operator command's exit code into a process exit.
+///
+/// A non-zero code is part of the interface (a deploy script branches on it),
+/// so it must not be swallowed into an `Err` that prints a stack trace.
+fn finish(result: anyhow::Result<i32>) -> anyhow::Result<()> {
+    match result {
+        Ok(0) => Ok(()),
+        Ok(code) => std::process::exit(code),
+        Err(error) => Err(error),
+    }
 }
 
 /// Installs the tracing subscriber.

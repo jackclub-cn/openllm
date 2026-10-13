@@ -70,6 +70,9 @@ pub struct RuntimeLimits {
     /// Consecutive provider failures that hard-open its circuit; `0` keeps the
     /// soft cooldown only.
     pub provider_open_threshold: u32,
+    /// Whether circuits and cooldowns are mirrored into SQLite so a restart
+    /// does not send traffic straight back to a failing provider.
+    pub resilience_state_persist: bool,
     /// Process-memory ceiling that arms the pressure guard, in MiB; `0`
     /// disables it.
     pub memory_limit_mib: u64,

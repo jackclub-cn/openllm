@@ -8,3 +8,7 @@
 /web/dist/
 .env
 .DS_Store
+
+# TLS material for the bundled nginx example is generated locally, never committed.
+deploy/nginx/certs/*
+!deploy/nginx/certs/.gitkeep

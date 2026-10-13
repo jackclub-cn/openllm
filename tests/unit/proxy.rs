@@ -3524,6 +3524,7 @@ async fn cost_optimized_orders_known_prices_before_unknown_targets() {
         "cost_optimized",
         vec![expensive, unknown, cheap],
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3585,7 +3586,7 @@ async fn latency_optimized_prefers_recent_successful_samples() {
         })
         .collect::<Vec<_>>();
 
-    let ordered = order_targets(&state, 1, "latency_optimized", targets, None)
+    let ordered = order_targets(&state, 1, "latency_optimized", targets, None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -3637,7 +3638,7 @@ async fn least_used_prefers_the_target_with_less_recent_traffic() {
     quiet.id = 2;
     quiet.provider_id = 2;
 
-    let ordered = order_targets(&state, 1, "least_used", vec![busy, quiet], None)
+    let ordered = order_targets(&state, 1, "least_used", vec![busy, quiet], None, None)
         .await
         .unwrap();
     assert_eq!(ordered[0].provider_id, 2);
@@ -3685,6 +3686,7 @@ async fn provider_keys_are_sticky_per_session_without_advancing_rotation() {
             "priority",
             vec![target.clone()],
             Some("session-a"),
+            None,
         )
         .await
         .unwrap(),
@@ -3696,6 +3698,7 @@ async fn provider_keys_are_sticky_per_session_without_advancing_rotation() {
             "priority",
             vec![target.clone()],
             Some("session-a"),
+            None,
         )
         .await
         .unwrap(),
@@ -3703,12 +3706,12 @@ async fn provider_keys_are_sticky_per_session_without_advancing_rotation() {
     assert_eq!(first, repeated);
 
     let no_session_first = keys(
-        order_targets(&state, 1, "priority", vec![target.clone()], None)
+        order_targets(&state, 1, "priority", vec![target.clone()], None, None)
             .await
             .unwrap(),
     );
     let no_session_second = keys(
-        order_targets(&state, 1, "priority", vec![target], None)
+        order_targets(&state, 1, "priority", vec![target], None, None)
             .await
             .unwrap(),
     );
@@ -3743,7 +3746,7 @@ async fn provider_keys_rotate_and_expand_a_route_target() {
     let mut target = endpoint_test_target("openai", None);
     target.id = 1;
 
-    let first = order_targets(&state, 1, "priority", vec![target.clone()], None)
+    let first = order_targets(&state, 1, "priority", vec![target.clone()], None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -3761,7 +3764,7 @@ async fn provider_keys_rotate_and_expand_a_route_target() {
             .all(|target| target.provider_api_key_id.is_some())
     );
 
-    let second = order_targets(&state, 1, "priority", vec![target], None)
+    let second = order_targets(&state, 1, "priority", vec![target], None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -3806,7 +3809,7 @@ async fn provider_keys_skip_cooling_candidates_when_alternatives_exist() {
         .lock()
         .await
         .insert(11, Instant::now() + Duration::from_secs(60));
-    let available = order_targets(&state, 1, "priority", vec![target.clone()], None)
+    let available = order_targets(&state, 1, "priority", vec![target.clone()], None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -3822,7 +3825,7 @@ async fn provider_keys_skip_cooling_candidates_when_alternatives_exist() {
         .lock()
         .await
         .insert(12, Instant::now() + Duration::from_secs(60));
-    let fallback = order_targets(&state, 1, "priority", vec![target], None)
+    let fallback = order_targets(&state, 1, "priority", vec![target], None, None)
         .await
         .unwrap();
     assert_eq!(fallback.len(), 2);
@@ -3870,6 +3873,7 @@ async fn provider_cooldowns_skip_cooling_providers_when_alternatives_exist() {
         "priority",
         vec![cooling.clone(), healthy.clone()],
         None,
+        None,
     )
     .await
     .unwrap();
@@ -3886,7 +3890,7 @@ async fn provider_cooldowns_skip_cooling_providers_when_alternatives_exist() {
         .lock()
         .await
         .insert(2, Instant::now() + Duration::from_secs(60));
-    let fallback = order_targets(&state, 1, "priority", vec![cooling, healthy], None)
+    let fallback = order_targets(&state, 1, "priority", vec![cooling, healthy], None, None)
         .await
         .unwrap();
     assert_eq!(
@@ -4500,7 +4504,11 @@ async fn saturated_model_falls_back_to_healthy_provider_sibling() {
     .unwrap();
 
     assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert_eq!(
+        response.headers()["x-openllm-fallback-count"], "0",
+        "a model at its concurrency cap is skipped in favour of a sibling with \
+         headroom, instead of waiting out its queue"
+    );
     assert_eq!(response.headers()["x-openllm-routed-model"], "model-b");
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert!(
@@ -4641,7 +4649,11 @@ async fn saturated_provider_falls_back_without_opening_its_circuit() {
     .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
-    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert_eq!(
+        response.headers()["x-openllm-fallback-count"], "0",
+        "live capacity is part of the candidate score, so a provider at its \
+         concurrency cap ranks behind one with headroom and no queue wait is spent"
+    );
     assert!(
         !state.provider_cooldown.lock().await.contains_key(&1),
         "local concurrency backpressure must not open the provider circuit"
@@ -4847,7 +4859,7 @@ async fn model_cooldowns_rank_healthy_sibling_models_first() {
         Instant::now() + Duration::from_secs(60),
     );
 
-    let ordered = order_targets(&state, 1, "priority", vec![cooling, healthy], None)
+    let ordered = order_targets(&state, 1, "priority", vec![cooling, healthy], None, None)
         .await
         .unwrap();
 
@@ -9013,6 +9025,113 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
     );
 }
 
+/// A half-open provider admits exactly one recovery probe. If that probe is
+/// stopped before it ever reaches the upstream (a provider-pool denial), the
+/// lease must be handed back, or the provider stays short-circuited for the whole
+/// probe lease even though nothing tested it.
+#[tokio::test]
+async fn a_pool_denial_releases_the_half_open_probe() {
+    let state = circuit_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'limited', 'openai', 'http://limited.example/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_pools (provider_id, name, enabled, window_seconds, \
+             request_limit, token_limit, saturation_threshold_pct) \
+         VALUES (1, 'cap', 1, 60, 1, NULL, 50)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    state.invalidate_pool_catalog().await;
+
+    // Half-open: the streak is at the threshold and the cooldown has elapsed, so
+    // the next attempt is admitted as the single recovery probe.
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(1));
+
+    // Burn the pool's one request for the window so the probe attempt is denied.
+    crate::allocation::charge_target_attempt(&state, 1, None).await;
+
+    let target = endpoint_test_target("openai", None);
+    let mut body = json!({"model": "model", "messages": []});
+    let result = send_provider_request_with_compat_retry(
+        &state,
+        &target,
+        None,
+        "pool-denied-probe",
+        OPENAI_CHAT_COMPLETIONS,
+        false,
+        &mut body,
+        |_body: &Value| -> AppResult<RequestBuilder> {
+            panic!("a pool denial must return before any upstream call")
+        },
+    )
+    .await;
+
+    match result {
+        Err(AppError::UpstreamStatus { status, .. }) => {
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        }
+        Ok(_) => panic!("the saturated pool must deny the attempt"),
+        Err(other) => panic!("expected a 429 pool denial, got {other:?}"),
+    }
+    assert!(
+        !state.provider_probe.lock().await.contains_key(&1),
+        "the denied probe must be released so the provider is not stuck half-open"
+    );
+}
+
+/// A request that fails to build never reaches the upstream, so the half-open
+/// probe the caller admitted must be handed back instead of being held for the
+/// whole lease.
+#[tokio::test]
+async fn a_build_failure_releases_the_half_open_probe() {
+    let state = circuit_state().await;
+    // Half-open: the streak is at the threshold and the cooldown has elapsed, so
+    // the attempt is admitted as the single recovery probe.
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(1));
+
+    let target = endpoint_test_target("openai", None);
+    let mut body = json!({"model": "model", "messages": []});
+    let result = send_provider_request_with_compat_retry(
+        &state,
+        &target,
+        None,
+        "build-failure-probe",
+        OPENAI_CHAT_COMPLETIONS,
+        false,
+        &mut body,
+        |_body: &Value| -> AppResult<RequestBuilder> {
+            Err(AppError::BadRequest("boom".to_string()))
+        },
+    )
+    .await;
+
+    match result {
+        Err(AppError::BadRequest(message)) => assert_eq!(message, "boom"),
+        Ok(_) => panic!("a build failure must propagate as an error"),
+        Err(other) => panic!("expected the build error, got {other:?}"),
+    }
+    assert!(
+        !state.provider_probe.lock().await.contains_key(&1),
+        "a request that was never built must not hold the probe lease"
+    );
+}
+
 /// The trip counter must count each hard-open so a flapping provider stands
 /// out, but must not count failures that stay below the threshold.
 #[tokio::test]
@@ -9104,6 +9223,288 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         "open"
     );
     assert!(circuit_events.try_recv().is_err());
+}
+
+/// A file-backed state so a second `AppState` can read what the first wrote.
+///
+/// Sharing the pool is what makes an in-process "restart" faithful: only the
+/// in-memory maps are thrown away, exactly as a relaunch of the binary does.
+async fn restartable_circuit_state() -> (tempfile::TempDir, AppState) {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(2)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(directory.path().join("resilience.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'flaky', 'openai', 'https://flaky.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret) \
+         VALUES (11, 1, 'main', 'sk-main')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    (directory, state)
+}
+
+async fn count_rows(state: &AppState, table: &str) -> i64 {
+    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
+}
+
+/// A restart must not send traffic straight back to a provider that was still
+/// cooling: the circuit and its cooldown deadline are restored from SQLite.
+#[tokio::test]
+async fn persisted_provider_circuit_survives_a_restart() {
+    let (_directory, state) = restartable_circuit_state().await;
+    let failure = StatusCode::SERVICE_UNAVAILABLE;
+    for _ in 0..crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD {
+        mark_provider_error(&state, 1, Some(failure), None, None).await;
+    }
+    crate::resilience_state::flush(&state).await.unwrap();
+    assert_eq!(count_rows(&state, "provider_circuit_state").await, 1);
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    let mut events = restarted.circuit_events.subscribe();
+    assert_eq!(
+        crate::resilience_state::restore(&restarted).await.unwrap(),
+        1,
+        "the provider circuit must be restored"
+    );
+    assert!(
+        events.try_recv().is_err(),
+        "restoring state is not a circuit transition and must not alert"
+    );
+    assert_eq!(
+        restarted
+            .provider_failure_streak
+            .lock()
+            .await
+            .get(&1)
+            .copied(),
+        Some(crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD)
+    );
+    let retry_after = admit_provider_attempt(&restarted, 1)
+        .await
+        .expect_err("a restored open circuit must still short-circuit the attempt");
+    assert!(
+        retry_after >= Duration::from_secs(1),
+        "the restored block must carry a Retry-After hint, got {retry_after:?}"
+    );
+
+    // The cooldown manager must show the restored remainder, or an operator
+    // cannot tell an outage from a cooldown that survived the restart.
+    let axum::Json(snapshot) =
+        crate::api::list_cooldowns(axum::extract::State(restarted.clone()))
+            .await
+            .unwrap();
+    let restored = snapshot
+        .provider_cooldowns
+        .iter()
+        .find(|entry| entry.provider_id == 1)
+        .expect("the restored cooldown must be listed");
+    assert_eq!(restored.state, "open");
+    assert!(restored.remaining_seconds > 0);
+    assert_eq!(restored.failure_streak, crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD);
+}
+
+/// A cooldown that elapsed while the process was down must come back as
+/// half-open, so a restart admits exactly one recovery probe instead of either
+/// blocking the provider forever or stampeding it.
+#[tokio::test]
+async fn restored_expired_cooldown_stays_half_open() {
+    let (_directory, state) = restartable_circuit_state().await;
+    for _ in 0..crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD {
+        mark_provider_error(&state, 1, Some(StatusCode::BAD_GATEWAY), None, None).await;
+    }
+    crate::resilience_state::flush(&state).await.unwrap();
+    // Simulate the cooldown elapsing while nothing was running.
+    sqlx::query("UPDATE provider_circuit_state SET cooldown_until_unix_ms = 0 WHERE provider_id = 1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 1);
+    assert!(
+        admit_provider_attempt(&restarted, 1).await.is_ok(),
+        "the first request after the restart probes recovery"
+    );
+    assert!(
+        admit_provider_attempt(&restarted, 1).await.is_err(),
+        "a second request must not stampede a half-open provider"
+    );
+}
+
+/// Persisted state expires on its own: a cooldown whose deadline has passed is
+/// dropped, and a half-open marker older than the restore window is treated as
+/// stale rather than gating a provider that has long since recovered.
+#[tokio::test]
+async fn expired_persisted_state_is_dropped_and_purged() {
+    let (_directory, state) = restartable_circuit_state().await;
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    sqlx::query(
+        "INSERT INTO provider_circuit_state
+             (provider_id, failure_streak, cooldown_until_unix_ms, updated_at_unix_ms)
+         VALUES (1, 3, ?, ?)",
+    )
+    .bind(now_unix_ms - 1_000)
+    .bind(now_unix_ms - (crate::resilience_state::HALF_OPEN_RESTORE_TTL_SECS + 60) * 1000)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO target_cooldown_state (provider_id, model, cooldown_until_unix_ms)
+         VALUES (1, 'stale-model', ?)",
+    )
+    .bind(now_unix_ms - 1_000)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_key_cooldown_state (provider_key_id, cooldown_until_unix_ms)
+         VALUES (11, ?)",
+    )
+    .bind(now_unix_ms - 1_000)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    assert_eq!(
+        crate::resilience_state::restore(&restarted).await.unwrap(),
+        0,
+        "expired rows must not be restored"
+    );
+    assert!(restarted.provider_failure_streak.lock().await.is_empty());
+    assert!(restarted.provider_cooldown.lock().await.is_empty());
+    assert!(restarted.target_cooldown.lock().await.is_empty());
+    assert!(restarted.provider_key_cooldown.lock().await.is_empty());
+    assert_eq!(count_rows(&restarted, "provider_circuit_state").await, 0);
+    assert_eq!(count_rows(&restarted, "target_cooldown_state").await, 0);
+    assert_eq!(count_rows(&restarted, "provider_key_cooldown_state").await, 0);
+}
+
+/// Model and credential cooldowns are restored too, so a restart does not
+/// re-hammer a model or a credential that was just isolated.
+#[tokio::test]
+async fn persisted_model_and_key_cooldowns_survive_a_restart() {
+    let (_directory, state) = restartable_circuit_state().await;
+    let target = endpoint_test_target("openai", None);
+    mark_target_error(&state, &target, StatusCode::TOO_MANY_REQUESTS, None).await;
+    mark_provider_api_key_error(&state, Some(11), StatusCode::TOO_MANY_REQUESTS, "busy", None)
+        .await;
+    crate::resilience_state::flush(&state).await.unwrap();
+    assert_eq!(count_rows(&state, "target_cooldown_state").await, 1);
+    assert_eq!(count_rows(&state, "provider_key_cooldown_state").await, 1);
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 2);
+    assert!(
+        restarted
+            .target_cooldown
+            .lock()
+            .await
+            .contains_key(&(1, target.upstream_model.clone()))
+    );
+    assert!(restarted.provider_key_cooldown.lock().await.contains_key(&11));
+
+    // Recovery must clear the persisted mirror as well, so the next restart
+    // does not resurrect a cooldown that a successful request lifted.
+    mark_target_success(&restarted, 1, &target.upstream_model).await;
+    mark_provider_api_key_success(&restarted, Some(11)).await;
+    crate::resilience_state::flush(&restarted).await.unwrap();
+    assert_eq!(count_rows(&restarted, "target_cooldown_state").await, 0);
+    assert_eq!(count_rows(&restarted, "provider_key_cooldown_state").await, 0);
+}
+
+/// An operator clearing cooldowns must also clear the persisted mirror; a
+/// restart afterwards must not bring the cooldowns back.
+#[tokio::test]
+async fn cleared_cooldowns_do_not_come_back_after_a_restart() {
+    let (_directory, state) = restartable_circuit_state().await;
+    for _ in 0..crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD {
+        mark_provider_error(&state, 1, Some(StatusCode::SERVICE_UNAVAILABLE), None, None).await;
+    }
+    let target = endpoint_test_target("openai", None);
+    mark_target_error(&state, &target, StatusCode::TOO_MANY_REQUESTS, None).await;
+    mark_provider_api_key_error(&state, Some(11), StatusCode::TOO_MANY_REQUESTS, "busy", None)
+        .await;
+    crate::resilience_state::flush(&state).await.unwrap();
+
+    let axum::Json(result) = crate::api::clear_cooldowns(
+        axum::extract::State(state.clone()),
+        axum::Json(crate::api::ClearCooldownsInput {
+            all: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(result.cleared_provider_cooldowns > 0);
+    crate::resilience_state::flush(&state).await.unwrap();
+    assert_eq!(count_rows(&state, "provider_circuit_state").await, 0);
+    assert_eq!(count_rows(&state, "target_cooldown_state").await, 0);
+    assert_eq!(count_rows(&state, "provider_key_cooldown_state").await, 0);
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 0);
+    assert!(admit_provider_attempt(&restarted, 1).await.is_ok());
+}
+
+/// Persistence is opt-out, and the parser has to fail safe: a typo must keep
+/// the protection on rather than silently making restarts forget a trip.
+#[test]
+fn resilience_state_persistence_parsing_fails_safe() {
+    use crate::resilience_state::parse_resilience_state_persist;
+    assert!(parse_resilience_state_persist(None));
+    assert!(parse_resilience_state_persist(Some("")));
+    assert!(parse_resilience_state_persist(Some("oops")));
+    assert!(parse_resilience_state_persist(Some("1")));
+    for disabled in ["0", "false", "FALSE", " no ", "off"] {
+        assert!(
+            !parse_resilience_state_persist(Some(disabled)),
+            "{disabled} must disable the mirror"
+        );
+    }
+}
+
+/// Deleting a provider while its state is dirty must clean both the row (via
+/// the cascade) and the in-memory entry, instead of failing the whole flush.
+#[tokio::test]
+async fn deleting_a_provider_drops_its_persisted_state() {
+    let (_directory, state) = restartable_circuit_state().await;
+    for _ in 0..crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD {
+        mark_provider_error(&state, 1, Some(StatusCode::SERVICE_UNAVAILABLE), None, None).await;
+    }
+    crate::resilience_state::flush(&state).await.unwrap();
+    sqlx::query("DELETE FROM providers WHERE id = 1")
+        .execute(&state.pool)
+        .await
+        .unwrap();
+    // A later mutation marks a provider that no longer exists.
+    state.mark_provider_resilience_dirty(1);
+    crate::resilience_state::flush(&state).await.unwrap();
+    assert_eq!(count_rows(&state, "provider_circuit_state").await, 0);
+    assert!(state.provider_failure_streak.lock().await.is_empty());
+    assert!(state.provider_cooldown.lock().await.is_empty());
 }
 
 /// A hard-open provider with no healthy alternative must fail fast with a 503

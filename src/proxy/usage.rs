@@ -791,6 +791,15 @@ pub(crate) async fn log_usage_warning(state: &AppState, request_id: &str, warnin
 
 pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
+    // Tokens are exact only once the response is complete, so the pool is
+    // charged here rather than at admission (requests are charged then).
+    crate::allocation::charge_token_usage(
+        state,
+        entry.provider_id,
+        entry.api_key_id,
+        usage.total_tokens,
+    )
+    .await;
     let estimated_cost_micros =
         if matches!(entry.status_code, 400 | 403 | 429) && entry.provider_id.is_none() {
             Some(0)

@@ -1,0 +1,82 @@
+# OpenLLM Gateway — single-instance deployment.
+#
+# The gateway keeps circuits, cooldowns, pool windows and concurrency slots in
+# this one process and stores everything in one SQLite file, so the deployment
+# is one container with one volume. A second replica sharing the volume is
+# refused at startup (see OPENLLM_MULTI_INSTANCE in the README) instead of
+# silently corrupting routing state.
+#
+#   cp deploy/openllm.env.example .env   # set OPENLLM_ADMIN_TOKEN
+#   docker compose up -d --build
+#   curl -fsS http://127.0.0.1:8080/api/ready
+#
+# The port is published on loopback only: terminate TLS in front of the gateway
+# (see deploy/nginx/openllm.conf or deploy/caddy/Caddyfile) instead of exposing
+# the plaintext port to the internet.
+
+services:
+  openllm:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: openllm:local
+    container_name: openllm
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      # Keep the container's own defaults explicit so a missing .env cannot
+      # silently expose an unauthenticated admin API on 0.0.0.0.
+      OPENLLM_BIND: 0.0.0.0:8080
+      OPENLLM_DATA_DIR: /data
+      OPENLLM_LOG_FORMAT: ${OPENLLM_LOG_FORMAT:-json}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - openllm-data:/data
+    # The image already declares these; repeated here so the compose file is
+    # self-documenting and `docker compose config` shows them.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/api/ready"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    # A long stream keeps writing while the shutdown grace period runs, so give
+    # the process room to drain (OPENLLM_SHUTDOWN_GRACE_SECS defaults to 30s).
+    stop_grace_period: 60s
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  # Optional TLS termination. Enable with:
+  #   docker compose --profile proxy up -d
+  # Create the certificate (or mount your own) first:
+  #   openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+  #     -keyout deploy/nginx/certs/privkey.pem \
+  #     -out deploy/nginx/certs/fullchain.pem \
+  #     -subj "/CN=gateway.example.com"
+  proxy:
+    image: nginx:1.27-alpine
+    container_name: openllm-proxy
+    profiles: ["proxy"]
+    restart: unless-stopped
+    depends_on:
+      openllm:
+        condition: service_healthy
+    ports:
+      - "8088:443"
+      # Plain HTTP only redirects to HTTPS. 8080 is already taken by the gateway
+      # itself, so the redirect listens on 8081 to avoid the collision.
+      - "8081:80"
+    volumes:
+      - ./deploy/nginx/openllm.conf:/etc/nginx/conf.d/openllm.conf:ro
+      - ./deploy/nginx/certs:/etc/nginx/certs:ro
+
+volumes:
+  openllm-data:

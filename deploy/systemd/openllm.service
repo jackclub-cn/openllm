@@ -1,0 +1,58 @@
+# OpenLLM Gateway — systemd unit (single instance).
+#
+#   sudo install -m 0755 target/release/openllm /usr/local/bin/openllm
+#   sudo install -d -o openllm -g openllm /var/lib/openllm
+#   sudo install -m 0600 -o root -g root deploy/openllm.env.example /etc/openllm/openllm.env
+#   sudo vi /etc/openllm/openllm.env          # set OPENLLM_ADMIN_TOKEN
+#   sudo install -m 0644 deploy/systemd/openllm.service /etc/systemd/system/openllm.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openllm
+#
+# `systemctl reload` is intentionally unsupported: the gateway has no config
+# file to re-read (settings live in the database and in the environment), so an
+# upgrade is a drain-and-restart — see docs/DEPLOYMENT.md.
+
+[Unit]
+Description=OpenLLM Gateway
+Documentation=https://github.com/jackclub-cn/openllm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=openllm
+Group=openllm
+EnvironmentFile=-/etc/openllm/openllm.env
+# StateDirectory gives /var/lib/openllm the right owner and mode, and systemd
+# keeps it across upgrades.
+StateDirectory=openllm
+WorkingDirectory=/var/lib/openllm
+ExecStart=/usr/local/bin/openllm --bind 0.0.0.0:8080 --data-dir /var/lib/openllm
+
+# A shutdown signal starts the drain: the listener closes immediately, in-flight
+# requests finish (OPENLLM_SHUTDOWN_GRACE_SECS, 30s by default), then the process
+# exits. TimeoutStopSec must stay above that budget, or systemd SIGKILLs the
+# process mid-drain.
+KillSignal=SIGTERM
+TimeoutStopSec=90
+Restart=on-failure
+RestartSec=2
+
+# Hardening. The process only needs its data directory and outbound HTTPS.
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+ReadWritePaths=/var/lib/openllm
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

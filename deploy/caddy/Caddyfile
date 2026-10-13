@@ -1,0 +1,23 @@
+# Reverse proxy + TLS example for the OpenLLM gateway (Caddy).
+#
+# Caddy is the shortest path to a working TLS setup: it obtains and renews the
+# certificate itself. `flush_interval -1` disables response buffering, which is
+# what makes Server-Sent Events stream immediately; the read/write timeouts are
+# inactivity timeouts, so long generations are not cut off.
+
+gateway.example.com {
+	encode zstd gzip
+
+	reverse_proxy 127.0.0.1:8080 {
+		flush_interval -1
+		transport http {
+			read_timeout 3600s
+			write_timeout 3600s
+			dial_timeout 15s
+		}
+	}
+
+	log {
+		output file /var/log/caddy/openllm-access.log
+	}
+}

@@ -10,7 +10,9 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   NodeIndexOutlined,
+  SafetyCertificateOutlined,
   SettingOutlined,
+  ToolOutlined,
 } from '@ant-design/icons'
 import { Button, Layout, Menu, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
@@ -29,6 +31,8 @@ const Webhooks = lazy(() => import('./pages/Webhooks'))
 const AuditLogs = lazy(() => import('./pages/AuditLogs'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const Playground = lazy(() => import('./pages/Playground'))
+const DiagnosticsPage = lazy(() => import('./pages/Diagnostics'))
+const MaintenancePage = lazy(() => import('./pages/Maintenance'))
 
 const navigation = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
@@ -40,6 +44,8 @@ const navigation = [
   { key: '/usage', icon: <DashboardOutlined />, label: '请求日志' },
   { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
   { key: '/audit', icon: <AuditOutlined />, label: '审计日志' },
+  { key: '/diagnostics', icon: <SafetyCertificateOutlined />, label: '诊断' },
+  { key: '/maintenance', icon: <ToolOutlined />, label: '运维' },
   { key: '/settings', icon: <SettingOutlined />, label: '设置' },
 ]
 
@@ -158,6 +164,8 @@ function AppLayout({
               <Route path="/usage" element={<Usage />} />
               <Route path="/webhooks" element={<Webhooks />} />
               <Route path="/audit" element={<AuditLogs />} />
+              <Route path="/diagnostics" element={<DiagnosticsPage />} />
+              <Route path="/maintenance" element={<MaintenancePage />} />
               <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>

@@ -21,8 +21,9 @@ use tokio_stream::wrappers::ReceiverStream;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     ApiKeyRecord, ModelCapabilities, ModelList, ProviderType, PublicModel, Route,
-    RouteDiagnoseRuntimeTarget, RouteDiagnoseTarget, RouteDiagnoseView, RouteStrategy, RouteTarget,
-    Usage, effective_cost_value, estimate_cost_micros,
+    RouteDiagnoseCandidate, RouteDiagnoseFactor, RouteDiagnoseRuntimeTarget, RouteDiagnoseTarget,
+    RouteDiagnoseView, RouteStrategy, RouteTarget, Usage, effective_cost_value,
+    estimate_cost_micros,
 };
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
@@ -45,7 +46,7 @@ pub(crate) use compat::*;
 use guardrails::*;
 pub(crate) use models_api::*;
 pub(crate) use openai_api::*;
-pub(crate) use routing::diagnose_route;
+pub(crate) use routing::{diagnose_route, diagnose_route_for_key};
 use routing::*;
 pub(crate) use session::*;
 use translation::*;

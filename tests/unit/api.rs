@@ -218,6 +218,18 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));
     assert!(body.contains("openllm_audit_logs 0"));
     assert!(body.contains("openllm_database_size_bytes"));
+    assert!(body.contains("openllm_ready 1"));
+    assert!(body.contains("# TYPE openllm_ready gauge"));
+    assert!(body.contains("# TYPE openllm_pool_requests_window gauge"));
+    assert!(body.contains("# TYPE openllm_pool_request_limit gauge"));
+    assert!(body.contains("# TYPE openllm_pool_tokens_window gauge"));
+    assert!(body.contains("# TYPE openllm_pool_token_limit gauge"));
+    assert!(body.contains("# TYPE openllm_pool_saturated gauge"));
+    assert!(body.contains("# TYPE openllm_pool_denials_total counter"));
+    assert!(body.contains("# TYPE openllm_pool_key_requests_window gauge"));
+    assert!(body.contains("# TYPE openllm_pool_key_request_share gauge"));
+    assert!(body.contains("# TYPE openllm_pool_key_tokens_window gauge"));
+    assert!(body.contains("# TYPE openllm_pool_key_token_share gauge"));
     assert!(body.contains("# TYPE openllm_provider_cooling gauge"));
     assert!(body.contains("# TYPE openllm_provider_circuit_state gauge"));
     assert!(body.contains("# TYPE openllm_provider_failure_streak gauge"));

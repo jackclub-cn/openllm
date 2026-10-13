@@ -94,6 +94,9 @@ pub async fn clear_cooldowns(
                 .await
                 .remove(&provider_key_id)
                 .is_some();
+            if removed {
+                state.mark_provider_key_resilience_dirty(provider_key_id);
+            }
             let cleared = ClearCooldownsResult {
                 cleared_provider_cooldowns: 0,
                 cleared_model_cooldowns: 0,
@@ -131,28 +134,16 @@ pub async fn clear_cooldowns(
         return Ok(Json(cleared));
     }
 
+    // One call captures the keys to purge, empties the maps and only then marks
+    // them dirty: marking first would let the writer persist the cooldowns this
+    // request is clearing, and marking after the clear without the captured keys
+    // would mark nothing at all and leave the rows in the mirror.
+    let cleared_all = state.clear_all_resilience_state().await;
     let cleared = ClearCooldownsResult {
-        cleared_provider_cooldowns: {
-            let mut cooldowns = state.provider_cooldown.lock().await;
-            let count = cooldowns.len();
-            cooldowns.clear();
-            count
-        },
-        cleared_model_cooldowns: {
-            let mut cooldowns = state.target_cooldown.lock().await;
-            let count = cooldowns.len();
-            cooldowns.clear();
-            count
-        },
-        cleared_provider_key_cooldowns: {
-            let mut cooldowns = state.provider_key_cooldown.lock().await;
-            let count = cooldowns.len();
-            cooldowns.clear();
-            count
-        },
+        cleared_provider_cooldowns: cleared_all.providers,
+        cleared_model_cooldowns: cleared_all.models,
+        cleared_provider_key_cooldowns: cleared_all.provider_keys,
     };
-    state.provider_failure_streak.lock().await.clear();
-    state.provider_probe.lock().await.clear();
     record_audit(
         &state,
         "clear",
@@ -174,17 +165,31 @@ async fn clear_provider_scope(
     provider_id: i64,
     model: Option<&str>,
 ) -> ClearCooldownsResult {
-    let cleared_model_cooldowns = {
+    let cleared_models = {
         let mut cooldowns = state.target_cooldown.lock().await;
-        let before = cooldowns.len();
+        let mut removed: Vec<(i64, String)> = Vec::new();
         match model {
             Some(model) => {
-                cooldowns.remove(&(provider_id, model.to_string()));
+                let key = (provider_id, model.to_string());
+                if cooldowns.remove(&key).is_some() {
+                    removed.push(key);
+                }
             }
-            None => cooldowns.retain(|(id, _), _| *id != provider_id),
+            None => cooldowns.retain(|key @ (id, _), _| {
+                if *id == provider_id {
+                    removed.push(key.clone());
+                    false
+                } else {
+                    true
+                }
+            }),
         }
-        before - cooldowns.len()
+        removed
     };
+    let cleared_model_cooldowns = cleared_models.len();
+    for (provider_id, model) in cleared_models {
+        state.mark_target_resilience_dirty(provider_id, &model);
+    }
 
     // Clearing one model leaves the provider circuit alone: sibling models may
     // still be failing. A provider-wide clear also resets the escalation streak
@@ -194,6 +199,7 @@ async fn clear_provider_scope(
     } else {
         state.provider_failure_streak.lock().await.remove(&provider_id);
         state.provider_probe.lock().await.remove(&provider_id);
+        state.mark_provider_resilience_dirty(provider_id);
         usize::from(
             state
                 .provider_cooldown
@@ -212,7 +218,7 @@ async fn clear_provider_scope(
 }
 
 /// Drops expired entries and resolves display names for the surviving ones.
-async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSnapshot> {
+pub(crate) async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSnapshot> {
     let now = std::time::Instant::now();
 
     let threshold = crate::state::provider_open_threshold();

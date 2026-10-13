@@ -1,0 +1,45 @@
+# Minimal Prometheus configuration that scrapes the OpenLLM gateway and loads
+# the bundled alert rules.
+#
+#   docker run --rm -p 9090:9090 \
+#     -v "$PWD/deploy/prometheus/prometheus.example.yml:/etc/prometheus/prometheus.yml:ro" \
+#     -v "$PWD/deploy/prometheus/openllm-alerts.yml:/etc/prometheus/openllm-alerts.yml:ro" \
+#     prom/prometheus:latest
+#
+# Then open http://localhost:9090 and check Status -> Targets and Alerts.
+#
+# The gateway keeps alert state consistent across restarts (circuit state,
+# cooldowns and quota windows live in SQLite), so Prometheus does not need any
+# extra configuration to survive a gateway restart.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/openllm-alerts.yml
+
+# Point these at Alertmanager if you have one; without it the rules still show
+# up under Alerts in the Prometheus UI and can be inspected there.
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: openllm
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+        labels:
+          service: openllm
+    # Uncomment when OPENLLM_ADMIN_TOKEN is set on the gateway: /metrics then
+    # requires the same credential as /api/status. Put the token in the file
+    # with no trailing newline.
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/openllm-admin-token
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]

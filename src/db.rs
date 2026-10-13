@@ -57,6 +57,9 @@ pub(crate) fn db_acquire_timeout_secs() -> u64 {
 
 pub struct Database {
     pub pool: SqlitePool,
+    /// Identity of this process's row in `instance_leases`, refreshed by the
+    /// heartbeat task and removed on a clean shutdown.
+    pub instance_id: String,
 }
 
 impl Database {
@@ -95,12 +98,50 @@ impl Database {
             .await
             .context("failed to connect to SQLite")?;
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await
-            .context("failed to run database migrations")?;
+        // Claim the database before migrating: a second instance must be
+        // detected before it is allowed to change the schema, not after.
+        let instance_id = uuid::Uuid::new_v4().simple().to_string();
+        let policy = crate::startup::multi_instance_policy();
+        let ttl_secs = crate::startup::lease_ttl_secs();
+        match crate::startup::claim_instance_lease(&pool, &instance_id, policy, ttl_secs).await {
+            Ok(Some(foreign)) => tracing::warn!(
+                foreign_instance = %foreign.id,
+                pid = foreign.pid,
+                host = %foreign.host,
+                heartbeat_age_secs = foreign.heartbeat_age_secs,
+                policy = policy.as_str(),
+                "OPENLLM_MULTI_INSTANCE=warn: starting alongside a live instance; two writers on                  one SQLite file are not supported"
+            ),
+            Ok(None) => {}
+            Err(error) => return Err(error),
+        }
 
-        Ok(Self { pool })
+        let migrator = sqlx::migrate!("./migrations");
+        let database_path = config
+            .database_url
+            .as_deref()
+            .map(crate::startup::sqlite_file_path)
+            .unwrap_or_else(|| Some(config.data_dir.join("openllm.db")));
+        let backup = crate::startup::backup_before_migrations(&pool, database_path.as_deref(), &migrator)
+            .await?;
+        if let Err(error) = migrator.run(&pool).await {
+            // Fail closed: never serve on a half-migrated schema. The lease is
+            // released so a retry after the operator fixes the problem is not
+            // blocked by this process's own row.
+            crate::startup::release_instance_lease(&pool, &instance_id).await;
+            let hint = match &backup {
+                Some(path) => format!(
+                    "; the database was not changed and a pre-migration backup is at {}",
+                    path.display()
+                ),
+                None => "; the database was not changed".to_string(),
+            };
+            return Err(anyhow::Error::new(error).context(format!(
+                "database migration failed{hint}"
+            )));
+        }
+
+        Ok(Self { pool, instance_id })
     }
 }
 

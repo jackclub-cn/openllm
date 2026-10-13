@@ -533,6 +533,7 @@ pub(crate) async fn forward_to_target(
     let response = match send_provider_request_with_compat_retry(
         state,
         &target,
+        api_key.map(|key| key.id),
         request_id,
         endpoint,
         streamed,

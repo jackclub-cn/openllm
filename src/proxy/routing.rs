@@ -1,5 +1,10 @@
 use super::*;
 
+use crate::allocation::PoolDecision;
+
+#[cfg(test)]
+#[path = "../../tests/unit/scoring.rs"]
+mod scoring_tests;
 use crate::state::{PROVIDER_PROBE_LEASE, provider_open_threshold};
 
 pub(super) fn target_upstream_endpoint<'a>(
@@ -86,6 +91,20 @@ pub async fn diagnose_route(
     endpoint: &str,
     session_id: Option<&str>,
 ) -> AppResult<RouteDiagnoseView> {
+    diagnose_route_for_key(state, model, endpoint, session_id, None).await
+}
+
+/// Diagnoses a route as a specific gateway API key would experience it.
+///
+/// `api_key_id` only affects the scoring of per-key pool shares; every other
+/// signal is key-independent. The whole preview performs no upstream request.
+pub async fn diagnose_route_for_key(
+    state: &AppState,
+    model: &str,
+    endpoint: &str,
+    session_id: Option<&str>,
+    api_key_id: Option<i64>,
+) -> AppResult<RouteDiagnoseView> {
     let session_id = session_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -121,12 +140,14 @@ pub async fn diagnose_route(
                 route,
                 true,
                 session_id.as_deref(),
+                api_key_id,
             )
             .await;
         }
         disabled_match.get_or_insert(route);
     }
-    let direct = diagnose_direct_route(state, model, endpoint, session_id.as_deref()).await?;
+    let direct =
+        diagnose_direct_route(state, model, endpoint, session_id.as_deref(), api_key_id).await?;
     if direct.matched {
         return Ok(direct);
     }
@@ -138,6 +159,7 @@ pub async fn diagnose_route(
             route,
             false,
             session_id.as_deref(),
+            api_key_id,
         )
         .await;
     }
@@ -151,6 +173,7 @@ pub(super) async fn diagnose_explicit_route(
     route: Route,
     route_enabled: bool,
     session_id: Option<&str>,
+    api_key_id: Option<i64>,
 ) -> AppResult<RouteDiagnoseView> {
     let rows = sqlx::query_as::<_, DiagnosticTargetRow>(
         r#"
@@ -168,7 +191,9 @@ pub(super) async fn diagnose_explicit_route(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
-               p.last_test_ok AS provider_health
+               p.last_test_ok AS provider_health,
+               p.max_concurrency,
+               pm.max_concurrency AS model_max_concurrency
         FROM route_targets rt
         JOIN providers p ON p.id = rt.provider_id
         LEFT JOIN provider_models pm
@@ -202,6 +227,7 @@ pub(super) async fn diagnose_explicit_route(
             &rows,
             &diagnosed,
             session_id,
+            api_key_id,
         )
         .await?
     } else {
@@ -226,12 +252,22 @@ pub(super) async fn diagnose_explicit_route(
         match_type: "explicit_route".to_string(),
         route_id: Some(route.id),
         route_name: Some(route.name),
-        strategy: Some(route.strategy),
+        strategy: Some(route.strategy.clone()),
         message,
         barrel: barrel.capabilities,
         barrel_incomplete: barrel.incomplete,
         session_id: session_id.map(ToOwned::to_owned),
         runtime_targets,
+        candidates: diagnostic_candidates(
+            state,
+            Some(route.id),
+            &route.strategy,
+            &rows,
+            &diagnosed,
+            session_id,
+            api_key_id,
+        )
+        .await?,
         targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
     })
 }
@@ -241,6 +277,7 @@ pub(super) async fn diagnose_direct_route(
     model: &str,
     endpoint: &str,
     session_id: Option<&str>,
+    api_key_id: Option<i64>,
 ) -> AppResult<RouteDiagnoseView> {
     let prefixed = sqlx::query_as::<_, DiagnosticTargetRow>(
         r#"
@@ -258,7 +295,9 @@ pub(super) async fn diagnose_direct_route(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
-               p.last_test_ok AS provider_health
+               p.last_test_ok AS provider_health,
+               p.max_concurrency,
+               pm.max_concurrency AS model_max_concurrency
         FROM providers p
         JOIN provider_models pm ON pm.provider_id = p.id
         WHERE p.model_prefix <> ''
@@ -284,6 +323,7 @@ pub(super) async fn diagnose_direct_route(
             prefixed,
             prefixed_diagnosed,
             session_id,
+            api_key_id,
         )
         .await;
     }
@@ -304,7 +344,9 @@ pub(super) async fn diagnose_direct_route(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
-               p.last_test_ok AS provider_health
+               p.last_test_ok AS provider_health,
+               p.max_concurrency,
+               pm.max_concurrency AS model_max_concurrency
         FROM providers p
         JOIN provider_models pm ON pm.provider_id = p.id
         WHERE p.model_prefix = '' AND pm.model_name = ?
@@ -327,6 +369,7 @@ pub(super) async fn diagnose_direct_route(
             unprefixed,
             unprefixed_diagnosed,
             session_id,
+            api_key_id,
         )
         .await;
     }
@@ -344,10 +387,15 @@ pub(super) async fn diagnose_direct_route(
         prefixed,
         prefixed_diagnosed,
         session_id,
+        api_key_id,
     )
     .await
 }
 
+/// The diagnostic paths thread the request context explicitly rather than in a
+/// struct: they are cold paths, and a struct would only hide which signal each
+/// caller supplies.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn build_direct_diagnosis(
     state: &AppState,
     model: &str,
@@ -356,6 +404,7 @@ pub(super) async fn build_direct_diagnosis(
     rows: Vec<DiagnosticTargetRow>,
     diagnosed: Vec<(RouteDiagnoseTarget, bool)>,
     session_id: Option<&str>,
+    api_key_id: Option<i64>,
 ) -> AppResult<RouteDiagnoseView> {
     let eligible_pairs = rows
         .iter()
@@ -389,11 +438,22 @@ pub(super) async fn build_direct_diagnosis(
             &rows,
             &diagnosed,
             session_id,
+            api_key_id,
         )
         .await?
     } else {
         None
     };
+    let candidates = diagnostic_candidates(
+        state,
+        None,
+        RouteStrategy::Priority.as_str(),
+        &rows,
+        &diagnosed,
+        session_id,
+        api_key_id,
+    )
+    .await?;
 
     Ok(RouteDiagnoseView {
         model: model.to_string(),
@@ -409,6 +469,7 @@ pub(super) async fn build_direct_diagnosis(
         barrel_incomplete: barrel.incomplete,
         session_id: session_id.map(ToOwned::to_owned),
         runtime_targets,
+        candidates,
         targets: diagnosed.into_iter().map(|(target, _)| target).collect(),
     })
 }
@@ -433,6 +494,8 @@ pub(super) struct DiagnosticTargetRow {
     cost_cache_read_override: Option<f64>,
     cost_cache_write_override: Option<f64>,
     provider_health: Option<i64>,
+    max_concurrency: Option<i64>,
+    model_max_concurrency: Option<i64>,
 }
 
 impl DiagnosticTargetRow {
@@ -483,6 +546,118 @@ impl DiagnosticTargetRow {
     }
 }
 
+/// Builds the routing view of one diagnostic row, so the session ordering and
+/// the explainable candidate list score exactly the same target.
+fn diagnostic_route_target(row: &DiagnosticTargetRow, route_id: Option<i64>) -> RouteTarget {
+    RouteTarget {
+        id: row.target_id,
+        route_id,
+        provider_id: row.provider_id,
+        provider_name: row.provider_name.clone(),
+        provider_type: row.provider_type.clone(),
+        base_url: String::new(),
+        model_prefix: String::new(),
+        api_key: None,
+        provider_headers: "{}".to_string(),
+        supported_endpoints: row.supported_endpoints.clone(),
+        cost: row.cost.clone(),
+        cost_input_override: row.cost_input_override,
+        cost_output_override: row.cost_output_override,
+        cost_cache_read_override: row.cost_cache_read_override,
+        cost_cache_write_override: row.cost_cache_write_override,
+        context_limit: None,
+        input_limit: None,
+        output_limit: None,
+        provider_enabled: None,
+        model_enabled: None,
+        tool_search_supported: 1,
+        timeout_seconds: None,
+        cooldown_seconds: None,
+        max_concurrency: row.max_concurrency,
+        queue_timeout_seconds: None,
+        model_max_concurrency: row.model_max_concurrency,
+        model_queue_timeout_seconds: None,
+        provider_health: row.provider_health,
+        upstream_model: row.upstream_model.clone(),
+        weight: row.target_weight,
+        priority: row.target_priority,
+        enabled: 1,
+        provider_api_key_id: None,
+        provider_api_key_name: None,
+        auth_retryable: false,
+    }
+}
+
+/// Scores every candidate of a diagnosis, in the order the gateway would try
+/// them, and appends the ineligible ones with their exclusion reason.
+///
+/// Makes no upstream request: the score comes from stored health, recent usage
+/// rows, live concurrency slots and the pool window.
+pub(super) async fn diagnostic_candidates(
+    state: &AppState,
+    route_id: Option<i64>,
+    strategy: &str,
+    rows: &[DiagnosticTargetRow],
+    diagnosed: &[(RouteDiagnoseTarget, bool)],
+    session_id: Option<&str>,
+    api_key_id: Option<i64>,
+) -> AppResult<Vec<RouteDiagnoseCandidate>> {
+    let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
+    let eligible = rows
+        .iter()
+        .zip(diagnosed)
+        .filter(|(_, (_, eligible))| *eligible)
+        .map(|(row, _)| diagnostic_route_target(row, route_id))
+        .collect::<Vec<_>>();
+    let assessments = assess_targets(state, strategy, &eligible, api_key_id).await?;
+    let ordered = order_targets(
+        state,
+        route_id.unwrap_or(-1),
+        strategy.as_str(),
+        eligible,
+        session_id,
+        api_key_id,
+    )
+    .await?;
+    let mut candidates = ordered
+        .iter()
+        .enumerate()
+        .map(|(index, target)| {
+            let assessment = assessments
+                .get(&(target.provider_id, target.upstream_model.clone()))
+                .cloned()
+                .unwrap_or_else(|| TargetAssessment::new(Vec::new()));
+            candidate_view(index + 1, target, &assessment)
+        })
+        .collect::<Vec<_>>();
+    // Rows that fail the eligibility pre-checks can never be tried, so they are
+    // listed with the reason instead of silently disappearing from the preview.
+    for (row, (target, eligible)) in rows.iter().zip(diagnosed) {
+        if *eligible {
+            continue;
+        }
+        candidates.push(RouteDiagnoseCandidate {
+            order: 0,
+            provider_id: row.provider_id,
+            provider_name: row.provider_name.clone(),
+            upstream_model: row.upstream_model.clone(),
+            score: 0.0,
+            eligible: false,
+            exclusion: Some(target.reason.clone()),
+            deprioritized: true,
+            factors: Vec::new(),
+        });
+    }
+    // The request path removes excluded candidates before ordering, so the
+    // preview must not show one ahead of a candidate it would actually use.
+    // The sort is stable, so the strategy's own order is preserved inside each
+    // group.
+    candidates.sort_by_key(|candidate| !candidate.eligible);
+    for (index, candidate) in candidates.iter_mut().enumerate() {
+        candidate.order = index + 1;
+    }
+    Ok(candidates)
+}
 pub(super) async fn diagnostic_runtime_targets(
     state: &AppState,
     route_id: Option<i64>,
@@ -490,6 +665,7 @@ pub(super) async fn diagnostic_runtime_targets(
     rows: &[DiagnosticTargetRow],
     diagnosed: &[(RouteDiagnoseTarget, bool)],
     session_id: Option<&str>,
+    api_key_id: Option<i64>,
 ) -> AppResult<Option<Vec<RouteDiagnoseRuntimeTarget>>> {
     let Some(session_id) = session_id else {
         return Ok(None);
@@ -498,43 +674,7 @@ pub(super) async fn diagnostic_runtime_targets(
         .iter()
         .zip(diagnosed)
         .filter(|(_, (_, eligible))| *eligible)
-        .map(|(row, _)| RouteTarget {
-            id: row.target_id,
-            route_id,
-            provider_id: row.provider_id,
-            provider_name: row.provider_name.clone(),
-            provider_type: row.provider_type.clone(),
-            base_url: String::new(),
-            model_prefix: String::new(),
-            api_key: None,
-            provider_headers: "{}".to_string(),
-            supported_endpoints: row.supported_endpoints.clone(),
-            cost: row.cost.clone(),
-            cost_input_override: row.cost_input_override,
-            cost_output_override: row.cost_output_override,
-            cost_cache_read_override: row.cost_cache_read_override,
-            cost_cache_write_override: row.cost_cache_write_override,
-            context_limit: None,
-            input_limit: None,
-            output_limit: None,
-            provider_enabled: None,
-            model_enabled: None,
-            tool_search_supported: 1,
-            timeout_seconds: None,
-            cooldown_seconds: None,
-            max_concurrency: None,
-            queue_timeout_seconds: None,
-            model_max_concurrency: None,
-            model_queue_timeout_seconds: None,
-            provider_health: row.provider_health,
-            upstream_model: row.upstream_model.clone(),
-            weight: row.target_weight,
-            priority: row.target_priority,
-            enabled: 1,
-            provider_api_key_id: None,
-            provider_api_key_name: None,
-            auth_retryable: false,
-        })
+        .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
     let metrics = runtime_target_metrics(state, &targets).await?;
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
@@ -544,6 +684,7 @@ pub(super) async fn diagnostic_runtime_targets(
         strategy.as_str(),
         targets,
         Some(session_id),
+        api_key_id,
     )
     .await?;
     Ok(Some(
@@ -1074,6 +1215,8 @@ pub(super) async fn mark_provider_error(
         provider_id,
         Instant::now() + cooldown,
     );
+    // Mirror the trip so a restart still knows this provider is unhealthy.
+    state.mark_provider_resilience_dirty(provider_id);
     if opened {
         let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
             provider_id,
@@ -1096,24 +1239,31 @@ pub(super) async fn mark_target_error(
     retry_after: Option<Duration>,
 ) -> usize {
     let now = Instant::now();
-    let mut cooldowns = state.target_cooldown.lock().await;
-    cooldowns.retain(|_, until| *until > now);
-    cooldowns.insert(
-        (target.provider_id, target.upstream_model.clone()),
-        now + target_cooldown(status, retry_after, target.cooldown_seconds),
-    );
-    cooldowns
-        .keys()
-        .filter(|(provider_id, _)| *provider_id == target.provider_id)
-        .count()
+    let active = {
+        let mut cooldowns = state.target_cooldown.lock().await;
+        cooldowns.retain(|_, until| *until > now);
+        cooldowns.insert(
+            (target.provider_id, target.upstream_model.clone()),
+            now + target_cooldown(status, retry_after, target.cooldown_seconds),
+        );
+        cooldowns
+            .keys()
+            .filter(|(provider_id, _)| *provider_id == target.provider_id)
+            .count()
+    };
+    state.mark_target_resilience_dirty(target.provider_id, &target.upstream_model);
+    active
 }
 
 pub(super) async fn mark_target_success(state: &AppState, provider_id: i64, upstream_model: &str) {
-    state
+    let removed = state
         .target_cooldown
         .lock()
         .await
         .remove(&(provider_id, upstream_model.to_string()));
+    if removed.is_some() {
+        state.mark_target_resilience_dirty(provider_id, upstream_model);
+    }
 }
 
 /// Cools a target after its response stream failed mid-flight.
@@ -1244,6 +1394,9 @@ async fn close_provider_circuit(state: &AppState, provider_id: i64, reason: &'st
         .remove(&provider_id)
         .unwrap_or(0);
     state.provider_probe.lock().await.remove(&provider_id);
+    // A recovery must be persisted too, or a restart would restore the
+    // cooldown this success just cleared.
+    state.mark_provider_resilience_dirty(provider_id);
     let threshold = provider_open_threshold();
     if threshold > 0 && streak >= threshold {
         tracing::info!(provider_id, reason, "provider circuit closed");
@@ -1312,6 +1465,18 @@ pub(super) async fn admit_provider_attempt(
     Ok(())
 }
 
+/// Releases a recovery-probe lease without touching the failure streak.
+///
+/// A half-open provider admits exactly one probe (see [`admit_provider_attempt`])
+/// so a burst cannot stampede a provider that is only just recovering. If that
+/// admitted attempt is then stopped before it reaches the upstream (today a
+/// provider-pool denial), the probe no longer represents anything in flight, so
+/// it has to be released here. Leaving it would keep the provider short-circuited
+/// for the whole probe lease even though nothing ever tested it.
+pub(super) async fn release_provider_probe(state: &AppState, provider_id: i64) {
+    state.provider_probe.lock().await.remove(&provider_id);
+}
+
 /// The outcome of an upstream attempt that may have been resent once.
 pub(super) enum UpstreamAttempt {
     /// The upstream answered successfully; the body has not been consumed.
@@ -1369,7 +1534,17 @@ pub(super) async fn send_provider_request(
     let mut retries_used = 0u32;
 
     loop {
-        let request = build()?;
+        let request = match build() {
+            Ok(request) => request,
+            Err(error) => {
+                // The request could not even be built, so nothing reached the
+                // upstream. Hand back a half-open probe the caller admitted
+                // instead of holding it for the whole lease; the transport path
+                // below already releases it through `mark_provider_error`.
+                release_provider_probe(state, target.provider_id).await;
+                return Err(error);
+            }
+        };
         let budget = target
             .timeout_seconds
             .filter(|seconds| *seconds > 0)
@@ -1551,9 +1726,15 @@ pub(super) async fn acquire_upstream_slots(
 ///
 /// `body` is the exact body sent upstream, so compatibility retries update the
 /// request rather than replaying the rejected payload.
+///
+/// The argument list is flat on purpose: the callers forward values they already
+/// hold, and a parameter struct would only add a construction step at each of
+/// the three dispatch sites.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn send_provider_request_with_compat_retry<F>(
     state: &AppState,
     target: &RouteTarget,
+    api_key_id: Option<i64>,
     request_id: &str,
     endpoint: &str,
     streamed: bool,
@@ -1575,6 +1756,31 @@ where
                 target.provider_name
             ),
             retry_after: Some(retry_after.max(Duration::from_secs(1))),
+        });
+    }
+
+    // Provider quota pool, charged once per attempt and only after every local
+    // gate above has passed: charging earlier (in the caller, before the
+    // concurrency slots and the circuit breaker) would let traffic the gateway
+    // rejects locally burn quota that no upstream call ever consumed, and
+    // charging later would race another attempt for the last free slot of the
+    // window. A denial here is a routing decision, so the fallback loop simply
+    // moves to the next target.
+    if let Some((reason, retry_after)) =
+        crate::allocation::charge_target_attempt(state, target.provider_id, api_key_id).await
+    {
+        // The attempt was admitted as a half-open recovery probe above but is
+        // denied before any upstream call, so hand the probe back. Otherwise the
+        // provider stays "probe in flight" and short-circuits every request for
+        // `PROVIDER_PROBE_LEASE` even though nothing was ever tested.
+        release_provider_probe(state, target.provider_id).await;
+        return Err(AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "excluded provider '{}': {reason}",
+                target.provider_name
+            ),
+            retry_after: Some(retry_after),
         });
     }
     let resilience = resilience_policy(state).await;
@@ -1745,6 +1951,7 @@ pub(super) async fn mark_provider_api_key_error(
         provider_api_key_id,
         Instant::now() + provider_key_cooldown(status, retry_after),
     );
+    state.mark_provider_key_resilience_dirty(provider_api_key_id);
     state
         .provider_key_error_state
         .lock()
@@ -1782,6 +1989,7 @@ pub(super) async fn mark_provider_api_key_success(
         .lock()
         .await
         .remove(&provider_api_key_id);
+    state.mark_provider_key_resilience_dirty(provider_api_key_id);
     let had_error = state
         .provider_key_error_state
         .lock()
@@ -1912,6 +2120,21 @@ struct RuntimeTargetMetricRow {
     upstream_model: String,
     requests: i64,
     avg_latency_ms: Option<f64>,
+    /// Rows that finished successfully in the window.
+    successes: i64,
+    /// Finished rows that failed because of the upstream (5xx, rate limit or a
+    /// transport error). Client-side rejections are not counted, so a caller
+    /// sending broken requests cannot make a healthy provider look unreliable.
+    upstream_faults: i64,
+}
+
+impl RuntimeTargetMetricRow {
+    /// Recent success rate over the upstream-caused outcomes, or `None` when
+    /// there is not enough evidence to judge.
+    fn success_rate(&self) -> Option<f64> {
+        let sample = self.successes + self.upstream_faults;
+        (sample > 0).then(|| self.successes as f64 / sample as f64)
+    }
 }
 
 async fn runtime_target_metrics(
@@ -1940,7 +2163,16 @@ async fn runtime_target_metrics(
                            THEN latency_ms
                        ELSE NULL
                    END
-               ) AS avg_latency_ms
+               ) AS avg_latency_ms,
+               SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
+               SUM(
+                   CASE
+                       WHEN success = 0
+                            AND (status_code >= 500 OR status_code = 429 OR status_code = 0)
+                           THEN 1
+                       ELSE 0
+                   END
+               ) AS upstream_faults
         FROM usage_logs
         WHERE in_flight = 0
           AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')
@@ -2435,12 +2667,535 @@ pub(super) async fn expand_target_provider_keys(
     Ok(expanded)
 }
 
+/// Neutral factor score used when a signal has no data.
+///
+/// Unknown must never penalise a candidate: a provider that has never served a
+/// request, or that publishes no price, would otherwise rank behind a candidate
+/// with mediocre known metrics just because less is known about it.
+const NEUTRAL_FACTOR_SCORE: f64 = 0.5;
+
+/// One explainable component of a candidate's score.
+#[derive(Debug, Clone)]
+pub(crate) struct TargetScoreFactor {
+    /// Stable factor name (`circuit`, `capacity`, `allocation`, ...).
+    pub(crate) name: &'static str,
+    /// `0.0..=1.0`, or `None` when nothing is known. Unknown factors contribute
+    /// [`NEUTRAL_FACTOR_SCORE`].
+    pub(crate) score: Option<f64>,
+    pub(crate) weight: f64,
+    /// `weight × (score or the neutral value)`, so an operator can see exactly
+    /// which factor moved a candidate.
+    pub(crate) contribution: f64,
+    pub(crate) detail: String,
+}
+
+/// Why a candidate ranks where it does.
+#[derive(Debug, Clone)]
+pub(crate) struct TargetAssessment {
+    /// `0..=100`, higher is better; 50 means "no known signal either way".
+    pub(crate) score: f64,
+    pub(crate) factors: Vec<TargetScoreFactor>,
+    /// Set when the request path will not use this candidate at all right now.
+    pub(crate) exclusion: Option<String>,
+    /// Usable, but tried after candidates without the penalty (a soft pool
+    /// share, a failed health check, saturated concurrency, or a cooling
+    /// circuit that has no healthy alternative).
+    pub(crate) deprioritized: bool,
+}
+
+impl TargetAssessment {
+    fn new(factors: Vec<TargetScoreFactor>) -> Self {
+        let mut weight_sum = 0.0;
+        let mut score_sum = 0.0;
+        for factor in &factors {
+            weight_sum += factor.weight;
+            score_sum += factor.contribution;
+        }
+        let score = if weight_sum > 0.0 {
+            score_sum / weight_sum * 100.0
+        } else {
+            NEUTRAL_FACTOR_SCORE * 100.0
+        };
+        Self {
+            score: (score * 100.0).round() / 100.0,
+            factors,
+            exclusion: None,
+            deprioritized: false,
+        }
+    }
+
+    fn excluded(mut self, reason: String) -> Self {
+        self.exclusion = Some(reason);
+        self
+    }
+
+    fn penalized(mut self) -> Self {
+        self.deprioritized = true;
+        self
+    }
+}
+
+fn score_factor(
+    name: &'static str,
+    weight: f64,
+    score: Option<f64>,
+    detail: impl Into<String>,
+) -> TargetScoreFactor {
+    let score = score.map(|value| value.clamp(0.0, 1.0));
+    TargetScoreFactor {
+        name,
+        weight,
+        score,
+        contribution: weight * score.unwrap_or(NEUTRAL_FACTOR_SCORE),
+        detail: detail.into(),
+    }
+}
+
+/// Seconds left on a monotonic cooldown deadline, rounded up and never below 1
+/// so a displayed "remaining" is never a misleading zero while still cooling.
+fn cooldown_remaining_seconds(until: Instant, now: Instant) -> u64 {
+    let remaining = until.saturating_duration_since(now);
+    (remaining.as_secs_f64().ceil() as u64).max(1)
+}
+
+/// Fraction of a `(available, limit)` pair that is still free.
+fn headroom_ratio(headroom: &(usize, usize)) -> f64 {
+    if headroom.1 == 0 {
+        1.0
+    } else {
+        headroom.0 as f64 / headroom.1 as f64
+    }
+}
+
+/// Concurrency headroom of the worst-limited dimension, as
+/// `(available, limit)`; `None` when the target caps nothing.
+///
+/// A limit that was configured but never used has no semaphore yet, which
+/// means every slot is free — not that the target is saturated.
+async fn concurrency_headroom(state: &AppState, target: &RouteTarget) -> Option<(usize, usize)> {
+    let mut worst: Option<(usize, usize)> = None;
+    if let Some(limit) = target.max_concurrency.filter(|limit| *limit > 0) {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let available = {
+            let semaphores = state.provider_concurrency.lock().await;
+            semaphores
+                .get(&target.provider_id)
+                .map(|semaphore| semaphore.available_permits())
+                .unwrap_or(limit)
+        };
+        worst = Some((available, limit));
+    }
+    if let Some(limit) = target.model_max_concurrency.filter(|limit| *limit > 0) {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        let available = {
+            let semaphores = state.model_concurrency.lock().await;
+            semaphores
+                .get(&(target.provider_id, target.upstream_model.clone()))
+                .map(|semaphore| semaphore.available_permits())
+                .unwrap_or(limit)
+        };
+        let candidate = (available, limit);
+        if headroom_ratio(&candidate)
+            < worst.map_or(f64::INFINITY, |current| headroom_ratio(&current))
+        {
+            worst = Some(candidate);
+        }
+    }
+    worst
+}
+
+/// Pool headroom for one key, plus a denial reason or a soft penalty.
+async fn allocation_signal(
+    state: &AppState,
+    provider_id: i64,
+    api_key_id: Option<i64>,
+) -> (Option<TargetScoreFactor>, Option<String>, bool) {
+    let Ok(catalog) = state.pool_catalog().await else {
+        return (None, None, false);
+    };
+    let pools = catalog.pools_for_provider(provider_id);
+    if pools.is_empty() {
+        return (None, None, false);
+    }
+    let api_key_id = api_key_id.unwrap_or(crate::allocation::ANONYMOUS_API_KEY_ID);
+    let now = Instant::now();
+    let mut headroom = f64::INFINITY;
+    let mut details = Vec::new();
+    let mut denied = None;
+    let mut penalized = false;
+    for spec in pools {
+        let decision = {
+            let mut ledger = state.allocation_ledger.lock().await;
+            ledger.decide(spec, api_key_id, now)
+        };
+        match decision {
+            PoolDecision::Allow => {}
+            PoolDecision::Penalize { reason } => {
+                penalized = true;
+                details.push(reason);
+            }
+            PoolDecision::Deny { reason, .. } => {
+                denied = Some(reason);
+            }
+        }
+        let usage = {
+            let mut ledger = state.allocation_ledger.lock().await;
+            ledger.usage(spec, api_key_id, now)
+        };
+        if let Some(limit) = spec.request_limit {
+            headroom = headroom.min(limit.saturating_sub(usage.requests) as f64 / limit as f64);
+            details.push(format!(
+                "池 '{}' 请求余量 {}/{}",
+                spec.name,
+                limit.saturating_sub(usage.requests),
+                limit
+            ));
+        }
+        if let Some(limit) = spec.token_limit {
+            headroom = headroom.min(limit.saturating_sub(usage.tokens) as f64 / limit as f64);
+            details.push(format!(
+                "池 '{}' token 余量 {}/{}",
+                spec.name,
+                limit.saturating_sub(usage.tokens),
+                limit
+            ));
+        }
+    }
+    if let Some(reason) = denied {
+        return (
+            Some(score_factor("allocation", 2.0, Some(0.0), reason.clone())),
+            Some(reason),
+            penalized,
+        );
+    }
+    let score = headroom.is_finite().then_some(headroom);
+    (
+        Some(score_factor("allocation", 2.0, score, details.join("；"))),
+        None,
+        penalized,
+    )
+}
+
+/// Scores every candidate with an explainable factor breakdown.
+///
+/// Performs no upstream request: every signal comes from the database, the
+/// in-memory control state, or recent usage rows.
+pub(crate) async fn assess_targets(
+    state: &AppState,
+    strategy: RouteStrategy,
+    targets: &[RouteTarget],
+    api_key_id: Option<i64>,
+) -> AppResult<HashMap<(i64, String), TargetAssessment>> {
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let metrics = runtime_target_metrics(state, targets).await?;
+    let key_of = |target: &RouteTarget| (target.provider_id, target.upstream_model.clone());
+
+    // Relative signals are only meaningful next to the other candidates.
+    let cheapest = targets
+        .iter()
+        .filter_map(target_cost_score)
+        .filter(|cost| *cost > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let fastest = targets
+        .iter()
+        .filter_map(|target| {
+            metrics
+                .get(&key_of(target))
+                .and_then(|metric| metric.avg_latency_ms)
+        })
+        .filter(|latency| *latency > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let busiest = targets
+        .iter()
+        .filter_map(|target| metrics.get(&key_of(target)).map(|metric| metric.requests))
+        .max()
+        .unwrap_or(0);
+    let best_priority = targets
+        .iter()
+        .map(|target| target.priority)
+        .min()
+        .unwrap_or(0);
+    let highest_weight = targets.iter().map(|target| target.weight).max().unwrap_or(1);
+
+    let now = Instant::now();
+    let threshold = provider_open_threshold();
+    let streaks = state.provider_failure_streak.lock().await.clone();
+    let provider_cooldowns = {
+        let mut cooldowns = state.provider_cooldown.lock().await;
+        cooldowns.retain(|_, until| *until + PROVIDER_PROBE_LEASE > now);
+        cooldowns.clone()
+    };
+    let model_cooldowns = {
+        let mut cooldowns = state.target_cooldown.lock().await;
+        cooldowns.retain(|_, until| *until + PROVIDER_PROBE_LEASE > now);
+        cooldowns.clone()
+    };
+
+    let mut assessments = HashMap::with_capacity(targets.len());
+    for target in targets {
+        let key = key_of(target);
+        let metric = metrics.get(&key);
+        let mut factors = Vec::new();
+
+        // 1. Circuit state: an open provider is short-circuited before any
+        //    upstream call, so it must score at the bottom.
+        let streak = streaks.get(&target.provider_id).copied().unwrap_or(0);
+        let provider_until = provider_cooldowns.get(&target.provider_id).copied();
+        let cooling = provider_until.is_some_and(|until| until > now);
+        let circuit_state = crate::state::provider_circuit_state(streak, cooling, threshold);
+        let (circuit_score, circuit_detail) = match circuit_state {
+            "open" => (
+                0.0,
+                format!(
+                    "熔断中（连续失败 {streak} 次，冷却剩余 {}s）",
+                    cooldown_remaining_seconds(provider_until.unwrap_or(now), now)
+                ),
+            ),
+            "half_open" => (
+                0.5,
+                format!("半开，仅放行一个探测请求（连续失败 {streak} 次）"),
+            ),
+            _ => (1.0, "熔断关闭".to_string()),
+        };
+        factors.push(score_factor("circuit", 2.5, Some(circuit_score), circuit_detail));
+
+        // 2. Live concurrency capacity.
+        let capacity = concurrency_headroom(state, target).await;
+        let capacity_score = capacity.map(|headroom| headroom_ratio(&headroom));
+        let capacity_detail = match capacity {
+            Some((available, limit)) => format!("并发余量 {available}/{limit}"),
+            None => "未设置并发上限".to_string(),
+        };
+        let saturated = capacity.is_some_and(|(available, _)| available == 0);
+        factors.push(score_factor("capacity", 2.0, capacity_score, capacity_detail));
+
+        // 3. Pool allocation: denial is a hard exclusion, a soft share only
+        //    deprioritises.
+        let (allocation_factor, allocation_denied, allocation_penalized) =
+            allocation_signal(state, target.provider_id, api_key_id).await;
+
+        // 4. Provider health from the last test or scheduled probe.
+        let (health_score, health_detail, health_failed) = match target.provider_health {
+            Some(0) => (0.0, "最近一次健康检查失败".to_string(), true),
+            Some(_) => (1.0, "最近一次健康检查通过".to_string(), false),
+            None => (NEUTRAL_FACTOR_SCORE, "尚未做过健康检查".to_string(), false),
+        };
+        factors.push(score_factor("health", 2.5, Some(health_score), health_detail));
+
+        // 5. Recent upstream-caused success rate.
+        let reliability = metric.and_then(|metric| metric.success_rate());
+        let reliability_detail = match (metric, reliability) {
+            (Some(metric), Some(rate)) => format!(
+                "近期成功率 {:.1}%（{}/{} 次上游结果）",
+                rate * 100.0,
+                metric.successes,
+                metric.successes + metric.upstream_faults
+            ),
+            _ => "近期没有可判定的上游结果".to_string(),
+        };
+        factors.push(score_factor("reliability", 2.0, reliability, reliability_detail));
+
+        // 6. Latency relative to the fastest known candidate.
+        let latency = metric
+            .and_then(|metric| metric.avg_latency_ms)
+            .filter(|value| *value > 0.0);
+        let latency_score = latency.map(|latency| {
+            if fastest.is_finite() && fastest > 0.0 {
+                (fastest / latency).clamp(0.0, 1.0)
+            } else {
+                NEUTRAL_FACTOR_SCORE
+            }
+        });
+        let latency_detail = match latency {
+            Some(latency) => format!("近期平均 {latency:.0}ms（最快 {fastest:.0}ms）"),
+            None => "近期没有延迟样本".to_string(),
+        };
+        factors.push(score_factor(
+            "latency",
+            1.0,
+            latency_score,
+            latency_detail.clone(),
+        ));
+
+        // 7. Cost relative to the cheapest known candidate.
+        let cost = target_cost_score(target);
+        let cost_score = cost.map(|cost| {
+            if cheapest.is_finite() && cheapest > 0.0 {
+                (cheapest / cost).clamp(0.0, 1.0)
+            } else {
+                NEUTRAL_FACTOR_SCORE
+            }
+        });
+        let cost_detail = match cost {
+            Some(cost) => format!("成本指数 {cost:.4}（最低 {cheapest:.4}）"),
+            None => "未公布价格".to_string(),
+        };
+        factors.push(score_factor("cost", 1.0, cost_score, cost_detail.clone()));
+
+        // 8. The strategy's own preference, so the score agrees with the order
+        //    the request path will use.
+        let (strategy_score, strategy_detail) = match strategy {
+            RouteStrategy::Priority => {
+                let rank = target.priority.saturating_sub(best_priority);
+                (
+                    Some(1.0 / (1.0 + rank as f64)),
+                    format!("优先级 {}（最低 {best_priority}）", target.priority),
+                )
+            }
+            RouteStrategy::Weighted => (
+                Some(target.weight.max(0) as f64 / highest_weight.max(1) as f64),
+                format!("权重 {}（最高 {highest_weight}）", target.weight),
+            ),
+            RouteStrategy::RoundRobin => (Some(1.0), "按轮询游标顺序".to_string()),
+            RouteStrategy::CostOptimized => (cost_score, cost_detail.clone()),
+            RouteStrategy::LatencyOptimized => (latency_score, latency_detail.clone()),
+            RouteStrategy::LeastUsed => {
+                let requests = metric.map(|metric| metric.requests).unwrap_or(0);
+                (
+                    Some(1.0 - requests as f64 / busiest.max(1) as f64),
+                    format!("近期 {requests} 次请求（最多 {busiest} 次）"),
+                )
+            }
+        };
+        factors.push(score_factor("strategy", 1.5, strategy_score, strategy_detail));
+
+        let mut assessment = TargetAssessment::new(factors);
+        if health_failed || saturated || allocation_penalized {
+            assessment = assessment.penalized();
+        }
+
+        // A model cooling down is skipped while a healthy alternative exists,
+        // an open circuit is short-circuited before the upstream call, and a
+        // pool denial removes the candidate outright.
+        let model_until = model_cooldowns
+            .get(&(target.provider_id, target.upstream_model.clone()))
+            .copied();
+        let model_cooling = model_until.is_some_and(|until| until > now);
+        let sibling_exists = targets.iter().any(|other| {
+            other.provider_id != target.provider_id
+                || other.upstream_model != target.upstream_model
+        });
+        if let Some(reason) = allocation_denied {
+            assessment = assessment.excluded(format!("提供商配额池拒绝：{reason}"));
+        } else if circuit_state == "open" {
+            assessment = assessment.excluded(
+                "提供商熔断中，请求会被立即短路".to_string(),
+            );
+        } else if model_cooling && sibling_exists {
+            assessment = assessment.excluded(format!(
+                "该模型正在冷却（剩余 {}s），存在可用替代目标",
+                cooldown_remaining_seconds(model_until.unwrap_or(now), now)
+            ));
+        }
+        if let Some(factor) = allocation_factor {
+            // Keep the factor list in a stable order for the UI.
+            let mut factors = assessment.factors;
+            factors.insert(3, factor);
+            assessment.factors = factors;
+        }
+        assessments.insert(key, assessment);
+    }
+    Ok(assessments)
+}
+
+/// Candidates that are usable but should be tried last.
+///
+/// This is the SQL-free subset of [`assess_targets`] used on the request path:
+/// it only reads in-memory control state (concurrency slots, pool window,
+/// circuit/cooldown maps), so it adds no query to a normal request.
+async fn deprioritized_target_keys(
+    state: &AppState,
+    targets: &[RouteTarget],
+    api_key_id: Option<i64>,
+) -> HashSet<(i64, String)> {
+    let mut keys = HashSet::new();
+    if targets.is_empty() {
+        return keys;
+    }
+    let now = Instant::now();
+    let threshold = provider_open_threshold();
+    let streaks = state.provider_failure_streak.lock().await.clone();
+    let provider_cooldowns = state.provider_cooldown.lock().await.clone();
+    for target in targets {
+        let streak = streaks.get(&target.provider_id).copied().unwrap_or(0);
+        let cooling = provider_cooldowns
+            .get(&target.provider_id)
+            .is_some_and(|until| *until > now);
+        if crate::state::provider_circuit_state(streak, cooling, threshold) == "open"
+            || target.provider_health == Some(0)
+            || concurrency_headroom(state, target)
+                .await
+                .is_some_and(|(available, _)| available == 0)
+        {
+            keys.insert((target.provider_id, target.upstream_model.clone()));
+            continue;
+        }
+        let Ok(catalog) = state.pool_catalog().await else {
+            continue;
+        };
+        let pools = catalog.pools_for_provider(target.provider_id);
+        if pools.is_empty() {
+            continue;
+        }
+        // The real gateway key is used (not the anonymous probe): a `soft`
+        // allocation penalises the key that is over its own share, and using
+        // the anonymous id here would leave that key unpenalised on the real
+        // request path while the diagnose preview did penalise it.
+        let api_key_id = api_key_id.unwrap_or(crate::allocation::ANONYMOUS_API_KEY_ID);
+        let penalized = {
+            let mut ledger = state.allocation_ledger.lock().await;
+            pools.iter().any(|spec| {
+                matches!(
+                    ledger.decide(spec, api_key_id, now),
+                    PoolDecision::Penalize { .. }
+                )
+            })
+        };
+        if penalized {
+            keys.insert((target.provider_id, target.upstream_model.clone()));
+        }
+    }
+    keys
+}
+
+/// Turns an assessment into the API-facing candidate row.
+pub(crate) fn candidate_view(
+    order: usize,
+    target: &RouteTarget,
+    assessment: &TargetAssessment,
+) -> RouteDiagnoseCandidate {
+    RouteDiagnoseCandidate {
+        order,
+        provider_id: target.provider_id,
+        provider_name: target.provider_name.clone(),
+        upstream_model: target.upstream_model.clone(),
+        score: assessment.score,
+        eligible: assessment.exclusion.is_none(),
+        exclusion: assessment.exclusion.clone(),
+        deprioritized: assessment.deprioritized,
+        factors: assessment
+            .factors
+            .iter()
+            .map(|factor| RouteDiagnoseFactor {
+                name: factor.name.to_string(),
+                score: factor.score,
+                weight: factor.weight,
+                contribution: factor.contribution,
+                detail: factor.detail.clone(),
+            })
+            .collect(),
+    }
+}
+
 pub(super) async fn order_targets(
     state: &AppState,
     route_id: i64,
     strategy: &str,
     mut targets: Vec<RouteTarget>,
     session_id: Option<&str>,
+    api_key_id: Option<i64>,
 ) -> AppResult<Vec<RouteTarget>> {
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
@@ -2522,6 +3277,18 @@ pub(super) async fn order_targets(
     // Keep strategy order within each health group, but try explicitly failed
     // providers last. Unknown health stays ahead of failed providers so a
     // previously-tested outage does not permanently suppress a recovery.
-    targets.sort_by_key(|target| provider_health_rank(target.provider_health));
+    // Live pressure (a saturated concurrency gate, an over-share pool
+    // allocation) is a second, softer bucket: such a candidate is still tried,
+    // just after the ones with headroom, and the stable sort keeps the
+    // strategy's own order inside each bucket.
+    let deprioritized = deprioritized_target_keys(state, &targets, api_key_id).await;
+    targets.sort_by_key(|target| {
+        (
+            provider_health_rank(target.provider_health),
+            u8::from(
+                deprioritized.contains(&(target.provider_id, target.upstream_model.clone())),
+            ),
+        )
+    });
     expand_target_provider_keys(state, targets, session_id).await
 }

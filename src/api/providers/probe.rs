@@ -493,6 +493,7 @@ async fn clear_provider_runtime_failure(state: &AppState, provider_id: i64) {
         .remove(&provider_id)
         .unwrap_or(0);
     state.provider_probe.lock().await.remove(&provider_id);
+    state.mark_provider_resilience_dirty(provider_id);
     let threshold = crate::state::provider_open_threshold();
     if threshold > 0 && streak >= threshold {
         tracing::info!(
@@ -522,6 +523,7 @@ pub(crate) async fn persist_provider_key_result(
     };
     if ok {
         state.provider_key_cooldown.lock().await.remove(&key_id);
+        state.mark_provider_key_resilience_dirty(key_id);
         state.provider_key_error_state.lock().await.remove(&key_id);
         sqlx::query(
             "UPDATE provider_api_keys \

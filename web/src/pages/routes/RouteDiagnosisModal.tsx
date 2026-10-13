@@ -8,6 +8,7 @@ import {
   Empty,
   Input,
   Modal,
+  Popover,
   Select,
   Space,
   Table,
@@ -19,6 +20,8 @@ import {
   api,
   formatError,
   type RouteDiagnose,
+  type RouteDiagnoseCandidate,
+  type RouteDiagnoseFactor,
   type RouteDiagnoseRuntimeTarget,
 } from '../../api'
 import {
@@ -47,6 +50,14 @@ const decisionReasonLabels: Record<string, string> = {
   priority_order: '优先级顺序',
   session_affinity: '会话粘性',
   provider_health_failed: '提供商健康异常',
+}
+
+function factorSummary(record: RouteDiagnoseCandidate) {
+  return record.factors.map((factor: RouteDiagnoseFactor) => {
+    const value =
+      factor.score == null ? '未知（按中性值计入）' : `${Math.round(factor.score * 100)}%`
+    return `${factor.name}：${value} × 权重 ${factor.weight} —— ${factor.detail}`
+  })
 }
 
 function runtimeMetric(record: RouteDiagnoseRuntimeTarget) {
@@ -195,6 +206,84 @@ export default function RouteDiagnosisModal({
                 {diagnosis.barrel_incomplete ? '（信息不完整）' : ''}
               </Descriptions.Item>
             </Descriptions>
+            {diagnosis.candidates && diagnosis.candidates.length > 0 && (
+              <>
+                <Typography.Text strong>候选评分（不发起上游请求）</Typography.Text>
+                <Table
+                  rowKey={(record) =>
+                    `${record.order}-${record.provider_id}-${record.upstream_model}`
+                  }
+                  size="small"
+                  pagination={false}
+                  dataSource={diagnosis.candidates}
+                  scroll={{ x: 980 }}
+                  columns={[
+                    {
+                      title: '顺序',
+                      dataIndex: 'order',
+                      width: 70,
+                    },
+                    {
+                      title: '提供商',
+                      dataIndex: 'provider_name',
+                      width: 170,
+                      render: (value: string) => (
+                        <Typography.Text strong>{value}</Typography.Text>
+                      ),
+                    },
+                    {
+                      title: '上游模型',
+                      dataIndex: 'upstream_model',
+                      width: 200,
+                      render: (value: string) => <Typography.Text code>{value}</Typography.Text>,
+                    },
+                    {
+                      title: '评分',
+                      dataIndex: 'score',
+                      width: 90,
+                      render: (value: number) => value.toFixed(2),
+                    },
+                    {
+                      title: '状态',
+                      width: 150,
+                      render: (_, record) =>
+                        !record.eligible ? (
+                          <Tag color="error">已排除</Tag>
+                        ) : record.deprioritized ? (
+                          <Tag color="warning">降权（仍可尝试）</Tag>
+                        ) : (
+                          <Tag color="success">可用</Tag>
+                        ),
+                    },
+                    {
+                      title: '原因 / 评分依据',
+                      width: 300,
+                      render: (_, record) => (
+                        <Space direction="vertical" size={2}>
+                          {record.exclusion && (
+                            <Typography.Text type="danger">{record.exclusion}</Typography.Text>
+                          )}
+                          <Popover
+                            title="评分依据"
+                            content={
+                              <div style={{ maxWidth: 520 }}>
+                                {factorSummary(record).map((line) => (
+                                  <div key={line}>{line}</div>
+                                ))}
+                              </div>
+                            }
+                          >
+                            <Button type="link" size="small">
+                              查看依据（{record.factors.length} 项）
+                            </Button>
+                          </Popover>
+                        </Space>
+                      ),
+                    },
+                  ]}
+                />
+              </>
+            )}
             {diagnosis.runtime_targets && diagnosis.runtime_targets.length > 0 && (
               <>
                 <Space>

@@ -23,10 +23,13 @@ use crate::state::{AppState, SETTING_GUARDRAILS, SETTING_INSPECTOR, SETTING_RESI
 
 mod admin;
 mod audit;
+mod diagnostics;
 mod helpers;
 mod keys;
+mod lifecycle;
 mod metrics;
 mod models;
+mod pools;
 mod providers;
 mod resilience;
 mod routes;
@@ -35,10 +38,13 @@ mod webhooks;
 
 pub use admin::*;
 pub use audit::*;
+pub(crate) use diagnostics::*;
 use helpers::*;
 pub use keys::*;
+pub(crate) use lifecycle::*;
 pub use metrics::*;
 pub use models::*;
+pub(crate) use pools::*;
 pub(crate) use providers::*;
 pub use resilience::*;
 pub use routes::*;

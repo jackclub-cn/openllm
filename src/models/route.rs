@@ -212,6 +212,11 @@ pub struct RouteDiagnoseInput {
     pub endpoint: String,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Preview the route as this gateway API key would experience it, so
+    /// per-key pool shares are scored for the right key. Omitted means the
+    /// anonymous/borrower view.
+    #[serde(default)]
+    pub api_key_id: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -232,7 +237,49 @@ pub struct RouteDiagnoseView {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime_targets: Option<Vec<RouteDiagnoseRuntimeTarget>>,
+    /// Every candidate with an explainable score, in the order the gateway
+    /// would try them. Unlike `runtime_targets` this is always populated and
+    /// never performs an upstream request.
+    pub candidates: Vec<RouteDiagnoseCandidate>,
     pub targets: Vec<RouteDiagnoseTarget>,
+}
+
+/// One scored routing candidate.
+///
+/// The score is a weighted average of the factors below, where a factor with no
+/// data contributes the neutral value so an unconfigured pool or an unknown
+/// price never ranks a candidate behind a known-mediocre one.
+#[derive(Debug, Serialize)]
+pub struct RouteDiagnoseCandidate {
+    /// Position the request path would try, `1` first.
+    pub order: usize,
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub upstream_model: String,
+    /// `0..=100`; `50` means no signal either way.
+    pub score: f64,
+    /// `false` when the request path will not use this candidate right now.
+    pub eligible: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusion: Option<String>,
+    /// Usable, but tried after candidates without the penalty.
+    pub deprioritized: bool,
+    pub factors: Vec<RouteDiagnoseFactor>,
+}
+
+/// One contributing factor of a candidate's score.
+#[derive(Debug, Serialize)]
+pub struct RouteDiagnoseFactor {
+    /// Stable factor name: `circuit`, `capacity`, `allocation`, `health`,
+    /// `reliability`, `latency`, `cost` or `strategy`.
+    pub name: String,
+    /// `0.0..=1.0`; `None` when nothing is known about this factor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+    pub weight: f64,
+    /// `weight × (score or the neutral value)`.
+    pub contribution: f64,
+    pub detail: String,
 }
 
 #[derive(Debug, Serialize)]

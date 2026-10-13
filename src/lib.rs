@@ -1,4 +1,6 @@
 mod api;
+mod allocation;
+pub mod cli;
 mod assets;
 mod db;
 mod error;
@@ -6,6 +8,8 @@ mod models;
 mod models_dev;
 mod proxy;
 mod registry;
+mod resilience_state;
+mod startup;
 mod state;
 mod webhooks;
 
@@ -27,20 +31,24 @@ use tower_http::trace::TraceLayer;
 
 use crate::api::{
     admin_auth, backup_database, cleanup_usage, clear_cooldowns, create_api_key, create_provider,
-    create_route,
-    create_webhook, delete_api_key, delete_provider, delete_route, delete_webhook, diagnose_route,
-    event_stream, export_audit_logs, export_usage, get_guardrails_settings, get_inspector_settings,
+    create_provider_pool, create_route,
+    create_webhook, delete_api_key, delete_provider, delete_provider_pool, delete_route, delete_webhook, diagnose_route,
+    diagnostic_snapshot,
+    event_stream, export_audit_logs, export_config, export_usage, get_guardrails_settings, get_inspector_settings,
     get_resilience_settings, get_runtime_settings, get_settings, get_status, get_usage_detail, health,
-    list_api_keys, list_audit_logs, list_cooldowns, list_model_inventory, list_models,
+    list_api_keys, list_audit_logs, list_backups, list_cooldowns, list_model_inventory, list_models,
     list_provider_model_limits,
-    list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
-    preview_provider_model_sync, prometheus_metrics, provider_quota, ready, rotate_api_key,
+    list_providers, list_provider_pools, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
+    preview_provider_model_sync, prometheus_metrics, provider_pool_usage, provider_quota, ready, rotate_api_key,
     run_maintenance,
+    self_check,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
     update_inspector_settings, update_provider, update_provider_model_limits,
     update_resilience_settings, update_route, update_runtime_settings, update_webhook,
+    update_provider_pool,
     vacuum_database,
+    create_backup, import_config, migration_status, upgrade_check, verify_backup,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -123,7 +131,11 @@ where
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
     let database = Database::connect(&config).await?;
+    let instance_id = database.instance_id.clone();
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
+    if let Err(error) = crate::resilience_state::restore(&state).await {
+        tracing::warn!(%error, "failed to restore persisted resilience state");
+    }
     if let Err(error) = state.load_provider_key_error_state().await {
         tracing::warn!(%error, "failed to load provider key error state");
     }
@@ -147,6 +159,36 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     spawn_supervised("webhook-dispatcher", move || {
         crate::webhooks::run_dispatcher(webhook_state.clone())
     });
+    // Keep the instance lease fresh so a second process on the same database
+    // can tell a live instance from a crashed one.
+    let lease_pool = state.pool.clone();
+    let lease_instance = instance_id.clone();
+    spawn_supervised("instance-lease", move || {
+        let pool = lease_pool.clone();
+        let instance = lease_instance.clone();
+        async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(
+                    crate::startup::lease_heartbeat_interval_secs(),
+                ))
+                .await;
+                if let Err(error) = crate::startup::heartbeat(&pool, &instance).await {
+                    tracing::warn!(%error, "failed to refresh the instance lease");
+                }
+            }
+        }
+    });
+    if state.resilience_state_persist {
+        let resilience_state = state.clone();
+        spawn_supervised("resilience-state-writer", move || {
+            crate::resilience_state::run_writer(resilience_state.clone())
+        });
+    } else {
+        tracing::warn!(
+            "OPENLLM_RESILIENCE_STATE_PERSIST is off; circuits and cooldowns will be \
+             forgotten on restart"
+        );
+    }
     let lag_state = state.clone();
     tokio::spawn(async move {
         monitor_runtime_lag(lag_state).await;
@@ -154,6 +196,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let limits = state.runtime_limits();
     let shutting_down = state.shutting_down.clone();
+    // Kept outside the router so the final flush below can still reach the
+    // writer's shared state after `build_router` consumes the other handle.
+    let persist_state = state.clone();
     let app = build_router(state);
     let listener = TcpListener::bind(config.bind)
         .await
@@ -174,6 +219,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         body_read_timeout_secs = ?limits.body_read_timeout_secs,
         request_timeout_secs = ?limits.request_timeout_secs,
         provider_open_threshold = %limits.provider_open_threshold,
+        resilience_state_persist = %limits.resilience_state_persist,
+        instance_id = %instance_id,
+        multi_instance_policy = %crate::startup::multi_instance_policy().as_str(),
+        instance_lease_ttl_secs = crate::startup::lease_ttl_secs(),
         memory_limit_mib = %limits.memory_limit_mib,
         memory_limit_source = %limits.memory_limit_source,
         memory_shed_ratio_pct = %limits.memory_shed_ratio_pct,
@@ -191,7 +240,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         // here while the drain below lets in-flight work finish.
         shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
     };
-    serve_until_shutdown(listener, app, grace_secs, shutdown).await
+    let result = serve_until_shutdown(listener, app, grace_secs, shutdown).await;
+    // A restart right after a deploy must not hand traffic straight back to a
+    // provider that was cooling when the process stopped, so flush what is
+    // still marked dirty before exiting.
+    if let Err(error) = crate::resilience_state::flush(&persist_state).await {
+        tracing::warn!(%error, "failed to persist resilience state during shutdown");
+    }
+    crate::startup::release_instance_lease(&persist_state.pool, &instance_id).await;
+    result
 }
 
 /// Serves until a shutdown signal, then drains in-flight work for a bounded
@@ -251,12 +308,21 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let admin = Router::new()
         .route("/status", get(get_status))
+        .route("/diagnostics/self-check", get(self_check))
+        .route("/diagnostics/snapshot", get(diagnostic_snapshot))
         .route("/overview", get(overview))
         .route("/audit-logs", get(list_audit_logs))
         .route("/audit-logs/export", get(export_audit_logs))
         .route("/database/backup", get(backup_database))
         .route("/database/vacuum", post(vacuum_database))
         .route("/maintenance/run", post(run_maintenance))
+        .route("/maintenance/backup", post(create_backup))
+        .route("/maintenance/backups", get(list_backups))
+        .route("/maintenance/backups/verify", post(verify_backup))
+        .route("/maintenance/migrations", get(migration_status))
+        .route("/maintenance/upgrade-check", get(upgrade_check))
+        .route("/config/export", get(export_config))
+        .route("/config/import", post(import_config))
         .route("/providers", get(list_providers).post(create_provider))
         .route("/providers/test-all", post(test_all_providers))
         .route("/providers/test-all-keys", post(test_all_provider_keys))
@@ -276,6 +342,15 @@ pub fn build_router(state: AppState) -> Router {
             get(list_provider_model_limits).put(update_provider_model_limits),
         )
         .route("/providers/{id}/quota", get(provider_quota))
+        .route(
+            "/provider-pools",
+            get(list_provider_pools).post(create_provider_pool),
+        )
+        .route(
+            "/provider-pools/{id}",
+            put(update_provider_pool).delete(delete_provider_pool),
+        )
+        .route("/providers/{id}/pool-usage", get(provider_pool_usage))
         .route("/resilience/cooldowns", get(list_cooldowns))
         .route(
             "/resilience/cooldowns/clear",

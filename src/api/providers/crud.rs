@@ -266,6 +266,7 @@ pub async fn update_provider(
     }
     tx.commit().await?;
     state.provider_cooldown.lock().await.remove(&id);
+    state.mark_provider_resilience_dirty(id);
     if concurrency_changed {
         state.provider_concurrency.lock().await.remove(&id);
     }
@@ -325,6 +326,7 @@ pub async fn delete_provider(
         return Err(AppError::NotFound("provider not found".to_string()));
     }
     state.provider_cooldown.lock().await.remove(&id);
+    state.mark_provider_resilience_dirty(id);
     state.provider_concurrency.lock().await.remove(&id);
     state
         .model_concurrency

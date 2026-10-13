@@ -1,0 +1,19 @@
+# Build context exclusions. `target/` and `web/node_modules/` are rebuilt
+# inside the image; copying them would make the build context enormous and
+# could ship stale artifacts.
+target/
+dist/
+data/
+web/node_modules/
+web/dist/
+.git/
+.github/
+.pi/
+.kilo/
+*.db
+*.db-shm
+*.db-wal
+.env
+# TLS material is mounted at run time; private keys must never enter the build
+# context.
+deploy/nginx/certs/

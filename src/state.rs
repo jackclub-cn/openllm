@@ -5,10 +5,12 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, RwLock, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
 
 use crate::error::AppResult;
+use crate::allocation::{AllocationLedger, PoolCatalog};
 use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings, RuntimeLimits};
+use crate::resilience_state::DirtyResilienceState;
 
 pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
 pub(crate) const SETTING_INSPECTOR: &str = "inspector";
@@ -135,6 +137,19 @@ pub struct AppState {
     /// Prevents overlapping provider health probes from overwriting each
     /// other's persisted result.
     pub provider_health_check: Arc<Mutex<HashSet<i64>>>,
+    /// Whether circuits and cooldowns are mirrored into SQLite so they survive
+    /// a restart (`OPENLLM_RESILIENCE_STATE_PERSIST=0` disables the mirror).
+    pub resilience_state_persist: bool,
+    /// Entities whose persisted resilience mirror is stale. The writer task
+    /// drains this set, so the hot path only pays for a small in-memory mark.
+    pub resilience_dirty: Arc<std::sync::Mutex<DirtyResilienceState>>,
+    /// Wakes the resilience-state writer after a state change.
+    pub resilience_flush: Arc<Notify>,
+    /// Cached provider-pool configuration. `None` means it must be re-read from
+    /// SQLite after a pool or allocation change.
+    pub pool_catalog: Arc<RwLock<Option<Arc<PoolCatalog>>>>,
+    /// Rolling-window usage per pool, shared by every gateway access key.
+    pub allocation_ledger: Arc<Mutex<AllocationLedger>>,
 }
 
 /// A fetched models.dev catalog and the instant it was retrieved.
@@ -487,6 +502,14 @@ pub struct UsageEvent {
     pub request_id: String,
     pub success: bool,
     pub streamed: bool,
+}
+
+/// How many runtime cooldown entries a bulk clear removed, per map.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ClearedCooldowns {
+    pub(crate) providers: usize,
+    pub(crate) models: usize,
+    pub(crate) provider_keys: usize,
 }
 
 /// One provider circuit transition, delivered to subscribed webhooks.
@@ -943,7 +966,134 @@ impl AppState {
             models_dev: Arc::new(RwLock::new(None)),
             provider_model_sync: Arc::new(Mutex::new(HashSet::new())),
             provider_health_check: Arc::new(Mutex::new(HashSet::new())),
+            resilience_state_persist: crate::resilience_state::resilience_state_persist(),
+            resilience_dirty: Arc::new(std::sync::Mutex::new(DirtyResilienceState::default())),
+            resilience_flush: Arc::new(Notify::new()),
+            pool_catalog: Arc::new(RwLock::new(None)),
+            allocation_ledger: Arc::new(Mutex::new(AllocationLedger::new(Instant::now()))),
         }
+    }
+
+    /// Returns the cached provider-pool configuration, loading it from SQLite
+    /// on first use or after a pool mutation invalidated the cache.
+    pub(crate) async fn pool_catalog(&self) -> AppResult<Arc<PoolCatalog>> {
+        // Copy the cached Arc out in its own statement so the read guard is
+        // released before any write lock is requested (tokio's RwLock is
+        // write-preferring, so holding both would deadlock).
+        let cached = self.pool_catalog.read().await.clone();
+        if let Some(catalog) = cached {
+            return Ok(catalog);
+        }
+        let catalog = Arc::new(PoolCatalog::load(&self.pool).await?);
+        *self.pool_catalog.write().await = Some(catalog.clone());
+        Ok(catalog)
+    }
+
+    /// Drops the cached pool configuration so the next request re-reads it.
+    pub(crate) async fn invalidate_pool_catalog(&self) {
+        *self.pool_catalog.write().await = None;
+    }
+
+    /// Marks a provider's circuit state as needing a persisted update.
+    ///
+    /// Cheap and synchronous on purpose: it is called from the failure path,
+    /// and the actual SQLite write is coalesced by the writer task.
+    pub(crate) fn mark_provider_resilience_dirty(&self, provider_id: i64) {
+        self.mark_resilience_dirty(|dirty| {
+            dirty.providers.insert(provider_id);
+        });
+    }
+
+    /// Marks one provider model's cooldown as needing a persisted update.
+    pub(crate) fn mark_target_resilience_dirty(&self, provider_id: i64, model: &str) {
+        self.mark_resilience_dirty(|dirty| {
+            dirty.targets.insert((provider_id, model.to_string()));
+        });
+    }
+
+    /// Marks one upstream credential's cooldown as needing a persisted update.
+    pub(crate) fn mark_provider_key_resilience_dirty(&self, provider_key_id: i64) {
+        self.mark_resilience_dirty(|dirty| {
+            dirty.provider_keys.insert(provider_key_id);
+        });
+    }
+
+    /// Empties every in-memory routing cooldown and marks exactly what was
+    /// removed as dirty, so the mirror deletes the rows it still holds.
+    ///
+    /// The keys are captured *before* the maps are emptied: the dirty mark is a
+    /// request to persist "whatever the runtime state is now", so marking the
+    /// live keys after the clear would mark nothing and leave the persisted rows
+    /// behind. Marking after the clear (rather than before) also closes the race
+    /// with the writer task — a writer that picks the mark up always observes the
+    /// cleared maps. Returns how many entries were dropped from each map.
+    pub(crate) async fn clear_all_resilience_state(&self) -> ClearedCooldowns {
+        let mut providers = self
+            .provider_failure_streak
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        providers.extend(self.provider_cooldown.lock().await.keys().copied());
+        let targets = self
+            .target_cooldown
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        let provider_keys = self
+            .provider_key_cooldown
+            .lock()
+            .await
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+
+        let cleared = ClearedCooldowns {
+            providers: {
+                let mut cooldowns = self.provider_cooldown.lock().await;
+                let count = cooldowns.len();
+                cooldowns.clear();
+                count
+            },
+            models: {
+                let mut cooldowns = self.target_cooldown.lock().await;
+                let count = cooldowns.len();
+                cooldowns.clear();
+                count
+            },
+            provider_keys: {
+                let mut cooldowns = self.provider_key_cooldown.lock().await;
+                let count = cooldowns.len();
+                cooldowns.clear();
+                count
+            },
+        };
+        self.provider_failure_streak.lock().await.clear();
+        self.provider_probe.lock().await.clear();
+
+        self.mark_resilience_dirty(|dirty| {
+            dirty.providers.extend(providers);
+            dirty.targets.extend(targets);
+            dirty.provider_keys.extend(provider_keys);
+        });
+        cleared
+    }
+
+    fn mark_resilience_dirty(&self, mark: impl FnOnce(&mut DirtyResilienceState)) {
+        if !self.resilience_state_persist {
+            return;
+        }
+        {
+            let mut dirty = self
+                .resilience_dirty
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            mark(&mut dirty);
+        }
+        self.resilience_flush.notify_one();
     }
 
     pub async fn load_provider_key_error_state(&self) -> Result<(), sqlx::Error> {
@@ -1075,6 +1225,7 @@ impl AppState {
                 .request_timeout
                 .map(|timeout| timeout.as_secs()),
             provider_open_threshold: provider_open_threshold(),
+            resilience_state_persist: self.resilience_state_persist,
             memory_limit_mib: self
                 .memory_pressure
                 .as_ref()
