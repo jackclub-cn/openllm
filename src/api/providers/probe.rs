@@ -176,9 +176,6 @@ pub(crate) async fn test_provider_inner_unlocked(
             {
                 persist_tool_search_support(state, provider.id, supported).await?;
             }
-            if let Some(key_id) = key_id {
-                state.provider_key_cooldown.lock().await.remove(&key_id);
-            }
             result = Some(attempt);
             break;
         }
@@ -249,6 +246,9 @@ pub(crate) async fn test_provider_keys_inner(
     }
     let ok = results.iter().filter(|result| result.ok).count();
     let total = results.len();
+    if ok > 0 {
+        clear_provider_runtime_failure(state, provider.id).await;
+    }
     Ok(ProviderKeyTestResult {
         provider_id: provider.id,
         provider_name: provider.name,
@@ -474,28 +474,32 @@ pub(crate) async fn persist_provider_test(
     .execute(&state.pool)
     .await?;
     if result.ok {
-        // An authoritative success closes the runtime circuit too: clear the
-        // cooldown, reset the failure streak so escalation restarts cleanly, and
-        // release any half-open probe slot. Without this the provider would stay
-        // deprioritised (or short-circuited) until the cooldown expired even
-        // though this probe just proved it answers again.
-        state.provider_cooldown.lock().await.remove(&provider_id);
-        let streak = state
-            .provider_failure_streak
-            .lock()
-            .await
-            .remove(&provider_id)
-            .unwrap_or(0);
-        state.provider_probe.lock().await.remove(&provider_id);
-        let threshold = crate::state::provider_open_threshold();
-        if threshold > 0 && streak >= threshold {
-            tracing::info!(
-                provider_id,
-                "provider circuit closed after a successful health probe"
-            );
-        }
+        clear_provider_runtime_failure(state, provider_id).await;
     }
     Ok(())
+}
+
+/// An authoritative success closes the provider's runtime circuit: clear the
+/// cooldown, reset the failure streak so escalation restarts cleanly, and
+/// release any half-open probe slot. Without this the provider would stay
+/// deprioritised or short-circuited until the cooldown expired even though a
+/// probe just proved it answers again.
+async fn clear_provider_runtime_failure(state: &AppState, provider_id: i64) {
+    state.provider_cooldown.lock().await.remove(&provider_id);
+    let streak = state
+        .provider_failure_streak
+        .lock()
+        .await
+        .remove(&provider_id)
+        .unwrap_or(0);
+    state.provider_probe.lock().await.remove(&provider_id);
+    let threshold = crate::state::provider_open_threshold();
+    if threshold > 0 && streak >= threshold {
+        tracing::info!(
+            provider_id,
+            "provider circuit closed after a successful health probe"
+        );
+    }
 }
 
 pub(crate) async fn persist_provider_key_result(
@@ -510,6 +514,7 @@ pub(crate) async fn persist_provider_key_result(
         return Ok(());
     };
     if ok {
+        state.provider_key_cooldown.lock().await.remove(&key_id);
         state.provider_key_error_state.lock().await.remove(&key_id);
         sqlx::query(
             "UPDATE provider_api_keys \

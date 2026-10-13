@@ -1246,10 +1246,14 @@ async fn provider_key_health_check_tests_every_enabled_key() {
     .execute(&state.pool)
     .await
     .unwrap();
-    state.provider_key_cooldown.lock().await.insert(
-        11,
-        std::time::Instant::now() + std::time::Duration::from_secs(60),
-    );
+    let cooldown_until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    {
+        let mut cooldowns = state.provider_key_cooldown.lock().await;
+        cooldowns.insert(11, cooldown_until);
+        cooldowns.insert(12, cooldown_until);
+    }
+    state.provider_cooldown.lock().await.insert(1, cooldown_until);
+    state.provider_failure_streak.lock().await.insert(1, 3);
 
     let result = test_provider_keys_inner(&state, 1).await.unwrap();
 
@@ -1273,6 +1277,9 @@ async fn provider_key_health_check_tests_every_enabled_key() {
         &["Bearer sk-bad".to_string(), "Bearer sk-good".to_string()]
     );
     assert!(state.provider_key_cooldown.lock().await.contains_key(&11));
+    assert!(!state.provider_key_cooldown.lock().await.contains_key(&12));
+    assert!(!state.provider_cooldown.lock().await.contains_key(&1));
+    assert!(!state.provider_failure_streak.lock().await.contains_key(&1));
     let failed: (Option<i64>, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT last_test_ok, last_test_checked, last_test_message \
              FROM provider_api_keys WHERE id = 11",
