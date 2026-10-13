@@ -697,7 +697,7 @@ fn extracts_trace_id_from_wrapped_upstream_error() {
 }
 
 #[tokio::test]
-async fn auto_route_ignores_models_that_do_not_support_the_requested_endpoint() {
+async fn route_resolution_ignores_models_that_do_not_support_the_requested_endpoint() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -737,7 +737,18 @@ async fn auto_route_ignores_models_that_do_not_support_the_requested_endpoint() 
     assert_eq!(resolved.targets[0].provider_id, 2);
 }
 
-async fn virtual_auto_state() -> AppState {
+async fn circuit_state() -> AppState {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    AppState::new(pool, None)
+}
+
+#[tokio::test]
+async fn per_request_routing_overrides_apply_and_echo() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -745,164 +756,97 @@ async fn virtual_auto_state() -> AppState {
         .unwrap();
     sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     sqlx::query(
-        "INSERT INTO providers (id, name, provider_type, base_url, model_prefix) VALUES
-            (1, 'fast', 'openai', 'https://fast.example/v1', 'fast/'),
-            (2, 'cheap', 'openai', 'https://cheap.example/v1', 'cheap/'),
-            (3, 'responses', 'openai', 'https://responses.example/v1', 'responses/'),
-            (4, 'embeddings', 'openai', 'https://embeddings.example/v1', 'embed/')",
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'fast', 'openai', 'https://fast.example/v1'),
+            (2, 'cheap', 'openai', 'https://cheap.example/v1')",
     )
     .execute(&pool)
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO provider_models (
-            provider_id, model_name, supported_endpoints, cost
-         ) VALUES
-            (1, 'small', '[\"/chat/completions\"]', '{\"input\":1,\"output\":2}'),
-            (2, 'tiny', '[\"/chat/completions\"]', '{\"input\":0.1,\"output\":0.2}'),
-            (3, 'only', '[\"/responses\"]', '{\"input\":0.5,\"output\":0.5}'),
-            (4, 'vector', '[\"/embeddings\"]', '{\"input\":0.01,\"output\":0}')",
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+            (1, 'small', '[\"/chat/completions\"]'),
+            (2, 'tiny', '[\"/chat/completions\"]')",
     )
     .execute(&pool)
     .await
     .unwrap();
-    AppState::new(pool, None)
-}
-
-#[tokio::test]
-async fn virtual_auto_routes_across_providers_and_respects_api_key_target_patterns() {
-    let state = virtual_auto_state().await;
-
-    let resolved = resolve_route_with_patterns(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, None)
-        .await
-        .unwrap();
-    assert_eq!(resolved.strategy, "latency_optimized");
-    assert_eq!(resolved.targets.len(), 3);
-    assert!(
-        resolved
-            .targets
-            .iter()
-            .all(|target| target.upstream_model != "vector"),
-        "embeddings-only models must not enter the chat auto pool"
-    );
-
-    let patterns = vec!["auto/fast".to_string(), "fast/*".to_string()];
-    let restricted = resolve_route_with_patterns(
-        &state,
-        "auto/fast",
-        OPENAI_CHAT_COMPLETIONS,
-        Some(&patterns),
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled) VALUES
+            (1, 'override route', 'override-model', 'priority', 1)",
     )
+    .execute(&pool)
     .await
     .unwrap();
-    assert_eq!(restricted.targets.len(), 1);
-    assert_eq!(restricted.targets[0].provider_id, 1);
-    assert_eq!(restricted.targets[0].upstream_model, "small");
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority, weight, enabled) VALUES
+            (1, 1, 'small', 0, 100, 1),
+            (1, 2, 'tiny', 0, 100, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
 
-    let denied = vec!["auto/fast".to_string()];
-    let error =
-        resolve_route_with_patterns(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, Some(&denied))
-            .await
-            .unwrap_err();
-    assert!(matches!(error, AppError::Forbidden(_)));
-}
-
-#[tokio::test]
-async fn virtual_auto_models_are_public_and_diagnosable() {
-    let state = virtual_auto_state().await;
-    let models = openai_public_models(&state, None).await.unwrap();
-    for (id, display_name, _) in crate::registry::AUTO_MODELS {
-        let model = models.iter().find(|model| model.id == id).unwrap();
-        assert_eq!(model.display_name.as_deref(), Some(display_name));
-        assert_eq!(model.target_count, Some(3));
-        assert_eq!(model.limits_verified, Some(false));
-    }
-
-    let patterns = vec!["auto/cheap".to_string(), "cheap/*".to_string()];
-    let models = openai_public_models(&state, Some(&patterns)).await.unwrap();
-    let ids = models
-        .iter()
-        .map(|model| model.id.as_str())
-        .collect::<Vec<_>>();
-    assert!(ids.contains(&"auto/cheap"));
-    assert!(ids.contains(&"cheap/tiny"));
-    assert!(!ids.contains(&"auto/fast"));
-    assert!(!ids.contains(&"fast/small"));
-
-    let diagnosis = diagnose_route(&state, "auto/fast", OPENAI_CHAT_COMPLETIONS, None)
+    let mut resolved = resolve_route(&state, "override-model", OPENAI_CHAT_COMPLETIONS)
         .await
         .unwrap();
-    assert!(diagnosis.matched);
-    assert!(diagnosis.resolved);
-    assert_eq!(diagnosis.match_type, "auto");
-    assert_eq!(diagnosis.route_name.as_deref(), Some("Auto"));
-    assert_eq!(diagnosis.strategy.as_deref(), Some("latency_optimized"));
-    assert_eq!(
-        diagnosis
-            .targets
-            .iter()
-            .filter(|target| target.eligible)
-            .count(),
-        3
-    );
-    assert_eq!(diagnosis.targets.len(), 4);
-}
-
-#[tokio::test]
-async fn per_request_routing_overrides_apply_and_echo() {
-    let state = virtual_auto_state().await;
-    let mut resolved = resolve_route_with_patterns(&state, "auto", OPENAI_CHAT_COMPLETIONS, None)
-        .await
-        .unwrap();
-    assert_eq!(resolved.strategy, "least_used");
-    assert_eq!(resolved.targets.len(), 3);
+    assert_eq!(resolved.strategy, "priority");
+    assert_eq!(resolved.targets.len(), 2);
 
     // A strategy override replaces the route's configured strategy.
     let overrides = RequestRoutingOverrides {
         strategy: Some("cost_optimized".to_string()),
         ..Default::default()
     };
-    apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
+    apply_routing_overrides(&mut resolved, "override-model", &overrides).unwrap();
     assert_eq!(resolved.strategy, "cost_optimized");
 
+    // Pinning by numeric id keeps only that provider.
+    let mut pinned = resolve_route(&state, "override-model", OPENAI_CHAT_COMPLETIONS)
+        .await
+        .unwrap();
+    let overrides = RequestRoutingOverrides {
+        provider: Some("2".to_string()),
+        ..Default::default()
+    };
+    apply_routing_overrides(&mut pinned, "override-model", &overrides).unwrap();
+    assert_eq!(pinned.targets.len(), 1);
+    assert_eq!(pinned.targets[0].provider_id, 2);
+
     // Excluding one provider removes exactly its target.
+    let mut excluded = resolve_route(&state, "override-model", OPENAI_CHAT_COMPLETIONS)
+        .await
+        .unwrap();
     let overrides = RequestRoutingOverrides {
         excluded_providers: vec!["cheap".to_string()],
         ..Default::default()
     };
-    let removed = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
+    let removed =
+        apply_routing_overrides(&mut excluded, "override-model", &overrides).unwrap();
     assert_eq!(removed, 1);
-    assert_eq!(resolved.targets.len(), 2);
+    assert_eq!(excluded.targets.len(), 1);
     assert!(
-        resolved
+        excluded
             .targets
             .iter()
             .all(|target| target.provider_name != "cheap")
     );
-
-    // Pinning by numeric id keeps only that provider.
-    let overrides = RequestRoutingOverrides {
-        provider: Some("3".to_string()),
-        ..Default::default()
-    };
-    apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap();
-    assert_eq!(resolved.targets.len(), 1);
-    assert_eq!(resolved.targets[0].provider_id, 3);
 
     // An unmatched pin is a client error, not a silent fallback.
     let overrides = RequestRoutingOverrides {
         provider: Some("nope".to_string()),
         ..Default::default()
     };
-    let error = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap_err();
+    let error = apply_routing_overrides(&mut excluded, "override-model", &overrides).unwrap_err();
     assert!(matches!(error, AppError::BadRequest(_)));
 
     // Excluding everything is rejected too.
     let overrides = RequestRoutingOverrides {
-        excluded_providers: vec!["3".to_string()],
+        excluded_providers: vec!["1".to_string()],
         ..Default::default()
     };
-    let error = apply_routing_overrides(&mut resolved, "auto", &overrides).unwrap_err();
+    let error = apply_routing_overrides(&mut excluded, "override-model", &overrides).unwrap_err();
     assert!(matches!(error, AppError::BadRequest(_)));
 }
 
@@ -981,6 +925,21 @@ async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
     .execute(&pool)
     .await
     .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled) VALUES
+            (1, 'override route', 'override-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority, weight, enabled) VALUES
+            (1, 1, 'small', 0, 100, 1),
+            (1, 2, 'tiny', 0, 100, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let state = AppState::new(pool, None);
     let mut headers = HeaderMap::new();
@@ -993,7 +952,7 @@ async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
         &OPENAI_CHAT_COMPLETIONS.parse().unwrap(),
         &Bytes::from(
             json!({
-                "model": "auto",
+                "model": "override-model",
                 "messages": [{"role": "user", "content": "hi"}]
             })
             .to_string(),
@@ -8926,7 +8885,7 @@ fn provider_open_threshold_parsing_keeps_a_safe_default() {
 /// is still allowed, so one transient failure cannot turn into an outage.
 #[tokio::test]
 async fn provider_circuit_stays_soft_below_the_open_threshold() {
-    let state = virtual_auto_state().await;
+    let state = circuit_state().await;
     state
         .provider_failure_streak
         .lock()
@@ -8948,7 +8907,7 @@ async fn provider_circuit_stays_soft_below_the_open_threshold() {
 /// request probes recovery.
 #[tokio::test]
 async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
-    let state = virtual_auto_state().await;
+    let state = circuit_state().await;
     state
         .provider_failure_streak
         .lock()
@@ -8995,7 +8954,7 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
 /// out, but must not count failures that stay below the threshold.
 #[tokio::test]
 async fn provider_circuit_trip_counter_registers_hard_opens() {
-    let state = virtual_auto_state().await;
+    let state = circuit_state().await;
     let mut circuit_events = state.circuit_events.subscribe();
     let failure = StatusCode::SERVICE_UNAVAILABLE;
 

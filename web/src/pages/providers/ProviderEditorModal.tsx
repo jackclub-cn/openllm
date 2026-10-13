@@ -103,7 +103,7 @@ export default function ProviderEditorModal({
         <Form.Item
           name="model_prefix"
           label="模型前缀"
-          extra="用于命名空间和自动路由，例如 openai/、local/。留空则不添加前缀。"
+          extra="用于命名空间和模型前缀匹配，例如 openai/、local/。留空则不添加前缀。"
         >
           <Input placeholder="openai/" />
         </Form.Item>

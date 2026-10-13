@@ -81,7 +81,7 @@ export default function UsageTable({
                   )}
                 </Space>
                 <Typography.Text type="secondary">
-                  {record.route_name || (record.route_id ? `#${record.route_id}` : '自动路由')}
+                  {record.route_name || (record.route_id ? `#${record.route_id}` : '直连模型')}
                 </Typography.Text>
               </div>
             ),

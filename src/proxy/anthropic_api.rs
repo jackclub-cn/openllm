@@ -36,14 +36,7 @@ pub(crate) async fn count_tokens_inner(
     let input_tokens = estimate_request_tokens(&inbound);
     let guardrails = state.guardrail_settings().await?;
     enforce_request_guardrails(&guardrails, &inbound, input_tokens)?;
-    let model_patterns = api_key_model_patterns(api_key.as_ref())?;
-    resolve_route_with_patterns(
-        state,
-        &requested_model,
-        ANTHROPIC_MESSAGES,
-        model_patterns.as_deref(),
-    )
-    .await?;
+    resolve_route(state, &requested_model, ANTHROPIC_MESSAGES).await?;
 
     Ok(Json(json!({"input_tokens": input_tokens})).into_response())
 }

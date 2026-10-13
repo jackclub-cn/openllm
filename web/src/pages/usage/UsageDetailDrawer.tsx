@@ -107,7 +107,7 @@ export default function UsageDetailDrawer({
                 (detail.provider_api_key_id ? `#${detail.provider_api_key_id}` : '-')}
             </Descriptions.Item>
             <Descriptions.Item label="路由">
-              {detail.route_name || (detail.route_id ? `#${detail.route_id}` : '自动路由')}
+              {detail.route_name || (detail.route_id ? `#${detail.route_id}` : '直连模型')}
             </Descriptions.Item>
             <Descriptions.Item label="访问密钥">
               {detail.api_key_name || (detail.api_key_id ? `#${detail.api_key_id}` : '匿名调用')}
