@@ -180,8 +180,10 @@ pub(crate) fn host_name() -> String {
 /// Both platforms have the same trap: a terminated process is not gone from the
 /// kernel's point of view until its parent reaps it (a zombie). Existence alone
 /// therefore reports a killed instance as alive, which would block the restart
-/// after a crash. Linux and macOS check the process state instead, and Windows
-/// waits on the process handle.
+/// after a crash. Linux reads the state from `/proc` and Windows waits on the
+/// process handle; macOS has no equivalent cheap probe — `proc_pidinfo` returns
+/// nothing at all for a zombie — so there an unreaped instance counts as alive
+/// and its lease is freed by the TTL instead.
 #[cfg(unix)]
 pub(crate) fn pid_is_running(pid: i64) -> Option<bool> {
     if pid <= 0 {
@@ -211,40 +213,14 @@ fn is_zombie(pid: i64) -> bool {
         .is_some_and(|state| state == "Z")
 }
 
-/// macOS has no `/proc`; the BSD info record carries the process state in
-/// `pbi_status`, the same field `ps` reports.
+/// Without `/proc` (macOS, the other BSDs) the answer stays unknown, so the pid
+/// counts as alive.
 ///
-/// A zombie still has a `proc` entry, so `kill(pid, 0)` reports it as alive;
-/// only the state distinguishes it from a running process. `proc_pidinfo`
-/// returning the whole record is what tells us the state was actually read, so
-/// a short or failed read stays "unknown" and the pid counts as alive — the
-/// safe direction, since a false "gone" could let a second writer in.
-#[cfg(target_os = "macos")]
-fn macos_process_status(pid: i64) -> Option<u32> {
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a correctly sized buffer for the requested flavor, and
-    // `proc_pidinfo` writes at most `size` bytes into it.
-    let written = unsafe {
-        libc::proc_pidinfo(
-            pid as libc::c_int,
-            libc::PROC_PIDTBSDINFO,
-            0,
-            std::ptr::addr_of_mut!(info).cast(),
-            size,
-        )
-    };
-    (written == size).then_some(info.pbi_status)
-}
-
-/// Whether a pid's macOS process state marks it as a zombie.
-#[cfg(target_os = "macos")]
-fn is_zombie(pid: i64) -> bool {
-    macos_process_status(pid) == Some(libc::SZOMB)
-}
-
-/// Everywhere else the answer stays unknown, so the pid counts as alive.
-#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+/// That errs toward "alive" on purpose: calling a live instance gone would let a
+/// second process serve the same SQLite file. The cost is only that a crashed
+/// instance which is still an unreaped zombie keeps its lease until the TTL
+/// expires, which `claim_instance_lease` already handles.
+#[cfg(all(unix, not(target_os = "linux")))]
 fn is_zombie(_pid: i64) -> bool {
     false
 }

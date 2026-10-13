@@ -1270,7 +1270,6 @@ dependencies = [
  "hmac",
  "http",
  "httpdate",
- "libc",
  "mime_guess",
  "rand 0.8.8",
  "reqwest",
