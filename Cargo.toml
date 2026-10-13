@@ -33,6 +33,11 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 uuid = { version = "1.17", features = ["v4", "serde"] }
 
+# macOS has no /proc, so zombie detection goes through proc_pidinfo; the linux
+# and windows paths use hand-rolled FFI and do not pull this in.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3.20"
 tower = { version = "0.5", features = ["util"] }

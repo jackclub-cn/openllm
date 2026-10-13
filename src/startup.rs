@@ -180,8 +180,8 @@ pub(crate) fn host_name() -> String {
 /// Both platforms have the same trap: a terminated process is not gone from the
 /// kernel's point of view until its parent reaps it (a zombie). Existence alone
 /// therefore reports a killed instance as alive, which would block the restart
-/// after a crash. On Linux the process state is checked instead, and on Windows
-/// the handle is waited on.
+/// after a crash. Linux and macOS check the process state instead, and Windows
+/// waits on the process handle.
 #[cfg(unix)]
 pub(crate) fn pid_is_running(pid: i64) -> Option<bool> {
     if pid <= 0 {
@@ -198,8 +198,7 @@ pub(crate) fn pid_is_running(pid: i64) -> Option<bool> {
 
 /// Whether a live pid is a zombie (exited but not reaped by its parent).
 ///
-/// Read from `/proc` on Linux, where the state field is available; elsewhere
-/// the answer stays unknown, so the pid counts as alive.
+/// Read from `/proc` on Linux, where the state field is available.
 #[cfg(target_os = "linux")]
 fn is_zombie(pid: i64) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -212,7 +211,32 @@ fn is_zombie(pid: i64) -> bool {
         .is_some_and(|state| state == "Z")
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
+/// macOS has no `/proc`; a short BSD info record carries the process state.
+///
+/// A zombie still has a `proc` entry, so `kill(pid, 0)` reports it as alive;
+/// only the state field distinguishes it from a running process. `proc_pidinfo`
+/// returning the full record is what tells us the state was actually read, so a
+/// short or failed read stays "unknown" and the pid counts as alive.
+#[cfg(target_os = "macos")]
+fn is_zombie(pid: i64) -> bool {
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: `info` is a correctly sized buffer for the requested flavor, and
+    // `proc_pidinfo` writes at most `size` bytes into it.
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDT_SHORTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size,
+        )
+    };
+    written == size && info.pbsi_status == libc::SZOMB
+}
+
+/// Everywhere else the answer stays unknown, so the pid counts as alive.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn is_zombie(_pid: i64) -> bool {
     false
 }
