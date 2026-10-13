@@ -9,6 +9,9 @@
 .env
 .DS_Store
 
+# Local scratch for agent runs (e2e scripts, rehearsal logs, captured secrets).
+/.pi/
+
 # TLS material for the bundled nginx example is generated locally, never committed.
 deploy/nginx/certs/*
 !deploy/nginx/certs/.gitkeep
