@@ -211,28 +211,36 @@ fn is_zombie(pid: i64) -> bool {
         .is_some_and(|state| state == "Z")
 }
 
-/// macOS has no `/proc`; a short BSD info record carries the process state.
+/// macOS has no `/proc`; the BSD info record carries the process state in
+/// `pbi_status`, the same field `ps` reports.
 ///
 /// A zombie still has a `proc` entry, so `kill(pid, 0)` reports it as alive;
-/// only the state field distinguishes it from a running process. `proc_pidinfo`
-/// returning the full record is what tells us the state was actually read, so a
-/// short or failed read stays "unknown" and the pid counts as alive.
+/// only the state distinguishes it from a running process. `proc_pidinfo`
+/// returning the whole record is what tells us the state was actually read, so
+/// a short or failed read stays "unknown" and the pid counts as alive — the
+/// safe direction, since a false "gone" could let a second writer in.
 #[cfg(target_os = "macos")]
-fn is_zombie(pid: i64) -> bool {
-    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+fn macos_process_status(pid: i64) -> Option<u32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     // SAFETY: `info` is a correctly sized buffer for the requested flavor, and
     // `proc_pidinfo` writes at most `size` bytes into it.
     let written = unsafe {
         libc::proc_pidinfo(
             pid as libc::c_int,
-            libc::PROC_PIDT_SHORTBSDINFO,
+            libc::PROC_PIDTBSDINFO,
             0,
             std::ptr::addr_of_mut!(info).cast(),
             size,
         )
     };
-    written == size && info.pbsi_status == libc::SZOMB
+    (written == size).then_some(info.pbi_status)
+}
+
+/// Whether a pid's macOS process state marks it as a zombie.
+#[cfg(target_os = "macos")]
+fn is_zombie(pid: i64) -> bool {
+    macos_process_status(pid) == Some(libc::SZOMB)
 }
 
 /// Everywhere else the answer stays unknown, so the pid counts as alive.

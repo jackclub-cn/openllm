@@ -406,8 +406,15 @@ fn an_exited_child_process_is_not_running() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Sampled while the child is still an unreaped zombie, so a failure records
+    // the state the platform actually reported.
+    #[cfg(target_os = "macos")]
+    let observed = macos_process_status(pid);
     let _ = child.kill();
     let _ = child.wait();
+    #[cfg(target_os = "macos")]
+    panic!("a finished child process must not look alive (macOS pbi_status={observed:?})");
+    #[cfg(not(target_os = "macos"))]
     panic!("a finished child process must not look alive");
 }
 
