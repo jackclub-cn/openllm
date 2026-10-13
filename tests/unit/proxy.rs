@@ -3924,6 +3924,58 @@ fn parses_retry_after_seconds_milliseconds_and_http_dates() {
     assert!(parsed >= Duration::from_secs(118));
     assert!(parsed <= Duration::from_secs(120));
 
+    let mut reset_after = HeaderMap::new();
+    reset_after.insert("x-ratelimit-reset-after", HeaderValue::from_static("42"));
+    assert_eq!(
+        retry_after_from_headers(&reset_after),
+        Some(Duration::from_secs(42))
+    );
+
+    let mut reset_durations = HeaderMap::new();
+    reset_durations.insert(
+        "x-ratelimit-reset-requests",
+        HeaderValue::from_static("1m30s"),
+    );
+    reset_durations.insert("x-ratelimit-reset-tokens", HeaderValue::from_static("45s"));
+    assert_eq!(
+        retry_after_from_headers(&reset_durations),
+        Some(Duration::from_secs(90)),
+        "the latest active reset window must win"
+    );
+
+    let mut reset_timestamp = HeaderMap::new();
+    let reset_at = chrono::Utc::now() + Duration::from_secs(120);
+    reset_timestamp.insert(
+        "anthropic-ratelimit-unified-reset",
+        HeaderValue::from_str(&reset_at.to_rfc3339()).unwrap(),
+    );
+    let parsed = retry_after_from_headers(&reset_timestamp).unwrap();
+    assert!(parsed >= Duration::from_secs(118));
+    assert!(parsed <= Duration::from_secs(120));
+
+    let mut unix_reset = HeaderMap::new();
+    unix_reset.insert(
+        "x-ratelimit-reset",
+        HeaderValue::from_str(&(chrono::Utc::now().timestamp() + 60).to_string()).unwrap(),
+    );
+    let parsed = retry_after_from_headers(&unix_reset).unwrap();
+    assert!(parsed >= Duration::from_secs(58));
+    assert!(parsed <= Duration::from_secs(60));
+
+    let mut stale_reset = HeaderMap::new();
+    stale_reset.insert(
+        "x-ratelimit-reset",
+        HeaderValue::from_str(&(chrono::Utc::now().timestamp() - 60).to_string()).unwrap(),
+    );
+    assert_eq!(retry_after_from_headers(&stale_reset), None);
+
+    let mut malformed = HeaderMap::new();
+    malformed.insert(
+        "x-ratelimit-reset-requests",
+        HeaderValue::from_static("999999999999999999999999999999h"),
+    );
+    assert_eq!(retry_after_from_headers(&malformed), None);
+
     let mut capped = HeaderMap::new();
     capped.insert("retry-after", HeaderValue::from_static("99999"));
     assert_eq!(

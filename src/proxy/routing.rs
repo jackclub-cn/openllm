@@ -829,18 +829,143 @@ pub(super) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> 
         return bounded_retry_after(Duration::from_millis(value), MAX_UPSTREAM_RETRY_AFTER);
     }
 
-    let value = headers
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim();
-    if let Ok(seconds) = value.parse::<u64>() {
-        return bounded_retry_after(Duration::from_secs(seconds), MAX_UPSTREAM_RETRY_AFTER);
+    if let Some(value) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+    {
+        if let Ok(seconds) = value.parse::<u64>() {
+            return bounded_retry_after(Duration::from_secs(seconds), MAX_UPSTREAM_RETRY_AFTER);
+        }
+
+        if let Ok(deadline) = httpdate::parse_http_date(value)
+            && let Ok(duration) = deadline.duration_since(std::time::SystemTime::now())
+        {
+            return bounded_retry_after(duration, MAX_UPSTREAM_RETRY_AFTER);
+        }
     }
 
-    let deadline = httpdate::parse_http_date(value).ok()?;
-    let duration = deadline.duration_since(std::time::SystemTime::now()).ok()?;
-    bounded_retry_after(duration, MAX_UPSTREAM_RETRY_AFTER)
+    retry_after_from_reset_headers(headers)
+}
+
+/// Parses the rate-limit reset headers used by common OpenAI and Anthropic
+/// compatible upstreams. When several windows are present, wait for the latest
+/// one so the next attempt does not immediately hit another active limit.
+fn retry_after_from_reset_headers(headers: &HeaderMap) -> Option<Duration> {
+    const RESET_AFTER_HEADERS: [&str; 2] =
+        ["x-ratelimit-reset-after", "ratelimit-reset-after"];
+    const RESET_DURATION_HEADERS: [&str; 2] = [
+        "x-ratelimit-reset-requests",
+        "x-ratelimit-reset-tokens",
+    ];
+    const RESET_TIMESTAMP_HEADERS: [&str; 3] = [
+        "anthropic-ratelimit-unified-reset",
+        "x-ratelimit-reset",
+        "ratelimit-reset",
+    ];
+
+    let mut latest = None;
+    for name in RESET_AFTER_HEADERS {
+        if let Some(duration) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_reset_after)
+        {
+            latest = Some(latest.map_or(duration, |current: Duration| current.max(duration)));
+        }
+    }
+    for name in RESET_DURATION_HEADERS {
+        if let Some(duration) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_reset_duration)
+        {
+            latest = Some(latest.map_or(duration, |current: Duration| current.max(duration)));
+        }
+    }
+    for name in RESET_TIMESTAMP_HEADERS {
+        if let Some(duration) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(parse_reset_timestamp)
+        {
+            latest = Some(latest.map_or(duration, |current: Duration| current.max(duration)));
+        }
+    }
+    latest.and_then(|duration| bounded_retry_after(duration, MAX_UPSTREAM_RETRY_AFTER))
+}
+
+fn parse_reset_after(value: &str) -> Option<Duration> {
+    let seconds = value.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
+fn parse_reset_duration(value: &str) -> Option<Duration> {
+    let value = value.trim().to_ascii_lowercase();
+    if value.is_empty() {
+        return None;
+    }
+    if let Some(seconds) = parse_reset_after(&value) {
+        return Some(seconds);
+    }
+
+    let mut total = Duration::ZERO;
+    let mut rest = value.as_str();
+    let mut parsed_any = false;
+    while !rest.is_empty() {
+        let number_end = rest
+            .find(|character: char| !character.is_ascii_digit() && character != '.')
+            .unwrap_or(rest.len());
+        if number_end == 0 {
+            return None;
+        }
+        let number = rest[..number_end].parse::<f64>().ok()?;
+        rest = &rest[number_end..];
+
+        let unit_end = rest
+            .find(|character: char| character.is_ascii_digit() || character == '.')
+            .unwrap_or(rest.len());
+        if unit_end == 0 {
+            return None;
+        }
+        let multiplier = match &rest[..unit_end] {
+            "ns" => 1e-9,
+            "us" => 1e-6,
+            "ms" => 1e-3,
+            "s" => 1.0,
+            "m" => 60.0,
+            "h" => 3600.0,
+            _ => return None,
+        };
+        let seconds = number * multiplier;
+        if !seconds.is_finite() || seconds < 0.0 {
+            return None;
+        }
+        total = total.saturating_add(Duration::try_from_secs_f64(seconds).ok()?);
+        rest = &rest[unit_end..];
+        parsed_any = true;
+    }
+    parsed_any.then_some(total)
+}
+
+fn parse_reset_timestamp(value: &str) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(raw) = value.parse::<i64>() {
+        // Unix reset timestamps may be seconds or milliseconds.
+        let seconds = if raw > 10_000_000_000 { raw / 1000 } else { raw };
+        let now = Utc::now().timestamp();
+        return (seconds > now).then(|| Duration::from_secs((seconds - now) as u64));
+    }
+    let deadline = chrono::DateTime::parse_from_rfc3339(value).ok()?;
+    let duration = deadline
+        .with_timezone(&Utc)
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .ok()?;
+    Some(duration)
 }
 
 pub(super) fn provider_cooldown(
