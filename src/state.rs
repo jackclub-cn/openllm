@@ -40,6 +40,11 @@ pub struct AppState {
     /// In-memory cooldowns for a specific provider model. This keeps one
     /// overloaded model from removing every sibling model on the provider.
     pub target_cooldown: Arc<Mutex<HashMap<(i64, String), Instant>>>,
+    /// Successful requests whose first token was slow. These targets are still
+    /// routable, but are tried after healthy siblings while the soft penalty
+    /// is active. This catches a provider that keeps returning 200 while its
+    /// time-to-first-token collapses under quota pressure.
+    pub target_slow: Arc<Mutex<HashMap<(i64, String), TargetSlowState>>>,
     /// In-memory cooldowns for provider keys that recently failed.
     pub provider_key_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
     /// Provider keys whose latest persisted runtime state contains an error.
@@ -237,6 +242,19 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 ///
 /// Override with `OPENLLM_PROVIDER_OPEN_THRESHOLD`.
 pub(crate) const DEFAULT_PROVIDER_OPEN_THRESHOLD: u32 = 3;
+
+/// Default first-token threshold at which a successful target is softly
+/// deprioritized. The target stays usable when it is the only candidate.
+///
+/// Override with `OPENLLM_SLOW_TARGET_MS`; `0` disables the penalty.
+pub(crate) const DEFAULT_SLOW_TARGET_MS: i64 = 15_000;
+
+/// How long one slow success keeps a target behind healthy siblings before it
+/// gets another probe. Repeated slow successes escalate this duration.
+pub(crate) const MAX_SLOW_TARGET_HOLD: Duration = Duration::from_secs(5 * 60);
+
+/// A target with no slow sample for this long starts a fresh penalty streak.
+pub(crate) const SLOW_TARGET_STREAK_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 /// How long a single half-open recovery probe may hold a provider's probe slot
 /// before another probe is admitted.
@@ -477,6 +495,32 @@ pub(crate) fn parse_provider_open_threshold(value: Option<&str>) -> u32 {
         None | Some("") => DEFAULT_PROVIDER_OPEN_THRESHOLD,
         Some(raw) => raw.parse::<u32>().unwrap_or(DEFAULT_PROVIDER_OPEN_THRESHOLD),
     }
+}
+
+/// Resolves the first-token threshold for soft target deprioritization.
+pub(crate) fn slow_target_threshold_ms() -> i64 {
+    static THRESHOLD_MS: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *THRESHOLD_MS.get_or_init(|| {
+        parse_slow_target_threshold_ms(std::env::var("OPENLLM_SLOW_TARGET_MS").ok().as_deref())
+    })
+}
+
+/// Parses the first-token threshold. An explicit `0` disables the penalty; a
+/// missing or unparsable value keeps the default so a typo cannot disable it.
+pub(crate) fn parse_slow_target_threshold_ms(value: Option<&str>) -> i64 {
+    match value.map(str::trim) {
+        None | Some("") => DEFAULT_SLOW_TARGET_MS,
+        Some(raw) => raw.parse::<i64>().unwrap_or(DEFAULT_SLOW_TARGET_MS).max(0),
+    }
+}
+
+/// In-memory state for a successful target whose first token was slow.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct TargetSlowState {
+    pub(crate) until: Option<Instant>,
+    pub(crate) slow_streak: u32,
+    pub(crate) last_first_token_ms: i64,
+    pub(crate) last_slow_at: Option<Instant>,
 }
 
 /// Derives a provider's circuit-breaker state from its failure streak and
@@ -923,6 +967,7 @@ impl AppState {
             provider_probe: Arc::new(Mutex::new(HashMap::new())),
             provider_circuit_trips: Arc::new(Mutex::new(HashMap::new())),
             target_cooldown: Arc::new(Mutex::new(HashMap::new())),
+            target_slow: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),

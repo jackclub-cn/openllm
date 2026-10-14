@@ -791,6 +791,19 @@ pub(crate) async fn log_usage_warning(state: &AppState, request_id: &str, warnin
 
 pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
+    if entry.success
+        && entry.streamed
+        && let (Some(provider_id), Some(upstream_model)) =
+            (entry.provider_id, entry.upstream_model)
+    {
+        record_target_latency_success(
+            state,
+            provider_id,
+            upstream_model,
+            entry.first_token_ms,
+        )
+        .await;
+    }
     // Tokens are exact only once the response is complete, so the pool is
     // charged here rather than at admission (requests are charged then).
     crate::allocation::charge_token_usage(

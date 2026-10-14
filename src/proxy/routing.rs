@@ -5,7 +5,10 @@ use crate::allocation::PoolDecision;
 #[cfg(test)]
 #[path = "../../tests/unit/scoring.rs"]
 mod scoring_tests;
-use crate::state::{PROVIDER_PROBE_LEASE, provider_open_threshold};
+use crate::state::{
+    MAX_SLOW_TARGET_HOLD, PROVIDER_PROBE_LEASE, SLOW_TARGET_STREAK_WINDOW, provider_open_threshold,
+    slow_target_threshold_ms,
+};
 
 pub(super) fn target_upstream_endpoint<'a>(
     target: &RouteTarget,
@@ -1264,6 +1267,81 @@ pub(super) async fn mark_target_success(state: &AppState, provider_id: i64, upst
     if removed.is_some() {
         state.mark_target_resilience_dirty(provider_id, upstream_model);
     }
+}
+
+/// Records a successful request's first-token latency as a soft routing signal.
+///
+/// A 200 response proves the provider is reachable, so this must not open the
+/// failure circuit or a hard model cooldown. It only makes that target lose to
+/// healthy siblings for a bounded period, which is what prevents a quota-drained
+/// upstream from attracting every following request while still eventually
+/// probing it again.
+pub(super) async fn record_target_latency_success(
+    state: &AppState,
+    provider_id: i64,
+    upstream_model: &str,
+    first_token_ms: Option<i64>,
+) {
+    let threshold_ms = slow_target_threshold_ms();
+    if threshold_ms <= 0 {
+        return;
+    }
+    let Some(first_token_ms) = first_token_ms.filter(|latency| *latency >= threshold_ms) else {
+        return;
+    };
+
+    let now = Instant::now();
+    let mut targets = state.target_slow.lock().await;
+    targets.retain(|_, entry| {
+        entry.until.is_some_and(|until| until > now)
+            || entry
+                .last_slow_at
+                .is_some_and(|last| now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW)
+    });
+
+    let entry = targets
+        .entry((provider_id, upstream_model.to_string()))
+        .or_default();
+    let same_streak = entry
+        .last_slow_at
+        .is_some_and(|last| now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW);
+    entry.slow_streak = if same_streak {
+        entry.slow_streak.saturating_add(1)
+    } else {
+        1
+    };
+    entry.last_slow_at = Some(now);
+    entry.last_first_token_ms = first_token_ms;
+    let hold = slow_target_hold(first_token_ms, threshold_ms, entry.slow_streak);
+    entry.until = Some(now + hold);
+
+    tracing::warn!(
+        provider_id,
+        model = upstream_model,
+        first_token_ms,
+        threshold_ms,
+        slow_streak = entry.slow_streak,
+        hold_seconds = hold.as_secs(),
+        "successful upstream response was slow; deprioritizing the target while healthy siblings exist"
+    );
+}
+
+fn slow_target_hold(first_token_ms: i64, threshold_ms: i64, slow_streak: u32) -> Duration {
+    const BASE_HOLD: Duration = Duration::from_secs(30);
+    const MAX_OBSERVED_ADDITION: Duration = Duration::from_secs(120);
+
+    let observed_addition = Duration::from_millis(
+        first_token_ms
+            .saturating_sub(threshold_ms)
+            .max(0)
+            .unsigned_abs()
+            .min(MAX_OBSERVED_ADDITION.as_millis() as u64)
+            / 2,
+    );
+    let multiplier = 1u32 << slow_streak.saturating_sub(1).min(3);
+    (BASE_HOLD + observed_addition)
+        .saturating_mul(multiplier)
+        .min(MAX_SLOW_TARGET_HOLD)
 }
 
 /// Cools a target after its response stream failed mid-flight.
@@ -2698,8 +2776,8 @@ pub(crate) struct TargetAssessment {
     /// Set when the request path will not use this candidate at all right now.
     pub(crate) exclusion: Option<String>,
     /// Usable, but tried after candidates without the penalty (a soft pool
-    /// share, a failed health check, saturated concurrency, or a cooling
-    /// circuit that has no healthy alternative).
+    /// share, a failed health check, saturated concurrency, a slow successful
+    /// first token, or a cooling circuit that has no healthy alternative).
     pub(crate) deprioritized: bool,
 }
 
@@ -2932,6 +3010,16 @@ pub(crate) async fn assess_targets(
         cooldowns.retain(|_, until| *until + PROVIDER_PROBE_LEASE > now);
         cooldowns.clone()
     };
+    let slow_targets = {
+        let mut targets = state.target_slow.lock().await;
+        targets.retain(|_, entry| {
+            entry.until.is_some_and(|until| until > now)
+                || entry.last_slow_at.is_some_and(|last| {
+                    now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW
+                })
+        });
+        targets.clone()
+    };
 
     let mut assessments = HashMap::with_capacity(targets.len());
     for target in targets {
@@ -3019,6 +3107,22 @@ pub(crate) async fn assess_targets(
             latency_detail.clone(),
         ));
 
+        let slow_state = slow_targets
+            .get(&key)
+            .filter(|entry| entry.until.is_some_and(|until| until > now));
+        if let Some(slow_state) = slow_state {
+            factors.push(score_factor(
+                "first_token",
+                1.5,
+                Some(0.0),
+                format!(
+                    "最近一次首字 {}ms，软降权剩余 {}s",
+                    slow_state.last_first_token_ms,
+                    cooldown_remaining_seconds(slow_state.until.unwrap_or(now), now)
+                ),
+            ));
+        }
+
         // 7. Cost relative to the cheapest known candidate.
         let cost = target_cost_score(target);
         let cost_score = cost.map(|cost| {
@@ -3062,7 +3166,7 @@ pub(crate) async fn assess_targets(
         factors.push(score_factor("strategy", 1.5, strategy_score, strategy_detail));
 
         let mut assessment = TargetAssessment::new(factors);
-        if health_failed || saturated || allocation_penalized {
+        if health_failed || saturated || allocation_penalized || slow_state.is_some() {
             assessment = assessment.penalized();
         }
 
@@ -3118,7 +3222,26 @@ async fn deprioritized_target_keys(
     let threshold = provider_open_threshold();
     let streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = state.provider_cooldown.lock().await.clone();
+    let slow_targets = {
+        let mut targets = state.target_slow.lock().await;
+        targets.retain(|_, entry| {
+            entry.until.is_some_and(|until| until > now)
+                || entry.last_slow_at.is_some_and(|last| {
+                    now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW
+                })
+        });
+        targets
+            .iter()
+            .filter(|(_, entry)| entry.until.is_some_and(|until| until > now))
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>()
+    };
     for target in targets {
+        let key = (target.provider_id, target.upstream_model.clone());
+        if slow_targets.contains(&key) {
+            keys.insert(key);
+            continue;
+        }
         let streak = streaks.get(&target.provider_id).copied().unwrap_or(0);
         let cooling = provider_cooldowns
             .get(&target.provider_id)
@@ -3129,7 +3252,7 @@ async fn deprioritized_target_keys(
                 .await
                 .is_some_and(|(available, _)| available == 0)
         {
-            keys.insert((target.provider_id, target.upstream_model.clone()));
+            keys.insert(key);
             continue;
         }
         let Ok(catalog) = state.pool_catalog().await else {
@@ -3154,7 +3277,7 @@ async fn deprioritized_target_keys(
             })
         };
         if penalized {
-            keys.insert((target.provider_id, target.upstream_model.clone()));
+            keys.insert(key);
         }
     }
     keys
@@ -3274,20 +3397,19 @@ pub(super) async fn order_targets(
     }
     drop(provider_cooldowns);
 
-    // Keep strategy order within each health group, but try explicitly failed
-    // providers last. Unknown health stays ahead of failed providers so a
-    // previously-tested outage does not permanently suppress a recovery.
-    // Live pressure (a saturated concurrency gate, an over-share pool
-    // allocation) is a second, softer bucket: such a candidate is still tried,
-    // just after the ones with headroom, and the stable sort keeps the
+    // Try soft-degraded candidates last even when their last health probe
+    // passed: a successful response that took too long is newer evidence than
+    // an older health check. Within each soft bucket, unknown health stays
+    // ahead of explicitly failed providers so a previously-tested outage does
+    // not permanently suppress a recovery. The stable sort keeps the
     // strategy's own order inside each bucket.
     let deprioritized = deprioritized_target_keys(state, &targets, api_key_id).await;
     targets.sort_by_key(|target| {
         (
-            provider_health_rank(target.provider_health),
             u8::from(
                 deprioritized.contains(&(target.provider_id, target.upstream_model.clone())),
             ),
+            provider_health_rank(target.provider_health),
         )
     });
     expand_target_provider_keys(state, targets, session_id).await
