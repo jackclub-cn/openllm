@@ -159,6 +159,14 @@ export type ProviderQuotaDetail = {
   value: string
 }
 
+export type ProviderQuotaModel = {
+  model_name: string
+  model_id?: string | null
+  monthly_credits?: number | null
+  promo_credits?: number | null
+  note?: string | null
+}
+
 export type ProviderPrice = {
   model_name: string
   input?: number | null
@@ -176,6 +184,7 @@ export type ProviderQuota = {
   key_suffix?: string | null
   source_url?: string | null
   items: ProviderQuotaItem[]
+  model_quotas: ProviderQuotaModel[]
   details: ProviderQuotaDetail[]
   prices: ProviderPrice[]
   fetched_at: string

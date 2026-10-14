@@ -12,7 +12,13 @@ import {
   Typography,
 } from 'antd'
 import dayjs from 'dayjs'
-import { api, formatError, type Provider, type ProviderQuota } from '../../api'
+import {
+  api,
+  formatError,
+  type Provider,
+  type ProviderQuota,
+  type ProviderQuotaModel,
+} from '../../api'
 import { formatUnitPrice } from './types'
 
 type ProviderQuotaModalProps = {
@@ -178,6 +184,56 @@ export default function ProviderQuotaModal({
                 </Tag>
               ))}
             </Space>
+          )}
+
+          {quota.model_quotas.length > 0 && (
+            <div>
+              <Typography.Title level={5}>模型月额度</Typography.Title>
+              <Table
+                rowKey="model_name"
+                size="small"
+                pagination={false}
+                dataSource={quota.model_quotas}
+                columns={[
+                  {
+                    title: '模型',
+                    dataIndex: 'model_id',
+                    render: (_: string | null | undefined, record: ProviderQuotaModel) => (
+                      <Space direction="vertical" size={0}>
+                        <Typography.Text code>
+                          {record.model_id ?? record.model_name}
+                        </Typography.Text>
+                        {record.model_id && (
+                          <Typography.Text type="secondary">
+                            {record.model_name}
+                          </Typography.Text>
+                        )}
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: '基础额度',
+                    dataIndex: 'monthly_credits',
+                    width: 110,
+                    render: (value?: number | null) =>
+                      value == null ? '—' : `$${value.toFixed(2)}`,
+                  },
+                  {
+                    title: '促销',
+                    dataIndex: 'promo_credits',
+                    width: 100,
+                    render: (value?: number | null) =>
+                      value == null ? '—' : `$${value.toFixed(2)}`,
+                  },
+                  {
+                    title: '说明',
+                    dataIndex: 'note',
+                    render: (value?: string | null) =>
+                      value ? <Typography.Text type="secondary">{value}</Typography.Text> : '—',
+                  },
+                ]}
+              />
+            </div>
           )}
 
           <div>

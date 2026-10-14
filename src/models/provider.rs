@@ -119,6 +119,7 @@ pub struct ProviderQuotaView {
     pub key_suffix: Option<String>,
     pub source_url: Option<String>,
     pub items: Vec<ProviderQuotaItem>,
+    pub model_quotas: Vec<ProviderQuotaModel>,
     pub details: Vec<ProviderQuotaDetail>,
     pub prices: Vec<ProviderPriceView>,
     pub fetched_at: String,
@@ -146,6 +147,20 @@ pub struct ProviderQuotaItem {
 pub struct ProviderQuotaDetail {
     pub label: String,
     pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderQuotaModel {
+    /// Display name shown on the provider's plan page.
+    pub model_name: String,
+    /// Provider model id when the display name maps to the model catalog.
+    pub model_id: Option<String>,
+    /// Base monthly allowance for this model on the current plan.
+    pub monthly_credits: Option<f64>,
+    /// Promotional allowance that temporarily replaces the base value.
+    pub promo_credits: Option<f64>,
+    /// Remaining promotional or plan text from the source table.
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
