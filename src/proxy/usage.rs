@@ -165,6 +165,7 @@ impl UsageParser {
         }
         for path in [
             "/choices/0/delta/reasoning_content",
+            "/choices/0/delta/reasoning_text",
             "/choices/0/delta/reasoning",
         ] {
             if let Some(delta) = value.pointer(path).and_then(Value::as_str)

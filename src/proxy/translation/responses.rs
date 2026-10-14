@@ -166,7 +166,8 @@ impl ResponsesStreamState {
                     "id": item_id,
                     "type": "reasoning",
                     "status": "completed",
-                    "summary": [part]
+                    "summary": [part],
+                    "content": [{"type": "reasoning_text", "text": text}]
                 });
                 self.send_event(
                     tx,
@@ -912,15 +913,12 @@ pub(crate) fn chat_request_to_responses(input: &Value, model: &str, streamed: bo
             // message; Responses carries it as its own item, and thinking-mode
             // upstreams reject the history when it is missing.
             if role == "assistant"
-                && let Some(reasoning) = message
-                    .get("reasoning_content")
-                    .or_else(|| message.get("reasoning"))
-                    .and_then(Value::as_str)
-                    .filter(|reasoning| !reasoning.is_empty())
+                && let Some(reasoning) = chat_reasoning_text(message)
             {
                 items.push(json!({
                     "type": "reasoning",
-                    "summary": [{"type": "summary_text", "text": reasoning}]
+                    "summary": [{"type": "summary_text", "text": reasoning}],
+                    "content": [{"type": "reasoning_text", "text": reasoning}]
                 }));
             }
             let parts = chat_content_to_responses_parts(&content, text_type);
@@ -1060,20 +1058,13 @@ pub(crate) fn chat_tool_to_responses(tool: &Value) -> Option<Value> {
 pub(crate) fn chat_response_to_responses(value: &Value, requested_model: &str) -> (Value, Usage) {
     let message = value.pointer("/choices/0/message");
     let mut output = Vec::new();
-    if let Some(reasoning) = message
-        .and_then(|message| {
-            message
-                .get("reasoning_content")
-                .or_else(|| message.get("reasoning"))
-        })
-        .and_then(Value::as_str)
-        .filter(|reasoning| !reasoning.is_empty())
-    {
+    if let Some(reasoning) = message.and_then(chat_reasoning_text) {
         output.push(json!({
             "id": format!("rs_{}", uuid::Uuid::new_v4().simple()),
             "type": "reasoning",
             "status": "completed",
-            "summary": [{"type": "summary_text", "text": reasoning}]
+            "summary": [{"type": "summary_text", "text": reasoning}],
+            "content": [{"type": "reasoning_text", "text": reasoning}]
         }));
     }
     if let Some(text) = message

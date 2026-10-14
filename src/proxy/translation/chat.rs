@@ -31,12 +31,7 @@ pub(crate) async fn process_chat_chunk_line(
     };
     let delta = choice.get("delta").unwrap_or(&Value::Null);
 
-    if let Some(reasoning) = delta
-        .get("reasoning_content")
-        .or_else(|| delta.get("reasoning"))
-        .and_then(Value::as_str)
-        && !reasoning.is_empty()
-    {
+    if let Some(reasoning) = chat_reasoning_text(delta) {
         if !matches!(stream.current, Some(ResponsesStreamBlock::Reasoning { .. })) {
             stream.finish_current(tx).await;
             let item_id = format!("rs_{}", uuid::Uuid::new_v4().simple());
@@ -85,7 +80,7 @@ pub(crate) async fn process_chat_chunk_line(
             _ => return,
         };
         if let Some(ResponsesStreamBlock::Reasoning { text, .. }) = stream.current.as_mut() {
-            text.push_str(reasoning);
+            text.push_str(&reasoning);
         }
         stream.output_chars += reasoning.chars().count();
         stream.mark_first_token();
@@ -489,7 +484,7 @@ pub(crate) async fn process_responses_line_for_chat(
         .and_then(Value::as_str)
         .unwrap_or(event_name.as_str());
     match event {
-        "response.reasoning_summary_text.delta" => {
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
             if let Some(delta) = value.get("delta").and_then(Value::as_str)
                 && !delta.is_empty()
             {
@@ -1188,43 +1183,16 @@ pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&V
     }
 }
 
-/// Extracts the reasoning text a Responses `reasoning` item carries.
-///
-/// Thinking-mode upstreams reject a replayed assistant turn whose reasoning was
-/// dropped, so both the summary form (`summary_text`) this gateway emits to
-/// Responses clients and the raw `reasoning_text` content form some providers
-/// use are read.
-pub(crate) fn responses_reasoning_text(item: &Value) -> Option<String> {
-    let mut text = String::new();
-    for key in ["summary", "content"] {
-        let Some(parts) = item.get(key).and_then(Value::as_array) else {
-            continue;
-        };
-        for part in parts {
-            if let Some(part) = part.get("text").and_then(Value::as_str)
-                && !part.is_empty()
-            {
-                text.push_str(part);
-            }
-        }
-    }
-    (!text.is_empty()).then_some(text)
-}
-
 /// Re-attaches replayed reasoning to the assistant turn it belongs to,
 /// appending when the message already carries some.
 fn attach_reasoning(message: &mut Value, reasoning: Option<String>) {
     let Some(reasoning) = reasoning else {
         return;
     };
+    let existing = chat_reasoning_text(message).unwrap_or_default();
     let Some(object) = message.as_object_mut() else {
         return;
     };
-    let existing = object
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     object.insert(
         "reasoning_content".to_string(),
         json!(format!("{existing}{reasoning}")),
@@ -1292,12 +1260,8 @@ pub(crate) fn responses_response_to_chat(value: &Value, requested_model: &str) -
         for item in items {
             match item.get("type").and_then(Value::as_str) {
                 Some("reasoning") => {
-                    if let Some(parts) = item.get("summary").and_then(Value::as_array) {
-                        for part in parts {
-                            if let Some(part) = part.get("text").and_then(Value::as_str) {
-                                reasoning.push_str(part);
-                            }
-                        }
+                    if let Some(text) = responses_reasoning_text(item) {
+                        reasoning.push_str(&text);
                     }
                 }
                 Some("message") => {

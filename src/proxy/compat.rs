@@ -72,6 +72,291 @@ pub(crate) fn sanitize_responses_tool_history(body: &mut Value) -> usize {
     before.saturating_sub(items.len())
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponsesStepKind {
+    Other,
+    Reasoning,
+    Said,
+    Call,
+    Output,
+    Turn,
+}
+
+fn responses_step_kind(item: &Value) -> ResponsesStepKind {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    let role = item.get("role").and_then(Value::as_str).unwrap_or_default();
+    if item_type == "reasoning" {
+        ResponsesStepKind::Reasoning
+    } else if item_type.ends_with("_output") {
+        ResponsesStepKind::Output
+    } else if item_type.ends_with("_call") {
+        ResponsesStepKind::Call
+    } else if (item_type == "message" || item_type.is_empty()) && role == "assistant" {
+        ResponsesStepKind::Said
+    } else if item_type == "message" || (item_type.is_empty() && !role.is_empty()) {
+        ResponsesStepKind::Turn
+    } else {
+        ResponsesStepKind::Other
+    }
+}
+
+fn is_responses_step(kind: ResponsesStepKind) -> bool {
+    matches!(
+        kind,
+        ResponsesStepKind::Reasoning | ResponsesStepKind::Said | ResponsesStepKind::Call
+    )
+}
+
+fn has_nonempty_reasoning_text(item: &Value) -> bool {
+    item.get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|part| {
+                part.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                    && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+            })
+        })
+}
+
+fn placeholder_reasoning_item() -> Value {
+    json!({
+        "type": "reasoning",
+        "summary": [],
+        "content": [{"type": "reasoning_text", "text": " "}]
+    })
+}
+
+/// Repairs the reasoning shape DeepSeek requires in Responses histories.
+///
+/// DeepSeek treats a run of reasoning, assistant messages, and calls after a
+/// user message or tool output as one step. In the continued turn, a step
+/// that makes a call or follows a tool output must start with a reasoning item
+/// whose `content` includes non-empty `reasoning_text`. Codex can replay a
+/// step as `[message, reasoning, function_call]`, or with no reasoning at all,
+/// after another provider produced that turn.
+pub(crate) fn normalize_responses_reasoning_history(body: &mut Value) -> usize {
+    let Some(items) = body.get_mut("input").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+
+    let mut changed = 0;
+    for item in items.iter_mut() {
+        if responses_step_kind(item) != ResponsesStepKind::Reasoning
+            || has_nonempty_reasoning_text(item)
+        {
+            continue;
+        }
+        let text = responses_reasoning_text(item).unwrap_or_else(|| " ".to_string());
+        item["content"] = json!([{"type": "reasoning_text", "text": text}]);
+        changed += 1;
+    }
+
+    let original = std::mem::take(items);
+    let current_turn_start = original
+        .iter()
+        .rposition(|item| {
+            let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+            (item_type == "message" || item_type.is_empty())
+                && item.get("role").and_then(Value::as_str) == Some("user")
+        })
+        .map_or(0, |index| index + 1);
+    let mut ordered = Vec::with_capacity(original.len() + 1);
+    let mut after_output = false;
+    let mut index = 0;
+    while index < original.len() {
+        let kind = responses_step_kind(&original[index]);
+        if !is_responses_step(kind) {
+            match kind {
+                ResponsesStepKind::Output => after_output = true,
+                ResponsesStepKind::Turn => after_output = false,
+                _ => {}
+            }
+            ordered.push(original[index].clone());
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        let mut end = index;
+        let mut has_call = false;
+        let mut first_reasoning = None;
+        while end < original.len() && is_responses_step(responses_step_kind(&original[end])) {
+            let kind = responses_step_kind(&original[end]);
+            has_call |= kind == ResponsesStepKind::Call;
+            if kind == ResponsesStepKind::Reasoning && first_reasoning.is_none() {
+                first_reasoning = Some(end);
+            }
+            end += 1;
+        }
+
+        if start >= current_turn_start
+            && (has_call || after_output)
+            && first_reasoning != Some(start)
+        {
+            if let Some(first) = first_reasoning {
+                ordered.push(original[first].clone());
+            } else {
+                ordered.push(placeholder_reasoning_item());
+            }
+            for (current, item) in original.iter().enumerate().take(end).skip(start) {
+                if Some(current) != first_reasoning {
+                    ordered.push(item.clone());
+                }
+            }
+            changed += 1;
+        } else {
+            ordered.extend_from_slice(&original[start..end]);
+        }
+        index = end;
+    }
+    *items = ordered;
+    changed
+}
+
+/// Whether an upstream is known to require replayed reasoning in Responses
+/// histories. OpenAI-family endpoints accept reasoning items but should not
+/// receive synthetic ones.
+pub(crate) fn responses_replays_reasoning(target: &RouteTarget) -> bool {
+    target_replays_reasoning(target)
+}
+
+fn target_replays_reasoning(target: &RouteTarget) -> bool {
+    let host = target.base_url.to_ascii_lowercase();
+    let model = target.upstream_model.to_ascii_lowercase();
+    let provider = target.provider_name.to_ascii_lowercase();
+    let prefix = target.model_prefix.to_ascii_lowercase();
+    (model.contains("deepseek")
+        || provider.contains("deepseek")
+        || prefix.contains("deepseek")
+        || host.contains("deepseek"))
+        && !host.contains("api.openai.com")
+        && !host.contains("openai.azure.com")
+}
+
+fn chat_replays_reasoning(target: &RouteTarget) -> bool {
+    target_replays_reasoning(target)
+}
+
+pub(crate) fn normalize_chat_reasoning_history(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let current_turn_start = messages
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .map_or(0, |index| index + 1);
+    let mut after_tool_result = false;
+    let mut changed = 0;
+    for (index, message) in messages.iter_mut().enumerate() {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if role == "tool" {
+            after_tool_result = true;
+            continue;
+        }
+        if role != "assistant" {
+            after_tool_result = false;
+            continue;
+        }
+        let has_tool_calls = message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        let needs_reasoning = index >= current_turn_start && (has_tool_calls || after_tool_result);
+        if needs_reasoning {
+            let existing_content = message
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty());
+            if existing_content.is_none() {
+                if let Some(reasoning) = chat_reasoning_text(message) {
+                    message["reasoning_content"] = json!(reasoning);
+                } else {
+                    message["reasoning_content"] = json!(" ");
+                }
+                changed += 1;
+            }
+        }
+        after_tool_result = false;
+    }
+    changed
+}
+
+pub(crate) fn normalize_anthropic_thinking_history(body: &mut Value) -> usize {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return 0;
+    };
+    let mut after_tool_result = false;
+    let mut changed = 0;
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            after_tool_result = role_has_tool_result(message);
+            continue;
+        }
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            after_tool_result = false;
+            continue;
+        };
+        let has_tool_use = content
+            .iter()
+            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"));
+        let needs_thinking = has_tool_use || after_tool_result;
+        if !needs_thinking {
+            after_tool_result = false;
+            continue;
+        }
+
+        let mut has_thinking = false;
+        let before = content.len();
+        content.retain(|block| {
+            let block_type = block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if block_type == "thinking"
+                && (block
+                    .get("thinking")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+                    || block
+                        .get("signature")
+                        .and_then(Value::as_str)
+                        .is_some_and(|signature| !signature.is_empty()))
+            {
+                has_thinking = true;
+                true
+            } else {
+                block_type != "redacted_thinking"
+            }
+        });
+        if before.saturating_sub(content.len()) > 0 {
+            changed += 1;
+        }
+        if !has_thinking {
+            content.insert(0, json!({"type": "thinking", "thinking": " "}));
+            changed += 1;
+        }
+        after_tool_result = false;
+    }
+    changed
+}
+
+fn role_has_tool_result(message: &Value) -> bool {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .is_some_and(|blocks| {
+            blocks
+                .iter()
+                .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+        })
+}
+
 pub(crate) fn chat_tool_call_id(call: &Value) -> Option<&str> {
     call.get("id")
         .and_then(Value::as_str)
@@ -90,7 +375,8 @@ pub(crate) fn chat_message_is_empty(message: &Value) -> bool {
         .get("tool_calls")
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty());
-    !has_content && !has_tool_calls
+    let has_reasoning = chat_reasoning_text(message).is_some();
+    !has_content && !has_tool_calls && !has_reasoning
 }
 
 /// Chat completions upstreams require every assistant `tool_calls` entry to
@@ -269,6 +555,45 @@ pub(crate) async fn apply_upstream_compat(
             ),
         )
         .await;
+    }
+
+    if shape == UpstreamShape::Responses && responses_replays_reasoning(target) {
+        let reasoning_items = normalize_responses_reasoning_history(body);
+        if reasoning_items > 0 {
+            tracing::debug!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                reasoning_items,
+                "normalized replayed reasoning before Responses request"
+            );
+        }
+    }
+
+    if shape == UpstreamShape::Chat && chat_replays_reasoning(target) {
+        let reasoning_messages = normalize_chat_reasoning_history(body);
+        if reasoning_messages > 0 {
+            tracing::debug!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                reasoning_messages,
+                "normalized replayed reasoning before chat request"
+            );
+        }
+    }
+
+    if shape == UpstreamShape::Anthropic && target_replays_reasoning(target) {
+        let thinking_messages = normalize_anthropic_thinking_history(body);
+        if thinking_messages > 0 {
+            tracing::debug!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                thinking_messages,
+                "normalized replayed thinking before Anthropic request"
+            );
+        }
     }
 
     if target.tool_search_supported == 0

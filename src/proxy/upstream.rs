@@ -286,7 +286,11 @@ fn event_has_usable_content(value: &Value) -> bool {
 
     // OpenAI chat-completions and legacy completions chunks.
     if let Some(delta) = value.pointer("/choices/0/delta") {
-        if non_empty_str(delta.get("content")) || non_empty_str(delta.get("reasoning_content")) {
+        if non_empty_str(delta.get("content"))
+            || non_empty_str(delta.get("reasoning_content"))
+            || non_empty_str(delta.get("reasoning_text"))
+            || non_empty_str(delta.get("reasoning"))
+        {
             return true;
         }
         if delta.get("tool_calls").is_some_and(|calls| !calls.is_null()) {
@@ -307,6 +311,7 @@ fn event_has_usable_content(value: &Value) -> bool {
         // Responses API events.
         Some("response.output_text.delta")
         | Some("response.reasoning_summary_text.delta")
+        | Some("response.reasoning_text.delta")
         | Some("response.function_call_arguments.delta") => {
             return non_empty_str(value.get("delta"));
         }
@@ -424,11 +429,13 @@ pub(crate) async fn upstream_error_response(
 
     record_upstream_failure(state, target, status, &response_headers, &message).await;
 
-    if should_try_next_target(target, status) {
+    let compatibility_retry = compat_thinking_history_error(status, &response_body);
+    if should_try_next_target(target, status) || compatibility_retry {
         tracing::warn!(
             provider = %target.provider_name,
             model = %target.upstream_model,
             %status,
+            compatibility_retry,
             "upstream failed, trying next route target"
         );
         return Err(upstream_failure_error(
@@ -1196,6 +1203,24 @@ pub(crate) fn transient_upstream_4xx(status: StatusCode, body: &[u8]) -> bool {
     }
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     text.contains("trace_id") && text.contains("invalid request") && !text.contains("\"param\"")
+}
+
+/// Detects a thinking-history compatibility error that should move to another
+/// route target instead of being surfaced as a client error.
+///
+/// DeepSeek can reject a request even after the gateway has repaired the
+/// known Responses, Chat, and Anthropic shapes, for example when a client
+/// sends a new variation of a tool-call step. The provider error itself is a
+/// 400, but the request is not malformed for the client; another target may
+/// still serve it.
+pub(crate) fn compat_thinking_history_error(status: StatusCode, body: &[u8]) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("thinking mode")
+        && text.contains("passed back")
+        && (text.contains("reasoning_text") || text.contains("content[].thinking"))
 }
 
 /// Corrects an upstream that reports quota exhaustion with a non-retryable

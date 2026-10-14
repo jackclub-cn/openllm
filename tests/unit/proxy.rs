@@ -684,6 +684,26 @@ fn transient_upstream_4xx_only_matches_opaque_aggregator_errors() {
 }
 
 #[test]
+fn compat_thinking_history_error_is_retryable_across_targets() {
+    assert!(compat_thinking_history_error(
+        StatusCode::BAD_REQUEST,
+        br#"{"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#
+    ));
+    assert!(compat_thinking_history_error(
+        StatusCode::BAD_REQUEST,
+        br#"{"error":{"message":"The `content[].thinking` in the thinking mode must be passed back to the API.","type":"invalid_request_error"}}"#
+    ));
+    assert!(!compat_thinking_history_error(
+        StatusCode::BAD_REQUEST,
+        br#"{"error":{"message":"missing model"}}"#
+    ));
+    assert!(!compat_thinking_history_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        br#"{"error":{"message":"The `reasoning_text` in the thinking mode must be passed back to the API."}}"#
+    ));
+}
+
+#[test]
 fn restates_quota_exhaustion_misreported_as_a_client_error() {
     // Chinese aggregators often use 403/400 for an empty balance.
     assert_eq!(
@@ -3074,6 +3094,144 @@ async fn quota_exhaustion_reported_as_403_falls_back_to_a_healthy_provider() {
     );
 
     exhausted_server.abort();
+    healthy_server.abort();
+}
+
+#[tokio::test]
+async fn reasoning_text_rejection_falls_back_to_a_healthy_provider() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let rejected_attempts = Arc::new(AtomicUsize::new(0));
+    let rejected = axum::Router::new().route(
+        OPENAI_RESPONSES,
+        axum::routing::post({
+            let rejected_attempts = rejected_attempts.clone();
+            move || {
+                let rejected_attempts = rejected_attempts.clone();
+                async move {
+                    rejected_attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "message": "The `reasoning_text` in the thinking mode must be passed back to the API.",
+                                "type": "invalid_request_error"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let healthy = axum::Router::new().route(
+        OPENAI_RESPONSES,
+        axum::routing::post(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "id": "resp_healthy",
+                    "status": "completed",
+                    "output": [{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "ok"}]
+                    }],
+                    "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+                })),
+            )
+                .into_response()
+        }),
+    );
+    let rejected_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rejected_address = rejected_listener.local_addr().unwrap();
+    let healthy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let healthy_address = healthy_listener.local_addr().unwrap();
+    let rejected_server = tokio::spawn(async move {
+        axum::serve(rejected_listener, rejected).await.unwrap();
+    });
+    let healthy_server = tokio::spawn(async move {
+        axum::serve(healthy_listener, healthy).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'rejected', 'openai', ?),
+            (2, 'healthy', 'openai', ?)",
+    )
+    .bind(format!("http://{rejected_address}/v1"))
+    .bind(format!("http://{healthy_address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'reasoning route', 'reasoning-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+            (1, 1, 'reasoning-model', 0),
+            (1, 2, 'reasoning-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO settings (key, value) VALUES ('resilience', ?)")
+        .bind(
+            json!({
+                "max_retries": 0,
+                "retry_backoff_ms": 1,
+                "retry_max_backoff_ms": 5
+            })
+            .to_string(),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "reasoning-model",
+            "input": [{"type": "message", "role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/responses".parse().unwrap(),
+        &body,
+        "reasoning-fallback",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(rejected_attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
+    assert!(
+        !state
+            .target_cooldown
+            .lock()
+            .await
+            .contains_key(&(1, "reasoning-model".to_string())),
+        "a request-shape compatibility error must not cool the provider"
+    );
+
+    rejected_server.abort();
     healthy_server.abort();
 }
 
@@ -7855,6 +8013,34 @@ async fn responses_stream_converts_to_chat_chunks() {
 }
 
 #[tokio::test]
+async fn responses_reasoning_text_stream_converts_to_chat_reasoning_content() {
+    let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+    let mut event_name = String::new();
+    let mut state = ChatStreamState::default();
+    for line in [
+        b"event: response.reasoning_text.delta\n".as_slice(),
+        b"data: {\"type\":\"response.reasoning_text.delta\",\"delta\":\"plan\"}\n".as_slice(),
+    ] {
+        process_responses_line_for_chat(
+            line,
+            &mut event_name,
+            &mut state,
+            "chatcmpl_test",
+            "coding",
+            Instant::now(),
+            &tx,
+        )
+        .await;
+    }
+    drop(tx);
+    let mut joined = String::new();
+    while let Some(chunk) = rx.recv().await {
+        joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+    }
+    assert!(joined.contains("\"reasoning_content\":\"plan\""));
+}
+
+#[tokio::test]
 async fn responses_stream_failure_is_not_a_successful_chat_or_anthropic_turn() {
     let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let failed = b"data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"quota exhausted\"},\"usage\":{\"input_tokens\":6,\"output_tokens\":0}}}\n";
@@ -8131,6 +8317,30 @@ fn chat_reasoning_content_becomes_responses_reasoning() {
     assert_eq!(converted["output"][1]["content"][0]["text"], "answer");
 }
 
+#[test]
+fn chat_reasoning_text_becomes_responses_reasoning() {
+    let (converted, _) = chat_response_to_responses(
+        &json!({
+            "id": "chatcmpl-1",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": "answer",
+                    "reasoning_text": "thought"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3 }
+        }),
+        "coding",
+    );
+    assert_eq!(converted["output"][0]["type"], "reasoning");
+    assert_eq!(converted["output"][0]["summary"][0]["text"], "thought");
+    assert_eq!(converted["output"][0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(converted["output"][0]["content"][0]["text"], "thought");
+}
+
 /// Thinking-mode chat upstreams reject a replayed assistant turn whose
 /// reasoning was dropped, so a Responses `reasoning` item has to survive the
 /// conversion back into `reasoning_content`.
@@ -8190,6 +8400,214 @@ fn responses_reasoning_is_replayed_on_text_turns() {
     assert!(messages[2].get("reasoning_content").is_none());
 }
 
+#[test]
+fn responses_reasoning_text_is_preserved_when_converted_to_chat() {
+    let (converted, _) = responses_response_to_chat(
+        &json!({
+            "id": "resp_1",
+            "status": "completed",
+            "output": [{
+                "type": "reasoning",
+                "content": [{"type": "reasoning_text", "text": "think hard"}]
+            }],
+            "usage": {"input_tokens": 1, "output_tokens": 2}
+        }),
+        "coding",
+    );
+    assert_eq!(
+        converted["choices"][0]["message"]["reasoning_content"],
+        "think hard"
+    );
+    assert_eq!(converted["choices"][0]["message"]["content"], Value::Null);
+}
+
+#[test]
+fn responses_top_level_reasoning_text_is_read() {
+    assert_eq!(
+        responses_reasoning_text(&json!({
+            "type": "reasoning",
+            "reasoning_text": "think hard"
+        })),
+        Some("think hard".to_string())
+    );
+}
+
+#[test]
+fn deepseek_responses_step_leads_with_reasoning_text() {
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "run ls"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "main.go"},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Now update the index."}]},
+            {"type": "function_call", "call_id": "call_2", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_2", "output": "main.go"}
+        ]
+    });
+    assert_eq!(normalize_responses_reasoning_history(&mut body), 2);
+
+    let input = body["input"].as_array().expect("input array");
+    let kinds = input
+        .iter()
+        .map(|item| item["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "message",
+            "reasoning",
+            "function_call",
+            "function_call_output",
+            "reasoning",
+            "message",
+            "function_call",
+            "function_call_output"
+        ]
+    );
+    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[1]["content"][0]["text"], " ");
+    assert_eq!(input[4]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[4]["content"][0]["text"], " ");
+}
+
+#[test]
+fn deepseek_responses_moves_reasoning_before_a_note() {
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "run ls"}]},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "Looking at the tree."}]},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"}
+        ]
+    });
+    assert_eq!(normalize_responses_reasoning_history(&mut body), 2);
+
+    let input = body["input"].as_array().expect("input array");
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["content"][0]["text"], "plan");
+    assert_eq!(input[2]["type"], "message");
+    assert_eq!(input[3]["type"], "function_call");
+}
+
+#[tokio::test]
+async fn deepseek_responses_compat_inserts_reasoning_before_forwarding() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_name = "CommandCode".to_string();
+    target.base_url = "https://api.commandcode.ai/provider/v1".to_string();
+    target.upstream_model = "deepseek-v4.1-flash".to_string();
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "input": [
+            {"type": "message", "role": "user", "content": "run ls"},
+            {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_1", "output": "main.go"}
+        ]
+    });
+
+    apply_upstream_compat(
+        &state,
+        "req_test",
+        &target,
+        UpstreamShape::Responses,
+        &mut body,
+    )
+    .await;
+
+    assert_eq!(body["input"][1]["type"], "reasoning");
+    assert_eq!(body["input"][1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(body["input"][2]["type"], "function_call");
+    assert_eq!(body["input"][3]["type"], "function_call_output");
+}
+
+#[test]
+fn deepseek_chat_tool_turns_get_reasoning_content() {
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "messages": [
+            {"role": "user", "content": "run ls"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": "{}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "main.go"},
+            {"role": "assistant", "content": "Now update the index."}
+        ]
+    });
+    assert_eq!(normalize_chat_reasoning_history(&mut body), 2);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages[1]["reasoning_content"], " ");
+    assert_eq!(messages[3]["reasoning_content"], " ");
+}
+
+#[test]
+fn deepseek_anthropic_tool_turns_get_thinking() {
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "run ls"}]},
+            {"role": "assistant", "content": [{
+                "type": "tool_use",
+                "id": "toolu_1",
+                "name": "shell",
+                "input": {}
+            }]},
+            {"role": "user", "content": [{
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": "main.go"
+            }]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Now update the index."}]},
+            {"role": "user", "content": [{"type": "text", "text": "thanks"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Welcome."}]}
+        ]
+    });
+    assert_eq!(normalize_anthropic_thinking_history(&mut body), 2);
+    let messages = body["messages"].as_array().expect("messages array");
+    assert_eq!(messages[1]["content"][0]["type"], "thinking");
+    assert_eq!(messages[1]["content"][0]["thinking"], " ");
+    assert_eq!(messages[3]["content"][0]["type"], "thinking");
+    assert_eq!(messages[3]["content"][0]["thinking"], " ");
+    assert_eq!(messages[5]["content"].as_array().unwrap().len(), 1);
+    assert_eq!(messages[5]["content"][0]["type"], "text");
+}
+
+#[test]
+fn deepseek_anthropic_replaces_redacted_thinking() {
+    let mut body = json!({
+        "model": "deepseek-v4.1-flash",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "run ls"}]},
+            {"role": "assistant", "content": [
+                {"type": "redacted_thinking", "data": "opaque"},
+                {"type": "tool_use", "id": "toolu_1", "name": "shell", "input": {}}
+            ]}
+        ]
+    });
+    assert!(normalize_anthropic_thinking_history(&mut body) > 0);
+    let content = body["messages"][1]["content"].as_array().unwrap();
+    assert_eq!(content[0]["type"], "thinking");
+    assert_eq!(content[0]["thinking"], " ");
+    assert_eq!(content[1]["type"], "tool_use");
+    assert!(!content.iter().any(|block| block["type"] == "redacted_thinking"));
+}
+
 /// The mirror case: a chat client talking to a Responses-wire thinking
 /// upstream must have its `reasoning_content` promoted to a reasoning item.
 #[test]
@@ -8219,9 +8637,40 @@ fn chat_reasoning_content_replays_as_responses_reasoning_item() {
     assert_eq!(input[1]["type"], "reasoning");
     assert_eq!(input[1]["summary"][0]["type"], "summary_text");
     assert_eq!(input[1]["summary"][0]["text"], "plan");
+    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[1]["content"][0]["text"], "plan");
     assert_eq!(input[2]["type"], "function_call");
     assert_eq!(input[2]["call_id"], "call_1");
     assert_eq!(input[3]["type"], "function_call_output");
+}
+
+#[test]
+fn chat_reasoning_text_replays_as_responses_reasoning_item() {
+    let converted = chat_request_to_responses(
+        &json!({
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_text": "plan",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "calc", "arguments": "{}" }
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "4"}
+            ]
+        }),
+        "gpt/x",
+        true,
+    );
+    let input = converted["input"].as_array().expect("input array");
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["content"][0]["type"], "reasoning_text");
+    assert_eq!(input[1]["content"][0]["text"], "plan");
 }
 
 #[test]
@@ -8282,6 +8731,31 @@ async fn anthropic_thinking_stream_emits_chat_reasoning_content() {
         joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
     }
     assert!(joined.contains("\"reasoning_content\":\"plan\""));
+}
+
+#[tokio::test]
+async fn chat_reasoning_text_stream_becomes_responses_reasoning_item() {
+    let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
+    let mut stream = ResponsesStreamState::new("coding".to_string(), Instant::now());
+    let mut tool_index = None;
+    process_chat_chunk_line(
+        &mut stream,
+        b"data: {\"choices\":[{\"delta\":{\"reasoning_text\":\"plan\"}}]}\n",
+        &mut tool_index,
+        &tx,
+    )
+    .await;
+    stream.complete(&tx).await;
+    drop(tx);
+    let mut joined = String::new();
+    while let Some(chunk) = rx.recv().await {
+        joined.push_str(&String::from_utf8_lossy(&chunk.expect("stream chunk")));
+    }
+    assert!(joined.contains("response.reasoning_summary_text.delta"));
+    assert_eq!(stream.output[0]["type"], "reasoning");
+    assert_eq!(stream.output[0]["summary"][0]["text"], "plan");
+    assert_eq!(stream.output[0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(stream.output[0]["content"][0]["text"], "plan");
 }
 
 #[tokio::test]

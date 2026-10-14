@@ -7,6 +7,76 @@ use super::*;
 /// a model is thinking and the upstream has sent nothing.
 pub(crate) const SSE_KEEPALIVE_LINE: &[u8] = b": keep-alive\n\n";
 
+/// Reads thinking text from a chat-completions message.
+///
+/// Different OpenAI-compatible providers use `reasoning_content`,
+/// `reasoning_text`, or `reasoning` for the same turn. A missing value must
+/// stay distinguishable from an actually empty string so callers can insert a
+/// placeholder only where the upstream requires one.
+pub(crate) fn chat_reasoning_text(message: &Value) -> Option<String> {
+    for key in ["reasoning_content", "reasoning_text", "reasoning"] {
+        if let Some(part) = message.get(key).and_then(Value::as_str)
+            && !part.is_empty()
+        {
+            return Some(part.to_string());
+        }
+    }
+    let mut text = String::new();
+    if let Some(details) = message.get("reasoning_details").and_then(Value::as_array) {
+        for detail in details {
+            if let Some(part) = detail.get("text").and_then(Value::as_str)
+                && !part.is_empty()
+            {
+                text.push_str(part);
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// Reads thinking text from a Responses reasoning item.
+///
+/// Responses providers disagree about whether the text lives in `summary`,
+/// `content[].reasoning_text`, or a top-level field. Reading all three keeps
+/// a reasoning item intact when a client or provider uses a non-OpenAI
+/// dialect.
+pub(crate) fn responses_reasoning_text(item: &Value) -> Option<String> {
+    let mut text = String::new();
+    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) == Some("reasoning_text")
+                && let Some(part) = part.get("text").and_then(Value::as_str)
+                && !part.is_empty()
+            {
+                text.push_str(part);
+            }
+        }
+    }
+    if !text.is_empty() {
+        return Some(text);
+    }
+    if let Some(parts) = item.get("summary").and_then(Value::as_array) {
+        for part in parts {
+            if let Some(part) = part.get("text").and_then(Value::as_str)
+                && !part.is_empty()
+            {
+                text.push_str(part);
+            }
+        }
+    }
+    if !text.is_empty() {
+        return Some(text);
+    }
+    for key in ["reasoning_content", "reasoning_text", "reasoning"] {
+        if let Some(part) = item.get(key).and_then(Value::as_str)
+            && !part.is_empty()
+        {
+            return Some(part.to_string());
+        }
+    }
+    None
+}
+
 /// Waits for upstream data or for the downstream client to disconnect.
 ///
 /// Dropping the response body closes the receiver; observing that immediately
