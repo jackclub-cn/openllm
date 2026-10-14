@@ -410,6 +410,17 @@ pub(crate) async fn upstream_error_response(
         .chars()
         .take(600)
         .collect::<String>();
+    let reported_status = status;
+    let status = effective_upstream_status(status, &response_body);
+    if status != reported_status {
+        tracing::warn!(
+            provider = %target.provider_name,
+            model = %target.upstream_model,
+            %reported_status,
+            %status,
+            "upstream reported quota exhaustion with a non-retryable status; treating it as a rate limit"
+        );
+    }
 
     record_upstream_failure(state, target, status, &response_headers, &message).await;
 
@@ -1185,6 +1196,55 @@ pub(crate) fn transient_upstream_4xx(status: StatusCode, body: &[u8]) -> bool {
     }
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
     text.contains("trace_id") && text.contains("invalid request") && !text.contains("\"param\"")
+}
+
+/// Corrects an upstream that reports quota exhaustion with a non-retryable
+/// status.
+///
+/// Several OpenAI-compatible gateways return `403` or `400` (and occasionally
+/// `402`) when the account behind the key is out of credits. Treating that as a
+/// permanent client error stops the fallback loop and surfaces an auth-shaped
+/// failure to the caller, even though another route target may still serve the
+/// request. The corrected status makes the existing cooldown and fallback
+/// machinery handle it exactly like an upstream `429`.
+pub(crate) fn effective_upstream_status(status: StatusCode, body: &[u8]) -> StatusCode {
+    if status == StatusCode::PAYMENT_REQUIRED {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
+    if !matches!(status, StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN) {
+        return status;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if [
+        "insufficient_quota",
+        "insufficient quota",
+        "quota exceeded",
+        "quota exhausted",
+        "exceeded your current quota",
+        "out of credits",
+        "no credits remaining",
+        "insufficient credits",
+        "insufficient balance",
+        "insufficient_balance",
+        "credit balance is too low",
+        "credits exhausted",
+        "billing hard limit",
+        "monthly spending limit",
+        "monthly quota",
+        "额度不足",
+        "余额不足",
+        "配额不足",
+        "额度已用完",
+        "额度用尽",
+        "欠费",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+    {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        status
+    }
 }
 
 pub(crate) fn upstream_trace_id(body: &[u8]) -> Option<String> {

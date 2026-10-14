@@ -607,6 +607,17 @@ pub(crate) async fn forward_anthropic_native(
                 .chars()
                 .take(600)
                 .collect::<String>();
+            let reported_status = status;
+            let status = effective_upstream_status(status, &response_body);
+            if status != reported_status {
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    %reported_status,
+                    %status,
+                    "upstream reported quota exhaustion with a non-retryable status; treating it as a rate limit"
+                );
+            }
             record_upstream_failure(state, &target, status, &response_headers, &message).await;
             if should_try_next_target(&target, status) {
                 return Err(upstream_failure_error(
@@ -774,6 +785,17 @@ pub(crate) async fn forward_openai_as_anthropic(
                 .chars()
                 .take(600)
                 .collect::<String>();
+            let reported_status = status;
+            let status = effective_upstream_status(status, &response_body);
+            if status != reported_status {
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    %reported_status,
+                    %status,
+                    "upstream reported quota exhaustion with a non-retryable status; treating it as a rate limit"
+                );
+            }
             record_upstream_failure(state, &target, status, &response_headers, &message).await;
             if should_try_next_target(&target, status) {
                 return Err(upstream_failure_error(
