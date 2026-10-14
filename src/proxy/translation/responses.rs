@@ -908,6 +908,21 @@ pub(crate) fn chat_request_to_responses(input: &Value, model: &str, streamed: bo
             } else {
                 "input_text"
             };
+            // Chat completions carries replayed reasoning on the assistant
+            // message; Responses carries it as its own item, and thinking-mode
+            // upstreams reject the history when it is missing.
+            if role == "assistant"
+                && let Some(reasoning) = message
+                    .get("reasoning_content")
+                    .or_else(|| message.get("reasoning"))
+                    .and_then(Value::as_str)
+                    .filter(|reasoning| !reasoning.is_empty())
+            {
+                items.push(json!({
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": reasoning}]
+                }));
+            }
             let parts = chat_content_to_responses_parts(&content, text_type);
             if !parts.is_empty() {
                 items.push(json!({"type": "message", "role": role, "content": parts}));

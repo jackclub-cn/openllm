@@ -1100,6 +1100,12 @@ pub(crate) fn responses_format_to_chat(format: &Value) -> Option<Value> {
 }
 
 pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&Value>) {
+    // Responses carries reasoning as its own item, while chat-completions
+    // thinking mode expects it back on the assistant message of the turn that
+    // produced it. Dropping it makes the upstream reject the whole request
+    // ("the reasoning must be passed back to the API"), so each item is
+    // buffered and re-attached to the assistant turn it belongs to.
+    let mut pending_reasoning = String::new();
     match input {
         Some(Value::String(text)) => {
             messages.push(json!({"role": "user", "content": text}));
@@ -1107,6 +1113,11 @@ pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&V
         Some(Value::Array(items)) => {
             for item in items {
                 match item.get("type").and_then(Value::as_str) {
+                    Some("reasoning") => {
+                        if let Some(text) = responses_reasoning_text(item) {
+                            pending_reasoning.push_str(&text);
+                        }
+                    }
                     Some("function_call") => {
                         let call = json!({
                             "id": item.get("call_id").or_else(|| item.get("id")).cloned()
@@ -1118,6 +1129,8 @@ pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&V
                                     .unwrap_or_else(|| json!("{}"))
                             }
                         });
+                        let reasoning = (!pending_reasoning.is_empty())
+                            .then(|| std::mem::take(&mut pending_reasoning));
                         if let Some(last) = messages.last_mut()
                             && last.get("role").and_then(Value::as_str) == Some("assistant")
                         {
@@ -1127,14 +1140,17 @@ pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&V
                                 .and_then(Value::as_array_mut);
                             if let Some(calls) = calls {
                                 calls.push(call);
+                                attach_reasoning(last, reasoning);
                                 continue;
                             }
                         }
-                        messages.push(json!({
+                        let mut message = json!({
                             "role": "assistant",
                             "content": Value::Null,
                             "tool_calls": [call]
-                        }));
+                        });
+                        attach_reasoning(&mut message, reasoning);
+                        messages.push(message);
                     }
                     Some("function_call_output") => {
                         messages.push(json!({
@@ -1149,13 +1165,70 @@ pub(crate) fn append_responses_input(messages: &mut Vec<Value>, input: Option<&V
                         };
                         let content =
                             responses_content_to_chat(item.get("content").unwrap_or(&Value::Null));
-                        messages.push(json!({"role": role, "content": content}));
+                        let mut message = json!({"role": role, "content": content});
+                        if role == "assistant" {
+                            let reasoning = (!pending_reasoning.is_empty())
+                                .then(|| std::mem::take(&mut pending_reasoning));
+                            attach_reasoning(&mut message, reasoning);
+                        }
+                        messages.push(message);
                     }
                 }
+            }
+            // Some clients emit the reasoning item after the turn it belongs
+            // to; the last assistant message is still the right home for it.
+            if !pending_reasoning.is_empty()
+                && let Some(last) = messages.last_mut()
+                && last.get("role").and_then(Value::as_str) == Some("assistant")
+            {
+                attach_reasoning(last, Some(std::mem::take(&mut pending_reasoning)));
             }
         }
         _ => {}
     }
+}
+
+/// Extracts the reasoning text a Responses `reasoning` item carries.
+///
+/// Thinking-mode upstreams reject a replayed assistant turn whose reasoning was
+/// dropped, so both the summary form (`summary_text`) this gateway emits to
+/// Responses clients and the raw `reasoning_text` content form some providers
+/// use are read.
+pub(crate) fn responses_reasoning_text(item: &Value) -> Option<String> {
+    let mut text = String::new();
+    for key in ["summary", "content"] {
+        let Some(parts) = item.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(part) = part.get("text").and_then(Value::as_str)
+                && !part.is_empty()
+            {
+                text.push_str(part);
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+/// Re-attaches replayed reasoning to the assistant turn it belongs to,
+/// appending when the message already carries some.
+fn attach_reasoning(message: &mut Value, reasoning: Option<String>) {
+    let Some(reasoning) = reasoning else {
+        return;
+    };
+    let Some(object) = message.as_object_mut() else {
+        return;
+    };
+    let existing = object
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    object.insert(
+        "reasoning_content".to_string(),
+        json!(format!("{existing}{reasoning}")),
+    );
 }
 
 pub(crate) fn responses_content_to_chat(content: &Value) -> Value {

@@ -7809,6 +7809,99 @@ fn chat_reasoning_content_becomes_responses_reasoning() {
     assert_eq!(converted["output"][1]["content"][0]["text"], "answer");
 }
 
+/// Thinking-mode chat upstreams reject a replayed assistant turn whose
+/// reasoning was dropped, so a Responses `reasoning` item has to survive the
+/// conversion back into `reasoning_content`.
+#[test]
+fn responses_reasoning_is_replayed_on_tool_turns() {
+    let converted = responses_request_to_chat(
+        &json!({
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "go"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think "}]},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "hard"}]},
+                {"type": "function_call", "call_id": "call_1", "name": "calc", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "4"},
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "continue"}]}
+            ]
+        }),
+        "deepseek/x",
+        true,
+    );
+    let messages = converted["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["reasoning_content"], "think hard");
+    assert_eq!(messages[1]["tool_calls"][0]["id"], "call_1");
+    assert_eq!(messages[2]["role"], "tool");
+    assert_eq!(messages[3]["role"], "user");
+    assert!(
+        messages[3].get("reasoning_content").is_none(),
+        "reasoning must not leak onto the following user turn"
+    );
+}
+
+#[test]
+fn responses_reasoning_is_replayed_on_text_turns() {
+    let converted = responses_request_to_chat(
+        &json!({
+            "model": "coding",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "answer"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+            ]
+        }),
+        "deepseek/x",
+        false,
+    );
+    let messages = converted["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["reasoning_content"], "plan");
+    assert_eq!(messages[2]["role"], "user");
+    assert!(messages[2].get("reasoning_content").is_none());
+}
+
+/// The mirror case: a chat client talking to a Responses-wire thinking
+/// upstream must have its `reasoning_content` promoted to a reasoning item.
+#[test]
+fn chat_reasoning_content_replays_as_responses_reasoning_item() {
+    let converted = chat_request_to_responses(
+        &json!({
+            "model": "coding",
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "reasoning_content": "plan",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": { "name": "calc", "arguments": "{}" }
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "4"}
+            ]
+        }),
+        "gpt/x",
+        true,
+    );
+    let input = converted["input"].as_array().expect("input array");
+    assert_eq!(input[1]["type"], "reasoning");
+    assert_eq!(input[1]["summary"][0]["type"], "summary_text");
+    assert_eq!(input[1]["summary"][0]["text"], "plan");
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["call_id"], "call_1");
+    assert_eq!(input[3]["type"], "function_call_output");
+}
+
 #[test]
 fn anthropic_thinking_sets_chat_reasoning_content() {
     let (converted, _) = convert_anthropic_response(&json!({
