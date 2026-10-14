@@ -377,8 +377,8 @@ curl -H "x-admin-token: $TOKEN" -H 'content-type: application/json' \
 GitHub Actions 不会在普通分支推送时构建。Pull Request 和手动触发会执行测试与构建；推送 `v*` 格式的标签时会创建 GitHub Release，并上传 Linux、Windows 和 macOS 二进制及校验文件。
 
 ```bash
-git tag v0.3.16
-git push origin v0.3.16
+git tag v0.3.17
+git push origin v0.3.17
 ```
 
 发布后的文件会出现在 Releases 页面：
