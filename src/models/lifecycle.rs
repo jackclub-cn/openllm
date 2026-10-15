@@ -164,6 +164,13 @@ pub struct ConfigWebhook {
     pub url: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Body shape the receiver expects; `generic` keeps the gateway envelope.
+    #[serde(default = "default_webhook_kind")]
+    pub kind: String,
+    /// Extra static fields merged into a rendered channel body (a Telegram
+    /// `chat_id`, a DingTalk mention list).
+    #[serde(default = "empty_json_object")]
+    pub body_fields: serde_json::Value,
     #[serde(default)]
     pub event_types: Vec<String>,
     #[serde(default)]
@@ -173,6 +180,14 @@ pub struct ConfigWebhook {
     /// Only present when secrets were exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+}
+
+fn default_webhook_kind() -> String {
+    super::WEBHOOK_DEFAULT_CHANNEL_KIND.to_string()
+}
+
+fn empty_json_object() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Serialize, Deserialize)]

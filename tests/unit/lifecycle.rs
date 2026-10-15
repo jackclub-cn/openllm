@@ -349,6 +349,52 @@ async fn reimporting_the_same_document_changes_nothing() {
     assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, snapshot);
 }
 
+/// A chat channel is configuration, not a credential: its kind and extra body
+/// fields have to survive a masked export/import round trip, or an alert
+/// channel could not be reviewed and re-created from a document.
+#[tokio::test]
+async fn a_chat_channel_round_trips_through_a_masked_document() {
+    let source = seeded_state().await;
+    exec(
+        &source,
+        "UPDATE webhooks SET kind = 'slack', body_fields = '{\"channel\":\"#ops\"}' \
+         WHERE name = 'hook'",
+    )
+    .await;
+
+    // A masked export still carries the channel configuration: only the
+    // credentials are held back.
+    let masked = export(&source, false).await;
+    assert_eq!(masked.webhooks[0].kind, "slack");
+    assert_eq!(masked.webhooks[0].body_fields["channel"], "#ops");
+
+    let target = empty_state().await;
+    let plan = import(&target, export(&source, true).await, true).await;
+    assert!(plan.applied, "{:#?}", plan.items);
+    assert_eq!(plan.counts.error, 0, "{:#?}", plan.items);
+
+    let (kind, body_fields) = sqlx::query_as::<_, (String, String)>(
+        "SELECT kind, body_fields FROM webhooks WHERE name = 'hook'",
+    )
+    .fetch_one(&target.pool)
+    .await
+    .unwrap();
+    assert_eq!(kind, "slack");
+    let body: Value = serde_json::from_str(&body_fields).unwrap();
+    assert_eq!(body["channel"], "#ops");
+
+    // Re-importing must see the row as unchanged, which is what proves the
+    // comparison covers the two new columns.
+    let again = import(&target, export(&target, true).await, false).await;
+    assert!(again.valid, "{:#?}", again.problems);
+    assert_eq!(
+        item(&again, "webhook", "hook").action,
+        "unchanged",
+        "{:#?}",
+        again.items
+    );
+}
+
 #[tokio::test]
 async fn a_masked_document_never_overwrites_an_existing_credential() {
     let source = seeded_state().await;

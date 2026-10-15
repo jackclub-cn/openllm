@@ -16,7 +16,18 @@ import {
   Typography,
 } from 'antd'
 import dayjs from 'dayjs'
-import type { Webhook } from '../../api'
+import type { Webhook, WebhookKind } from '../../api'
+
+/// Short label for the body shape, shown next to the webhook name so an
+/// operator can tell a chat channel from a generic event sink at a glance.
+const kindLabels: Record<WebhookKind, string> = {
+  generic: '事件信封',
+  slack: 'Slack',
+  discord: 'Discord',
+  telegram: 'Telegram',
+  feishu: '飞书',
+  dingtalk: '钉钉',
+}
 
 type Props = {
   items: Webhook[]
@@ -65,11 +76,14 @@ export default function WebhooksTable({
           {
             title: '名称',
             dataIndex: 'name',
-            width: 180,
+            width: 200,
             render: (value: string, record) => (
               <Space direction="vertical" size={0}>
                 <Typography.Text strong>{value}</Typography.Text>
-                <Typography.Text type={record.secret_set ? 'success' : 'secondary'}>
+                <Typography.Text
+                  type={record.secret_set ? 'success' : 'secondary'}
+                >
+                  {kindLabels[record.kind] ?? record.kind} ·{' '}
                   {record.secret_set ? '已签名' : '未签名'}
                 </Typography.Text>
               </Space>

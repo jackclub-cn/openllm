@@ -270,19 +270,26 @@ pub(crate) async fn build_config_document(
         webhook_headers.insert(id, headers);
     }
 
-    let webhooks = sqlx::query_as::<_, (i64, String, String, String, i64)>(
-        "SELECT id, name, url, event_types, enabled FROM webhooks ORDER BY id",
+    let webhooks = sqlx::query_as::<_, (i64, String, String, String, String, String, i64)>(
+        "SELECT id, name, url, event_types, kind, body_fields, enabled \
+         FROM webhooks ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await?
     .into_iter()
-    .map(|(id, name, url, event_types, enabled)| {
+    .map(|(id, name, url, event_types, kind, body_fields, enabled)| {
         let headers = webhook_headers.get(&id).cloned().unwrap_or_default();
         let headers = parse_json_or_empty(&headers);
         ConfigWebhook {
             name,
             url,
             enabled: enabled != 0,
+            kind,
+            // Destination parameters such as a Telegram chat id are
+            // configuration, not credentials, so they travel with the
+            // document; the signing secret and credential-bearing headers
+            // keep the existing masking rules.
+            body_fields: parse_json_or_empty(&body_fields),
             event_types: parse_string_list(&event_types),
             headers: if include_secrets {
                 headers.clone()
@@ -507,6 +514,19 @@ struct ProviderFacts {
     /// Existing key rows by secret, used to keep a key's identity (and with it
     /// its lifetime statistics and usage attribution) across an import.
     key_ids_by_secret: HashMap<String, i64>,
+}
+
+/// A webhook as it currently exists, reduced to the fields the importer
+/// compares. The signing secret is loaded only when the document carries
+/// secrets; `kind` and `body_fields` are configuration and always compared.
+struct WebhookFacts {
+    url: String,
+    enabled: bool,
+    event_types: Vec<String>,
+    headers: Value,
+    kind: String,
+    body_fields: Value,
+    secret: Option<String>,
 }
 
 struct ImportRun<'a> {
@@ -1394,13 +1414,15 @@ impl<'a> ImportRun<'a> {
                             continue;
                         }
                     };
-                    if facts.0 == doc.url
-                        && facts.1 == doc.enabled
-                        && same_set(&facts.2, &doc.event_types)
+                    if facts.url == doc.url
+                        && facts.enabled == doc.enabled
+                        && same_set(&facts.event_types, &doc.event_types)
+                        && facts.kind == doc.kind
+                        && facts.body_fields == doc.body_fields
                         && (!self.secrets_included
-                            || header_values_match(&facts.3, &doc.headers))
+                            || header_values_match(&facts.headers, &doc.headers))
                         && (!self.secrets_included
-                            || facts.4.as_deref() == doc.secret.as_deref())
+                            || facts.secret.as_deref() == doc.secret.as_deref())
                     {
                         self.record(
                             "webhook",
@@ -1428,6 +1450,8 @@ impl<'a> ImportRun<'a> {
                             None
                         },
                         headers,
+                        kind: Some(doc.kind.clone()),
+                        body_fields: Some(doc.body_fields.clone()),
                         clear_secret: None,
                         event_types: Some(doc.event_types.clone()),
                         enabled: Some(doc.enabled),
@@ -1465,6 +1489,8 @@ impl<'a> ImportRun<'a> {
                             None
                         },
                         headers,
+                        kind: Some(doc.kind.clone()),
+                        body_fields: Some(doc.body_fields.clone()),
                         event_types: Some(doc.event_types.clone()),
                         enabled: doc.enabled,
                     };
@@ -1491,25 +1517,36 @@ impl<'a> ImportRun<'a> {
         }
     }
 
-    /// (url, enabled, event_types, headers, secret)
-    async fn webhook_facts(
-        &self,
-        id: i64,
-    ) -> AppResult<(String, bool, Vec<String>, Value, Option<String>)> {
-        let (url, enabled, event_types, headers, secret) =
-            sqlx::query_as::<_, (String, i64, String, String, Option<String>)>(
-                "SELECT url, enabled, event_types, headers, secret FROM webhooks WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_one(&self.state.pool)
-            .await?;
-        Ok((
+    /// Current state of one webhook, used to decide whether a document would
+    /// change anything.
+    async fn webhook_facts(&self, id: i64) -> AppResult<WebhookFacts> {
+        let (url, enabled, event_types, headers, kind, body_fields, secret) = sqlx::query_as::<
+            _,
+            (
+                String,
+                i64,
+                String,
+                String,
+                String,
+                String,
+                Option<String>,
+            ),
+        >(
+            "SELECT url, enabled, event_types, headers, kind, body_fields, secret \
+             FROM webhooks WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&self.state.pool)
+        .await?;
+        Ok(WebhookFacts {
             url,
-            enabled != 0,
-            parse_string_list(&event_types),
-            parse_json_or_empty(&headers),
-            secret.filter(|secret| !secret.is_empty()),
-        ))
+            enabled: enabled != 0,
+            event_types: parse_string_list(&event_types),
+            headers: parse_json_or_empty(&headers),
+            kind,
+            body_fields: parse_json_or_empty(&body_fields),
+            secret: secret.filter(|secret| !secret.is_empty()),
+        })
     }
 
     fn finish(self, document_version: i64) -> ImportPlan {

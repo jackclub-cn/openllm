@@ -8,7 +8,11 @@ import {
 } from 'antd'
 import type { FormInstance } from 'antd'
 import type { Webhook } from '../../api'
-import { webhookEventOptions, type WebhookFormValues } from './types'
+import {
+  webhookEventOptions,
+  webhookKindOptions,
+  type WebhookFormValues,
+} from './types'
 
 type Props = {
   open: boolean
@@ -27,6 +31,9 @@ export default function WebhookEditorModal({
   onCancel,
   onSave,
 }: Props) {
+  const kind = Form.useWatch('kind', form) ?? 'generic'
+  const isChatChannel = kind !== 'generic'
+
   return (
     <Modal
       title={editing ? '编辑 Webhook' : '新建 Webhook'}
@@ -95,6 +102,60 @@ export default function WebhookEditorModal({
         >
           <Input.TextArea rows={3} placeholder='{"Authorization":"Bearer ..."}' />
         </Form.Item>
+        <Form.Item
+          name="kind"
+          label="投递格式"
+          extra="选择 generic 会发送网关事件信封；选择聊天平台会改发一条可读消息。"
+        >
+          <Select options={webhookKindOptions} />
+        </Form.Item>
+        {isChatChannel && (
+          <Form.Item
+            name="body_fields"
+            label="附加字段"
+            extra={
+              kind === 'telegram'
+                ? 'JSON 对象。Telegram 必须提供 chat_id，例如 {"chat_id":"-1001234567890"}。'
+                : 'JSON 对象，会被合并进消息体，例如 {"channel":"#ops"}。'
+            }
+            rules={[
+              {
+                validator: (_, value: string) => {
+                  let parsed: unknown = {}
+                  if (value?.trim()) {
+                    try {
+                      parsed = JSON.parse(value)
+                    } catch {
+                      return Promise.reject(new Error('请输入 JSON 对象'))
+                    }
+                  }
+                  if (
+                    typeof parsed !== 'object' ||
+                    parsed === null ||
+                    Array.isArray(parsed)
+                  ) {
+                    return Promise.reject(new Error('请输入 JSON 对象'))
+                  }
+                  if (kind === 'telegram') {
+                    const chat = (parsed as Record<string, unknown>).chat_id
+                    const text =
+                      typeof chat === 'number'
+                        ? String(chat)
+                        : typeof chat === 'string'
+                          ? chat.trim()
+                          : ''
+                    if (!text) {
+                      return Promise.reject(new Error('Telegram 需要填写 chat_id'))
+                    }
+                  }
+                  return Promise.resolve()
+                },
+              },
+            ]}
+          >
+            <Input.TextArea rows={2} placeholder='{"channel":"#ops"}' />
+          </Form.Item>
+        )}
         <Form.Item
           name="event_types"
           label="订阅事件"

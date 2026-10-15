@@ -72,17 +72,7 @@ fn webhook_headers_are_normalized_and_gateway_headers_are_reserved() {
 
 #[test]
 fn webhook_event_subscription_matching() {
-    let webhook = Webhook {
-        id: 1,
-        name: "hook".to_string(),
-        url: "https://example.com/hook".to_string(),
-        secret: String::new(),
-        headers: "{}".to_string(),
-        event_types: r#"["request.failed"]"#.to_string(),
-        enabled: 1,
-        created_at: "2026-01-01T00:00:00Z".to_string(),
-        updated_at: "2026-01-01T00:00:00Z".to_string(),
-    };
+    let webhook = test_webhook("generic", "{}", r#"["request.failed"]"#);
     assert!(webhook.subscribes_to("request.failed"));
     assert!(!webhook.subscribes_to("request.completed"));
 
@@ -95,6 +85,164 @@ fn webhook_event_subscription_matching() {
     assert!(corrupted.subscribes_to("request.failed"));
     assert!(corrupted.subscribes_to("provider.circuit_open"));
     assert!(corrupted.subscribes_to("provider.circuit_closed"));
+}
+
+/// A webhook row as the delivery path sees it, for tests that only care about
+/// how the body is rendered.
+fn test_webhook(kind: &str, body_fields: &str, event_types: &str) -> Webhook {
+    Webhook {
+        id: 7,
+        name: "alerts".to_string(),
+        url: "https://example.com/hook".to_string(),
+        secret: String::new(),
+        headers: "{}".to_string(),
+        kind: kind.to_string(),
+        body_fields: body_fields.to_string(),
+        event_types: event_types.to_string(),
+        enabled: 1,
+        created_at: "2026-01-01T00:00:00Z".to_string(),
+        updated_at: "2026-01-01T00:00:00Z".to_string(),
+    }
+}
+
+#[test]
+fn webhook_channel_kinds_and_body_fields_are_validated() {
+    assert_eq!(normalize_channel_kind(None).unwrap(), "generic");
+    assert_eq!(normalize_channel_kind(Some(" slack ")).unwrap(), "slack");
+    assert_eq!(normalize_channel_kind(Some("")).unwrap(), "generic");
+    for invalid in ["teams", "slack2", "webhook"] {
+        assert!(
+            normalize_channel_kind(Some(invalid)).is_err(),
+            "{invalid} should be rejected"
+        );
+    }
+
+    assert_eq!(normalize_body_fields("generic", None).unwrap(), "{}");
+    assert_eq!(
+        normalize_body_fields("generic", Some(&serde_json::json!(null))).unwrap(),
+        "{}"
+    );
+    for invalid in [
+        serde_json::json!(["a"]),
+        serde_json::json!("text"),
+        serde_json::json!({"": "blank key"}),
+    ] {
+        assert!(
+            normalize_body_fields("slack", Some(&invalid)).is_err(),
+            "{invalid} should be rejected"
+        );
+    }
+
+    // Telegram addresses the chat in the body, so a missing chat id is caught
+    // while saving rather than on every alert that fails to deliver.
+    assert!(normalize_body_fields("telegram", Some(&serde_json::json!({}))).is_err());
+    assert!(
+        normalize_body_fields("telegram", Some(&serde_json::json!({"chat_id": "  "}))).is_err(),
+        "a blank chat id is as unusable as a missing one"
+    );
+    let stored = normalize_body_fields(
+        "telegram",
+        Some(&serde_json::json!({"chat_id": 42})),
+    )
+    .unwrap();
+    assert_eq!(stored, r#"{"chat_id":42}"#);
+}
+
+/// A chat channel must receive its own body shape, while the generic kind keeps
+/// the envelope every existing integration is written against.
+#[test]
+fn webhook_channel_kinds_render_the_body_each_platform_expects() {
+    let base = test_webhook("generic", "{}", r#"["provider.circuit_open"]"#);
+    let data = serde_json::json!({
+        "provider_id": 2,
+        "provider_name": "DeepSeek",
+        "state": "open",
+        "reason": "failure_threshold",
+        "failure_streak": 3,
+        "cooldown_seconds": 80
+    });
+
+    let generic: serde_json::Value =
+        serde_json::from_str(&crate::webhooks::delivery_body(
+            &base,
+            "provider.circuit_open",
+            &data,
+        ))
+        .unwrap();
+    assert_eq!(generic["event"], "provider.circuit_open");
+    assert_eq!(generic["webhook_id"], 7);
+    assert_eq!(generic["data"], data);
+
+    let rendered = |kind: &str, body_fields: &str| -> serde_json::Value {
+        let webhook = Webhook {
+            kind: kind.to_string(),
+            body_fields: body_fields.to_string(),
+            ..base.clone()
+        };
+        serde_json::from_str(&crate::webhooks::delivery_body(
+            &webhook,
+            "provider.circuit_open",
+            &data,
+        ))
+        .unwrap()
+    };
+
+    let slack = rendered("slack", r##"{"channel":"#ops"}"##);
+    assert!(slack.get("event").is_none(), "chat channels get no envelope");
+    assert_eq!(slack["channel"], "#ops");
+    let text = slack["text"].as_str().unwrap();
+    assert!(text.contains("provider circuit OPEN: DeepSeek"), "{text}");
+    assert!(text.contains("reason: failure_threshold"), "{text}");
+    assert!(text.contains("consecutive failures: 3"), "{text}");
+    assert!(text.contains("cooldown (s): 80"), "{text}");
+
+    assert_eq!(
+        rendered("discord", "{}")["content"],
+        serde_json::json!(text)
+    );
+    assert_eq!(
+        rendered("telegram", r#"{"chat_id":"-100200"}"#)["chat_id"],
+        "-100200"
+    );
+    assert_eq!(
+        rendered("feishu", "{}")["content"]["text"],
+        serde_json::json!(text)
+    );
+    assert_eq!(
+        rendered("dingtalk", "{}")["text"]["content"],
+        serde_json::json!(text)
+    );
+
+    // An explicit body field never replaces a key the renderer owns.
+    assert_eq!(
+        rendered("slack", r#"{"text":"hijacked"}"#)["text"],
+        serde_json::json!(text)
+    );
+}
+
+#[test]
+fn webhook_alert_messages_stay_short_and_readable() {
+    // A missing field must not leave a dangling "label: " line behind.
+    let sparse = serde_json::json!({"provider_name": "alpha"});
+    let text = crate::webhooks::delivery_body(
+        &test_webhook("slack", "{}", r#"["provider.circuit_closed"]"#),
+        "provider.circuit_closed",
+        &sparse,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let message = parsed["text"].as_str().unwrap();
+    assert_eq!(message, "[openllm] provider circuit CLOSED: alpha");
+
+    // An unknown field falls back to a labelled headline instead of an empty
+    // message a channel would reject.
+    let other = serde_json::json!({"provider_name": "alpha"});
+    let fallback = crate::webhooks::delivery_body(
+        &test_webhook("slack", "{}", "[]"),
+        "provider.unknown",
+        &other,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&fallback).unwrap();
+    assert_eq!(parsed["text"], "[openllm] provider.unknown");
 }
 
 #[test]
@@ -270,6 +418,102 @@ async fn webhook_api_supports_crud_testing_and_delivery_history() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     server.abort();
+}
+
+/// The kind chosen through the API is what the delivery path renders, so a
+/// channel configured from the console receives a message it can actually read.
+#[tokio::test]
+async fn a_channel_created_through_the_api_delivers_a_chat_message() {
+    use tower::ServiceExt;
+
+    let state = webhook_state().await;
+    seed_usage_log(&state, "req-channel").await;
+    let (url, mut receiver, server) = spawn_receiver(200).await;
+    let router = crate::build_router(state.clone());
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Ops channel",
+                        "url": url,
+                        "kind": "slack",
+                        "body_fields": {"channel": "#ops"},
+                        "event_types": ["request.completed"],
+                        "enabled": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created["kind"], "slack");
+    assert_eq!(
+        created["body_fields"],
+        serde_json::json!({"channel": "#ops"})
+    );
+
+    // A kind that cannot deliver without an extra field is refused while
+    // saving instead of failing every alert afterwards.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "name": "Telegram",
+                        "url": "https://api.telegram.org/botTOKEN/sendMessage",
+                        "kind": "telegram",
+                        "body_fields": {},
+                        "event_types": ["provider.circuit_open"],
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    crate::webhooks::deliver_usage_event(
+        &state,
+        crate::state::UsageEvent {
+            id: 1,
+            request_id: "req-channel".to_string(),
+            success: true,
+            streamed: false,
+        },
+    )
+    .await;
+
+    let captured = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv())
+        .await
+        .expect("channel delivery timed out")
+        .expect("webhook receiver closed before receiving a request");
+    server.abort();
+
+    let payload: serde_json::Value = serde_json::from_str(&captured.body).unwrap();
+    assert!(
+        payload.get("event").is_none(),
+        "a chat channel must not receive the gateway envelope: {payload}"
+    );
+    assert_eq!(payload["channel"], "#ops");
+    let text = payload["text"].as_str().unwrap();
+    assert!(text.contains("[openllm] request completed: HTTP 200"), "{text}");
+    assert!(text.contains("request_id: req-channel"), "{text}");
 }
 
 /// Inserts a completed request so a delivery has a real usage row to describe.

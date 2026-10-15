@@ -121,6 +121,77 @@ fn webhook_headers(raw: &str) -> serde_json::Value {
         .unwrap_or_else(|| json!({}))
 }
 
+/// Validates the channel kind, defaulting to the generic event envelope.
+fn normalize_channel_kind(value: Option<&str>) -> AppResult<String> {
+    let kind = value
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .unwrap_or(WEBHOOK_DEFAULT_CHANNEL_KIND);
+    if !WEBHOOK_CHANNEL_KINDS.contains(&kind) {
+        return Err(AppError::BadRequest(format!(
+            "unsupported webhook kind '{kind}'; expected one of {}",
+            WEBHOOK_CHANNEL_KINDS.join(", ")
+        )));
+    }
+    Ok(kind.to_string())
+}
+
+/// Telegram accepts a chat id as a string or a number; both address the same
+/// chat, so the validation accepts either and only rejects a missing one.
+fn chat_id_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.trim().to_string(),
+        serde_json::Value::Number(number) => number.to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Validates the static fields merged into a channel body.
+///
+/// A kind that cannot deliver without an extra field is rejected here rather
+/// than at delivery time: a wrong `chat_id` would otherwise show up as a failed
+/// delivery on every alert instead of as a clear error while saving.
+fn normalize_body_fields(kind: &str, value: Option<&serde_json::Value>) -> AppResult<String> {
+    let Some(value) = value else {
+        return Ok("{}".to_string());
+    };
+    if value.is_null() {
+        return Ok("{}".to_string());
+    }
+    let object = value.as_object().ok_or_else(|| {
+        AppError::BadRequest("webhook body_fields must be a JSON object".to_string())
+    })?;
+    if object.len() > 32 {
+        return Err(AppError::BadRequest(
+            "webhook body_fields are limited to 32 entries".to_string(),
+        ));
+    }
+    if object.keys().any(|name| name.trim().is_empty()) {
+        return Err(AppError::BadRequest(
+            "webhook body_fields keys must not be empty".to_string(),
+        ));
+    }
+    if kind == "telegram"
+        && object
+            .get("chat_id")
+            .map(chat_id_text)
+            .unwrap_or_default()
+            .is_empty()
+    {
+        return Err(AppError::BadRequest(
+            "telegram webhooks need a non-empty body_fields.chat_id".to_string(),
+        ));
+    }
+    serde_json::to_string(&object).map_err(|error| AppError::Internal(error.into()))
+}
+
+fn webhook_body_fields(raw: &str) -> serde_json::Value {
+    serde_json::from_str(raw)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| json!({}))
+}
+
 async fn webhook_view(state: &AppState, id: i64) -> AppResult<WebhookView> {
     let webhook = sqlx::query_as::<_, Webhook>("SELECT * FROM webhooks WHERE id = ?")
         .bind(id)
@@ -154,6 +225,8 @@ async fn into_view(state: &AppState, webhook: Webhook) -> AppResult<WebhookView>
         url: webhook.url,
         secret_set: !webhook.secret.is_empty(),
         headers,
+        kind: webhook.kind,
+        body_fields: webhook_body_fields(&webhook.body_fields),
         event_types,
         enabled: webhook.enabled != 0,
         created_at: webhook.created_at,
@@ -185,16 +258,20 @@ pub async fn create_webhook(
     }
     let url = validate_webhook_url(&input.url)?;
     let headers = normalize_webhook_headers(input.headers.as_ref())?;
+    let kind = normalize_channel_kind(input.kind.as_deref())?;
+    let body_fields = normalize_body_fields(&kind, input.body_fields.as_ref())?;
     let (_, stored_events) = normalize_event_types(input.event_types)?;
     let secret = input.secret.as_deref().map(str::trim).unwrap_or("");
     let result = sqlx::query(
-        "INSERT INTO webhooks (name, url, secret, headers, event_types, enabled) \
-         VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO webhooks (name, url, secret, headers, kind, body_fields, event_types, enabled) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(name)
     .bind(url)
     .bind(secret)
     .bind(headers)
+    .bind(kind)
+    .bind(body_fields)
     .bind(stored_events)
     .bind(input.enabled as i64)
     .execute(&state.pool)
@@ -241,6 +318,20 @@ pub async fn update_webhook(
         Some(value) => normalize_webhook_headers(Some(value))?,
         None => current.headers.clone(),
     };
+    let kind = normalize_channel_kind(
+        input
+            .kind
+            .as_deref()
+            .or(Some(current.kind.as_str())),
+    )?;
+    // Validate the extra fields against the kind that will actually be stored,
+    // so switching a webhook to a kind that needs one without supplying it is
+    // rejected here instead of failing every delivery afterwards.
+    let body_fields = match input.body_fields.as_ref() {
+        Some(value) => normalize_body_fields(&kind, Some(value))?,
+        None if input.kind.is_none() => current.body_fields.clone(),
+        None => normalize_body_fields(&kind, Some(&webhook_body_fields(&current.body_fields)))?,
+    };
     let stored_events = match input.event_types {
         Some(values) => normalize_event_types(Some(values))?.1,
         None => current.event_types.clone(),
@@ -259,13 +350,16 @@ pub async fn update_webhook(
     let enabled = input.enabled.unwrap_or(current.enabled != 0);
 
     sqlx::query(
-        "UPDATE webhooks SET name = ?, url = ?, secret = ?, headers = ?, event_types = ?, \
-         enabled = ?, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE webhooks SET name = ?, url = ?, secret = ?, headers = ?, kind = ?, \
+         body_fields = ?, event_types = ?, enabled = ?, \
+         updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name.clone())
     .bind(url)
     .bind(secret)
     .bind(headers)
+    .bind(kind)
+    .bind(body_fields)
     .bind(stored_events)
     .bind(enabled as i64)
     .bind(id)

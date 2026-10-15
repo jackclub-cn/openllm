@@ -265,6 +265,155 @@ pub(crate) fn signature_header(secret: &str, timestamp: i64, body: &str) -> Stri
     format!("t={timestamp},v1={hex}")
 }
 
+/// One labelled line for a chat message, or `None` when the field is absent.
+fn alert_line(data: &Value, label: &str, key: &str) -> Option<String> {
+    let value = match data.get(key) {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Null) | None => return None,
+        Some(other) => other.to_string(),
+    };
+    (!value.is_empty()).then(|| format!("{label}: {value}"))
+}
+
+/// Renders a scalar field for a headline, falling back when it is missing or
+/// not renderable. Usage payloads carry counts as JSON numbers, so a
+/// string-only check would turn every status code into a placeholder.
+fn alert_field(data: &Value, key: &str, fallback: &str) -> String {
+    match data.get(key) {
+        Some(Value::String(text)) if !text.trim().is_empty() => text.trim().to_string(),
+        Some(Value::Number(number)) => number.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+/// One short, human-readable summary of an event, sized for a chat message.
+///
+/// A phone notification is not the place for the whole payload, so this is a
+/// headline plus a handful of labelled lines; the full envelope stays available
+/// in the delivery history for anything that scripts against it.
+fn alert_message(event_type: &str, data: &Value) -> String {
+    let mut lines = Vec::new();
+    match event_type {
+        "provider.circuit_open" | "provider.circuit_closed" => {
+            let state = if event_type == "provider.circuit_open" {
+                "OPEN"
+            } else {
+                "CLOSED"
+            };
+            lines.push(format!(
+                "[openllm] provider circuit {state}: {}",
+                alert_field(data, "provider_name", "unknown provider")
+            ));
+            lines.extend(
+                [
+                    alert_line(data, "reason", "reason"),
+                    alert_line(data, "consecutive failures", "failure_streak"),
+                    alert_line(data, "cooldown (s)", "cooldown_seconds"),
+                    alert_line(data, "provider_id", "provider_id"),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+        "request.failed" => {
+            lines.push(format!(
+                "[openllm] request FAILED: HTTP {}",
+                alert_field(data, "status_code", "?")
+            ));
+            lines.extend(
+                [
+                    alert_line(data, "model", "requested_model"),
+                    alert_line(data, "provider", "provider_name"),
+                    alert_line(data, "endpoint", "endpoint"),
+                    alert_line(data, "error", "error_message"),
+                    alert_line(data, "request_id", "request_id"),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+        "request.completed" => {
+            lines.push(format!(
+                "[openllm] request completed: HTTP {}",
+                alert_field(data, "status_code", "?")
+            ));
+            lines.extend(
+                [
+                    alert_line(data, "model", "requested_model"),
+                    alert_line(data, "provider", "provider_name"),
+                    alert_line(data, "total tokens", "total_tokens"),
+                    alert_line(data, "latency (ms)", "latency_ms"),
+                    alert_line(data, "first token (ms)", "first_token_ms"),
+                    alert_line(data, "request_id", "request_id"),
+                ]
+                .into_iter()
+                .flatten(),
+            );
+        }
+        other => lines.push(format!("[openllm] {other}")),
+    }
+    lines.join("\n")
+}
+
+/// Builds the request body for one delivery.
+///
+/// `generic` keeps the gateway's own event envelope, which is what an
+/// integration written against this API expects. A chat channel instead gets a
+/// short readable message in the shape that platform accepts, because posting
+/// the envelope to Slack or Telegram produces a payload the channel rejects.
+pub(crate) fn delivery_body(webhook: &Webhook, event_type: &str, data: &Value) -> String {
+    if !webhook.is_chat_channel() {
+        return json!({
+            "event": event_type,
+            "sent_at": chrono::Utc::now().to_rfc3339(),
+            "webhook_id": webhook.id,
+            "data": data,
+        })
+        .to_string();
+    }
+
+    let message = alert_message(event_type, data);
+    let mut body = serde_json::Map::new();
+    match webhook.kind.as_str() {
+        "slack" => {
+            body.insert("text".to_string(), json!(message));
+        }
+        "discord" => {
+            body.insert("content".to_string(), json!(message));
+        }
+        "telegram" => {
+            body.insert("text".to_string(), json!(message));
+            body.insert("disable_web_page_preview".to_string(), json!(true));
+        }
+        "feishu" => {
+            body.insert("msg_type".to_string(), json!("text"));
+            body.insert("content".to_string(), json!({ "text": message }));
+        }
+        "dingtalk" => {
+            body.insert("msgtype".to_string(), json!("text"));
+            body.insert("text".to_string(), json!({ "content": message }));
+        }
+        _ => {
+            // Only a kind that passed validation can reach this, so the branch
+            // is unreachable in practice; fall back to the envelope rather than
+            // posting a body no channel can read.
+            return json!({
+                "event": event_type,
+                "sent_at": chrono::Utc::now().to_rfc3339(),
+                "webhook_id": webhook.id,
+                "data": data,
+            })
+            .to_string();
+        }
+    }
+    // Operator-supplied fields (Telegram's `chat_id`, a DingTalk mention list)
+    // are merged in last but never override a key the renderer owns.
+    for (key, value) in webhook.body_fields_object() {
+        body.entry(key).or_insert(value);
+    }
+    Value::Object(body).to_string()
+}
+
 /// POSTs one event payload, retrying transient failures with a short backoff.
 pub(crate) async fn deliver(
     state: &AppState,
@@ -274,13 +423,7 @@ pub(crate) async fn deliver(
 ) -> DeliveryOutcome {
     let started = Instant::now();
     let timestamp = chrono::Utc::now().timestamp();
-    let body = json!({
-        "event": event_type,
-        "sent_at": chrono::Utc::now().to_rfc3339(),
-        "webhook_id": webhook.id,
-        "data": data,
-    })
-    .to_string();
+    let body = delivery_body(webhook, event_type, data);
     let signature = signature_header(&webhook.secret, timestamp, &body);
     let custom_headers = webhook_header_map(webhook);
 

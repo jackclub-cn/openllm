@@ -45,6 +45,8 @@ export default function WebhooksPage() {
             url: webhook.url,
             secret: '',
             headers: JSON.stringify(webhook.headers || {}, null, 2),
+            kind: webhook.kind,
+            body_fields: JSON.stringify(webhook.body_fields || {}, null, 2),
             clear_secret: false,
             event_types: webhook.event_types,
             enabled: webhook.enabled,
@@ -54,6 +56,8 @@ export default function WebhooksPage() {
             url: '',
             secret: '',
             headers: '{}',
+            kind: 'generic',
+            body_fields: '{}',
             clear_secret: false,
             event_types: ['request.completed', 'request.failed'],
             enabled: true,
@@ -65,18 +69,26 @@ export default function WebhooksPage() {
   const save = async () => {
     const values = await validateOrUndefined(form)
     if (!values) return
-    const input: WebhookInput = {
-      name: values.name,
-      url: values.url,
-      event_types: values.event_types,
-      enabled: values.enabled,
-    }
-    if (values.secret?.trim()) input.secret = values.secret.trim()
-    if (values.headers?.trim()) input.headers = JSON.parse(values.headers)
-    if (values.clear_secret) input.clear_secret = true
 
     setSaving(true)
     try {
+      const input: WebhookInput = {
+        name: values.name,
+        url: values.url,
+        kind: values.kind ?? 'generic',
+        // A generic webhook renders the gateway envelope, so stale channel
+        // fields are cleared rather than left to reappear on a later switch.
+        body_fields:
+          values.kind && values.kind !== 'generic' && values.body_fields?.trim()
+            ? JSON.parse(values.body_fields)
+            : {},
+        event_types: values.event_types,
+        enabled: values.enabled,
+      }
+      if (values.secret?.trim()) input.secret = values.secret.trim()
+      if (values.headers?.trim()) input.headers = JSON.parse(values.headers)
+      if (values.clear_secret) input.clear_secret = true
+
       if (editing) await api.put(`/api/webhooks/${editing.id}`, input)
       else await api.post('/api/webhooks', input)
       message.success(editing ? 'Webhook 已更新' : 'Webhook 已创建')
