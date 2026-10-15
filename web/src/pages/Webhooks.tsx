@@ -3,6 +3,7 @@ import { PlusOutlined, ReloadOutlined } from '@ant-design/icons'
 import { App, Button, Form, Space } from 'antd'
 import { api, formatError, type Webhook, type WebhookInput } from '../api'
 import PageHeader from '../components/PageHeader'
+import { validateOrUndefined } from '../forms'
 import WebhookDeliveriesDrawer from './webhooks/WebhookDeliveriesDrawer'
 import WebhookEditorModal from './webhooks/WebhookEditorModal'
 import WebhooksTable from './webhooks/WebhooksTable'
@@ -62,7 +63,8 @@ export default function WebhooksPage() {
   }
 
   const save = async () => {
-    const values = await form.validateFields()
+    const values = await validateOrUndefined(form)
+    if (!values) return
     const input: WebhookInput = {
       name: values.name,
       url: values.url,

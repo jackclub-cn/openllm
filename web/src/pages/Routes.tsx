@@ -7,6 +7,7 @@ import {
   type GatewayRoute,
   type Provider,
 } from '../api'
+import { validateOrUndefined } from '../forms'
 import RouteDiagnosisModal, {
   type RouteDiagnosisRequest,
 } from './routes/RouteDiagnosisModal'
@@ -84,7 +85,8 @@ export default function RoutesPage() {
   }
 
   const save = async () => {
-    const values = await form.validateFields()
+    const values = await validateOrUndefined(form)
+    if (!values) return
     setSaving(true)
     try {
       if (editing) await api.put(`/api/routes/${editing.id}`, values)

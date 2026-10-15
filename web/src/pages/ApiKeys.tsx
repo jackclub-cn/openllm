@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { App, Form } from 'antd'
 import dayjs from 'dayjs'
 import { api, formatError, type ApiKey } from '../api'
+import { validateOrUndefined } from '../forms'
 import ApiKeyCreateModal from './apiKeys/ApiKeyCreateModal'
 import ApiKeyLimitsModal from './apiKeys/ApiKeyLimitsModal'
 import ApiKeysTable from './apiKeys/ApiKeysTable'
@@ -42,7 +43,8 @@ export default function ApiKeys() {
   }, [])
 
   const create = async () => {
-    const values = await form.validateFields()
+    const values = await validateOrUndefined(form)
+    if (!values) return
     setSaving(true)
     try {
       const result = await api.post<{ key: string; item: ApiKey }>('/api/api-keys', {

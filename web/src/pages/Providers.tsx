@@ -11,6 +11,7 @@ import {
   type ProviderKeyTestAllResult,
 } from '../api'
 import { providerPresets } from '../providerPresets'
+import { validateOrUndefined } from '../forms'
 import ProviderEditorModal from './providers/ProviderEditorModal'
 import ProviderKeyTestModal from './providers/ProviderKeyTestModal'
 import ProviderLimitsModal from './providers/ProviderLimitsModal'
@@ -159,7 +160,8 @@ export default function Providers() {
   }
 
   const save = async () => {
-    const values = await form.validateFields()
+    const values = await validateOrUndefined(form)
+    if (!values) return
     let headers: Record<string, string>
     try {
       headers = JSON.parse(values.headersText || '{}')
