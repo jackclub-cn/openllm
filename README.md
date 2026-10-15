@@ -155,6 +155,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 同一个上游提供商的容量由所有访问它的网关密钥共享。没有显式分配时，单个客户端的突发可以先吃满上游窗口，之后其他密钥即使几乎没用过也会收到上游 `429`。配额池把这份共享容量声明出来，并按权重为指定密钥保留份额：
 
+- 控制台「配额池」页可以创建、编辑、启用/停用和删除池，并直接编辑每个密钥的权重与策略；列表同时显示每个池的实时用量、是否饱和以及本进程内的拒绝次数，不需要手写下面的 API 调用。
 - `POST /api/provider-pools` 创建池：`provider_id`、`name`、`window_seconds`（默认 60，上限 86400）、`request_limit` 与/或 `token_limit`（至少填一个，否则池不约束任何东西）、`saturation_threshold_pct`（默认 50），以及可选的 `allocations`。`GET /api/provider-pools` 查看（含每个密钥根据权重得出的实际份额），`PUT /api/provider-pools/{id}` 更新（未提供的字段保持原值，提供了 `allocations` 就整体替换），`DELETE /api/provider-pools/{id}` 删除。
 - 每条分配包含 `api_key_id`、`weight_pct`（该密钥保留的池容量百分比，1–100）和 `policy`：`hard` 在池饱和时拒绝超出份额的请求，`soft` 不拒绝、只把该密钥的流量排在份额内的密钥之后，`burst` 仍可使用剩余余量。
 - 判定沿用工作守恒的公平分配：用量低于 `saturation_threshold_pct` 时池处于宽松模式，任何密钥都可以借用空闲容量（最多到池上限）；达到阈值后转为严格模式，有分配的密钥被限制在 `limit × weight%`；没有分配记录的密钥（包括未创建访问密钥时的匿名调用）是借用者，只能用剩余余量，不能把池推过上限。

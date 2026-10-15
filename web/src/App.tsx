@@ -4,6 +4,7 @@ import {
   AppstoreOutlined,
   BellOutlined,
   AuditOutlined,
+  ClusterOutlined,
   DashboardOutlined,
   KeyOutlined,
   MessageOutlined,
@@ -26,6 +27,7 @@ const ModelCatalog = lazy(() => import('./pages/ModelCatalog'))
 const Providers = lazy(() => import('./pages/Providers'))
 const RoutesPage = lazy(() => import('./pages/Routes'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
+const ProviderPools = lazy(() => import('./pages/ProviderPools'))
 const Usage = lazy(() => import('./pages/Usage'))
 const Webhooks = lazy(() => import('./pages/Webhooks'))
 const AuditLogs = lazy(() => import('./pages/AuditLogs'))
@@ -41,6 +43,7 @@ const navigation = [
   { key: '/routes', icon: <NodeIndexOutlined />, label: '路由' },
   { key: '/playground', icon: <MessageOutlined />, label: '模型调试' },
   { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
+  { key: '/pools', icon: <ClusterOutlined />, label: '配额池' },
   { key: '/usage', icon: <DashboardOutlined />, label: '请求日志' },
   { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
   { key: '/audit', icon: <AuditOutlined />, label: '审计日志' },
@@ -161,6 +164,7 @@ function AppLayout({
               <Route path="/routes" element={<RoutesPage />} />
               <Route path="/playground" element={<Playground />} />
               <Route path="/keys" element={<ApiKeys />} />
+              <Route path="/pools" element={<ProviderPools />} />
               <Route path="/usage" element={<Usage />} />
               <Route path="/webhooks" element={<Webhooks />} />
               <Route path="/audit" element={<AuditLogs />} />
