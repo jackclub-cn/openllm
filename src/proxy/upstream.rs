@@ -875,6 +875,48 @@ pub(crate) async fn forward_to_target(
         .bytes()
         .await
         .map_err(|error| AppError::Upstream(error.to_string()))?;
+    // Every endpoint that reaches this branch answers with JSON: chat
+    // completions, completions, responses and embeddings. A success status
+    // whose body is not JSON is a broken upstream — an HTML error page from a
+    // proxy, an empty body, a truncated payload — and forwarding it does two
+    // kinds of damage: the client receives garbage under a 2xx, and the caller
+    // marks the provider healthy on the strength of it, clearing the very
+    // circuit that should have routed around it. Fail it as a bad gateway so
+    // the fallback loop tries the next target, which is already what the
+    // translating branches above do when their upstream body fails to parse.
+    if serde_json::from_slice::<Value>(&response_bytes).is_err() {
+        let snippet = String::from_utf8_lossy(&response_bytes)
+            .chars()
+            .take(200)
+            .collect::<String>();
+        tracing::warn!(
+            provider = %target.provider_name,
+            model = %target.upstream_model,
+            request_id,
+            bytes = response_bytes.len(),
+            "upstream returned a success status with a non-JSON body; trying the next target"
+        );
+        record_upstream_failure(
+            state,
+            &target,
+            StatusCode::BAD_GATEWAY,
+            // A `Retry-After` on a 2xx carrying a broken body is not a signal
+            // worth honouring, and the response headers are already consumed
+            // with the body; fall back to the built-in bad-gateway cooldown.
+            &HeaderMap::new(),
+            &snippet,
+        )
+        .await;
+        return Err(upstream_failure_error(
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "{} returned a {} response that is not JSON: {snippet}",
+                target.provider_name,
+                status.as_u16()
+            ),
+            None,
+        ));
+    }
     let usage = extract_usage_from_json(&response_bytes)
         .unwrap_or_else(|| estimated_completion_usage(request_tokens, &response_bytes));
     let response_text = String::from_utf8_lossy(&response_bytes)
