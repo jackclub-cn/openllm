@@ -243,14 +243,16 @@ pub(crate) const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 /// Override with `OPENLLM_PROVIDER_OPEN_THRESHOLD`.
 pub(crate) const DEFAULT_PROVIDER_OPEN_THRESHOLD: u32 = 3;
 
-/// Default first-token threshold at which a successful target is softly
-/// deprioritized. The target stays usable when it is the only candidate.
+/// Default first-token threshold above which a successful target is recorded
+/// as slow. Only `latency_optimized` routes act on the sample, and the target
+/// stays usable when it is the only candidate.
 ///
 /// Override with `OPENLLM_SLOW_TARGET_MS`; `0` disables the penalty.
 pub(crate) const DEFAULT_SLOW_TARGET_MS: i64 = 15_000;
 
-/// How long one slow success keeps a target behind healthy siblings before it
-/// gets another probe. Repeated slow successes escalate this duration.
+/// How long one slow success keeps a target behind healthy siblings on a
+/// latency-first route before it gets another probe. Repeated slow successes
+/// escalate this duration.
 pub(crate) const MAX_SLOW_TARGET_HOLD: Duration = Duration::from_secs(5 * 60);
 
 /// A target with no slow sample for this long starts a fresh penalty streak.
@@ -514,7 +516,8 @@ pub(crate) fn parse_slow_target_threshold_ms(value: Option<&str>) -> i64 {
     }
 }
 
-/// In-memory state for a successful target whose first token was slow.
+/// In-memory state for a successful target whose first token was slow. Read by
+/// `latency_optimized` routing only.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TargetSlowState {
     pub(crate) until: Option<Instant>,

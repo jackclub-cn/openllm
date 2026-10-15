@@ -1272,10 +1272,12 @@ pub(super) async fn mark_target_success(state: &AppState, provider_id: i64, upst
 /// Records a successful request's first-token latency as a soft routing signal.
 ///
 /// A 200 response proves the provider is reachable, so this must not open the
-/// failure circuit or a hard model cooldown. It only makes that target lose to
-/// healthy siblings for a bounded period, which is what prevents a quota-drained
-/// upstream from attracting every following request while still eventually
-/// probing it again.
+/// failure circuit or a hard model cooldown. The sample is only consulted by
+/// `latency_optimized` routes, where it makes a target lose to healthy siblings
+/// for a bounded period. That keeps a quota-drained upstream from attracting
+/// every following request on a latency-first route while still eventually
+/// probing it again, without touching the order configured for every other
+/// strategy.
 pub(super) async fn record_target_latency_success(
     state: &AppState,
     provider_id: i64,
@@ -1322,7 +1324,7 @@ pub(super) async fn record_target_latency_success(
         threshold_ms,
         slow_streak = entry.slow_streak,
         hold_seconds = hold.as_secs(),
-        "successful upstream response was slow; deprioritizing the target while healthy siblings exist"
+        "successful upstream response was slow; recorded for latency-optimized routes"
     );
 }
 
@@ -3107,9 +3109,13 @@ pub(crate) async fn assess_targets(
             latency_detail.clone(),
         ));
 
-        let slow_state = slow_targets
-            .get(&key)
-            .filter(|entry| entry.until.is_some_and(|until| until > now));
+        // Only the latency-first strategy lets a recent slow first token
+        // reshuffle the order; every other strategy keeps the order the
+        // operator configured.
+        let slow_state = slow_targets.get(&key).filter(|entry| {
+            strategy == RouteStrategy::LatencyOptimized
+                && entry.until.is_some_and(|until| until > now)
+        });
         if let Some(slow_state) = slow_state {
             factors.push(score_factor(
                 "first_token",
@@ -3208,9 +3214,12 @@ pub(crate) async fn assess_targets(
 ///
 /// This is the SQL-free subset of [`assess_targets`] used on the request path:
 /// it only reads in-memory control state (concurrency slots, pool window,
-/// circuit/cooldown maps), so it adds no query to a normal request.
+/// circuit/cooldown maps), so it adds no query to a normal request. The
+/// recent first-token signal is folded in only for `latency_optimized` routes;
+/// every other strategy keeps its own configured order.
 async fn deprioritized_target_keys(
     state: &AppState,
+    strategy: RouteStrategy,
     targets: &[RouteTarget],
     api_key_id: Option<i64>,
 ) -> HashSet<(i64, String)> {
@@ -3222,7 +3231,7 @@ async fn deprioritized_target_keys(
     let threshold = provider_open_threshold();
     let streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = state.provider_cooldown.lock().await.clone();
-    let slow_targets = {
+    let slow_targets = if strategy == RouteStrategy::LatencyOptimized {
         let mut targets = state.target_slow.lock().await;
         targets.retain(|_, entry| {
             entry.until.is_some_and(|until| until > now)
@@ -3235,6 +3244,8 @@ async fn deprioritized_target_keys(
             .filter(|(_, entry)| entry.until.is_some_and(|until| until > now))
             .map(|(key, _)| key.clone())
             .collect::<HashSet<_>>()
+    } else {
+        HashSet::new()
     };
     for target in targets {
         let key = (target.provider_id, target.upstream_model.clone());
@@ -3403,7 +3414,7 @@ pub(super) async fn order_targets(
     // ahead of explicitly failed providers so a previously-tested outage does
     // not permanently suppress a recovery. The stable sort keeps the
     // strategy's own order inside each bucket.
-    let deprioritized = deprioritized_target_keys(state, &targets, api_key_id).await;
+    let deprioritized = deprioritized_target_keys(state, strategy, &targets, api_key_id).await;
     targets.sort_by_key(|target| {
         (
             u8::from(

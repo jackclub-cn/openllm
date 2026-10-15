@@ -4242,7 +4242,7 @@ async fn provider_cooldowns_skip_cooling_providers_when_alternatives_exist() {
 }
 
 #[tokio::test]
-async fn slow_success_deprioritizes_target_when_a_healthy_sibling_exists() {
+async fn slow_success_deprioritizes_only_latency_optimized_routes() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -4289,13 +4289,38 @@ async fn slow_success_deprioritizes_target_when_a_healthy_sibling_exists() {
     );
 
     record_target_latency_success(&state, 1, "model", Some(60_000)).await;
+    // A fixed strategy keeps the order the operator configured: the recent
+    // first-token signal belongs to the latency-first strategy alone.
     assert_eq!(
-        order_targets(&state, 1, "priority", vec![slow, healthy], None, None)
+        order_targets(
+            &state,
+            1,
+            "priority",
+            vec![slow.clone(), healthy.clone()],
+            None,
+            None,
+        )
             .await
             .unwrap()
             .into_iter()
             .map(|target| target.provider_id)
             .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert_eq!(
+        order_targets(
+            &state,
+            1,
+            "latency_optimized",
+            vec![slow, healthy],
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|target| target.provider_id)
+        .collect::<Vec<_>>(),
         vec![2, 1]
     );
 }
@@ -4321,7 +4346,7 @@ async fn slow_success_keeps_the_only_target_routable() {
     let target = endpoint_test_target("openai", None);
 
     record_target_latency_success(&state, 1, "model", Some(60_000)).await;
-    let ordered = order_targets(&state, 1, "priority", vec![target], None, None)
+    let ordered = order_targets(&state, 1, "latency_optimized", vec![target], None, None)
         .await
         .unwrap();
     assert_eq!(ordered.len(), 1);
