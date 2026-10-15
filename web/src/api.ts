@@ -588,6 +588,14 @@ export type Overview = {
     prompt_tokens: number
     completion_tokens: number
   }>
+  daily_model_requests: DailyBreakdownUsage[]
+  daily_provider_requests: DailyBreakdownUsage[]
+}
+
+export type DailyBreakdownUsage = {
+  day: string
+  label: string
+  requests: number
 }
 
 export type DatabaseStats = {

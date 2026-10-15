@@ -4,9 +4,7 @@ import dayjs, { type Dayjs } from 'dayjs'
 import { api, formatError, type Overview } from '../api'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
-import DashboardCharts, {
-  type DashboardChartMetric,
-} from './dashboard/DashboardCharts'
+import DashboardCharts from './dashboard/DashboardCharts'
 import DashboardDetails from './dashboard/DashboardDetails'
 import DashboardMetrics from './dashboard/DashboardMetrics'
 import DashboardModelUsage from './dashboard/DashboardModelUsage'
@@ -20,7 +18,6 @@ export default function Dashboard() {
     dayjs().subtract(13, 'day').startOf('day'),
     dayjs().endOf('day'),
   ])
-  const [chartMetric, setChartMetric] = useState<DashboardChartMetric>('requests')
 
   const load = useCallback(async () => {
     try {
@@ -75,11 +72,7 @@ export default function Dashboard() {
       />
       <DashboardMetrics data={data} />
       <DashboardRuntimeStatus />
-      <DashboardCharts
-        data={data}
-        metric={chartMetric}
-        onMetricChange={setChartMetric}
-      />
+      <DashboardCharts data={data} />
       <DashboardDetails data={data} />
       <DashboardModelUsage data={data} />
     </>

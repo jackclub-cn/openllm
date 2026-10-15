@@ -1,27 +1,89 @@
-import { Area } from '@ant-design/plots'
+import { Line } from '@ant-design/plots'
 import { Card, Col, Empty, Row, Segmented, Table, Tag, Tooltip, Typography } from 'antd'
+import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
-import type { Overview } from '../../api'
+import type { DailyBreakdownUsage, Overview } from '../../api'
 import { formatCompact, formatCostMicros, formatExact } from '../../format'
 
-export type DashboardChartMetric =
-  | 'requests'
-  | 'tokens'
-  | 'prompt_tokens'
-  | 'completion_tokens'
+type BreakdownDimension = 'model' | 'provider'
+
+type TrendMetric = 'requests' | 'tokens' | BreakdownDimension
+
+const BREAKDOWN_COLORS = [
+  '#1677ff',
+  '#13c2c2',
+  '#52c41a',
+  '#faad14',
+  '#eb2f96',
+  '#722ed1',
+  '#8c8c8c',
+]
+
+const METRIC_OPTIONS = [
+  { label: '请求数', value: 'requests' },
+  { label: '总 tokens', value: 'tokens' },
+  { label: '按模型', value: 'model' },
+  { label: '按提供商', value: 'provider' },
+]
+
+type BreakdownPoint = {
+  day: string
+  label: string
+  requests: number
+}
+
+// Expand the per-day breakdown into a dense day x series matrix so every line
+// keeps a point for days it saw no traffic.
+function buildBreakdownSeries(
+  breakdown: DailyBreakdownUsage[],
+  days: Overview['daily_usage'],
+): BreakdownPoint[] {
+  if (!breakdown.length || !days.length) return []
+  const totals = new Map<string, number>()
+  for (const row of breakdown) {
+    totals.set(row.label, (totals.get(row.label) ?? 0) + row.requests)
+  }
+  const labels = [...totals.keys()].sort((left, right) => {
+    if (left === '其他') return 1
+    if (right === '其他') return -1
+    return (totals.get(right) ?? 0) - (totals.get(left) ?? 0)
+  })
+  const byDayLabel = new Map(
+    breakdown.map((row) => [`${row.day}\u0000${row.label}`, row.requests]),
+  )
+  return days.flatMap((day) =>
+    labels.map((label) => {
+      const requests = byDayLabel.get(`${day.day}\u0000${label}`) ?? 0
+      return { day: day.day, label, requests }
+    }),
+  )
+}
 
 type DashboardChartsProps = {
   data: Overview
-  metric: DashboardChartMetric
-  onMetricChange: (metric: DashboardChartMetric) => void
 }
 
-export default function DashboardCharts({
-  data,
-  metric,
-  onMetricChange,
-}: DashboardChartsProps) {
+export default function DashboardCharts({ data }: DashboardChartsProps) {
   const navigate = useNavigate()
+  const [metric, setMetric] = useState<TrendMetric>('requests')
+  const isBreakdown = metric === 'model' || metric === 'provider'
+  const points = useMemo(
+    () =>
+      isBreakdown
+        ? buildBreakdownSeries(
+            metric === 'model' ? data.daily_model_requests : data.daily_provider_requests,
+            data.daily_usage,
+          )
+        : data.daily_usage,
+    [
+      data.daily_model_requests,
+      data.daily_provider_requests,
+      data.daily_usage,
+      isBreakdown,
+      metric,
+    ],
+  )
+  const valueName = metric === 'tokens' ? '总 tokens' : '请求数'
 
   return (
     <Row gutter={[16, 16]} className="section-row">
@@ -31,24 +93,36 @@ export default function DashboardCharts({
             block
             size="small"
             value={metric}
-            onChange={(value) => onMetricChange(value as DashboardChartMetric)}
-            options={[
-              { label: '请求数', value: 'requests' },
-              { label: '总 tokens', value: 'tokens' },
-              { label: '输入 tokens', value: 'prompt_tokens' },
-              { label: '输出 tokens', value: 'completion_tokens' },
-            ]}
+            onChange={(value) => setMetric(value as TrendMetric)}
+            options={METRIC_OPTIONS}
             style={{ marginBottom: 16 }}
           />
-          {data.daily_usage.length ? (
-            <Area
-              data={data.daily_usage}
+          {points.length ? (
+            <Line
+              data={points}
               xField="day"
-              yField={metric}
+              yField={metric === 'tokens' ? 'tokens' : 'requests'}
+              colorField={isBreakdown ? 'label' : undefined}
               height={260}
-              axis={{ x: { title: false }, y: { title: false } }}
-              style={{ fill: 'linear-gradient(-90deg, white 0%, #1677ff 100%)' }}
-              line={{ style: { stroke: '#1677ff', strokeWidth: 2 } }}
+              axis={{
+                x: { title: false },
+                y: {
+                  title: false,
+                  labelFormatter: (value: number) => formatCompact(value),
+                },
+              }}
+              scale={isBreakdown ? { color: { range: BREAKDOWN_COLORS } } : undefined}
+              legend={isBreakdown ? { color: { position: 'bottom' } } : undefined}
+              style={{ lineWidth: 2 }}
+              tooltip={{
+                items: [
+                  {
+                    channel: 'y',
+                    name: valueName,
+                    valueFormatter: (value: number) => formatExact(value),
+                  },
+                ],
+              }}
             />
           ) : (
             <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无请求数据" />

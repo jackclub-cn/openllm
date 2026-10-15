@@ -641,11 +641,76 @@ pub async fn overview(
     .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool);
 
-    let (recent, provider_usage, daily_rows, model_usage) = tokio::try_join!(
+    let daily_model_requests_fut = sqlx::query_as::<_, DailyBreakdownUsage>(
+        r#"
+        WITH busiest AS (
+            SELECT requested_model AS label
+            FROM usage_logs
+            WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+            GROUP BY requested_model
+            ORDER BY COUNT(*) DESC, requested_model
+            LIMIT 6
+        )
+        SELECT date(datetime(created_at), ? || ' minutes') AS day,
+               CASE WHEN requested_model IN (SELECT label FROM busiest)
+                    THEN requested_model ELSE '其他' END AS label,
+               COUNT(*) AS requests
+        FROM usage_logs
+        WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+        GROUP BY day, label
+        ORDER BY day, requests DESC
+        "#,
+    )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .bind(tz_offset)
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .fetch_all(&state.pool);
+
+    let daily_provider_requests_fut = sqlx::query_as::<_, DailyBreakdownUsage>(
+        r#"
+        WITH busiest AS (
+            SELECT provider_id
+            FROM usage_logs
+            WHERE created_at >= ? AND created_at < ? AND in_flight = 0
+              AND provider_id IS NOT NULL
+            GROUP BY provider_id
+            ORDER BY COUNT(*) DESC, provider_id
+            LIMIT 6
+        )
+        SELECT date(datetime(u.created_at), ? || ' minutes') AS day,
+               CASE WHEN u.provider_id IN (SELECT provider_id FROM busiest)
+                    THEN COALESCE(p.name, '未知提供商') ELSE '其他' END AS label,
+               COUNT(*) AS requests
+        FROM usage_logs u
+        LEFT JOIN providers p ON p.id = u.provider_id
+        WHERE u.created_at >= ? AND u.created_at < ? AND u.in_flight = 0
+        GROUP BY day, label
+        ORDER BY day, requests DESC
+        "#,
+    )
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .bind(tz_offset)
+    .bind(range_start.to_rfc3339())
+    .bind(range_end.to_rfc3339())
+    .fetch_all(&state.pool);
+
+    let (
+        recent,
+        provider_usage,
+        daily_rows,
+        model_usage,
+        daily_model_requests,
+        daily_provider_requests,
+    ) = tokio::try_join!(
         recent_fut,
         provider_usage_fut,
         daily_rows_fut,
-        model_usage_fut
+        model_usage_fut,
+        daily_model_requests_fut,
+        daily_provider_requests_fut
     )?;
 
     // Fill in days with no traffic so the chart has a continuous axis
@@ -743,5 +808,7 @@ pub async fn overview(
         provider_usage,
         model_usage,
         daily_usage,
+        daily_model_requests,
+        daily_provider_requests,
     }))
 }

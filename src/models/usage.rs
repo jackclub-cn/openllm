@@ -325,6 +325,11 @@ pub struct Overview {
     pub provider_usage: Vec<ProviderUsage>,
     pub model_usage: Vec<ModelUsage>,
     pub daily_usage: Vec<DailyUsage>,
+    /// Per-day request counts for the busiest models and providers, with the
+    /// remaining traffic folded into an "其他" bucket, so the dashboard can
+    /// chart how each one's share of requests moves over time.
+    pub daily_model_requests: Vec<DailyBreakdownUsage>,
+    pub daily_provider_requests: Vec<DailyBreakdownUsage>,
 }
 
 #[derive(Debug, FromRow, Serialize)]
@@ -359,6 +364,13 @@ pub struct DailyUsage {
     pub tokens: i64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+}
+
+#[derive(Debug, FromRow, Serialize)]
+pub struct DailyBreakdownUsage {
+    pub day: String,
+    pub label: String,
+    pub requests: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

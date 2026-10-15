@@ -3508,6 +3508,32 @@ async fn overview_range_filters_dashboard_usage() {
     assert_eq!(view.model_usage[0].tokens, 190);
     assert_eq!(view.model_usage[0].prompt_tokens, 140);
     assert_eq!(view.model_usage[0].completion_tokens, 50);
+    assert_eq!(
+        view.daily_model_requests
+            .iter()
+            .map(|row| row.requests)
+            .sum::<i64>(),
+        view.range_requests
+    );
+    assert!(
+        view.daily_model_requests
+            .iter()
+            .all(|row| row.label == "test-model")
+    );
+    // Requests with no routed provider still count toward the daily totals, so
+    // the share chart keeps the same denominator as the trend line.
+    assert_eq!(
+        view.daily_provider_requests
+            .iter()
+            .map(|row| row.requests)
+            .sum::<i64>(),
+        view.range_requests
+    );
+    assert!(
+        view.daily_provider_requests
+            .iter()
+            .all(|row| row.label == "其他")
+    );
 
     let Json(view_without_sessions) = overview(
         State(state),
