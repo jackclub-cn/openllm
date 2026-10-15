@@ -591,6 +591,73 @@ async fn pool_update_keeps_or_replaces_allocations() {
     );
 }
 
+/// An explicit `null` clears a pool limit, while omitting the field keeps it.
+///
+/// The console sends the whole pool back on save, so "clear the request limit
+/// but keep the token limit" has to round-trip. Before the `double_option`
+/// deserializer both an explicit `null` and an absent field collapsed to
+/// "keep the current value", so an operator's cleared ceiling silently came
+/// back on the next read.
+#[tokio::test]
+async fn pool_update_can_clear_a_limit_with_an_explicit_null() {
+    let state = pool_test_state().await;
+    let view = create_pool(
+        &state,
+        serde_json::json!({
+            "provider_id": 1,
+            "name": "shared",
+            "request_limit": 10,
+            "token_limit": 1000
+        }),
+    )
+    .await;
+
+    let update = |body: serde_json::Value| {
+        serde_json::from_value::<crate::models::ProviderPoolUpdate>(body).unwrap()
+    };
+
+    let axum::Json(cleared) = crate::api::update_provider_pool(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(view.id),
+        axum::Json(update(serde_json::json!({ "request_limit": null }))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cleared.request_limit, None,
+        "an explicit null clears the request limit"
+    );
+    assert_eq!(
+        cleared.token_limit,
+        Some(1000),
+        "the untouched token limit is kept"
+    );
+
+    // An omitted field must still mean "keep", not "clear".
+    let axum::Json(kept) = crate::api::update_provider_pool(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(view.id),
+        axum::Json(update(serde_json::json!({ "name": "renamed" }))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(kept.name, "renamed");
+    assert_eq!(kept.token_limit, Some(1000));
+
+    // Clearing every limit leaves a pool that can allocate nothing; the API
+    // rejects it instead of silently keeping a stale ceiling.
+    let all_cleared = crate::api::update_provider_pool(
+        axum::extract::State(state.clone()),
+        axum::extract::Path(view.id),
+        axum::Json(update(serde_json::json!({ "token_limit": null }))),
+    )
+    .await;
+    assert!(
+        all_cleared.is_err(),
+        "a pool must keep at least one limit"
+    );
+}
+
 /// Denials counted on the request path surface through the usage snapshot and
 /// the metrics endpoint, so an operator can alert on a key being throttled by
 /// its fair share instead of only reading the request log.

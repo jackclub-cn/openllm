@@ -54,14 +54,29 @@ pub struct ProviderPoolUpdate {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub window_seconds: Option<i64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     pub request_limit: Option<Option<i64>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "double_option")]
     pub token_limit: Option<Option<i64>>,
     #[serde(default)]
     pub saturation_threshold_pct: Option<i64>,
     #[serde(default)]
     pub allocations: Option<Vec<ProviderPoolAllocationInput>>,
+}
+
+/// Distinguishes an absent update field from an explicit JSON `null`.
+///
+/// A plain `Option<Option<T>>` cannot: serde maps a `null` straight to `None`,
+/// so a client that wants to *clear* a limit becomes indistinguishable from one
+/// that omitted the field and wants the current value kept. With this
+/// deserializer an absent field stays `None`, an explicit `null` becomes
+/// `Some(None)` and a value becomes `Some(Some(value))`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 /// One key's reserved share inside a pool payload.
