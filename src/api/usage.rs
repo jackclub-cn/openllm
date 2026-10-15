@@ -365,6 +365,18 @@ pub(super) fn normalize_overview_range(
     Ok((start, end))
 }
 
+/// Append one dashboard bucket, filling zeros for a window with no traffic.
+fn push_usage_bucket(buckets: &mut Vec<DailyUsage>, rows: &[DailyUsage], bucket: String) {
+    let existing = rows.iter().find(|row| row.day == bucket);
+    buckets.push(DailyUsage {
+        day: bucket,
+        requests: existing.map_or(0, |row| row.requests),
+        tokens: existing.map_or(0, |row| row.tokens),
+        prompt_tokens: existing.map_or(0, |row| row.prompt_tokens),
+        completion_tokens: existing.map_or(0, |row| row.completion_tokens),
+    });
+}
+
 pub async fn overview(
     State(state): State<AppState>,
     Query(query): Query<OverviewQuery>,
@@ -387,6 +399,16 @@ pub async fn overview(
         day_start - Duration::days(13),
         day_start + Duration::days(1),
     )?;
+    // A single-day window reads far better hour by hour, so one-day ranges
+    // bucket by hour while longer windows stay daily.
+    let hourly_buckets = range_end - range_start <= Duration::hours(24);
+    let bucket_expression = |column: &str| {
+        if hourly_buckets {
+            format!("strftime('%Y-%m-%d %H:00', datetime({column}, ? || ' minutes'))")
+        } else {
+            format!("date(datetime({column}, ? || ' minutes'))")
+        }
+    };
 
     let totals_fut = sqlx::query(
         r#"
@@ -601,24 +623,26 @@ pub async fn overview(
     .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool);
 
-    let daily_rows_fut = sqlx::query_as::<_, DailyUsage>(
+    let daily_rows_sql = format!(
         r#"
-        SELECT date(datetime(created_at), ? || ' minutes') AS day,
+        SELECT {bucket} AS day,
                COUNT(*) AS requests,
                COALESCE(SUM(total_tokens), 0) AS tokens,
                COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
                COALESCE(SUM(completion_tokens), 0) AS completion_tokens
         FROM usage_logs
         WHERE created_at >= ? AND created_at < ? AND in_flight = 0
-        GROUP BY date(datetime(created_at), ? || ' minutes')
+        GROUP BY {bucket}
         ORDER BY day
         "#,
-    )
-    .bind(tz_offset)
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .bind(tz_offset)
-    .fetch_all(&state.pool);
+        bucket = bucket_expression("created_at"),
+    );
+    let daily_rows_fut = sqlx::query_as::<_, DailyUsage>(&daily_rows_sql)
+        .bind(tz_offset)
+        .bind(range_start.to_rfc3339())
+        .bind(range_end.to_rfc3339())
+        .bind(tz_offset)
+        .fetch_all(&state.pool);
 
     let model_usage_fut = sqlx::query_as::<_, ModelUsage>(
         r#"
@@ -641,7 +665,7 @@ pub async fn overview(
     .bind(range_end.to_rfc3339())
     .fetch_all(&state.pool);
 
-    let daily_model_requests_fut = sqlx::query_as::<_, DailyBreakdownUsage>(
+    let daily_model_requests_sql = format!(
         r#"
         WITH busiest AS (
             SELECT requested_model AS label
@@ -651,7 +675,7 @@ pub async fn overview(
             ORDER BY COUNT(*) DESC, requested_model
             LIMIT 6
         )
-        SELECT date(datetime(created_at), ? || ' minutes') AS day,
+        SELECT {bucket} AS day,
                CASE WHEN requested_model IN (SELECT label FROM busiest)
                     THEN requested_model ELSE '其他' END AS label,
                COUNT(*) AS requests
@@ -660,15 +684,18 @@ pub async fn overview(
         GROUP BY day, label
         ORDER BY day, requests DESC
         "#,
-    )
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .bind(tz_offset)
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .fetch_all(&state.pool);
+        bucket = bucket_expression("created_at"),
+    );
+    let daily_model_requests_fut =
+        sqlx::query_as::<_, DailyBreakdownUsage>(&daily_model_requests_sql)
+            .bind(range_start.to_rfc3339())
+            .bind(range_end.to_rfc3339())
+            .bind(tz_offset)
+            .bind(range_start.to_rfc3339())
+            .bind(range_end.to_rfc3339())
+            .fetch_all(&state.pool);
 
-    let daily_provider_requests_fut = sqlx::query_as::<_, DailyBreakdownUsage>(
+    let daily_provider_requests_sql = format!(
         r#"
         WITH busiest AS (
             SELECT provider_id
@@ -679,7 +706,7 @@ pub async fn overview(
             ORDER BY COUNT(*) DESC, provider_id
             LIMIT 6
         )
-        SELECT date(datetime(u.created_at), ? || ' minutes') AS day,
+        SELECT {bucket} AS day,
                CASE WHEN u.provider_id IN (SELECT provider_id FROM busiest)
                     THEN COALESCE(p.name, '未知提供商') ELSE '其他' END AS label,
                COUNT(*) AS requests
@@ -689,13 +716,16 @@ pub async fn overview(
         GROUP BY day, label
         ORDER BY day, requests DESC
         "#,
-    )
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .bind(tz_offset)
-    .bind(range_start.to_rfc3339())
-    .bind(range_end.to_rfc3339())
-    .fetch_all(&state.pool);
+        bucket = bucket_expression("u.created_at"),
+    );
+    let daily_provider_requests_fut =
+        sqlx::query_as::<_, DailyBreakdownUsage>(&daily_provider_requests_sql)
+            .bind(range_start.to_rfc3339())
+            .bind(range_end.to_rfc3339())
+            .bind(tz_offset)
+            .bind(range_start.to_rfc3339())
+            .bind(range_end.to_rfc3339())
+            .fetch_all(&state.pool);
 
     let (
         recent,
@@ -713,26 +743,39 @@ pub async fn overview(
         daily_provider_requests_fut
     )?;
 
-    // Fill in days with no traffic so the chart has a continuous axis
-    // instead of collapsing to only the days that happened to have requests.
+    // Fill in buckets with no traffic so the chart has a continuous axis
+    // instead of collapsing to only the buckets that saw requests.
     let local_range_start = range_start + Duration::minutes(tz_offset);
     let local_range_end = range_end + Duration::minutes(tz_offset);
-    let first_day = local_range_start.date_naive();
-    let last_day = (local_range_end - Duration::nanoseconds(1)).date_naive();
-    let day_count = (last_day - first_day).num_days() + 1;
-    let mut daily_usage = Vec::with_capacity(day_count.max(0) as usize);
-    for offset in 0..day_count {
-        let day = (first_day + Duration::days(offset))
-            .format("%Y-%m-%d")
-            .to_string();
-        let existing = daily_rows.iter().find(|row| row.day == day);
-        daily_usage.push(DailyUsage {
-            day,
-            requests: existing.map_or(0, |row| row.requests),
-            tokens: existing.map_or(0, |row| row.tokens),
-            prompt_tokens: existing.map_or(0, |row| row.prompt_tokens),
-            completion_tokens: existing.map_or(0, |row| row.completion_tokens),
-        });
+    let mut daily_usage = Vec::new();
+    if hourly_buckets {
+        let mut cursor = local_range_start
+            .with_minute(0)
+            .and_then(|value| value.with_second(0))
+            .and_then(|value| value.with_nanosecond(0))
+            .unwrap_or(local_range_start);
+        while cursor < local_range_end {
+            push_usage_bucket(
+                &mut daily_usage,
+                &daily_rows,
+                cursor.format("%Y-%m-%d %H:00").to_string(),
+            );
+            cursor += Duration::hours(1);
+        }
+    } else {
+        let first_day = local_range_start.date_naive();
+        let last_day = (local_range_end - Duration::nanoseconds(1)).date_naive();
+        let day_count = (last_day - first_day).num_days() + 1;
+        daily_usage.reserve(day_count.max(0) as usize);
+        for offset in 0..day_count {
+            push_usage_bucket(
+                &mut daily_usage,
+                &daily_rows,
+                (first_day + Duration::days(offset))
+                    .format("%Y-%m-%d")
+                    .to_string(),
+            );
+        }
     }
 
     let range_requests: i64 = range_totals.get("requests");
@@ -807,6 +850,7 @@ pub async fn overview(
         recent_requests: recent.into_iter().map(Into::into).collect(),
         provider_usage,
         model_usage,
+        granularity: if hourly_buckets { "hour" } else { "day" },
         daily_usage,
         daily_model_requests,
         daily_provider_requests,

@@ -3483,6 +3483,7 @@ async fn overview_range_filters_dashboard_usage() {
     assert_eq!(view.cooling_providers, 1);
     assert_eq!(view.cooling_provider_keys, 1);
     assert_eq!(view.in_flight_requests, 1);
+    assert_eq!(view.granularity, "day");
     assert_eq!(
         view.daily_usage
             .iter()
@@ -3549,6 +3550,78 @@ async fn overview_range_filters_dashboard_usage() {
     assert_eq!(view_without_sessions.range_requests, view.range_requests);
     assert_eq!(view_without_sessions.range_sessions, 0);
     assert_eq!(view_without_sessions.range_session_coverage, 0.0);
+}
+
+#[tokio::test]
+async fn overview_buckets_a_single_day_by_hour() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let day_start = Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .expect("midnight is a valid time")
+        .and_utc();
+    for (request_id, hour) in [("morning", 9_i64), ("evening", 21)] {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                    request_id, requested_model, endpoint, prompt_tokens,
+                    completion_tokens, total_tokens, status_code, success, created_at
+                 ) VALUES (
+                    ?, 'test-model', '/v1/chat/completions', 10, 5, 15, 200, 1, ?
+                 )",
+        )
+        .bind(request_id)
+        .bind((day_start + Duration::hours(hour)).to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let Json(view) = overview(
+        State(AppState::new(pool, None)),
+        Query(OverviewQuery {
+            tz_offset_minutes: 0,
+            from: Some(day_start.to_rfc3339()),
+            to: Some((day_start + Duration::days(1)).to_rfc3339()),
+            include_session_metrics: false,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let day = day_start.format("%Y-%m-%d").to_string();
+    assert_eq!(view.granularity, "hour");
+    assert_eq!(view.daily_usage.len(), 24);
+    assert_eq!(view.daily_usage[0].day, format!("{day} 00:00"));
+    assert_eq!(view.daily_usage[23].day, format!("{day} 23:00"));
+
+    let busy: Vec<_> = view
+        .daily_usage
+        .iter()
+        .filter(|row| row.requests > 0)
+        .collect();
+    assert_eq!(busy.len(), 2);
+    assert_eq!(busy[0].day, format!("{day} 09:00"));
+    assert_eq!(busy[0].requests, 1);
+    assert_eq!(busy[1].day, format!("{day} 21:00"));
+    // The model and provider breakdowns share the same hourly buckets.
+    assert!(
+        view.daily_model_requests
+            .iter()
+            .all(|row| row.day.starts_with(&format!("{day} ")))
+    );
+    assert_eq!(
+        view.daily_model_requests
+            .iter()
+            .map(|row| row.requests)
+            .sum::<i64>(),
+        2
+    );
 }
 
 #[tokio::test]

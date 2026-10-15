@@ -560,6 +560,7 @@ export type Overview = {
   cooling_provider_keys: number
   in_flight_requests: number
   recent_requests: UsageLog[]
+  granularity: 'hour' | 'day'
   provider_usage: Array<{
     provider_id: number
     provider_name: string

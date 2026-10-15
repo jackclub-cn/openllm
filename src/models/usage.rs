@@ -324,10 +324,13 @@ pub struct Overview {
     pub recent_requests: Vec<UsageLogView>,
     pub provider_usage: Vec<ProviderUsage>,
     pub model_usage: Vec<ModelUsage>,
+    /// Bucket size behind `daily_usage` and the request breakdowns: `hour` for
+    /// one-day ranges, `day` for anything longer.
+    pub granularity: &'static str,
     pub daily_usage: Vec<DailyUsage>,
-    /// Per-day request counts for the busiest models and providers, with the
-    /// remaining traffic folded into an "其他" bucket, so the dashboard can
-    /// chart how each one's share of requests moves over time.
+    /// Per-bucket request counts for the busiest models and providers, with
+    /// the remaining traffic folded into an "其他" bucket, so the dashboard
+    /// can chart traffic per model and provider over time.
     pub daily_model_requests: Vec<DailyBreakdownUsage>,
     pub daily_provider_requests: Vec<DailyBreakdownUsage>,
 }

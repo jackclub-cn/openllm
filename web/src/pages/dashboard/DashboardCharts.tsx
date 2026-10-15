@@ -105,7 +105,11 @@ export default function DashboardCharts({ data }: DashboardChartsProps) {
               colorField={isBreakdown ? 'label' : undefined}
               height={260}
               axis={{
-                x: { title: false },
+                x: {
+                  title: false,
+                  labelFormatter: (value: string) =>
+                    data.granularity === 'hour' ? value.slice(11, 16) : value,
+                },
                 y: {
                   title: false,
                   labelFormatter: (value: number) => formatCompact(value),
