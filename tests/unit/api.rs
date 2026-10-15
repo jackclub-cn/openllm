@@ -168,6 +168,9 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_db_pool_max_connections gauge"));
     assert!(body.contains("# TYPE openllm_runtime_lag_millis gauge"));
     assert!(body.contains("openllm_runtime_lag_millis 0"));
+    assert!(body.contains("# TYPE openllm_session_affinity_entries gauge"));
+    assert!(body.contains("# TYPE openllm_session_affinity_hits_total counter"));
+    assert!(body.contains("openllm_session_affinity_entries 0"));
     assert!(body.contains("# TYPE openllm_maintenance_runs_total counter"));
     assert!(body.contains("openllm_maintenance_runs_total 0"));
     assert!(body.contains("openllm_maintenance_last_run_timestamp_seconds 0"));
@@ -4036,6 +4039,19 @@ async fn runtime_settings_expose_effective_limits() {
         .unwrap_or(0);
     let expected_memory_ratio_pct = (state.memory_shed_ratio * 100.0).round() as u64;
     let expected_memory_source = state.memory_limit_source;
+    let expected_affinity_ttl = state
+        .session_affinity
+        .as_ref()
+        .map(|store| store.ttl_secs());
+    let expected_affinity_capacity = state
+        .session_affinity
+        .as_ref()
+        .map(|store| store.capacity())
+        .unwrap_or(crate::session_affinity::DEFAULT_SESSION_AFFINITY_CAPACITY);
+    let expected_affinity_persist = state
+        .session_affinity
+        .as_ref()
+        .is_some_and(|store| store.persist());
     let Json(view) = get_runtime_settings(State(state)).await.unwrap();
     assert!(view.limits.max_request_body_mib >= 1);
     assert!(view.limits.max_upstream_body_mib >= 1);
@@ -4056,6 +4072,15 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.memory_limit_mib, expected_memory_limit_mib);
     assert_eq!(view.limits.memory_limit_source, expected_memory_source);
     assert_eq!(view.limits.memory_shed_ratio_pct, expected_memory_ratio_pct);
+    assert_eq!(view.limits.session_affinity_ttl_secs, expected_affinity_ttl);
+    assert_eq!(
+        view.limits.session_affinity_capacity,
+        expected_affinity_capacity
+    );
+    assert_eq!(
+        view.limits.session_affinity_persist,
+        expected_affinity_persist
+    );
     assert_eq!(view.limits.db_max_connections, crate::db::db_max_connections());
     assert_eq!(
         view.limits.db_busy_timeout_secs,

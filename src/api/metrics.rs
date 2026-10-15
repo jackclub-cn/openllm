@@ -250,6 +250,10 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             })
             .collect::<HashMap<_, _>>()
     };
+    let affinity_stats = match state.session_affinity.as_ref() {
+        Some(store) => store.stats().await,
+        None => crate::session_affinity::SessionAffinityStats::default(),
+    };
     // A pool catalog read failure must not blank the whole scrape; the pool
     // metrics simply go missing until the next successful refresh.
     let pool_usage = crate::allocation::all_pool_usage(&state)
@@ -619,6 +623,72 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         "Retained configuration change audit records",
     );
     push_metric(&mut body, "openllm_audit_logs", &[], statuses.audit_logs);
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_entries",
+        "Prompt/session affinity entries resident in process memory",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_entries",
+        &[],
+        affinity_stats.entries as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_hits_total",
+        "Requests that found a healthy prompt/session affinity target",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_hits_total",
+        &[],
+        affinity_stats.hits as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_misses_total",
+        "Requests that had no usable prompt/session affinity target",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_misses_total",
+        &[],
+        affinity_stats.misses as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_rebinds_total",
+        "Affinity targets replaced because the previous target stopped being usable",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_rebinds_total",
+        &[],
+        affinity_stats.rebinds as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_evictions_total",
+        "Affinity entries evicted by expiry or the in-memory capacity bound",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_evictions_total",
+        &[],
+        affinity_stats.evictions as i64,
+    );
+    metric_header(
+        &mut body,
+        "openllm_session_affinity_persistence_errors_total",
+        "Failed reads or writes of the optional SQLite affinity mirror",
+    );
+    push_metric(
+        &mut body,
+        "openllm_session_affinity_persistence_errors_total",
+        &[],
+        affinity_stats.persistence_errors as i64,
+    );
 
     metric_header(
         &mut body,

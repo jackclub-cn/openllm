@@ -9,6 +9,7 @@ mod models_dev;
 mod proxy;
 mod registry;
 mod resilience_state;
+mod session_affinity;
 mod startup;
 mod state;
 mod webhooks;

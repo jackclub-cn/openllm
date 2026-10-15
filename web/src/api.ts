@@ -660,6 +660,9 @@ export type RuntimeLimits = {
   request_timeout_secs?: number | null
   provider_open_threshold: number
   resilience_state_persist: boolean
+  session_affinity_ttl_secs?: number | null
+  session_affinity_capacity: number
+  session_affinity_persist: boolean
   memory_limit_mib: number
   memory_limit_source: string
   memory_shed_ratio_pct: number

@@ -171,6 +171,69 @@ async fn route_diagnosis_scores_candidates_without_an_upstream_call() {
     assert_eq!(usage, 0, "the preview must not record any request");
 }
 
+#[tokio::test]
+async fn session_affinity_factor_marks_the_pinned_target() {
+    use crate::session_affinity::SessionAffinityStore;
+    use std::sync::Arc;
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let mut state = AppState::new(pool, None);
+    state.session_affinity = Some(Arc::new(SessionAffinityStore::new(
+        Duration::from_secs(60),
+        16,
+        false,
+    )));
+
+    let first = scoring_target(1, "first");
+    let second = scoring_target(2, "second");
+    order_targets(
+        &state,
+        7,
+        "priority",
+        vec![second.clone()],
+        Some("session-a"),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let affinity = session_affinity_context(&state, 7, Some("session-a"), None, false)
+        .await
+        .expect("affinity is enabled in this test");
+    let assessments = assess_targets(
+        &state,
+        RouteStrategy::Priority,
+        &[first, second],
+        None,
+        Some(&affinity),
+    )
+    .await
+    .unwrap();
+
+    let pinned = assessments
+        .get(&(2, "model".to_string()))
+        .unwrap()
+        .factors
+        .iter()
+        .find(|factor| factor.name == "session")
+        .unwrap();
+    assert_eq!(pinned.score, Some(1.0));
+    assert!(pinned.detail.contains("命中会话粘性"));
+    let other = assessments
+        .get(&(1, "model".to_string()))
+        .unwrap()
+        .factors
+        .iter()
+        .find(|factor| factor.name == "session")
+        .unwrap();
+    assert_eq!(other.score, Some(0.0));
+}
+
 /// A provider at its concurrency cap ranks behind one with headroom, but is
 /// never dropped: a single-target route must still be able to queue for it.
 #[tokio::test]
@@ -213,7 +276,7 @@ async fn saturated_capacity_is_deprioritized_but_not_dropped() {
         "the candidate with headroom is tried first"
     );
 
-    let assessments = assess_targets(&state, RouteStrategy::Priority, &ordered, None)
+    let assessments = assess_targets(&state, RouteStrategy::Priority, &ordered, None, None)
         .await
         .unwrap();
     let busy_assessment = assessments

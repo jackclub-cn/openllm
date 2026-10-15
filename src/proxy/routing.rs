@@ -612,14 +612,19 @@ pub(super) async fn diagnostic_candidates(
         .filter(|(_, (_, eligible))| *eligible)
         .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
-    let assessments = assess_targets(state, strategy, &eligible, api_key_id).await?;
-    let ordered = order_targets(
+    let route_id = route_id.unwrap_or(-1);
+    let affinity =
+        session_affinity_context(state, route_id, session_id, api_key_id, false).await;
+    let assessments =
+        assess_targets(state, strategy, &eligible, api_key_id, affinity.as_ref()).await?;
+    let ordered = order_targets_with_context(
         state,
-        route_id.unwrap_or(-1),
+        route_id,
         strategy.as_str(),
         eligible,
         session_id,
         api_key_id,
+        affinity.as_ref(),
     )
     .await?;
     let mut candidates = ordered
@@ -681,13 +686,17 @@ pub(super) async fn diagnostic_runtime_targets(
         .collect::<Vec<_>>();
     let metrics = runtime_target_metrics(state, &targets).await?;
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
-    let ordered = order_targets(
+    let route_id = route_id.unwrap_or(-1);
+    let affinity =
+        session_affinity_context(state, route_id, Some(session_id), api_key_id, false).await;
+    let ordered = order_targets_with_context(
         state,
-        route_id.unwrap_or(-1),
+        route_id,
         strategy.as_str(),
         targets,
         Some(session_id),
         api_key_id,
+        affinity.as_ref(),
     )
     .await?;
     Ok(Some(
@@ -697,8 +706,15 @@ pub(super) async fn diagnostic_runtime_targets(
             .map(|(index, target)| {
                 let metric = metrics.get(&(target.provider_id, target.upstream_model.clone()));
                 let (input_cost_per_million, output_cost_per_million) = target_cost_prices(&target);
-                let decision_reason =
-                    target_decision_reason(strategy, &target, metric, index == 0).to_string();
+                let session_pinned = affinity
+                    .as_ref()
+                    .and_then(|affinity| affinity.pinned.as_ref())
+                    .is_some_and(|pinned| same_affinity_target(&target, pinned));
+                let decision_reason = if index == 0 && session_pinned {
+                    "session_affinity".to_string()
+                } else {
+                    target_decision_reason(strategy, &target, metric, index == 0).to_string()
+                };
                 RouteDiagnoseRuntimeTarget {
                     order: index + 1,
                     provider_id: target.provider_id,
@@ -2956,6 +2972,86 @@ async fn allocation_signal(
     )
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct SessionAffinityContext {
+    scope: crate::session_affinity::SessionAffinityScope,
+    pinned: Option<crate::session_affinity::SessionAffinityTarget>,
+    record_bind: bool,
+}
+
+async fn session_affinity_context(
+    state: &AppState,
+    route_id: i64,
+    session_key: Option<&str>,
+    api_key_id: Option<i64>,
+    record_metrics: bool,
+) -> Option<SessionAffinityContext> {
+    let store = state.session_affinity.as_ref()?;
+    let session_key = session_key.map(str::trim).filter(|value| !value.is_empty())?;
+    let scope = crate::session_affinity::SessionAffinityScope::new(
+        api_key_id,
+        route_id,
+        session_key,
+    );
+    let pinned = if record_metrics {
+        store.lookup(&state.pool, &scope).await
+    } else {
+        store.peek(&state.pool, &scope).await
+    };
+    Some(SessionAffinityContext {
+        scope,
+        pinned,
+        record_bind: record_metrics,
+    })
+}
+
+fn same_affinity_target(
+    target: &RouteTarget,
+    affinity: &crate::session_affinity::SessionAffinityTarget,
+) -> bool {
+    target.provider_id == affinity.provider_id
+        && target.upstream_model == affinity.upstream_model
+}
+
+fn affinity_target(target: &RouteTarget) -> crate::session_affinity::SessionAffinityTarget {
+    crate::session_affinity::SessionAffinityTarget {
+        provider_id: target.provider_id,
+        upstream_model: target.upstream_model.clone(),
+    }
+}
+
+fn session_factor(
+    context: &SessionAffinityContext,
+    target: &RouteTarget,
+) -> TargetScoreFactor {
+    match &context.pinned {
+        Some(pinned) if same_affinity_target(target, pinned) => score_factor(
+            "session",
+            1.25,
+            Some(1.0),
+            format!(
+                "命中会话粘性，优先回到 {} / {}",
+                target.provider_name, target.upstream_model
+            ),
+        ),
+        Some(pinned) => score_factor(
+            "session",
+            1.25,
+            Some(0.0),
+            format!(
+                "本会话已固定到 provider {} / {}",
+                pinned.provider_id, pinned.upstream_model
+            ),
+        ),
+        None => score_factor(
+            "session",
+            1.25,
+            None,
+            "该会话尚未建立粘性目标；首个健康候选会被记住",
+        ),
+    }
+}
+
 /// Scores every candidate with an explainable factor breakdown.
 ///
 /// Performs no upstream request: every signal comes from the database, the
@@ -2965,6 +3061,7 @@ pub(crate) async fn assess_targets(
     strategy: RouteStrategy,
     targets: &[RouteTarget],
     api_key_id: Option<i64>,
+    affinity: Option<&SessionAffinityContext>,
 ) -> AppResult<HashMap<(i64, String), TargetAssessment>> {
     if targets.is_empty() {
         return Ok(HashMap::new());
@@ -3170,6 +3267,9 @@ pub(crate) async fn assess_targets(
             }
         };
         factors.push(score_factor("strategy", 1.5, strategy_score, strategy_detail));
+        if let Some(affinity) = affinity {
+            factors.push(session_factor(affinity, target));
+        }
 
         let mut assessment = TargetAssessment::new(factors);
         if health_failed || saturated || allocation_penalized || slow_state.is_some() {
@@ -3327,9 +3427,32 @@ pub(super) async fn order_targets(
     state: &AppState,
     route_id: i64,
     strategy: &str,
+    targets: Vec<RouteTarget>,
+    session_id: Option<&str>,
+    api_key_id: Option<i64>,
+) -> AppResult<Vec<RouteTarget>> {
+    let affinity =
+        session_affinity_context(state, route_id, session_id, api_key_id, true).await;
+    order_targets_with_context(
+        state,
+        route_id,
+        strategy,
+        targets,
+        session_id,
+        api_key_id,
+        affinity.as_ref(),
+    )
+    .await
+}
+
+async fn order_targets_with_context(
+    state: &AppState,
+    route_id: i64,
+    strategy: &str,
     mut targets: Vec<RouteTarget>,
     session_id: Option<&str>,
     api_key_id: Option<i64>,
+    affinity: Option<&SessionAffinityContext>,
 ) -> AppResult<Vec<RouteTarget>> {
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
@@ -3423,5 +3546,29 @@ pub(super) async fn order_targets(
             provider_health_rank(target.provider_health),
         )
     });
+    if let Some(affinity) = affinity {
+        let pinned_index = affinity.pinned.as_ref().and_then(|pinned| {
+            targets.iter().position(|target| {
+                same_affinity_target(target, pinned)
+                    && !deprioritized
+                        .contains(&(target.provider_id, target.upstream_model.clone()))
+            })
+        });
+        if let Some(index) = pinned_index {
+            if index > 0 {
+                targets[..=index].rotate_right(1);
+            }
+        } else if affinity.record_bind {
+            let healthy_index = targets.iter().position(|target| {
+                !deprioritized.contains(&(target.provider_id, target.upstream_model.clone()))
+            });
+            if let (Some(index), Some(store)) = (healthy_index, state.session_affinity.as_ref()) {
+                let target = affinity_target(&targets[index]);
+                if affinity.pinned.as_ref() != Some(&target) {
+                    store.bind(&state.pool, &affinity.scope, target).await;
+                }
+            }
+        }
+    }
     expand_target_provider_keys(state, targets, session_id).await
 }

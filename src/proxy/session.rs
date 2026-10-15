@@ -55,6 +55,105 @@ pub(crate) fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<S
     None
 }
 
+/// Stable routing affinity key for a request.
+///
+/// Explicit client session identifiers always win. When a client does not
+/// send one, a sufficiently long first prompt prefix is hashed as a fallback.
+/// The hash is process-local routing input and is never written as raw prompt
+/// text; the database mirror stores a second scope hash as well.
+pub(crate) fn session_affinity_key(headers: &HeaderMap, body: &Value) -> Option<String> {
+    if let Some(session_id) = upstream_session_id(headers, body) {
+        return Some(session_id);
+    }
+    let text = prompt_affinity_text(body)?;
+    if text.chars().count() < PROMPT_AFFINITY_MIN_CHARS {
+        return None;
+    }
+    let bounded = text.chars().take(PROMPT_AFFINITY_MAX_CHARS).collect::<String>();
+    let mut hasher = Sha256::new();
+    hasher.update(b"openllm-prompt-affinity-v1");
+    hasher.update(bounded.as_bytes());
+    Some(format!("prompt:sha256:{:x}", hasher.finalize()))
+}
+
+const PROMPT_AFFINITY_MIN_CHARS: usize = 64;
+const PROMPT_AFFINITY_MAX_CHARS: usize = 4096;
+
+fn prompt_affinity_text(body: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(system) = body.get("system").and_then(affinity_text) {
+        parts.push(system);
+    }
+    if let Some(instructions) = body.get("instructions").and_then(affinity_text) {
+        parts.push(instructions);
+    }
+    if let Some(system) = body
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages.iter().find(|message| {
+                matches!(
+                    message.get("role").and_then(Value::as_str),
+                    Some("system" | "developer")
+                )
+            })
+        })
+        .and_then(|message| message.get("content").or(Some(message)))
+        .and_then(affinity_text)
+    {
+        parts.push(system);
+    }
+
+    let conversation = if let Some(input) = body.get("input") {
+        first_affinity_input_text(input)
+    } else if let Some(messages) = body.get("messages").and_then(Value::as_array) {
+        messages
+            .iter()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .or_else(|| messages.first())
+            .and_then(|message| message.get("content").or(Some(message)))
+            .and_then(affinity_text)
+    } else {
+        body.get("prompt").and_then(affinity_text)
+    };
+    if let Some(conversation) = conversation {
+        parts.push(conversation);
+    }
+
+    (!parts.is_empty()).then(|| parts.join("\n"))
+}
+
+fn first_affinity_input_text(input: &Value) -> Option<String> {
+    match input {
+        Value::Array(items) => items
+            .iter()
+            .find(|item| item.get("role").and_then(Value::as_str) == Some("user"))
+            .or_else(|| items.first())
+            .and_then(|item| item.get("content").or(Some(item)))
+            .and_then(affinity_text),
+        value => affinity_text(value),
+    }
+}
+
+fn affinity_text(value: &Value) -> Option<String> {
+    if let Some(text) = value.as_str() {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    if let Some(content) = value.get("content") {
+        let text = content_text(content)?;
+        let text = text.trim();
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let text = content_text(value)?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_string())
+}
+
 pub(crate) fn is_opencode_go_target(target: &RouteTarget) -> bool {
     let provider_name = target.provider_name.to_ascii_lowercase();
     let model_prefix = target.model_prefix.trim().trim_end_matches('/');

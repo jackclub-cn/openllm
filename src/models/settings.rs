@@ -73,6 +73,12 @@ pub struct RuntimeLimits {
     /// Whether circuits and cooldowns are mirrored into SQLite so a restart
     /// does not send traffic straight back to a failing provider.
     pub resilience_state_persist: bool,
+    /// TTL of the process-local prompt/session affinity map; `None` disables it.
+    pub session_affinity_ttl_secs: Option<u64>,
+    /// Maximum number of in-memory affinity entries.
+    pub session_affinity_capacity: usize,
+    /// Whether affinity is mirrored to SQLite across restarts.
+    pub session_affinity_persist: bool,
     /// Process-memory ceiling that arms the pressure guard, in MiB; `0`
     /// disables it.
     pub memory_limit_mib: u64,

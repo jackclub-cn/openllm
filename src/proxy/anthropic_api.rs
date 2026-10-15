@@ -135,6 +135,7 @@ pub(crate) async fn proxy_anthropic_inner(
     // operate on the OpenAI shape.
     let mut request_json = anthropic_request_to_openai(&inbound, &requested_model);
     let session_id = upstream_session_id(headers, &inbound);
+    let affinity_key = session_affinity_key(headers, &inbound);
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
@@ -299,7 +300,7 @@ pub(crate) async fn proxy_anthropic_inner(
         ordering_key,
         &resolved.strategy,
         resolved.targets,
-        session_id.as_deref(),
+        affinity_key.as_deref(),
         api_key.as_ref().map(|key| key.id),
     )
     .await?;

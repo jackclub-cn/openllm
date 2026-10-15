@@ -11,6 +11,7 @@ use crate::error::AppResult;
 use crate::allocation::{AllocationLedger, PoolCatalog};
 use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings, RuntimeLimits};
 use crate::resilience_state::DirtyResilienceState;
+use crate::session_affinity::{SessionAffinityConfig, SessionAffinityStore};
 
 pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
 pub(crate) const SETTING_INSPECTOR: &str = "inspector";
@@ -22,6 +23,8 @@ pub struct AppState {
     pub client: Client,
     pub admin_token: Option<String>,
     pub round_robin: Arc<Mutex<HashMap<i64, usize>>>,
+    /// Process-local prompt/session affinity, optionally mirrored to SQLite.
+    pub(crate) session_affinity: Option<Arc<SessionAffinityStore>>,
     /// Per-provider cursor used to rotate upstream API keys across requests.
     pub provider_key_cursor: Arc<Mutex<HashMap<i64, usize>>>,
     /// In-memory cooldowns for providers that recently failed at runtime.
@@ -959,11 +962,21 @@ impl AppState {
             );
         }
 
+        let affinity_config = SessionAffinityConfig::from_env();
+        let session_affinity = affinity_config.ttl.map(|ttl| {
+            Arc::new(SessionAffinityStore::new(
+                ttl,
+                affinity_config.capacity,
+                affinity_config.persist,
+            ))
+        });
+
         Self {
             pool,
             client,
             admin_token: admin_token.filter(|token| !token.is_empty()),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
+            session_affinity,
             provider_key_cursor: Arc::new(Mutex::new(HashMap::new())),
             provider_cooldown: Arc::new(Mutex::new(HashMap::new())),
             provider_failure_streak: Arc::new(Mutex::new(HashMap::new())),
@@ -1274,6 +1287,19 @@ impl AppState {
                 .map(|timeout| timeout.as_secs()),
             provider_open_threshold: provider_open_threshold(),
             resilience_state_persist: self.resilience_state_persist,
+            session_affinity_ttl_secs: self
+                .session_affinity
+                .as_ref()
+                .map(|store| store.ttl_secs()),
+            session_affinity_capacity: self
+                .session_affinity
+                .as_ref()
+                .map(|store| store.capacity())
+                .unwrap_or(crate::session_affinity::DEFAULT_SESSION_AFFINITY_CAPACITY),
+            session_affinity_persist: self
+                .session_affinity
+                .as_ref()
+                .is_some_and(|store| store.persist()),
             memory_limit_mib: self
                 .memory_pressure
                 .as_ref()

@@ -271,7 +271,7 @@ pub struct RouteDiagnoseCandidate {
 #[derive(Debug, Serialize)]
 pub struct RouteDiagnoseFactor {
     /// Stable factor name: `circuit`, `capacity`, `allocation`, `health`,
-    /// `reliability`, `latency`, `cost` or `strategy`.
+    /// `reliability`, `latency`, `cost`, `strategy` or `session`.
     pub name: String,
     /// `0.0..=1.0`; `None` when nothing is known about this factor.
     #[serde(skip_serializing_if = "Option::is_none")]

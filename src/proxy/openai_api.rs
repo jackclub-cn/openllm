@@ -116,6 +116,7 @@ pub(crate) async fn proxy_openai_inner(
     })?;
     let requested_model = requested_model_of(&request_json)?;
     let session_id = upstream_session_id(headers, &request_json);
+    let affinity_key = session_affinity_key(headers, &request_json);
     let streamed = request_json
         .get("stream")
         .and_then(Value::as_bool)
@@ -290,7 +291,7 @@ pub(crate) async fn proxy_openai_inner(
         ordering_key,
         &resolved.strategy,
         resolved.targets,
-        session_id.as_deref(),
+        affinity_key.as_deref(),
         api_key.as_ref().map(|key| key.id),
     )
     .await?;

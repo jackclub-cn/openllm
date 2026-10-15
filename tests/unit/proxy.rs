@@ -913,53 +913,51 @@ async fn per_request_routing_overrides_apply_and_echo() {
     assert!(matches!(error, AppError::BadRequest(_)));
 }
 
+async fn spawn_chat_upstream() -> (
+    std::net::SocketAddr,
+    std::sync::Arc<tokio::sync::Mutex<Vec<Value>>>,
+    tokio::task::JoinHandle<()>,
+) {
+    let requests = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let requests = requests.clone();
+            move |Json(body): Json<Value>| {
+                let requests = requests.clone();
+                async move {
+                    requests.lock().await.push(body);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-routing-override",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 1,
+                                "total_tokens": 4
+                            }
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (address, requests, server)
+}
+
 #[tokio::test]
 async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
-    use std::sync::Arc;
-    use tokio::sync::Mutex;
-
-    async fn spawn_chat_upstream() -> (
-        std::net::SocketAddr,
-        Arc<Mutex<Vec<Value>>>,
-        tokio::task::JoinHandle<()>,
-    ) {
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let app = axum::Router::new().route(
-            OPENAI_CHAT_COMPLETIONS,
-            axum::routing::post({
-                let requests = requests.clone();
-                move |Json(body): Json<Value>| {
-                    let requests = requests.clone();
-                    async move {
-                        requests.lock().await.push(body);
-                        (
-                            StatusCode::OK,
-                            Json(json!({
-                                "id": "chatcmpl-routing-override",
-                                "object": "chat.completion",
-                                "choices": [{
-                                    "index": 0,
-                                    "message": {"role": "assistant", "content": "ok"},
-                                    "finish_reason": "stop"
-                                }],
-                                "usage": {
-                                    "prompt_tokens": 3,
-                                    "completion_tokens": 1,
-                                    "total_tokens": 4
-                                }
-                            })),
-                        )
-                    }
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (address, requests, server)
-    }
 
     let (fast_address, fast_requests, fast_server) = spawn_chat_upstream().await;
     let (cheap_address, cheap_requests, cheap_server) = spawn_chat_upstream().await;
@@ -1048,6 +1046,93 @@ async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
 
     fast_server.abort();
     cheap_server.abort();
+}
+
+#[tokio::test]
+async fn prompt_affinity_keeps_round_robin_requests_on_one_upstream_without_a_session_header() {
+    let (first_address, first_requests, first_server) = spawn_chat_upstream().await;
+    let (second_address, second_requests, second_server) = spawn_chat_upstream().await;
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (
+             id, name, provider_type, base_url, model_prefix, enabled
+         ) VALUES
+             (1, 'first', 'openai', ?, 'first/', 1),
+             (2, 'second', 'openai', ?, 'second/', 1)",
+    )
+    .bind(format!("http://{first_address}"))
+    .bind(format!("http://{second_address}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, supported_endpoints) VALUES
+             (1, 'model', '[\"/chat/completions\"]'),
+             (2, 'model', '[\"/chat/completions\"]')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled) VALUES
+             (1, 'affinity route', 'affinity-model', 'round_robin', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (
+             route_id, provider_id, upstream_model, priority, weight, enabled
+         ) VALUES
+             (1, 1, 'model', 0, 100, 1),
+             (1, 2, 'model', 0, 100, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let prefix = "stable prompt prefix ".repeat(8);
+    for request_id in ["affinity-one", "affinity-two"] {
+        let response = proxy_openai_inner(
+            &state,
+            &HeaderMap::new(),
+            &OPENAI_CHAT_COMPLETIONS.parse().unwrap(),
+            &Bytes::from(
+                json!({
+                    "model": "affinity-model",
+                    "messages": [{"role": "user", "content": prefix.clone()}]
+                })
+                .to_string(),
+            ),
+            request_id,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let first_count = first_requests.lock().await.len();
+    let second_count = second_requests.lock().await.len();
+    assert_eq!(
+        first_count + second_count,
+        2,
+        "both requests must reach exactly one upstream"
+    );
+    assert!(
+        first_count == 2 || second_count == 2,
+        "the prompt prefix must keep round-robin calls on the same target, got {first_count}/{second_count}"
+    );
+
+    first_server.abort();
+    second_server.abort();
 }
 
 #[test]
@@ -4070,6 +4155,204 @@ fn session_target_order_is_stable_and_spreads_weighted_sessions() {
             "sessions should spread across every target for {strategy:?}"
         );
     }
+}
+
+#[test]
+fn prompt_affinity_key_uses_explicit_ids_then_a_stable_first_prompt_prefix() {
+    use crate::proxy::session_affinity_key;
+
+    let mut headers = HeaderMap::new();
+    let long_prompt = "x".repeat(96);
+    let first = json!({
+        "model": "model",
+        "messages": [
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": long_prompt}
+        ]
+    });
+    let later_turn = json!({
+        "model": "model",
+        "messages": [
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": long_prompt},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "follow up"}
+        ]
+    });
+
+    let first_key = session_affinity_key(&headers, &first).unwrap();
+    assert_eq!(first_key, session_affinity_key(&headers, &later_turn).unwrap());
+    assert!(first_key.starts_with("prompt:sha256:"));
+    assert_ne!(
+        first_key,
+        session_affinity_key(
+            &headers,
+            &json!({"messages": [{"role": "user", "content": "y".repeat(96)}]})
+        )
+        .unwrap()
+    );
+    assert!(
+        session_affinity_key(&headers, &json!({"messages": [{"role": "user", "content": "short"}]}))
+            .is_none(),
+        "short prompts should not create global affinity churn"
+    );
+
+    headers.insert("x-session-id", HeaderValue::from_static("session-a"));
+    assert_eq!(
+        session_affinity_key(&headers, &first).as_deref(),
+        Some("session-a")
+    );
+}
+
+#[test]
+fn session_affinity_settings_parse_safe_bounds_and_keep_persistence_opt_in() {
+    use crate::session_affinity::{
+        MAX_SESSION_AFFINITY_CAPACITY, MAX_SESSION_AFFINITY_TTL_SECS,
+        parse_session_affinity_capacity, parse_session_affinity_persist,
+        parse_session_affinity_ttl,
+    };
+
+    assert_eq!(
+        parse_session_affinity_ttl(None).unwrap(),
+        Duration::from_secs(30 * 60)
+    );
+    assert_eq!(parse_session_affinity_ttl(Some("0")), None);
+    assert_eq!(
+        parse_session_affinity_ttl(Some("999999999")).unwrap(),
+        Duration::from_secs(MAX_SESSION_AFFINITY_TTL_SECS)
+    );
+    assert_eq!(parse_session_affinity_capacity(None), 10_000);
+    assert_eq!(
+        parse_session_affinity_capacity(Some("999999999")),
+        MAX_SESSION_AFFINITY_CAPACITY
+    );
+    assert!(!parse_session_affinity_persist(None));
+    assert!(parse_session_affinity_persist(Some("true")));
+    assert!(!parse_session_affinity_persist(Some("off")));
+}
+
+#[tokio::test]
+async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_healthy() {
+    use crate::session_affinity::SessionAffinityStore;
+    use std::sync::Arc;
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let mut state = AppState::new(pool, None);
+    state.session_affinity = Some(Arc::new(SessionAffinityStore::new(
+        Duration::from_secs(60),
+        32,
+        false,
+    )));
+
+    let mut preferred = endpoint_test_target("openai", None);
+    preferred.id = 2;
+    preferred.provider_id = 2;
+    preferred.priority = 10;
+    let mut fallback = endpoint_test_target("openai", None);
+    fallback.id = 1;
+    fallback.provider_id = 1;
+    fallback.priority = 0;
+
+    let first = order_targets(
+        &state,
+        7,
+        "priority",
+        vec![preferred.clone()],
+        Some("session-a"),
+        Some(42),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first[0].provider_id, 2);
+
+    let repeated = order_targets(
+        &state,
+        7,
+        "priority",
+        vec![fallback.clone(), preferred.clone()],
+        Some("session-a"),
+        Some(42),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated[0].provider_id, 2,
+        "the explicit session pin must outrank a different priority order"
+    );
+
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(2, Instant::now() + Duration::from_secs(60));
+    let failed_over = order_targets(
+        &state,
+        7,
+        "priority",
+        vec![fallback.clone(), preferred],
+        Some("session-a"),
+        Some(42),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        failed_over[0].provider_id, 1,
+        "a cooling pin must not block failover"
+    );
+    let stats = state.session_affinity.as_ref().unwrap().stats().await;
+    assert_eq!(stats.rebinds, 1);
+}
+
+#[tokio::test]
+async fn session_affinity_ttl_capacity_and_sqlite_mirror_are_bounded() {
+    use crate::session_affinity::{
+        SessionAffinityScope, SessionAffinityStore, SessionAffinityTarget,
+    };
+
+    let ttl_store = SessionAffinityStore::new(Duration::from_millis(5), 1, false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let scope = SessionAffinityScope::new(Some(1), 7, "session-a");
+    let target = SessionAffinityTarget {
+        provider_id: 1,
+        upstream_model: "model".to_string(),
+    };
+    ttl_store.bind(&pool, &scope, target.clone()).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(ttl_store.lookup(&pool, &scope).await.is_none());
+
+    let capacity_store = SessionAffinityStore::new(Duration::from_secs(60), 1, false);
+    capacity_store.bind(&pool, &scope, target.clone()).await;
+    let other = SessionAffinityScope::new(Some(1), 7, "session-b");
+    capacity_store.bind(&pool, &other, target.clone()).await;
+    let stats = capacity_store.stats().await;
+    assert_eq!(stats.entries, 1);
+    assert!(stats.evictions >= 1);
+
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Mirror provider', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let persistent_store = SessionAffinityStore::new(Duration::from_secs(60), 8, true);
+    persistent_store.bind(&pool, &scope, target.clone()).await;
+    let restarted_store = SessionAffinityStore::new(Duration::from_secs(60), 8, true);
+    assert_eq!(
+        restarted_store.lookup(&pool, &scope).await,
+        Some(target),
+        "the optional SQLite mirror should restore a live affinity pin"
+    );
 }
 
 #[tokio::test]

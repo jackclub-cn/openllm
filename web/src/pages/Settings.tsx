@@ -387,6 +387,13 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
             <Descriptions.Item label="熔断状态持久化">
               {limits ? (limits.resilience_state_persist ? '开启（重启后保留冷却与熔断）' : '关闭（重启后清空）') : '-'}
             </Descriptions.Item>
+            <Descriptions.Item label="会话粘性">
+              {limits
+                ? limits.session_affinity_ttl_secs != null
+                  ? `TTL ${limits.session_affinity_ttl_secs} 秒 / 最多 ${limits.session_affinity_capacity} 条${limits.session_affinity_persist ? '，重启后保留' : '，重启后清空'}`
+                  : '关闭'
+                : '-'}
+            </Descriptions.Item>
             <Descriptions.Item label="内存压力保护">
               {limits
                 ? limits.memory_limit_mib > 0
