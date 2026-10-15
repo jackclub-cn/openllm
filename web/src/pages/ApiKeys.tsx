@@ -4,6 +4,7 @@ import dayjs from 'dayjs'
 import { api, formatError, type ApiKey } from '../api'
 import { validateOrUndefined } from '../forms'
 import ApiKeyCreateModal from './apiKeys/ApiKeyCreateModal'
+import ApiKeyCodexGuide from './apiKeys/ApiKeyCodexGuide'
 import ApiKeyLimitsModal from './apiKeys/ApiKeyLimitsModal'
 import ApiKeysTable from './apiKeys/ApiKeysTable'
 import ApiKeysToolbar from './apiKeys/ApiKeysToolbar'
@@ -23,6 +24,7 @@ export default function ApiKeys() {
   const [createdKey, setCreatedKey] = useState('')
   const [editing, setEditing] = useState<ApiKey>()
   const [limitsOpen, setLimitsOpen] = useState(false)
+  const [codexGuideOpen, setCodexGuideOpen] = useState(false)
   const [limitsSaving, setLimitsSaving] = useState(false)
   const [form] = Form.useForm<ApiKeyForm>()
   const [limitsForm] = Form.useForm<ApiKeyForm>()
@@ -199,6 +201,7 @@ export default function ApiKeys() {
           setStatus(value)
           setPage(1)
         }}
+        onOpenCodexGuide={() => setCodexGuideOpen(true)}
         onCreate={() => setOpen(true)}
       />
       <ApiKeysTable
@@ -219,6 +222,10 @@ export default function ApiKeys() {
         form={form}
         onCancel={closeModal}
         onCreate={() => void create()}
+      />
+      <ApiKeyCodexGuide
+        open={codexGuideOpen}
+        onCancel={() => setCodexGuideOpen(false)}
       />
       <ApiKeyLimitsModal
         open={limitsOpen}

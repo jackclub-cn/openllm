@@ -1,4 +1,4 @@
-import { PlusOutlined, SearchOutlined } from '@ant-design/icons'
+import { BookOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons'
 import { Alert, Button, Input, Select, Space, Tag } from 'antd'
 import PageHeader from '../../components/PageHeader'
 
@@ -11,6 +11,7 @@ type ApiKeysToolbarProps = {
   filteredCount: number
   onSearchChange: (value: string) => void
   onStatusChange: (value: ApiKeyStatus) => void
+  onOpenCodexGuide: () => void
   onCreate: () => void
 }
 
@@ -21,6 +22,7 @@ export default function ApiKeysToolbar({
   filteredCount,
   onSearchChange,
   onStatusChange,
+  onOpenCodexGuide,
   onCreate,
 }: ApiKeysToolbarProps) {
   return (
@@ -52,6 +54,9 @@ export default function ApiKeysToolbar({
             <Tag>
               {filteredCount}/{itemCount}
             </Tag>
+            <Button icon={<BookOutlined />} onClick={onOpenCodexGuide}>
+              Codex 使用说明
+            </Button>
             <Button type="primary" icon={<PlusOutlined />} onClick={onCreate}>
               创建密钥
             </Button>
