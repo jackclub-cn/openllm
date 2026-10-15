@@ -38,9 +38,13 @@ base_url = "${baseUrl}"
 wire_api = "responses"
 env_key = "OPENLLM_API_KEY"`
 
-  const powershellCommand = `$k="<你的密钥>"; [Environment]::SetEnvironmentVariable("OPENLLM_API_KEY",$k,"User"); $env:OPENLLM_API_KEY=$k; $d="$env:USERPROFILE\\.codex\\model-catalogs"; New-Item -ItemType Directory -Force $d | Out-Null; irm "${powershellUrl}" -OutFile "$d\\organize-relay-catalog.ps1"; pwsh -File "$d\\organize-relay-catalog.ps1"`
+  const auth = `{
+  "OPENLLM_API_KEY": "<你的密钥>"
+}`
 
-  const shellCommand = `d="$HOME/.codex/model-catalogs"; mkdir -p "$d" && curl -fsSL "${shellUrl}" -o "$d/organize-relay-catalog.sh" && chmod +x "$d/organize-relay-catalog.sh" && OPENLLM_API_KEY="<你的密钥>" "$d/organize-relay-catalog.sh"`
+  const powershellCommand = `$k="<你的密钥>"; $a="$env:USERPROFILE\\.codex\\auth.json"; New-Item -ItemType Directory -Force (Split-Path $a) | Out-Null; $j=if (Test-Path -LiteralPath $a) { Get-Content -Raw -LiteralPath $a | ConvertFrom-Json } else { [pscustomobject]@{} }; if ($null -eq $j) { $j=[pscustomobject]@{} }; $j | Add-Member -Force -NotePropertyName OPENLLM_API_KEY -NotePropertyValue $k; $j | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $a -Encoding utf8; $d="$env:USERPROFILE\\.codex\\model-catalogs"; New-Item -ItemType Directory -Force $d | Out-Null; irm "${powershellUrl}" -OutFile "$d\\organize-relay-catalog.ps1"; pwsh -File "$d\\organize-relay-catalog.ps1"`
+
+  const shellCommand = `a="$HOME/.codex/auth.json"; k="<你的密钥>"; mkdir -p "$HOME/.codex"; python3 -c 'import json,os,sys; p=sys.argv[1]; d=json.load(open(p,encoding="utf-8")) if os.path.exists(p) and os.path.getsize(p) else {}; d["OPENLLM_API_KEY"]=sys.argv[2]; open(p,"w",encoding="utf-8").write(json.dumps(d,ensure_ascii=False,indent=2)+"\\n"); os.chmod(p,0o600)' "$a" "$k"; d="$HOME/.codex/model-catalogs"; mkdir -p "$d" && curl -fsSL "${shellUrl}" -o "$d/organize-relay-catalog.sh" && chmod +x "$d/organize-relay-catalog.sh" && "$d/organize-relay-catalog.sh"`
 
   return (
     <Modal
@@ -57,7 +61,8 @@ env_key = "OPENLLM_API_KEY"`
     >
       <Space direction="vertical" size={24} style={{ width: '100%' }}>
         <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-          Codex 通过 <Typography.Text code>config.toml</Typography.Text>{' '}
+          Codex 通过 <Typography.Text code>config.toml</Typography.Text> 和{' '}
+          <Typography.Text code>auth.json</Typography.Text>{' '}
           读取网关地址、密钥和模型目录。下面命令会自动下载导入脚本，读取本机 Codex
           配置，并生成
           <Typography.Text code>~/.codex/model-catalogs/relay-mtwm81nx.json</Typography.Text>。
@@ -87,14 +92,18 @@ env_key = "OPENLLM_API_KEY"`
           <Typography.Paragraph type="secondary">
             合并到 <Typography.Text code>~/.codex/config.toml</Typography.Text>。
             顶层字段要放在第一个 <Typography.Text code>[...]</Typography.Text>{' '}
-            配置表之前；如果已有同名的 model provider，请只补齐缺失项。
+            配置表之前；如果已有同名的 model provider，请只补齐缺失项。密钥写入{' '}
+            <Typography.Text code>~/.codex/auth.json</Typography.Text>。
           </Typography.Paragraph>
-          <CommandBlock label="config.toml" command={config} />
+          <Space direction="vertical" size={12} style={{ width: '100%' }}>
+            <CommandBlock label="config.toml" command={config} />
+            <CommandBlock label="auth.json" command={auth} />
+          </Space>
           <Alert
             type="warning"
             showIcon
             style={{ marginTop: 12 }}
-            message="OPENLLM_API_KEY 必须常驻在启动 Codex 的环境中。Windows 命令会写入当前用户环境变量；macOS / Linux 请把同名 export 写入 shell 配置，然后重启 Codex。"
+            message="auth.json 可能已有 Codex 的其它认证字段。请只补充 OPENLLM_API_KEY，不要整文件覆盖；下面的一键命令会自动合并。"
           />
         </section>
 
