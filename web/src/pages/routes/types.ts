@@ -14,6 +14,7 @@ export const strategyLabels = {
   round_robin: '轮询',
   cost_optimized: '成本优先',
   latency_optimized: '延迟优先',
+  p95_latency_optimized: 'P95 延迟优先',
   least_used: '负载最少',
 }
 

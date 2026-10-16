@@ -6,6 +6,10 @@ const STRATEGY_OPTIONS = [
   { value: 'round_robin', label: 'round_robin · 轮询' },
   { value: 'cost_optimized', label: 'cost_optimized · 成本优先' },
   { value: 'latency_optimized', label: 'latency_optimized · 延迟优先' },
+  {
+    value: 'p95_latency_optimized',
+    label: 'p95_latency_optimized · P95 延迟优先',
+  },
   { value: 'least_used', label: 'least_used · 最少使用' },
 ]
 

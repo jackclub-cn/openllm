@@ -8,6 +8,7 @@ pub enum RouteStrategy {
     RoundRobin,
     CostOptimized,
     LatencyOptimized,
+    P95LatencyOptimized,
     LeastUsed,
 }
 
@@ -19,6 +20,7 @@ impl RouteStrategy {
             Self::RoundRobin => "round_robin",
             Self::CostOptimized => "cost_optimized",
             Self::LatencyOptimized => "latency_optimized",
+            Self::P95LatencyOptimized => "p95_latency_optimized",
             Self::LeastUsed => "least_used",
         }
     }
@@ -28,11 +30,22 @@ impl RouteStrategy {
     /// advanced strategies use `priority` as their storage fallback.
     pub fn storage_values(self) -> (&'static str, &'static str) {
         match self {
-            Self::CostOptimized | Self::LatencyOptimized | Self::LeastUsed => {
+            Self::CostOptimized
+            | Self::LatencyOptimized
+            | Self::P95LatencyOptimized
+            | Self::LeastUsed => {
                 ("priority", self.as_str())
             }
             _ => (self.as_str(), ""),
         }
+    }
+
+    /// Strategies that treat recent latency as their primary routing signal.
+    pub fn is_latency_first(self) -> bool {
+        matches!(
+            self,
+            Self::LatencyOptimized | Self::P95LatencyOptimized
+        )
     }
 }
 
@@ -46,6 +59,7 @@ impl std::str::FromStr for RouteStrategy {
             "round_robin" => Ok(Self::RoundRobin),
             "cost_optimized" => Ok(Self::CostOptimized),
             "latency_optimized" => Ok(Self::LatencyOptimized),
+            "p95_latency_optimized" => Ok(Self::P95LatencyOptimized),
             "least_used" => Ok(Self::LeastUsed),
             _ => Err(format!("unsupported route strategy: {value}")),
         }

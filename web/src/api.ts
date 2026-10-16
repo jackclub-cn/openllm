@@ -325,6 +325,7 @@ export type GatewayRoute = {
     | 'round_robin'
     | 'cost_optimized'
     | 'latency_optimized'
+    | 'p95_latency_optimized'
     | 'least_used'
   enabled: boolean
   context_limit?: number | null

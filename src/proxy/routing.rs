@@ -684,8 +684,10 @@ pub(super) async fn diagnostic_runtime_targets(
         .filter(|(_, (_, eligible))| *eligible)
         .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
-    let metrics = runtime_target_metrics(state, &targets).await?;
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
+    let metrics =
+        runtime_target_metrics(state, &targets, strategy == RouteStrategy::P95LatencyOptimized)
+            .await?;
     let route_id = route_id.unwrap_or(-1);
     let affinity =
         session_affinity_context(state, route_id, Some(session_id), api_key_id, false).await;
@@ -2255,6 +2257,7 @@ pub(super) fn order_targets_for_session(
         }
         RouteStrategy::CostOptimized
         | RouteStrategy::LatencyOptimized
+        | RouteStrategy::P95LatencyOptimized
         | RouteStrategy::LeastUsed => {}
     }
 }
@@ -2265,6 +2268,8 @@ struct RuntimeTargetMetricRow {
     upstream_model: String,
     requests: i64,
     avg_latency_ms: Option<f64>,
+    /// Nearest-rank 95th percentile first-token (or total) latency.
+    p95_latency_ms: Option<f64>,
     /// Rows that finished successfully in the window.
     successes: i64,
     /// Finished rows that failed because of the upstream (5xx, rate limit or a
@@ -2285,6 +2290,7 @@ impl RuntimeTargetMetricRow {
 async fn runtime_target_metrics(
     state: &AppState,
     targets: &[RouteTarget],
+    include_p95: bool,
 ) -> AppResult<HashMap<(i64, String), RuntimeTargetMetricRow>> {
     if targets.is_empty() {
         return Ok(HashMap::new());
@@ -2309,6 +2315,7 @@ async fn runtime_target_metrics(
                        ELSE NULL
                    END
                ) AS avg_latency_ms,
+               NULL AS p95_latency_ms,
                SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END) AS successes,
                SUM(
                    CASE
@@ -2339,9 +2346,90 @@ async fn runtime_target_metrics(
         .build_query_as::<RuntimeTargetMetricRow>()
         .fetch_all(&state.pool)
         .await?;
-    Ok(rows
+    let mut metrics = rows
         .into_iter()
         .map(|row| ((row.provider_id, row.upstream_model.clone()), row))
+        .collect::<HashMap<_, _>>();
+    if include_p95 {
+        let p95 = runtime_target_p95_latency(state, targets).await?;
+        for (key, value) in p95 {
+            if let Some(metric) = metrics.get_mut(&key) {
+                metric.p95_latency_ms = Some(value);
+            }
+        }
+    }
+    Ok(metrics)
+}
+
+/// Nearest-rank P95 for the same one-day success window as the average metric.
+///
+/// The query only runs for the P95 strategy, so the extra window-function pass
+/// never enters the hot path of the other strategies.
+async fn runtime_target_p95_latency(
+    state: &AppState,
+    targets: &[RouteTarget],
+) -> AppResult<HashMap<(i64, String), f64>> {
+    if targets.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let provider_ids = targets
+        .iter()
+        .map(|target| target.provider_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        r#"
+        WITH samples AS (
+            SELECT provider_id,
+                   upstream_model,
+                   CASE
+                       WHEN first_token_ms IS NOT NULL AND first_token_ms > 0
+                           THEN first_token_ms
+                       ELSE latency_ms
+                   END AS sample
+            FROM usage_logs
+            WHERE in_flight = 0
+              AND success = 1
+              AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')
+              AND (first_token_ms > 0 OR latency_ms > 0)
+              AND provider_id IN (
+        "#,
+    );
+    {
+        let mut separated = query.separated(", ");
+        for provider_id in provider_ids {
+            separated.push_bind(provider_id);
+        }
+    }
+    query.push(
+        r#")
+        ),
+        ranked AS (
+            SELECT provider_id,
+                   upstream_model,
+                   sample,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY provider_id, upstream_model ORDER BY sample
+                   ) AS rank,
+                   COUNT(*) OVER (
+                       PARTITION BY provider_id, upstream_model
+                   ) AS total
+            FROM samples
+        )
+        SELECT provider_id,
+               upstream_model,
+               CAST(MAX(sample) AS REAL) AS p95_latency_ms
+        FROM ranked
+        WHERE rank >= (total * 95 + 99) / 100
+        GROUP BY provider_id, upstream_model
+        "#,
+    );
+    let rows = query
+        .build_query_as::<(i64, String, f64)>()
+        .fetch_all(&state.pool)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(provider_id, model, latency)| ((provider_id, model), latency))
         .collect())
 }
 
@@ -2675,6 +2763,11 @@ fn target_decision_reason(
             Some(_) => "recent_latency",
             None => "no_recent_latency",
         },
+        RouteStrategy::P95LatencyOptimized => match metric.and_then(|metric| metric.p95_latency_ms) {
+            Some(_) if first => "lowest_recent_p95_latency",
+            Some(_) => "recent_p95_latency",
+            None => "no_recent_p95_latency",
+        },
         RouteStrategy::LeastUsed => match metric {
             Some(_) if first => "least_recent_traffic",
             Some(_) => "recent_traffic",
@@ -2709,6 +2802,20 @@ fn sort_targets_by_strategy_metrics(
                     .unwrap_or(f64::INFINITY);
                 let right_latency = metric_for(right)
                     .and_then(|metric| metric.avg_latency_ms)
+                    .unwrap_or(f64::INFINITY);
+                left_latency
+                    .total_cmp(&right_latency)
+                    .then_with(|| left.priority.cmp(&right.priority))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+        }
+        RouteStrategy::P95LatencyOptimized => {
+            targets.sort_by(|left, right| {
+                let left_latency = metric_for(left)
+                    .and_then(|metric| metric.p95_latency_ms)
+                    .unwrap_or(f64::INFINITY);
+                let right_latency = metric_for(right)
+                    .and_then(|metric| metric.p95_latency_ms)
                     .unwrap_or(f64::INFINITY);
                 left_latency
                     .total_cmp(&right_latency)
@@ -3115,7 +3222,9 @@ pub(crate) async fn assess_targets(
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
-    let metrics = runtime_target_metrics(state, targets).await?;
+    let metrics =
+        runtime_target_metrics(state, targets, strategy == RouteStrategy::P95LatencyOptimized)
+            .await?;
     let key_of = |target: &RouteTarget| (target.provider_id, target.upstream_model.clone());
 
     // Relative signals are only meaningful next to the other candidates.
@@ -3130,6 +3239,15 @@ pub(crate) async fn assess_targets(
             metrics
                 .get(&key_of(target))
                 .and_then(|metric| metric.avg_latency_ms)
+        })
+        .filter(|latency| *latency > 0.0)
+        .fold(f64::INFINITY, f64::min);
+    let fastest_p95 = targets
+        .iter()
+        .filter_map(|target| {
+            metrics
+                .get(&key_of(target))
+                .and_then(|metric| metric.p95_latency_ms)
         })
         .filter(|latency| *latency > 0.0)
         .fold(f64::INFINITY, f64::min);
@@ -3254,12 +3372,26 @@ pub(crate) async fn assess_targets(
             latency_score,
             latency_detail.clone(),
         ));
+        let p95_latency = metric
+            .and_then(|metric| metric.p95_latency_ms)
+            .filter(|value| *value > 0.0);
+        let p95_latency_score = p95_latency.map(|latency| {
+            if fastest_p95.is_finite() && fastest_p95 > 0.0 {
+                (fastest_p95 / latency).clamp(0.0, 1.0)
+            } else {
+                NEUTRAL_FACTOR_SCORE
+            }
+        });
+        let p95_latency_detail = match p95_latency {
+            Some(latency) => format!("近期 P95 {latency:.0}ms（最快 {fastest_p95:.0}ms）"),
+            None => "近期没有 P95 延迟样本".to_string(),
+        };
 
         // Only the latency-first strategy lets a recent slow first token
         // reshuffle the order; every other strategy keeps the order the
         // operator configured.
         let slow_state = slow_targets.get(&key).filter(|entry| {
-            strategy == RouteStrategy::LatencyOptimized
+            strategy.is_latency_first()
                 && entry.until.is_some_and(|until| until > now)
         });
         if let Some(slow_state) = slow_state {
@@ -3307,6 +3439,9 @@ pub(crate) async fn assess_targets(
             RouteStrategy::RoundRobin => (Some(1.0), "按轮询游标顺序".to_string()),
             RouteStrategy::CostOptimized => (cost_score, cost_detail.clone()),
             RouteStrategy::LatencyOptimized => (latency_score, latency_detail.clone()),
+            RouteStrategy::P95LatencyOptimized => {
+                (p95_latency_score, p95_latency_detail.clone())
+            }
             RouteStrategy::LeastUsed => {
                 let requests = metric.map(|metric| metric.requests).unwrap_or(0);
                 (
@@ -3380,7 +3515,7 @@ async fn deprioritized_target_keys(
     let threshold = provider_open_threshold();
     let streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = state.provider_cooldown.lock().await.clone();
-    let slow_targets = if strategy == RouteStrategy::LatencyOptimized {
+    let slow_targets = if strategy.is_latency_first() {
         let mut targets = state.target_slow.lock().await;
         targets.retain(|_, entry| {
             entry.until.is_some_and(|until| until > now)
@@ -3506,8 +3641,15 @@ async fn order_targets_with_context(
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
     let runtime_metrics = match strategy {
-        RouteStrategy::LatencyOptimized | RouteStrategy::LeastUsed => {
-            runtime_target_metrics(state, &targets).await?
+        RouteStrategy::LatencyOptimized
+        | RouteStrategy::P95LatencyOptimized
+        | RouteStrategy::LeastUsed => {
+            runtime_target_metrics(
+                state,
+                &targets,
+                strategy == RouteStrategy::P95LatencyOptimized,
+            )
+            .await?
         }
         RouteStrategy::Priority
         | RouteStrategy::Weighted
@@ -3548,6 +3690,7 @@ async fn order_targets_with_context(
             }
             RouteStrategy::CostOptimized
             | RouteStrategy::LatencyOptimized
+            | RouteStrategy::P95LatencyOptimized
             | RouteStrategy::LeastUsed => {}
         }
     }

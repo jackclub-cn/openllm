@@ -100,6 +100,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `round_robin` | 进程内轮询 |
 | `cost_optimized` | 按模型输入/输出价格估算成本 |
 | `latency_optimized` | 优先近 24 小时平均延迟更低的目标，并参考首字慢降权信号 |
+| `p95_latency_optimized` | 优先近 24 小时 P95 延迟更低的目标，减少尾延迟抖动 |
 | `least_used` | 优先近 24 小时完成请求更少的目标 |
 
 支持会话 ID；没有显式会话 ID 时使用首个用户消息加系统提示的稳定前缀哈希，尽量保持上游 prompt cache。请求头 `x-openllm-strategy`、`x-openllm-provider`、`x-openllm-exclude-providers` 可按请求覆盖密钥默认策略。
