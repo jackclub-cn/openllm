@@ -1239,7 +1239,11 @@ pub(super) async fn mark_provider_error(
             && (*failures - 1 < threshold || probe_was_in_flight);
         let cooldown =
             provider_cooldown(status, *failures, retry_after, configured_cooldown_seconds);
-        cooldowns.insert(provider_id, now + cooldown);
+        let deadline = now + cooldown;
+        cooldowns
+            .entry(provider_id)
+            .and_modify(|until| *until = (*until).max(deadline))
+            .or_insert(deadline);
         (*failures, opened, cooldown)
     };
     if opened {
@@ -1282,10 +1286,12 @@ pub(super) async fn mark_target_error(
     let active = {
         let mut cooldowns = state.target_cooldown.lock().await;
         cooldowns.retain(|_, until| *until > now);
-        cooldowns.insert(
-            (target.provider_id, target.upstream_model.clone()),
-            now + target_cooldown(status, retry_after, target.cooldown_seconds),
-        );
+        let key = (target.provider_id, target.upstream_model.clone());
+        let deadline = now + target_cooldown(status, retry_after, target.cooldown_seconds);
+        cooldowns
+            .entry(key)
+            .and_modify(|until| *until = (*until).max(deadline))
+            .or_insert(deadline);
         cooldowns
             .keys()
             .filter(|(provider_id, _)| *provider_id == target.provider_id)
@@ -2064,10 +2070,14 @@ pub(super) async fn mark_provider_api_key_error(
     let Some(provider_api_key_id) = provider_api_key_id else {
         return;
     };
-    state.provider_key_cooldown.lock().await.insert(
-        provider_api_key_id,
-        Instant::now() + provider_key_cooldown(status, retry_after),
-    );
+    let deadline = Instant::now() + provider_key_cooldown(status, retry_after);
+    state
+        .provider_key_cooldown
+        .lock()
+        .await
+        .entry(provider_api_key_id)
+        .and_modify(|until| *until = (*until).max(deadline))
+        .or_insert(deadline);
     state.mark_provider_key_resilience_dirty(provider_api_key_id);
     state
         .provider_key_error_state

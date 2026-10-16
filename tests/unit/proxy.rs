@@ -5051,6 +5051,66 @@ fn provider_cooldown_escalates_with_consecutive_failures_and_caps() {
 }
 
 #[tokio::test]
+async fn concurrent_failures_never_shorten_key_or_model_cooldowns() {
+    let state = circuit_state().await;
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.upstream_model = "model-a".to_string();
+
+    mark_target_error(
+        &state,
+        &target,
+        StatusCode::TOO_MANY_REQUESTS,
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let target_deadline = *state
+        .target_cooldown
+        .lock()
+        .await
+        .get(&(7, "model-a".to_string()))
+        .unwrap();
+    mark_target_error(&state, &target, StatusCode::SERVICE_UNAVAILABLE, None).await;
+    assert_eq!(
+        state
+            .target_cooldown
+            .lock()
+            .await
+            .get(&(7, "model-a".to_string()))
+            .copied(),
+        Some(target_deadline),
+        "a shorter model failure must not cut an active cooldown short"
+    );
+
+    mark_provider_api_key_error(
+        &state,
+        Some(11),
+        StatusCode::TOO_MANY_REQUESTS,
+        "busy",
+        Some(Duration::from_secs(120)),
+    )
+    .await;
+    let key_deadline = *state
+        .provider_key_cooldown
+        .lock()
+        .await
+        .get(&11)
+        .unwrap();
+    mark_provider_api_key_error(&state, Some(11), StatusCode::SERVICE_UNAVAILABLE, "boom", None)
+        .await;
+    assert_eq!(
+        state
+            .provider_key_cooldown
+            .lock()
+            .await
+            .get(&11)
+            .copied(),
+        Some(key_deadline),
+        "a shorter key failure must not cut an active cooldown short"
+    );
+}
+
+#[tokio::test]
 async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
     let app = axum::Router::new().route(
         "/v1/chat/completions",
