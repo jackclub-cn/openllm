@@ -42,6 +42,23 @@ struct Args {
     #[arg(long)]
     self_check: bool,
 
+    /// Export the portable configuration document, then exit. Use `-` for stdout.
+    #[arg(long, value_name = "FILE")]
+    export_config: Option<PathBuf>,
+
+    /// Import a portable configuration document, then exit. Validates unless
+    /// --apply is also present.
+    #[arg(long, value_name = "FILE")]
+    import_config: Option<PathBuf>,
+
+    /// Include plaintext upstream credentials and webhook secrets in an export.
+    #[arg(long)]
+    include_secrets: bool,
+
+    /// Apply an import after validating it.
+    #[arg(long)]
+    apply: bool,
+
     /// Restore a backup and exit. Takes a file name from the backups
     /// directory, or a path. The gateway must not be running.
     #[arg(long, value_name = "FILE")]
@@ -74,6 +91,14 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.self_check {
         return finish(openllm::cli::self_check(&config, args.json).await);
+    }
+    if let Some(path) = args.export_config.as_deref() {
+        return finish(
+            openllm::cli::export_config(&config, path, args.include_secrets, args.json).await,
+        );
+    }
+    if let Some(path) = args.import_config.as_deref() {
+        return finish(openllm::cli::import_config(&config, path, args.apply, args.json).await);
     }
     if let Some(backup) = args.restore_backup.as_deref() {
         return finish(openllm::cli::restore_backup(&config, backup, args.json).await);

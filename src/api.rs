@@ -26,7 +26,7 @@ mod audit;
 pub(crate) mod diagnostics;
 mod helpers;
 mod keys;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod metrics;
 mod models;
 mod pools;

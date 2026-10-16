@@ -133,6 +133,110 @@ pub async fn self_check(config: &Config, json: bool) -> anyhow::Result<i32> {
     })
 }
 
+/// `--export-config`: write the portable configuration document to a file.
+pub async fn export_config(
+    config: &Config,
+    output: &std::path::Path,
+    include_secrets: bool,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let database_path = crate::startup::database_path(config);
+    if !database_path.exists() {
+        anyhow::bail!("{} does not exist yet", database_path.display());
+    }
+    let pool = crate::startup::open_operator_read_pool(&database_path).await?;
+    let state = crate::state::AppState::new(pool.clone(), None);
+    let document = crate::api::lifecycle::build_config_document(&state, include_secrets).await?;
+    pool.close().await;
+    let rendered = serde_json::to_string_pretty(&document)?;
+
+    if output == std::path::Path::new("-") {
+        println!("{rendered}");
+    } else {
+        std::fs::write(output, format!("{rendered}\n"))
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "output": output.to_string_lossy().replace('\\', "/"),
+                    "include_secrets": include_secrets,
+                    "providers": document.providers.len(),
+                    "routes": document.routes.len(),
+                    "provider_pools": document.provider_pools.len(),
+                    "webhooks": document.webhooks.len(),
+                }))?
+            );
+        } else {
+            println!(
+                "已导出配置: {}（provider {} / route {} / pool {} / webhook {}{}）",
+                output.display(),
+                document.providers.len(),
+                document.routes.len(),
+                document.provider_pools.len(),
+                document.webhooks.len(),
+                if include_secrets {
+                    "，含明文凭据"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(0)
+}
+
+/// `--import-config`: validate or apply a portable configuration document.
+pub async fn import_config(
+    config: &Config,
+    input: &std::path::Path,
+    apply: bool,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let database_path = crate::startup::database_path(config);
+    if !database_path.exists() {
+        anyhow::bail!("{} does not exist yet", database_path.display());
+    }
+    let raw = std::fs::read_to_string(input)
+        .with_context(|| format!("failed to read {}", input.display()))?;
+    let document = serde_json::from_str(&raw)
+        .with_context(|| format!("{} is not a valid configuration document", input.display()))?;
+    let pool = crate::startup::open_operator_pool(&database_path).await?;
+    let state = crate::state::AppState::new(pool.clone(), None);
+    let axum::Json(plan) = crate::api::lifecycle::import_config(
+        axum::extract::State(state),
+        axum::Json(crate::models::ImportConfigRequest { document, apply }),
+    )
+    .await?;
+    pool.close().await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+    } else {
+        println!(
+            "{}配置导入（create {} / update {} / unchanged {} / skip {} / error {}）",
+            if plan.applied { "已应用" } else { "仅校验" },
+            plan.counts.create,
+            plan.counts.update,
+            plan.counts.unchanged,
+            plan.counts.skip,
+            plan.counts.error
+        );
+        for problem in &plan.problems {
+            println!("问题: {problem}");
+        }
+        if !plan.applied && plan.valid && plan.counts.error == 0 {
+            println!("校验通过；加 --apply 才会写入数据库。");
+        }
+    }
+
+    Ok(if plan.valid && plan.counts.error == 0 {
+        0
+    } else {
+        1
+    })
+}
+
 /// `--backup`: write an on-demand backup. Safe to run while the gateway serves.
 pub async fn create_backup(config: &Config, json: bool) -> anyhow::Result<i32> {
     let database_path = crate::startup::database_path(config);
@@ -242,8 +346,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    #[tokio::test]
-    async fn self_check_runs_against_an_existing_database() {
+    async fn database_config() -> (tempfile::TempDir, Config) {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
             bind: "127.0.0.1:8080".parse().unwrap(),
@@ -264,11 +367,35 @@ mod tests {
             .unwrap();
         sqlx::migrate!("./migrations").run(&pool).await.unwrap();
         pool.close().await;
+        (directory, config)
+    }
 
+    #[tokio::test]
+    async fn self_check_runs_against_an_existing_database() {
+        let (_directory, config) = database_config().await;
         let code = self_check(&config, true).await.unwrap();
         assert_eq!(
             code, 1,
             "a fresh database has no routable model yet, so the self-check must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn config_export_and_import_work_offline() {
+        let (_directory, config) = database_config().await;
+        let output = config.data_dir.join("openllm-config.json");
+
+        assert_eq!(
+            export_config(&config, &output, false, true).await.unwrap(),
+            0
+        );
+        let raw = std::fs::read_to_string(&output).unwrap();
+        assert!(raw.contains("\"openllm_config_version\": 1"));
+
+        assert_eq!(
+            import_config(&config, &output, false, true).await.unwrap(),
+            0,
+            "validating the same document against its source database must pass"
         );
     }
 }
