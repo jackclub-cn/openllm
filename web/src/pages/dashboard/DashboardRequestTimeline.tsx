@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Alert, Card, Space, Tooltip, Typography } from 'antd'
 import dayjs from 'dayjs'
 import type { UsageLog } from '../../api'
@@ -17,6 +17,7 @@ type TimelineEntry = {
 }
 
 const WINDOW_MS = 60_000
+const TICK_MS = 10_000
 const LANE_HEIGHT = 24
 const BAR_HEIGHT = 14
 
@@ -54,11 +55,17 @@ function buildTimeline(items: UsageLog[], now: number) {
     entry.lane = lane
   }
 
-  const tickCount = 6
-  const ticks = Array.from(
-    { length: tickCount },
-    (_, index) => domainStart + (WINDOW_MS * index) / (tickCount - 1),
-  )
+  // Ticks land on absolute ten-second boundaries, so a label keeps its time and
+  // scrolls through the window instead of being relabelled in place every
+  // second. One tick past each edge keeps the ruler covered while it slides.
+  const ticks: number[] = []
+  for (
+    let tick = Math.floor(domainStart / TICK_MS) * TICK_MS;
+    tick <= domainEnd + TICK_MS;
+    tick += TICK_MS
+  ) {
+    ticks.push(tick)
+  }
 
   return {
     entries: visible,
@@ -86,11 +93,62 @@ export default function DashboardRequestTimeline({
   error,
   onOpenDetail,
 }: DashboardRequestTimelineProps) {
-  const [now, setNow] = useState(Date.now())
+  // `now` is the render-time anchor: every second the window is rebuilt
+  // against a fresh timestamp. Between anchors the whole plot is slid by a
+  // per-frame transform, so the timeline glides instead of hopping once a
+  // second.
+  const [now, setNow] = useState(() => Date.now())
+  const nowRef = useRef(now)
+  const axisLayerRef = useRef<HTMLDivElement>(null)
+  const plotLayerRef = useRef<HTMLDivElement>(null)
+  const pendingBarsRef = useRef<HTMLElement[]>([])
+
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000)
     return () => window.clearInterval(timer)
   }, [])
+
+  const slideWindow = useCallback(() => {
+    const plot = plotLayerRef.current
+    const axis = axisLayerRef.current
+    if (!plot || !axis || !plot.clientWidth) return
+    const elapsed = Math.min(Math.max(Date.now() - nowRef.current, 0), WINDOW_MS)
+    const offset = (elapsed / WINDOW_MS) * plot.clientWidth
+    const transform = `translate3d(${-offset}px, 0, 0)`
+    plot.style.transform = transform
+    axis.style.transform = transform
+    // An in-flight request ends at "now", so its right edge has to stay pinned
+    // to the right side of the window while everything else slides under it.
+    for (const bar of pendingBarsRef.current) {
+      bar.style.right = `${-offset}px`
+    }
+  }, [])
+
+  // Runs before paint, so re-anchoring never shows a one-frame jump.
+  useLayoutEffect(() => {
+    nowRef.current = now
+    pendingBarsRef.current = Array.from(
+      plotLayerRef.current?.querySelectorAll<HTMLElement>(
+        '.usage-timeline-bar-pending',
+      ) ?? [],
+    )
+    slideWindow()
+  }, [now, items, slideWindow])
+
+  useEffect(() => {
+    let handle = 0
+    const step = () => {
+      if (!document.hidden) {
+        // A backgrounded tab throttles the one-second anchor; re-anchor in one
+        // go instead of letting the plot fly off its window.
+        if (Date.now() - nowRef.current > 2_000) setNow(Date.now())
+        else slideWindow()
+      }
+      handle = window.requestAnimationFrame(step)
+    }
+    handle = window.requestAnimationFrame(step)
+    return () => window.cancelAnimationFrame(handle)
+  }, [slideWindow])
 
   const { entries, ticks, domainStart, domainEnd, laneCount } = buildTimeline(
     items,
@@ -99,8 +157,10 @@ export default function DashboardRequestTimeline({
   const span = domainEnd - domainStart
   const plotHeight = Math.max(laneCount * LANE_HEIGHT, 72)
 
-  const percent = (value: number) =>
-    Math.max(0, Math.min(100, ((value - domainStart) / span) * 100))
+  // Positions stay unclamped: bars and ticks that reach past either edge have
+  // to keep moving with the window and let the plot clip them, otherwise they
+  // would sit still between re-anchors and lurch on every one.
+  const position = (value: number) => ((value - domainStart) / span) * 100
 
   return (
     <Card
@@ -143,55 +203,65 @@ export default function DashboardRequestTimeline({
       )}
       <div className="usage-timeline-canvas" style={{ height: 36 + plotHeight }}>
         <div className="usage-timeline-axis">
-          {ticks.map((tick) => (
-            <span key={tick} style={{ left: `${percent(tick)}%` }}>
-              {dayjs(tick).format('HH:mm:ss')}
-            </span>
-          ))}
+          <div className="usage-timeline-layer" ref={axisLayerRef}>
+            {ticks.map((tick) => (
+              <span key={tick} style={{ left: `${position(tick)}%` }}>
+                {dayjs(tick).format('HH:mm:ss')}
+              </span>
+            ))}
+          </div>
         </div>
         <div className="usage-timeline-plot" style={{ height: plotHeight }}>
-          {ticks.map((tick) => (
-            <i key={tick} style={{ left: `${percent(tick)}%` }} />
-          ))}
-          {entries.map((entry) => {
-            const left = percent(Math.max(entry.start, domainStart))
-            const right = percent(Math.min(entry.end, domainEnd))
-            const width = Math.max(right - left, 0.35)
-            const duration = entry.end - entry.start
-            const record = entry.record
-            return (
-              <Tooltip
-                key={record.id}
-                title={
-                  <div className="usage-timeline-tooltip">
-                    <strong>{record.requested_model}</strong>
-                    <span>
-                      {requestStatus(record)} · {formatDuration(duration)}
-                    </span>
-                    <span>{dayjs(entry.start).format('YYYY-MM-DD HH:mm:ss.SSS')}</span>
-                    <span>
-                      {record.provider_name ||
-                        (record.provider_id ? `#${record.provider_id}` : '未知提供商')}
-                      {record.route_name ? ` · ${record.route_name}` : ''}
-                    </span>
-                  </div>
-                }
-              >
-                <button
-                  type="button"
-                  className={`usage-timeline-bar ${barClass(record)}`}
-                  aria-label={`${record.requested_model} ${formatDuration(duration)}`}
-                  style={{
-                    left: `${left}%`,
-                    width: `${Math.min(width, 100 - left)}%`,
-                    top: entry.lane * LANE_HEIGHT + (LANE_HEIGHT - BAR_HEIGHT) / 2,
-                    height: BAR_HEIGHT,
-                  }}
-                  onClick={() => onOpenDetail(record)}
-                />
-              </Tooltip>
-            )
-          })}
+          <div className="usage-timeline-layer" ref={plotLayerRef}>
+            {ticks.map((tick) => (
+              <i
+                key={tick}
+                className="usage-timeline-gridline"
+                style={{ left: `${position(tick)}%` }}
+              />
+            ))}
+            {entries.map((entry) => {
+              const left = position(entry.start)
+              const width = Math.max(position(entry.end) - left, 0.35)
+              const duration = entry.end - entry.start
+              const record = entry.record
+              const top =
+                entry.lane * LANE_HEIGHT + (LANE_HEIGHT - BAR_HEIGHT) / 2
+              return (
+                <Tooltip
+                  key={record.id}
+                  title={
+                    <div className="usage-timeline-tooltip">
+                      <strong>{record.requested_model}</strong>
+                      <span>
+                        {requestStatus(record)} · {formatDuration(duration)}
+                      </span>
+                      <span>{dayjs(entry.start).format('YYYY-MM-DD HH:mm:ss.SSS')}</span>
+                      <span>
+                        {record.provider_name ||
+                          (record.provider_id ? `#${record.provider_id}` : '未知提供商')}
+                        {record.route_name ? ` · ${record.route_name}` : ''}
+                      </span>
+                    </div>
+                  }
+                >
+                  <button
+                    type="button"
+                    className={`usage-timeline-bar ${barClass(record)}`}
+                    aria-label={`${record.requested_model} ${formatDuration(duration)}`}
+                    style={
+                      // In-flight bars are stretched to the live right edge by
+                      // the animation loop; finished bars keep a fixed width.
+                      record.in_flight
+                        ? { left: `${left}%`, right: 0, top, height: BAR_HEIGHT }
+                        : { left: `${left}%`, width: `${width}%`, top, height: BAR_HEIGHT }
+                    }
+                    onClick={() => onOpenDetail(record)}
+                  />
+                </Tooltip>
+              )
+            })}
+          </div>
         </div>
       </div>
     </Card>
