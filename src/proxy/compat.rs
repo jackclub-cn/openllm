@@ -414,71 +414,104 @@ pub(crate) fn chat_message_is_empty(message: &Value) -> bool {
 }
 
 /// Chat completions upstreams require every assistant `tool_calls` entry to
-/// have a matching `tool` result. Drop only the unpaired side and remove
-/// assistant shells that become empty.
+/// have a matching `tool` result. The result must also follow the call in
+/// history, so repair the pairing in order instead of comparing two global id
+/// sets. This catches results replayed before their call and results separated
+/// from the call by another assistant or user turn.
 pub(crate) fn sanitize_chat_tool_history(body: &mut Value) -> usize {
     let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return 0;
     };
 
-    let mut call_ids = HashSet::new();
-    let mut result_ids = HashSet::new();
-    for message in messages.iter() {
-        if message.get("role").and_then(Value::as_str) == Some("assistant")
-            && let Some(calls) = message.get("tool_calls").and_then(Value::as_array)
-        {
-            for call in calls {
-                if let Some(id) = chat_tool_call_id(call) {
+    let mut removed = 0;
+    let mut pending: Option<(usize, HashSet<String>)> = None;
+    let mut sanitized = Vec::with_capacity(messages.len());
+
+    for mut message in messages.iter().cloned() {
+        let role = message.get("role").and_then(Value::as_str);
+        if role == Some("assistant") {
+            if let Some((index, call_ids)) = pending.take() {
+                removed += remove_chat_tool_calls(&mut sanitized[index], &call_ids);
+            }
+
+            let mut call_ids = HashSet::new();
+            if let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                let before = calls.len();
+                calls.retain(|call| {
+                    let Some(id) = chat_tool_call_id(call) else {
+                        return false;
+                    };
                     call_ids.insert(id.to_string());
+                    true
+                });
+                removed += before.saturating_sub(calls.len());
+                if calls.is_empty() {
+                    message
+                        .as_object_mut()
+                        .map(|object| object.remove("tool_calls"));
                 }
             }
-        }
-        if message.get("role").and_then(Value::as_str) == Some("tool")
-            && let Some(id) = message
-                .get("tool_call_id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-        {
-            result_ids.insert(id.to_string());
-        }
-    }
-
-    let paired = call_ids
-        .intersection(&result_ids)
-        .cloned()
-        .collect::<HashSet<_>>();
-    let mut removed = 0;
-
-    for message in messages.iter_mut() {
-        if message.get("role").and_then(Value::as_str) == Some("assistant")
-            && let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut)
-        {
-            let before = calls.len();
-            calls.retain(|call| chat_tool_call_id(call).is_some_and(|id| paired.contains(id)));
-            removed += before.saturating_sub(calls.len());
-            if calls.is_empty() {
-                message
-                    .as_object_mut()
-                    .map(|object| object.remove("tool_calls"));
+            if !call_ids.is_empty() {
+                pending = Some((sanitized.len(), call_ids));
             }
+            sanitized.push(message);
+            continue;
         }
-    }
 
-    let before = messages.len();
-    messages.retain(|message| {
-        let role = message.get("role").and_then(Value::as_str);
         if role == Some("tool") {
-            return message
+            let call_id = message
                 .get("tool_call_id")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .is_some_and(|id| paired.contains(id));
+                .map(str::to_string);
+            if let Some(call_id) = call_id
+                && let Some((_, call_ids)) = pending.as_mut()
+                && call_ids.remove(&call_id)
+            {
+                sanitized.push(message);
+                continue;
+            }
+            removed += 1;
+            continue;
         }
-        !(role == Some("assistant") && chat_message_is_empty(message))
+
+        if let Some((index, call_ids)) = pending.take() {
+            removed += remove_chat_tool_calls(&mut sanitized[index], &call_ids);
+        }
+        sanitized.push(message);
+    }
+
+    if let Some((index, call_ids)) = pending.take() {
+        removed += remove_chat_tool_calls(&mut sanitized[index], &call_ids);
+    }
+
+    let before = sanitized.len();
+    sanitized.retain(|message| {
+        message.get("role").and_then(Value::as_str) != Some("assistant")
+            || !chat_message_is_empty(message)
     });
-    removed + before.saturating_sub(messages.len())
+    removed += before.saturating_sub(sanitized.len());
+    *messages = sanitized;
+    removed
+}
+
+fn remove_chat_tool_calls(message: &mut Value, call_ids: &HashSet<String>) -> usize {
+    let remove = {
+        let Some(calls) = message.get_mut("tool_calls").and_then(Value::as_array_mut) else {
+            return 0;
+        };
+        let before = calls.len();
+        calls.retain(|call| chat_tool_call_id(call).is_some_and(|id| !call_ids.contains(id)));
+        let removed = before.saturating_sub(calls.len());
+        (removed, calls.is_empty())
+    };
+    if remove.1 {
+        message
+            .as_object_mut()
+            .map(|object| object.remove("tool_calls"));
+    }
+    remove.0
 }
 
 pub(crate) fn command_code_max_output_tokens(body: &mut Value) -> usize {

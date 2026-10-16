@@ -6,8 +6,7 @@ import {
   NodeIndexOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
-import { Col, Row, Tooltip, Typography } from 'antd'
-import { useNavigate } from 'react-router-dom'
+import { Col, Row } from 'antd'
 import type { Overview } from '../../api'
 import MetricCard from '../../components/MetricCard'
 import { formatCompact } from '../../format'
@@ -17,54 +16,46 @@ type DashboardMetricsProps = {
 }
 
 export default function DashboardMetrics({ data }: DashboardMetricsProps) {
-  const navigate = useNavigate()
+  const cacheHitRate =
+    data.prompt_tokens_total > 0
+      ? (data.cache_read_total / data.prompt_tokens_total) * 100
+      : 0
 
   return (
     <>
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="请求"
-            value={data.range_requests}
+            label="累计请求"
+            value={data.requests_total}
             icon={<ThunderboltOutlined />}
             tone="blue"
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="总 tokens"
-            value={data.range_tokens}
+            label="累计 tokens"
+            value={data.tokens_total}
             compact
             icon={<ApiOutlined />}
             tone="cyan"
-            hint={`输入 ${formatCompact(data.range_prompt_tokens)} · 输出 ${formatCompact(data.range_completion_tokens)}`}
+            hint={`输入 ${formatCompact(data.prompt_tokens_total)} · 输出 ${formatCompact(data.completion_tokens_total)}`}
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="成功率"
-            value={data.range_success_rate}
+            label="累计成功率"
+            value={data.success_rate}
             precision={1}
             suffix="%"
             icon={<NodeIndexOutlined />}
             tone="green"
-            hint={
-              data.range_gateway_adjusted > 0 ? (
-                <Tooltip title="兼容层自动修复工具历史或调整上游请求参数的次数">
-                  <Typography.Link onClick={() => navigate('/usage?gateway_adjusted=true')}>
-                    网关调整 {data.range_gateway_adjusted} 次
-                  </Typography.Link>
-                </Tooltip>
-              ) : (
-                '无兼容调整'
-              )
-            }
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="平均总用时"
-            value={data.range_avg_latency_ms}
+            label="累计平均总用时"
+            value={data.avg_latency_ms}
             precision={0}
             suffix="ms"
             icon={<ClockCircleOutlined />}
@@ -75,8 +66,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
       <Row gutter={[16, 16]} className="section-row">
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="缓存命中率"
-            value={data.range_cache_hit_rate}
+            label="累计缓存命中率"
+            value={cacheHitRate}
             precision={1}
             suffix="%"
             icon={<DollarOutlined />}
@@ -85,8 +76,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="缓存读取"
-            value={data.range_cache_read}
+            label="累计缓存读取"
+            value={data.cache_read_total}
             compact
             icon={<DatabaseOutlined />}
             tone="green"
@@ -94,8 +85,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="缓存写入"
-            value={data.range_cache_write}
+            label="累计缓存写入"
+            value={data.cache_write_total}
             compact
             icon={<DatabaseOutlined />}
             tone="cyan"
@@ -103,8 +94,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="费用"
-            value={data.range_cost_micros / 1_000_000}
+            label="累计费用"
+            value={data.cost_total_micros / 1_000_000}
             precision={4}
             suffix="USD"
             icon={<DatabaseOutlined />}

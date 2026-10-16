@@ -2927,6 +2927,92 @@ async fn advanced_route_strategy_round_trips_through_storage() {
 }
 
 #[tokio::test]
+async fn updating_a_route_clears_its_session_affinity_pins() {
+    use crate::session_affinity::{
+        SessionAffinityScope, SessionAffinityStore, SessionAffinityTarget,
+    };
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let mut state = provider_key_test_state().await;
+    let store = Arc::new(SessionAffinityStore::new(Duration::from_secs(60), 8, false));
+    state.session_affinity = Some(store.clone());
+
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Primary', 'openai', 'https://primary.example/v1'),
+                (2, 'Backup', 'openai', 'https://backup.example/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled)
+         VALUES (1, 'model-a', 1), (2, 'model-b', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let target = |provider_id, upstream_model: &str, priority| RouteTargetInput {
+        id: None,
+        provider_id,
+        upstream_model: upstream_model.to_string(),
+        weight: 100,
+        priority,
+        enabled: true,
+    };
+    let (_, created) = create_route(
+        State(state.clone()),
+        Json(RouteInput {
+            name: "Sticky route".to_string(),
+            model_pattern: "sticky-model".to_string(),
+            strategy: RouteStrategy::Priority,
+            enabled: true,
+            context_override: None,
+            output_override: None,
+            all_targets_busy_wait_seconds: None,
+            retry_jitter_ms: None,
+            max_waiting_requests: None,
+            keepalive_during_wait: None,
+            targets: vec![target(1, "model-a", 0), target(2, "model-b", 1)],
+        }),
+    )
+    .await
+    .unwrap();
+
+    let scope = SessionAffinityScope::new(None, created.0.id, "sticky-session");
+    let pinned = SessionAffinityTarget {
+        provider_id: 2,
+        upstream_model: "model-b".to_string(),
+    };
+    store.bind(&state.pool, &scope, pinned.clone()).await;
+    assert_eq!(store.peek(&state.pool, &scope).await, Some(pinned));
+
+    let _ = update_route(
+        State(state.clone()),
+        Path(created.0.id),
+        Json(RouteUpdate {
+            name: None,
+            model_pattern: None,
+            strategy: None,
+            enabled: None,
+            context_override: None,
+            output_override: None,
+            all_targets_busy_wait_seconds: None,
+            retry_jitter_ms: None,
+            max_waiting_requests: None,
+            keepalive_during_wait: None,
+            targets: Some(vec![target(2, "model-b", 0), target(1, "model-a", 1)]),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(store.peek(&state.pool, &scope).await, None);
+}
+
+#[tokio::test]
 async fn route_busy_wait_settings_round_trip_and_validate() {
     let state = provider_key_test_state().await;
     sqlx::query(

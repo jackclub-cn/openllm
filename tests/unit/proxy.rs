@@ -8291,6 +8291,42 @@ fn repairs_orphaned_chat_tool_messages() {
 }
 
 #[test]
+fn repairs_chat_tool_messages_that_do_not_follow_their_calls() {
+    let mut body = json!({
+        "messages": [
+            {"role": "tool", "tool_call_id": "call_early", "content": "too early"},
+            {"role": "user", "content": "continue"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_cross_turn",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"}
+                }]
+            },
+            {"role": "user", "content": "skip the result"},
+            {"role": "tool", "tool_call_id": "call_cross_turn", "content": "late"},
+            {"role": "assistant", "content": "done"}
+        ]
+    });
+
+    assert_eq!(sanitize_chat_tool_history(&mut body), 4);
+    let messages = body["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[1]["content"], "skip the result");
+    assert_eq!(messages[2]["role"], "assistant");
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.get("tool_calls").is_none()
+                && message.get("role").and_then(Value::as_str) != Some("tool")),
+        "unordered tool history must be removed: {body}"
+    );
+}
+
+#[test]
 fn normalizes_command_code_output_caps_and_reasoning_effort() {
     let mut responses = json!({
         "input": "hi",

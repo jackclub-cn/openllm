@@ -240,11 +240,14 @@ export default function DashboardDetails({ data }: DashboardDetailsProps) {
                 )}
               </div>
             </div>
-            <Progress
-              percent={Math.round(data.range_success_rate)}
-              status="active"
-              strokeColor="#52c41a"
-            />
+            <div>
+              <Typography.Text type="secondary">累计成功率</Typography.Text>
+              <Progress
+                percent={Math.round(data.success_rate)}
+                status="active"
+                strokeColor="#52c41a"
+              />
+            </div>
           </Space>
         </Card>
       </Col>

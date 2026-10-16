@@ -207,6 +207,9 @@ pub async fn update_route(
     }
     tx.commit().await?;
     crate::proxy::clear_target_sinks_for_route(&state, id).await;
+    if let Some(store) = state.session_affinity.as_ref() {
+        store.clear_route(&state.pool, id).await;
+    }
 
     record_audit(
         &state,
@@ -345,6 +348,9 @@ pub async fn delete_route(
         .await?;
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("route not found".to_string()));
+    }
+    if let Some(store) = state.session_affinity.as_ref() {
+        store.clear_route(&state.pool, id).await;
     }
     record_audit(
         &state,

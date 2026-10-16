@@ -296,6 +296,31 @@ impl SessionAffinityStore {
         }
     }
 
+    /// Drop every session preference for a route after its configuration
+    /// changes. The next request will bind a fresh target using the new route
+    /// order instead of honoring a potentially stale prompt-cache pin.
+    pub(crate) async fn clear_route(&self, pool: &SqlitePool, route_id: i64) -> usize {
+        let removed = {
+            let mut entries = self.entries.lock().await;
+            let before = entries.len();
+            entries.retain(|scope, _| scope.route_id != route_id);
+            before.saturating_sub(entries.len())
+        };
+        if removed > 0 {
+            self.evictions.fetch_add(removed as u64, Ordering::Relaxed);
+        }
+
+        if let Err(error) = sqlx::query("DELETE FROM session_affinity WHERE route_id = ?")
+            .bind(route_id)
+            .execute(pool)
+            .await
+        {
+            self.record_persistence_error(error);
+        }
+
+        removed
+    }
+
     fn insert_locked(
         &self,
         entries: &mut HashMap<SessionAffinityScope, SessionAffinityEntry>,
