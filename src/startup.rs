@@ -885,6 +885,29 @@ pub(crate) async fn open_operator_pool(path: &Path) -> anyhow::Result<SqlitePool
     Ok(pool)
 }
 
+/// Open an existing database in strict read-only mode for diagnostics.
+///
+/// Unlike [`open_operator_pool`], this never changes the journal mode or
+/// creates sidecar files, so `--self-check` is safe to run while the gateway is
+/// serving and on read-only mounts.
+pub(crate) async fn open_operator_read_pool(path: &Path) -> anyhow::Result<SqlitePool> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    let url = format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"));
+    let options = SqliteConnectOptions::from_str(&url)?
+        .read_only(true)
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(10));
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .with_context(|| format!("failed to open {} read-only", path.display()))?;
+    Ok(pool)
+}
+
 /// Resolve an operator-supplied backup name.
 ///
 /// A plain name is looked up in the backups directory. Anything containing a

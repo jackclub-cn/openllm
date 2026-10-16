@@ -106,7 +106,7 @@ pub async fn self_check(config: &Config, json: bool) -> anyhow::Result<i32> {
             database_path.display()
         );
     }
-    let pool = crate::startup::open_operator_pool(&database_path).await?;
+    let pool = crate::startup::open_operator_read_pool(&database_path).await?;
     let state = crate::state::AppState::new(pool.clone(), None);
     let report = crate::api::diagnostics::run_self_check(&state).await;
     pool.close().await;
