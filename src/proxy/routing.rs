@@ -1197,6 +1197,7 @@ pub(super) async fn mark_provider_error(
     retry_after: Option<Duration>,
     configured_cooldown_seconds: Option<i64>,
 ) {
+    let now = Instant::now();
     // A probe that just failed is no longer in flight; the cooldown below
     // decides when the next recovery probe may be admitted. Whether one was in
     // flight also tells the trip counter that a HALF_OPEN probe re-opened the
@@ -1207,15 +1208,40 @@ pub(super) async fn mark_provider_error(
         .await
         .remove(&provider_id)
         .is_some();
-    let failures = {
+    let threshold = provider_open_threshold();
+    let (failures, opened, cooldown) = {
+        // Keep the streak and deadline under one lock so a burst of requests
+        // that failed just before the circuit opened cannot keep extending the
+        // same outage. A half-open probe is the one exception: its failure must
+        // re-open the circuit with the next escalated cooldown.
+        let mut cooldowns = state.provider_cooldown.lock().await;
         let mut streaks = state.provider_failure_streak.lock().await;
+        let current = streaks.get(&provider_id).copied().unwrap_or(0);
+        if threshold > 0
+            && !probe_was_in_flight
+            && current >= threshold
+            && cooldowns
+                .get(&provider_id)
+                .is_some_and(|until| *until > now)
+        {
+            tracing::debug!(
+                provider_id,
+                failure_streak = current,
+                "ignoring a follower failure while the provider circuit is open"
+            );
+            return;
+        }
+
         let failures = streaks.entry(provider_id).or_default();
         *failures = failures.saturating_add(1);
-        *failures
+        let opened = threshold > 0
+            && *failures >= threshold
+            && (*failures - 1 < threshold || probe_was_in_flight);
+        let cooldown =
+            provider_cooldown(status, *failures, retry_after, configured_cooldown_seconds);
+        cooldowns.insert(provider_id, now + cooldown);
+        (*failures, opened, cooldown)
     };
-    let threshold = provider_open_threshold();
-    let opened =
-        threshold > 0 && failures >= threshold && (failures - 1 < threshold || probe_was_in_flight);
     if opened {
         *state
             .provider_circuit_trips
@@ -1229,11 +1255,6 @@ pub(super) async fn mark_provider_error(
             "provider circuit opened after repeated failures; short-circuiting until it recovers"
         );
     }
-    let cooldown = provider_cooldown(status, failures, retry_after, configured_cooldown_seconds);
-    state.provider_cooldown.lock().await.insert(
-        provider_id,
-        Instant::now() + cooldown,
-    );
     // Mirror the trip so a restart still knows this provider is unhealthy.
     state.mark_provider_resilience_dirty(provider_id);
     if opened {

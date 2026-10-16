@@ -10611,8 +10611,43 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
     assert_eq!(opened.failure_streak, 3);
     assert!(opened.cooldown_seconds > 0);
 
-    // A further failure on the already-open circuit is not a new trip.
+    // A further failure from a request that was already in flight when the
+    // circuit opened must not extend the streak or move the cooldown deadline.
+    let opened_streak = state
+        .provider_failure_streak
+        .lock()
+        .await
+        .get(&1)
+        .copied()
+        .unwrap();
+    let opened_until = state
+        .provider_cooldown
+        .lock()
+        .await
+        .get(&1)
+        .copied()
+        .unwrap();
     mark_provider_error(&state, 1, Some(failure), None, None).await;
+    assert_eq!(
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .get(&1)
+            .copied(),
+        Some(opened_streak),
+        "concurrent follower failures must not inflate the streak"
+    );
+    assert_eq!(
+        state
+            .provider_cooldown
+            .lock()
+            .await
+            .get(&1)
+            .copied(),
+        Some(opened_until),
+        "concurrent follower failures must not extend the cooldown"
+    );
     assert_eq!(
         state
             .provider_circuit_trips
@@ -10656,6 +10691,41 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         "open"
     );
     assert!(circuit_events.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn a_failed_half_open_probe_still_escalates_the_open_circuit() {
+    let state = circuit_state().await;
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(1));
+    state.provider_probe.lock().await.insert(1, Instant::now());
+
+    mark_provider_error(&state, 1, Some(StatusCode::SERVICE_UNAVAILABLE), None, None).await;
+
+    assert_eq!(
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .get(&1)
+            .copied(),
+        Some(4),
+        "a failed half-open probe must advance the streak"
+    );
+    assert!(
+        state
+            .provider_cooldown
+            .lock()
+            .await
+            .get(&1)
+            .is_some_and(|until| *until > Instant::now() + Duration::from_secs(60)),
+        "a failed half-open probe must install an escalated cooldown"
+    );
+    assert!(!state.provider_probe.lock().await.contains_key(&1));
 }
 
 /// A file-backed state so a second `AppState` can read what the first wrote.
