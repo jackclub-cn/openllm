@@ -237,6 +237,67 @@ pub async fn import_config(
     })
 }
 
+/// `--snapshot`: write the same diagnostic support bundle as the HTTP endpoint.
+pub async fn diagnostic_snapshot(
+    config: &Config,
+    output: &std::path::Path,
+    include_secrets: bool,
+    json: bool,
+) -> anyhow::Result<i32> {
+    let database_path = crate::startup::database_path(config);
+    if !database_path.exists() {
+        anyhow::bail!("{} does not exist yet", database_path.display());
+    }
+    // Secret-bearing snapshots record an audit row, so they need the normal
+    // operator pool. Redacted snapshots stay strictly read-only.
+    let pool = if include_secrets {
+        crate::startup::open_operator_pool(&database_path).await?
+    } else {
+        crate::startup::open_operator_read_pool(&database_path).await?
+    };
+    let state = crate::state::AppState::new(pool.clone(), None);
+    let axum::Json(snapshot) = crate::api::diagnostics::diagnostic_snapshot(
+        axum::extract::State(state),
+        axum::extract::Query(crate::api::diagnostics::SnapshotQuery { include_secrets }),
+    )
+    .await?;
+    pool.close().await;
+    let rendered = serde_json::to_string_pretty(&snapshot)?;
+
+    if output == std::path::Path::new("-") {
+        println!("{rendered}");
+    } else {
+        std::fs::write(output, format!("{rendered}\n"))
+            .with_context(|| format!("failed to write {}", output.display()))?;
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "output": output.to_string_lossy().replace('\\', "/"),
+                    "include_secrets": include_secrets,
+                    "overall": snapshot.self_check.overall,
+                    "failed_checks": snapshot.self_check.counts.fail,
+                    "warnings": snapshot.self_check.counts.warn,
+                }))?
+            );
+        } else {
+            println!(
+                "已导出诊断快照: {}（自检 {} / fail {} / warn {}{}）",
+                output.display(),
+                snapshot.self_check.overall,
+                snapshot.self_check.counts.fail,
+                snapshot.self_check.counts.warn,
+                if include_secrets {
+                    "，含明文凭据"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+    Ok(0)
+}
+
 /// `--backup`: write an on-demand backup. Safe to run while the gateway serves.
 pub async fn create_backup(config: &Config, json: bool) -> anyhow::Result<i32> {
     let database_path = crate::startup::database_path(config);
@@ -397,5 +458,23 @@ mod tests {
             0,
             "validating the same document against its source database must pass"
         );
+    }
+
+    #[tokio::test]
+    async fn diagnostic_snapshot_works_offline() {
+        let (_directory, config) = database_config().await;
+        let output = config.data_dir.join("openllm-snapshot.json");
+
+        assert_eq!(
+            diagnostic_snapshot(&config, &output, false, true)
+                .await
+                .unwrap(),
+            0
+        );
+        let document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&output).unwrap()).unwrap();
+        assert!(document.get("self_check").is_some());
+        assert!(document.get("resilience").is_some());
+        assert_eq!(document["secrets_included"], false);
     }
 }

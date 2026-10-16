@@ -159,6 +159,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 离线自检 | `openllm --data-dir ./data --self-check [--json]` |
 | 离线导出配置 | `openllm --data-dir ./data --export-config openllm-config.json` |
 | 离线导入配置 | `openllm --data-dir ./data --import-config openllm-config.json [--apply]` |
+| 离线诊断快照 | `openllm --data-dir ./data --snapshot openllm-snapshot.json` |
 | 在线备份 | `openllm --data-dir ./data --backup` |
 | 列出备份 | `openllm --data-dir ./data --list-backups` |
 | 恢复 | `openllm --data-dir ./data --restore-backup <文件名>`，必须在停服后执行 |

@@ -51,6 +51,10 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     import_config: Option<PathBuf>,
 
+    /// Export the diagnostic snapshot, then exit. Use `-` for stdout.
+    #[arg(long, value_name = "FILE")]
+    snapshot: Option<PathBuf>,
+
     /// Include plaintext upstream credentials and webhook secrets in an export.
     #[arg(long)]
     include_secrets: bool,
@@ -99,6 +103,11 @@ async fn main() -> anyhow::Result<()> {
     }
     if let Some(path) = args.import_config.as_deref() {
         return finish(openllm::cli::import_config(&config, path, args.apply, args.json).await);
+    }
+    if let Some(path) = args.snapshot.as_deref() {
+        return finish(
+            openllm::cli::diagnostic_snapshot(&config, path, args.include_secrets, args.json).await,
+        );
     }
     if let Some(backup) = args.restore_backup.as_deref() {
         return finish(openllm::cli::restore_backup(&config, backup, args.json).await);
