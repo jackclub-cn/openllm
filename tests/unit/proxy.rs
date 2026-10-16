@@ -1797,6 +1797,8 @@ async fn disabled_provider_model_is_skipped_by_explicit_routes() {
                 model_pattern TEXT NOT NULL,
                 name TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                context_override INTEGER,
+                output_override INTEGER,
                 created_at TEXT NOT NULL DEFAULT ''
             )",
     )
@@ -6243,6 +6245,55 @@ fn effective_input_limit_prefers_the_stricter_value() {
         ..Default::default()
     };
     assert_eq!(effective_input_limit(&capabilities), Some(100));
+}
+
+#[tokio::test]
+async fn route_capability_overrides_cap_the_runtime_barrel() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Primary', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (
+            provider_id, model_name, enabled, context_limit, input_limit, output_limit
+         ) VALUES (1, 'model', 1, 100000, 80000, 20000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+            id, name, model_pattern, strategy, enabled, context_override, output_override
+         ) VALUES (1, 'capped', 'capped-model', 'priority', 1, 64000, 8000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model)
+         VALUES (1, 1, 'model')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+
+    let resolved = resolve_route(&state, "capped-model", "/v1/chat/completions")
+        .await
+        .unwrap();
+    let capabilities = resolved.barrel.unwrap().capabilities.unwrap();
+    assert_eq!(capabilities.context_limit, Some(64_000));
+    assert_eq!(capabilities.input_limit, Some(64_000));
+    assert_eq!(capabilities.output_limit, Some(8_000));
 }
 
 #[test]

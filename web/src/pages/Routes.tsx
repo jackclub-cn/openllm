@@ -63,6 +63,8 @@ export default function RoutesPage() {
             model_pattern: item.model_pattern,
             strategy: item.strategy,
             enabled: item.enabled,
+            context_override: item.context_override ?? null,
+            output_override: item.output_override ?? null,
             targets: item.targets.map((target) => ({ ...target })),
           }
         : ({
@@ -70,6 +72,8 @@ export default function RoutesPage() {
             model_pattern: '',
             strategy: 'priority',
             enabled: true,
+            context_override: null,
+            output_override: null,
             targets: [
               {
                 provider_id: providers[0]?.id,

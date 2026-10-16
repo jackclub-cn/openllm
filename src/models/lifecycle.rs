@@ -111,6 +111,10 @@ pub struct ConfigRoute {
     pub strategy: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_override: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_override: Option<i64>,
     #[serde(default)]
     pub targets: Vec<ConfigRouteTarget>,
 }

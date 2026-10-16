@@ -2553,6 +2553,8 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             model_pattern: "cost-model".to_string(),
             strategy: RouteStrategy::CostOptimized,
             enabled: true,
+            context_override: None,
+            output_override: None,
             targets: vec![RouteTargetInput {
                 id: None,
                 provider_id: 1,
@@ -2583,6 +2585,8 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             model_pattern: None,
             strategy: Some(RouteStrategy::LatencyOptimized),
             enabled: None,
+            context_override: None,
+            output_override: None,
             targets: None,
         }),
     )
@@ -2597,6 +2601,78 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             .unwrap();
     assert_eq!(stored, "priority");
     assert_eq!(extension, "latency_optimized");
+}
+
+#[tokio::test]
+async fn route_capability_overrides_must_stay_within_the_target_barrel() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Primary', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (
+            provider_id, model_name, enabled, context_limit, input_limit, output_limit
+         ) VALUES (1, 'model', 1, 100000, 80000, 20000)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    let input = |context_override: Option<i64>, output_override: Option<i64>| RouteInput {
+        name: format!(
+            "route-{}-{}",
+            context_override.unwrap_or(0),
+            output_override.unwrap_or(0)
+        ),
+        model_pattern: format!(
+            "model-{}-{}",
+            context_override.unwrap_or(0),
+            output_override.unwrap_or(0)
+        ),
+        strategy: RouteStrategy::Priority,
+        enabled: true,
+        context_override,
+        output_override,
+        targets: vec![RouteTargetInput {
+            id: None,
+            provider_id: 1,
+            upstream_model: "model".to_string(),
+            weight: 100,
+            priority: 0,
+            enabled: true,
+        }],
+    };
+
+    let (_, created) = create_route(
+        State(state.clone()),
+        Json(input(Some(64_000), Some(8_000))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.0.context_limit_base, Some(100_000));
+    assert_eq!(created.0.output_limit_base, Some(20_000));
+    assert_eq!(created.0.context_limit, Some(64_000));
+    assert_eq!(created.0.input_limit, Some(64_000));
+    assert_eq!(created.0.output_limit, Some(8_000));
+
+    let too_large = create_route(
+        State(state.clone()),
+        Json(input(Some(120_000), Some(25_000))),
+    )
+    .await;
+    assert!(
+        matches!(too_large, Err(AppError::BadRequest(_))),
+        "an override that widens the target barrel must be rejected"
+    );
 }
 
 #[tokio::test]

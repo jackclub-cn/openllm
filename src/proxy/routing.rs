@@ -60,7 +60,12 @@ pub(super) async fn resolve_route(
             .iter()
             .map(|target| (target.provider_id, target.upstream_model.clone()))
             .collect::<Vec<_>>();
-        let barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
+        let mut barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
+        crate::registry::apply_route_capability_overrides(
+            &mut barrel,
+            route.context_override,
+            route.output_override,
+        );
         return Ok(ResolvedRoute {
             route_id: Some(route.id),
             strategy: route.strategy,
@@ -116,7 +121,7 @@ pub async fn diagnose_route_for_key(
         r#"
         SELECT id, name, model_pattern,
                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy,
-               enabled, created_at, updated_at
+               enabled, context_override, output_override, created_at, updated_at
         FROM routes
         ORDER BY
             CASE WHEN instr(model_pattern, '*') = 0 AND instr(model_pattern, '?') = 0 THEN 0 ELSE 1 END,
@@ -220,7 +225,12 @@ pub(super) async fn diagnose_explicit_route(
         .filter(|(_, (_, eligible))| *eligible)
         .map(|(row, _)| (row.provider_id, row.upstream_model.clone()))
         .collect::<Vec<_>>();
-    let barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
+    let mut barrel = crate::registry::barrel_for_targets(&state.pool, &eligible_pairs).await?;
+    crate::registry::apply_route_capability_overrides(
+        &mut barrel,
+        route.context_override,
+        route.output_override,
+    );
     let resolved = route_enabled && !eligible_pairs.is_empty();
     let runtime_targets = if resolved {
         diagnostic_runtime_targets(
@@ -785,7 +795,7 @@ pub(super) async fn find_explicit_route(state: &AppState, model: &str) -> AppRes
         r#"
         SELECT id, name, model_pattern,
                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy,
-               enabled, created_at, updated_at
+               enabled, context_override, output_override, created_at, updated_at
         FROM routes
         WHERE enabled = 1
         ORDER BY

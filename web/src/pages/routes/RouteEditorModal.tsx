@@ -94,6 +94,40 @@ export default function RouteEditorModal({
           <Form.Item name="enabled" label="启用" valuePropName="checked">
             <Switch />
           </Form.Item>
+          <Form.Item
+            name="context_override"
+            label="上下文长度上限"
+            extra={
+              editing?.context_limit_base != null
+                ? `原能力桶 ${editing.context_limit_base.toLocaleString()}，只能设置得更小。`
+                : '留空表示沿用目标公共能力桶。'
+            }
+          >
+            <InputNumber
+              min={1}
+              precision={0}
+              max={editing?.context_limit_base ?? undefined}
+              placeholder="沿用原能力桶"
+              style={{ width: '100%' }}
+            />
+          </Form.Item>
+          <Form.Item
+            name="output_override"
+            label="最大输出上限"
+            extra={
+              editing?.output_limit_base != null
+                ? `原能力桶 ${editing.output_limit_base.toLocaleString()}，只能设置得更小。`
+                : '留空表示沿用目标公共能力桶。'
+            }
+          >
+            <InputNumber
+              min={1}
+              precision={0}
+              max={editing?.output_limit_base ?? undefined}
+              placeholder="沿用原能力桶"
+              style={{ width: '100%' }}
+            />
+          </Form.Item>
         </div>
         <Typography.Title level={5}>上游目标</Typography.Title>
         <Form.List name="targets">

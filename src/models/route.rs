@@ -73,6 +73,10 @@ pub struct Route {
     pub model_pattern: String,
     pub strategy: String,
     pub enabled: i64,
+    #[sqlx(default)]
+    pub context_override: Option<i64>,
+    #[sqlx(default)]
+    pub output_override: Option<i64>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -160,6 +164,10 @@ pub struct RouteView {
     pub context_limit: Option<i64>,
     pub input_limit: Option<i64>,
     pub output_limit: Option<i64>,
+    pub context_limit_base: Option<i64>,
+    pub output_limit_base: Option<i64>,
+    pub context_override: Option<i64>,
+    pub output_override: Option<i64>,
     pub limits_verified: bool,
     pub targets: Vec<RouteTargetView>,
     pub created_at: String,
@@ -194,6 +202,10 @@ pub struct RouteInput {
     pub strategy: RouteStrategy,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub context_override: Option<i64>,
+    #[serde(default)]
+    pub output_override: Option<i64>,
     pub targets: Vec<RouteTargetInput>,
 }
 
@@ -203,7 +215,20 @@ pub struct RouteUpdate {
     pub model_pattern: Option<String>,
     pub strategy: Option<RouteStrategy>,
     pub enabled: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub context_override: Option<Option<i64>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub output_override: Option<Option<i64>>,
     pub targets: Option<Vec<RouteTargetInput>>,
+}
+
+/// Distinguishes an absent route update field from an explicit JSON `null`.
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(deserializer)?))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

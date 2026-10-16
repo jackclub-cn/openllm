@@ -5,6 +5,8 @@ export type RouteFormValues = {
   model_pattern: string
   strategy: GatewayRoute['strategy']
   enabled: boolean
+  context_override?: number | null
+  output_override?: number | null
   targets: RouteTarget[]
 }
 

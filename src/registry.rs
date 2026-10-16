@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use serde_json::Value;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::models::ModelCapabilities;
 
 /// A model exposed by a provider, addressed as `prefix + upstream model`.
@@ -226,6 +226,80 @@ pub struct BarrelEnvelope {
     pub target_count: usize,
 }
 
+/// Reject a route override that would widen the targets' common envelope.
+pub fn validate_route_capability_overrides(
+    barrel: &BarrelEnvelope,
+    context_override: Option<i64>,
+    output_override: Option<i64>,
+) -> AppResult<()> {
+    let capabilities = barrel.capabilities.as_ref();
+    if let Some(limit) = context_override {
+        if limit <= 0 {
+            return Err(AppError::BadRequest(
+                "route context override must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(base) = capabilities.and_then(|caps| {
+            caps.total_context_tokens.or(caps.context_limit)
+        }) && limit > base
+        {
+            return Err(AppError::BadRequest(format!(
+                "route context override {limit} cannot exceed the target capability bucket {base}"
+            )));
+        }
+    }
+    if let Some(limit) = output_override {
+        if limit <= 0 {
+            return Err(AppError::BadRequest(
+                "route output override must be greater than zero".to_string(),
+            ));
+        }
+        if let Some(base) = capabilities.and_then(|caps| caps.output_limit)
+            && limit > base
+        {
+            return Err(AppError::BadRequest(format!(
+                "route output override {limit} cannot exceed the target capability bucket {base}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Apply validated route-level caps to a barrel.
+pub fn apply_route_capability_overrides(
+    barrel: &mut BarrelEnvelope,
+    context_override: Option<i64>,
+    output_override: Option<i64>,
+) {
+    let capabilities = barrel
+        .capabilities
+        .get_or_insert_with(ModelCapabilities::default);
+    if let Some(limit) = context_override {
+        let effective_input = capabilities
+            .input_limit
+            .or(capabilities.context_limit)
+            .map(|value| value.min(limit))
+            .unwrap_or(limit);
+        let total_context = capabilities
+            .total_context_tokens
+            .or(capabilities.context_limit)
+            .map(|value| value.min(limit))
+            .unwrap_or(limit);
+        capabilities.context_limit = Some(effective_input);
+        capabilities.input_limit = Some(effective_input);
+        capabilities.total_context_tokens =
+            (total_context != effective_input).then_some(total_context);
+    }
+    if let Some(limit) = output_override {
+        capabilities.output_limit = Some(
+            capabilities
+                .output_limit
+                .map(|value| value.min(limit))
+                .unwrap_or(limit),
+        );
+    }
+}
+
 pub async fn barrel_for_targets(
     pool: &SqlitePool,
     targets: &[(i64, String)],
@@ -276,8 +350,9 @@ pub async fn barrel_for_targets(
 }
 
 pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
-    let routes = sqlx::query_as::<_, (i64, String, String, String)>(
-        "SELECT id, model_pattern, name, created_at FROM routes WHERE enabled = 1 \
+    let routes = sqlx::query_as::<_, (i64, String, String, String, Option<i64>, Option<i64>)>(
+        "SELECT id, model_pattern, name, created_at, context_override, output_override \
+         FROM routes WHERE enabled = 1 \
          ORDER BY model_pattern COLLATE NOCASE",
     )
     .fetch_all(pool)
@@ -319,7 +394,9 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
     }
 
     let mut models = Vec::with_capacity(routes.len());
-    for (route_id, pattern, route_name, route_created_at) in routes {
+    for (route_id, pattern, route_name, route_created_at, context_override, output_override) in
+        routes
+    {
         let targets = targets_by_route.remove(&route_id).unwrap_or_default();
         let target_count = targets.len();
         if target_count == 0 {
@@ -339,14 +416,20 @@ pub async fn route_models(pool: &SqlitePool) -> AppResult<Vec<RouteModel>> {
         // intersection is only a lower bound in that case.
         let incomplete = capabilities.iter().any(Option::is_none);
         let known = capabilities.iter().flatten().collect::<Vec<_>>();
+        let mut barrel = BarrelEnvelope {
+            capabilities: ModelCapabilities::intersect(known),
+            incomplete,
+            target_count,
+        };
+        apply_route_capability_overrides(&mut barrel, context_override, output_override);
         models.push(RouteModel {
             id: pattern,
             display_name: Some(route_name),
             created_at: Some(route_created_at),
             target_count,
-            capabilities: ModelCapabilities::intersect(known),
+            capabilities: barrel.capabilities,
             supported_endpoints,
-            incomplete,
+            incomplete: barrel.incomplete,
         });
     }
     Ok(models)

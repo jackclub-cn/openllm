@@ -331,6 +331,10 @@ export type GatewayRoute = {
   context_limit?: number | null
   input_limit?: number | null
   output_limit?: number | null
+  context_limit_base?: number | null
+  output_limit_base?: number | null
+  context_override?: number | null
+  output_override?: number | null
   limits_verified: boolean
   targets: RouteTarget[]
   created_at: string

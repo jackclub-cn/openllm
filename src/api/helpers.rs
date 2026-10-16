@@ -21,7 +21,7 @@ pub(super) async fn get_route(state: &AppState, id: i64) -> AppResult<RouteView>
     let route = sqlx::query_as::<_, Route>(
         "SELECT id, name, model_pattern, \
                 CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy, \
-                enabled, created_at, updated_at \
+                enabled, context_override, output_override, created_at, updated_at \
          FROM routes WHERE id = ?",
     )
     .bind(id)
@@ -102,7 +102,25 @@ pub(super) fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> Route
             capabilities
         })
         .collect::<Vec<_>>();
-    let barrel = ModelCapabilities::intersect(capabilities.iter()).unwrap_or_default();
+    let mut barrel = crate::registry::BarrelEnvelope {
+        capabilities: ModelCapabilities::intersect(capabilities.iter()),
+        incomplete,
+        target_count: enabled_targets.len(),
+    };
+    let context_limit_base = barrel
+        .capabilities
+        .as_ref()
+        .and_then(|caps| caps.total_context_tokens.or(caps.context_limit));
+    let output_limit_base = barrel
+        .capabilities
+        .as_ref()
+        .and_then(|caps| caps.output_limit);
+    crate::registry::apply_route_capability_overrides(
+        &mut barrel,
+        route.context_override,
+        route.output_override,
+    );
+    let capabilities = barrel.capabilities.unwrap_or_default();
 
     RouteView {
         id: route.id,
@@ -110,10 +128,16 @@ pub(super) fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> Route
         model_pattern: route.model_pattern,
         strategy: route.strategy,
         enabled: route.enabled != 0,
-        context_limit: barrel.total_context_tokens.or(barrel.context_limit),
-        input_limit: barrel.input_limit,
-        output_limit: barrel.output_limit,
-        limits_verified: !incomplete,
+        context_limit: capabilities
+            .total_context_tokens
+            .or(capabilities.context_limit),
+        input_limit: capabilities.input_limit,
+        output_limit: capabilities.output_limit,
+        context_limit_base,
+        output_limit_base,
+        context_override: route.context_override,
+        output_override: route.output_override,
+        limits_verified: !barrel.incomplete,
         targets: targets
             .into_iter()
             .map(|target| RouteTargetView {

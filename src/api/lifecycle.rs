@@ -191,21 +191,34 @@ pub(crate) async fn build_config_document(
             });
     }
 
-    let routes = sqlx::query_as::<_, (i64, String, String, String, i64)>(
+    let routes = sqlx::query_as::<_, (i64, String, String, String, i64, Option<i64>, Option<i64>)>(
         "SELECT id, name, model_pattern, \
-                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END, enabled \
+                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END, enabled, \
+                context_override, output_override \
          FROM routes ORDER BY id",
     )
     .fetch_all(&state.pool)
     .await?
     .into_iter()
-    .map(|(id, name, model_pattern, strategy, enabled)| ConfigRoute {
-        name,
-        model_pattern,
-        strategy,
-        enabled: enabled != 0,
-        targets: route_targets.remove(&id).unwrap_or_default(),
-    })
+    .map(
+        |(
+            id,
+            name,
+            model_pattern,
+            strategy,
+            enabled,
+            context_override,
+            output_override,
+        )| ConfigRoute {
+            name,
+            model_pattern,
+            strategy,
+            enabled: enabled != 0,
+            context_override,
+            output_override,
+            targets: route_targets.remove(&id).unwrap_or_default(),
+        },
+    )
     .collect();
 
     let mut pool_allocations = HashMap::<i64, Vec<ConfigPoolAllocation>>::new();
@@ -541,7 +554,7 @@ struct ImportRun<'a> {
     blocked: bool,
     providers: HashMap<String, i64>,
     api_keys: HashMap<String, Vec<i64>>,
-    routes: Vec<(i64, String, String)>,
+    routes: Vec<(i64, String, String, Option<i64>, Option<i64>)>,
     pools: Vec<(i64, i64, String)>,
     webhooks: Vec<(i64, String, String)>,
 }
@@ -579,8 +592,9 @@ impl<'a> ImportRun<'a> {
         {
             self.api_keys.entry(name).or_default().push(id);
         }
-        self.routes = sqlx::query_as::<_, (i64, String, String)>(
-            "SELECT id, name, model_pattern FROM routes ORDER BY id",
+        self.routes = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>)>(
+            "SELECT id, name, model_pattern, context_override, output_override \
+             FROM routes ORDER BY id",
         )
         .fetch_all(&self.state.pool)
         .await?;
@@ -1139,17 +1153,22 @@ impl<'a> ImportRun<'a> {
             let existing = self
                 .routes
                 .iter()
-                .find(|(_, existing_name, _)| existing_name == &name)
+                .find(|(_, existing_name, _, _, _)| existing_name == &name)
                 .or_else(|| {
                     self.routes
                         .iter()
-                        .find(|(_, _, pattern)| pattern == &doc.model_pattern)
+                        .find(|(_, _, pattern, _, _)| pattern == &doc.model_pattern)
                 })
-                .map(|(id, _, _)| *id);
+                .map(|(id, _, _, context_override, output_override)| {
+                    (*id, *context_override, *output_override)
+                });
             match existing {
-                Some(id) => {
+                Some((id, current_context_override, current_output_override)) => {
                     let current = self.route_targets(id).await.unwrap_or_default();
-                    if route_targets_match(&current, &desired) {
+                    if route_targets_match(&current, &desired)
+                        && current_context_override == doc.context_override
+                        && current_output_override == doc.output_override
+                    {
                         self.record(
                             "route",
                             &name,
@@ -1172,6 +1191,8 @@ impl<'a> ImportRun<'a> {
                         model_pattern: Some(doc.model_pattern.clone()),
                         strategy: Some(strategy),
                         enabled: Some(doc.enabled),
+                        context_override: Some(doc.context_override),
+                        output_override: Some(doc.output_override),
                         targets: Some(targets),
                     };
                     match super::update_route(State(self.state.clone()), Path(id), Json(update))
@@ -1206,11 +1227,19 @@ impl<'a> ImportRun<'a> {
                         model_pattern: doc.model_pattern.clone(),
                         strategy,
                         enabled: doc.enabled,
+                        context_override: doc.context_override,
+                        output_override: doc.output_override,
                         targets,
                     };
                     match super::create_route(State(self.state.clone()), Json(input)).await {
                         Ok((_, Json(view))) => {
-                            self.routes.push((view.id, name.clone(), doc.model_pattern.clone()));
+                            self.routes.push((
+                                view.id,
+                                name.clone(),
+                                doc.model_pattern.clone(),
+                                view.context_override,
+                                view.output_override,
+                            ));
                             self.record("route", &name, ACTION_CREATE, "已新建路由".to_string());
                         }
                         Err(error) => self.record(
