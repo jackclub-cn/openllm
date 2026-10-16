@@ -400,9 +400,9 @@ pub(super) fn normalize_api_key_routing_policy(
     if policy.is_empty() {
         return Ok(None);
     }
-    serde_json::to_string(&policy)
-        .map(Some)
-        .map_err(|error| AppError::Internal(anyhow::anyhow!("failed to store routing policy: {error}")))
+    serde_json::to_string(&policy).map(Some).map_err(|error| {
+        AppError::Internal(anyhow::anyhow!("failed to store routing policy: {error}"))
+    })
 }
 
 pub(super) fn normalize_expiration(value: Option<String>) -> AppResult<Option<String>> {

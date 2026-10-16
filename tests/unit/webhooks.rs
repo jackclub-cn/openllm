@@ -140,11 +140,8 @@ fn webhook_channel_kinds_and_body_fields_are_validated() {
         normalize_body_fields("telegram", Some(&serde_json::json!({"chat_id": "  "}))).is_err(),
         "a blank chat id is as unusable as a missing one"
     );
-    let stored = normalize_body_fields(
-        "telegram",
-        Some(&serde_json::json!({"chat_id": 42})),
-    )
-    .unwrap();
+    let stored =
+        normalize_body_fields("telegram", Some(&serde_json::json!({"chat_id": 42}))).unwrap();
     assert_eq!(stored, r#"{"chat_id":42}"#);
 }
 
@@ -162,13 +159,12 @@ fn webhook_channel_kinds_render_the_body_each_platform_expects() {
         "cooldown_seconds": 80
     });
 
-    let generic: serde_json::Value =
-        serde_json::from_str(&crate::webhooks::delivery_body(
-            &base,
-            "provider.circuit_open",
-            &data,
-        ))
-        .unwrap();
+    let generic: serde_json::Value = serde_json::from_str(&crate::webhooks::delivery_body(
+        &base,
+        "provider.circuit_open",
+        &data,
+    ))
+    .unwrap();
     assert_eq!(generic["event"], "provider.circuit_open");
     assert_eq!(generic["webhook_id"], 7);
     assert_eq!(generic["data"], data);
@@ -188,7 +184,10 @@ fn webhook_channel_kinds_render_the_body_each_platform_expects() {
     };
 
     let slack = rendered("slack", r##"{"channel":"#ops"}"##);
-    assert!(slack.get("event").is_none(), "chat channels get no envelope");
+    assert!(
+        slack.get("event").is_none(),
+        "chat channels get no envelope"
+    );
     assert_eq!(slack["channel"], "#ops");
     let text = slack["text"].as_str().unwrap();
     assert!(text.contains("provider circuit OPEN: DeepSeek"), "{text}");
@@ -512,7 +511,10 @@ async fn a_channel_created_through_the_api_delivers_a_chat_message() {
     );
     assert_eq!(payload["channel"], "#ops");
     let text = payload["text"].as_str().unwrap();
-    assert!(text.contains("[openllm] request completed: HTTP 200"), "{text}");
+    assert!(
+        text.contains("[openllm] request completed: HTTP 200"),
+        "{text}"
+    );
     assert!(text.contains("request_id: req-channel"), "{text}");
 }
 

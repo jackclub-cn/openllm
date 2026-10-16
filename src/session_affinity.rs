@@ -258,8 +258,7 @@ impl SessionAffinityStore {
         if !self.persist {
             return;
         }
-        let expires_at_unix_ms =
-            now_unix_millis().saturating_add(self.ttl.as_millis() as i64);
+        let expires_at_unix_ms = now_unix_millis().saturating_add(self.ttl.as_millis() as i64);
         let write = sqlx::query(
             "INSERT INTO session_affinity (
                  api_key_id, route_id, session_hash, provider_id, upstream_model,

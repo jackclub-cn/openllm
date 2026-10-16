@@ -14,6 +14,40 @@ pub(crate) fn strip_tool_search_tools(body: &Value) -> Option<Value> {
     Some(compat)
 }
 
+pub(crate) fn strip_strict_tools(body: &Value) -> Option<Value> {
+    let mut compat = body.clone();
+    let tools = compat.get_mut("tools")?.as_array_mut()?;
+    let mut changed = false;
+    for tool in tools {
+        let Some(tool) = tool.as_object_mut() else {
+            continue;
+        };
+        changed |= tool.remove("strict").is_some();
+        if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+            changed |= function.remove("strict").is_some();
+        }
+    }
+    changed.then_some(compat)
+}
+
+pub(crate) fn upstream_rejects_strict_tools(body: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    text.contains("strict")
+        && (text.contains("tool") || text.contains("function") || text.contains("schema"))
+        && [
+            "unsupported",
+            "not supported",
+            "unknown",
+            "invalid",
+            "not allowed",
+            "unexpected",
+            "extra field",
+            "additional property",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
 pub(crate) fn responses_tool_call_id(item: &Value) -> Option<&str> {
     item.get("call_id")
         .or_else(|| item.get("id"))
@@ -531,9 +565,34 @@ pub(crate) async fn apply_upstream_compat(
     state: &AppState,
     request_id: &str,
     target: &RouteTarget,
+    endpoint: &str,
     shape: UpstreamShape,
     body: &mut Value,
 ) {
+    let reasoning_profile = crate::capabilities::capability_support(
+        state,
+        target.provider_id,
+        &target.upstream_model,
+        endpoint,
+        crate::capabilities::CAPABILITY_REASONING_HISTORY,
+    )
+    .await;
+    let tool_search_profile = crate::capabilities::capability_support(
+        state,
+        target.provider_id,
+        &target.upstream_model,
+        endpoint,
+        crate::capabilities::CAPABILITY_TOOL_SEARCH,
+    )
+    .await;
+    let strict_tools_profile = crate::capabilities::capability_support(
+        state,
+        target.provider_id,
+        &target.upstream_model,
+        endpoint,
+        crate::capabilities::CAPABILITY_STRICT_TOOLS,
+    )
+    .await;
     let repaired_tool_items = match shape {
         UpstreamShape::Responses => sanitize_responses_tool_history(body),
         UpstreamShape::Chat => sanitize_chat_tool_history(body),
@@ -557,7 +616,9 @@ pub(crate) async fn apply_upstream_compat(
         .await;
     }
 
-    if shape == UpstreamShape::Responses && responses_replays_reasoning(target) {
+    if shape == UpstreamShape::Responses
+        && (reasoning_profile == Some(true) || responses_replays_reasoning(target))
+    {
         let reasoning_items = normalize_responses_reasoning_history(body);
         if reasoning_items > 0 {
             tracing::debug!(
@@ -570,7 +631,9 @@ pub(crate) async fn apply_upstream_compat(
         }
     }
 
-    if shape == UpstreamShape::Chat && chat_replays_reasoning(target) {
+    if shape == UpstreamShape::Chat
+        && (reasoning_profile == Some(true) || chat_replays_reasoning(target))
+    {
         let reasoning_messages = normalize_chat_reasoning_history(body);
         if reasoning_messages > 0 {
             tracing::debug!(
@@ -583,7 +646,9 @@ pub(crate) async fn apply_upstream_compat(
         }
     }
 
-    if shape == UpstreamShape::Anthropic && target_replays_reasoning(target) {
+    if shape == UpstreamShape::Anthropic
+        && (reasoning_profile == Some(true) || target_replays_reasoning(target))
+    {
         let thinking_messages = normalize_anthropic_thinking_history(body);
         if thinking_messages > 0 {
             tracing::debug!(
@@ -596,8 +661,14 @@ pub(crate) async fn apply_upstream_compat(
         }
     }
 
-    if target.tool_search_supported == 0
+    if (target.tool_search_supported == 0 || tool_search_profile == Some(false))
         && let Some(compat_body) = strip_tool_search_tools(body)
+    {
+        *body = compat_body;
+    }
+
+    if strict_tools_profile == Some(false)
+        && let Some(compat_body) = strip_strict_tools(body)
     {
         *body = compat_body;
     }
@@ -658,4 +729,15 @@ pub(crate) async fn mark_provider_tool_search_unsupported(state: &AppState, prov
     {
         tracing::warn!(%error, provider_id, "failed to persist tool_search compatibility");
     }
+    crate::capabilities::record_capability(
+        state,
+        provider_id,
+        "",
+        "",
+        crate::capabilities::CAPABILITY_TOOL_SEARCH,
+        false,
+        crate::capabilities::SOURCE_RUNTIME,
+        "exact",
+    )
+    .await;
 }

@@ -342,9 +342,7 @@ async fn check_circuit_persistence(state: &AppState) -> SelfCheckItem {
     let pending = state
         .resilience_dirty
         .lock()
-        .map(|dirty| {
-            dirty.providers.len() + dirty.targets.len() + dirty.provider_keys.len()
-        })
+        .map(|dirty| dirty.providers.len() + dirty.targets.len() + dirty.provider_keys.len())
         .unwrap_or(0);
     pass(
         ID,
@@ -569,7 +567,8 @@ async fn check_routes(state: &AppState) -> SelfCheckItem {
             );
         }
     };
-    let detail = format!("启用路由 {routes} 条 · 启用路由目标 {targets} 个 · 可路由模型 {models} 个");
+    let detail =
+        format!("启用路由 {routes} 条 · 启用路由目标 {targets} 个 · 可路由模型 {models} 个");
     // With no explicit route/target row the gateway still routes by model
     // straight to any enabled provider exposing it (verified against the real
     // binary), so the only genuinely fatal state is having nothing to route to.
@@ -597,11 +596,10 @@ async fn check_gateway_keys(state: &AppState) -> SelfCheckItem {
     const ID: &str = "gateway_keys";
     const CATEGORY: &str = "routing";
     const TITLE: &str = "网关访问密钥";
-    let row = sqlx::query_as::<_, (i64, i64)>(
-        "SELECT COUNT(*), COALESCE(SUM(enabled), 0) FROM api_keys",
-    )
-    .fetch_one(&state.pool)
-    .await;
+    let row =
+        sqlx::query_as::<_, (i64, i64)>("SELECT COUNT(*), COALESCE(SUM(enabled), 0) FROM api_keys")
+            .fetch_one(&state.pool)
+            .await;
     let (total, enabled) = match row {
         Ok(row) => row,
         Err(error) => {
@@ -643,12 +641,11 @@ async fn check_capacity(state: &AppState) -> SelfCheckItem {
     const CATEGORY: &str = "capacity";
     const TITLE: &str = "准入与内存保护";
     let limits = state.runtime_limits();
-    let in_flight = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let in_flight =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
     let memory_limit = state
         .memory_pressure
         .as_ref()
@@ -1152,11 +1149,13 @@ async fn load_secrets(
     }
     let provider_headers = headers
         .into_iter()
-        .map(|(provider_id, provider_name, headers)| ProviderHeaderSecret {
-            provider_id,
-            provider_name,
-            headers,
-        })
+        .map(
+            |(provider_id, provider_name, headers)| ProviderHeaderSecret {
+                provider_id,
+                provider_name,
+                headers,
+            },
+        )
         .collect();
     Ok((
         SnapshotSecrets {
@@ -1208,9 +1207,16 @@ pub(crate) fn redact_headers(headers: &Value) -> Value {
 
 fn is_secret_header(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["authorization", "api-key", "apikey", "token", "secret", "cookie"]
-        .iter()
-        .any(|needle| name.contains(needle))
+    [
+        "authorization",
+        "api-key",
+        "apikey",
+        "token",
+        "secret",
+        "cookie",
+    ]
+    .iter()
+    .any(|needle| name.contains(needle))
 }
 
 #[cfg(test)]

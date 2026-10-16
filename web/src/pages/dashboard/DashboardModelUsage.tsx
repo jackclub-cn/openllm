@@ -9,13 +9,17 @@ type DashboardModelUsageProps = {
 
 export default function DashboardModelUsage({ data }: DashboardModelUsageProps) {
   const navigate = useNavigate()
+  const totalRequests = data.model_usage.reduce(
+    (sum, record) => sum + record.requests,
+    0,
+  )
 
   return (
     <Card title="模型用量" bordered={false} className="section-row">
       <Table
         rowKey="model"
         size="middle"
-        pagination={false}
+        pagination={{ pageSize: 20, hideOnSinglePage: true }}
         dataSource={data.model_usage}
         onRow={(record) => ({
           onClick: () => navigate(`/usage?model=${encodeURIComponent(record.model)}`),
@@ -30,6 +34,15 @@ export default function DashboardModelUsage({ data }: DashboardModelUsageProps) 
             render: (value: string) => <Typography.Text strong>{value}</Typography.Text>,
           },
           { title: '请求数', dataIndex: 'requests', width: 100 },
+          {
+            title: '请求占比',
+            width: 100,
+            sorter: (a, b) => a.requests - b.requests,
+            render: (_, record) =>
+              totalRequests > 0
+                ? `${((record.requests / totalRequests) * 100).toFixed(1)}%`
+                : '-',
+          },
           {
             title: '输入 tokens',
             dataIndex: 'prompt_tokens',

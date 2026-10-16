@@ -69,7 +69,10 @@ pub(crate) fn session_affinity_key(headers: &HeaderMap, body: &Value) -> Option<
     if text.chars().count() < PROMPT_AFFINITY_MIN_CHARS {
         return None;
     }
-    let bounded = text.chars().take(PROMPT_AFFINITY_MAX_CHARS).collect::<String>();
+    let bounded = text
+        .chars()
+        .take(PROMPT_AFFINITY_MAX_CHARS)
+        .collect::<String>();
     let mut hasher = Sha256::new();
     hasher.update(b"openllm-prompt-affinity-v1");
     hasher.update(bounded.as_bytes());

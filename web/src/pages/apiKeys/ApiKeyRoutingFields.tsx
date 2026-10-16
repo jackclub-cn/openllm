@@ -11,6 +11,7 @@ const STRATEGY_OPTIONS = [
     label: 'p95_latency_optimized · P95 延迟优先',
   },
   { value: 'least_used', label: 'least_used · 最少使用' },
+  { value: 'quota_paced', label: 'quota_paced · 额度节奏优先' },
 ]
 
 /// Routing constraints shared by the create and edit dialogs. The same policy

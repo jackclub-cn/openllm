@@ -6,7 +6,9 @@ import {
   AuditOutlined,
   ClusterOutlined,
   DashboardOutlined,
+  FileSearchOutlined,
   KeyOutlined,
+  LineChartOutlined,
   MessageOutlined,
   MenuFoldOutlined,
   MenuUnfoldOutlined,
@@ -23,6 +25,7 @@ import { RealtimeProvider, useRealtime } from './realtime'
 const { Header, Sider, Content } = Layout
 
 const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Analytics = lazy(() => import('./pages/Analytics'))
 const ModelCatalog = lazy(() => import('./pages/ModelCatalog'))
 const Providers = lazy(() => import('./pages/Providers'))
 const RoutesPage = lazy(() => import('./pages/Routes'))
@@ -38,13 +41,14 @@ const MaintenancePage = lazy(() => import('./pages/Maintenance'))
 
 const navigation = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
+  { key: '/analytics', icon: <LineChartOutlined />, label: '用量分析' },
   { key: '/providers', icon: <ApiOutlined />, label: '提供商' },
   { key: '/models', icon: <AppstoreOutlined />, label: '模型目录' },
   { key: '/routes', icon: <NodeIndexOutlined />, label: '路由' },
   { key: '/playground', icon: <MessageOutlined />, label: '模型调试' },
   { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
   { key: '/pools', icon: <ClusterOutlined />, label: '配额池' },
-  { key: '/usage', icon: <DashboardOutlined />, label: '请求日志' },
+  { key: '/usage', icon: <FileSearchOutlined />, label: '请求日志' },
   { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
   { key: '/audit', icon: <AuditOutlined />, label: '审计日志' },
   { key: '/diagnostics', icon: <SafetyCertificateOutlined />, label: '诊断' },
@@ -159,6 +163,7 @@ function AppLayout({
           <Suspense fallback={<Skeleton active paragraph={{ rows: 8 }} />}>
             <Routes>
               <Route path="/" element={<Dashboard />} />
+              <Route path="/analytics" element={<Analytics />} />
               <Route path="/providers" element={<Providers />} />
               <Route path="/models" element={<ModelCatalog />} />
               <Route path="/routes" element={<RoutesPage />} />

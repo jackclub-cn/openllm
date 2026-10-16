@@ -49,6 +49,7 @@ pub struct Provider {
     pub tool_search_checked_at: Option<String>,
     pub models_synced_at: Option<String>,
     pub models_sync_error: Option<String>,
+    pub model_auto_include_rules: String,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<i64>,
     pub last_test_latency_ms: Option<i64>,
@@ -87,6 +88,7 @@ pub struct ProviderView {
     pub models: Vec<String>,
     pub models_synced_at: Option<String>,
     pub models_sync_error: Option<String>,
+    pub model_auto_include_rules: Vec<String>,
     pub last_test_at: Option<String>,
     pub last_test_ok: Option<bool>,
     pub last_test_latency_ms: Option<i64>,
@@ -122,6 +124,8 @@ pub struct ProviderQuotaView {
     pub model_quotas: Vec<ProviderQuotaModel>,
     pub details: Vec<ProviderQuotaDetail>,
     pub prices: Vec<ProviderPriceView>,
+    #[serde(default)]
+    pub snapshots: Vec<ProviderQuotaSnapshotView>,
     pub fetched_at: String,
 }
 
@@ -199,6 +203,14 @@ pub struct ProviderApiKeyRecord {
     pub lifetime_prompt_tokens: i64,
     #[sqlx(default)]
     pub lifetime_completion_tokens: i64,
+    #[sqlx(default)]
+    pub max_concurrency: Option<i64>,
+    #[sqlx(default)]
+    pub requests_per_minute: Option<i64>,
+    #[sqlx(default)]
+    pub queue_limit: Option<i64>,
+    #[sqlx(default)]
+    pub queue_wait_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,6 +233,10 @@ pub struct ProviderApiKeyView {
     pub avg_latency_ms: f64,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    pub max_concurrency: Option<i64>,
+    pub requests_per_minute: Option<i64>,
+    pub queue_limit: Option<i64>,
+    pub queue_wait_ms: Option<i64>,
     pub cooldown_seconds: Option<i64>,
     pub created_at: String,
 }
@@ -235,6 +251,14 @@ pub struct ProviderApiKeyInput {
     pub api_key: Option<String>,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default)]
+    pub max_concurrency: Option<i64>,
+    #[serde(default)]
+    pub requests_per_minute: Option<i64>,
+    #[serde(default)]
+    pub queue_limit: Option<i64>,
+    #[serde(default)]
+    pub queue_wait_ms: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -256,6 +280,8 @@ pub struct ProviderInput {
     pub auto_sync_models: bool,
     #[serde(default)]
     pub models: Vec<String>,
+    #[serde(default)]
+    pub model_auto_include_rules: Vec<String>,
     #[serde(default)]
     pub health_check_interval_minutes: Option<i64>,
     #[serde(default)]
@@ -288,6 +314,7 @@ pub struct ProviderUpdate {
     pub enabled: Option<bool>,
     pub auto_sync_models: Option<bool>,
     pub models: Option<Vec<String>>,
+    pub model_auto_include_rules: Option<Vec<String>>,
     #[serde(default)]
     pub health_check_interval_minutes: Option<i64>,
     #[serde(default)]
@@ -582,6 +609,8 @@ impl From<Provider> for ProviderView {
             models: Vec::new(),
             models_synced_at: value.models_synced_at,
             models_sync_error: value.models_sync_error,
+            model_auto_include_rules: serde_json::from_str(&value.model_auto_include_rules)
+                .unwrap_or_default(),
             last_test_at: value.last_test_at,
             last_test_ok: value.last_test_ok.map(|value| value != 0),
             last_test_latency_ms: value.last_test_latency_ms,

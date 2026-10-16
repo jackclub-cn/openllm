@@ -13,6 +13,7 @@ pub struct CooldownSnapshot {
     pub provider_cooldowns: Vec<ProviderCooldownView>,
     pub model_cooldowns: Vec<ModelCooldownView>,
     pub provider_key_cooldowns: Vec<ProviderKeyCooldownView>,
+    pub target_sinks: Vec<TargetSinkView>,
     /// Consecutive failures that hard-open a provider's circuit; `0` keeps the
     /// soft cooldown only.
     pub provider_open_threshold: u32,
@@ -30,6 +31,11 @@ pub struct ProviderCooldownView {
     pub failure_streak: u32,
     /// Circuit breaker state: `open`, `half_open`, or `closed`.
     pub state: &'static str,
+    pub scope: Option<&'static str>,
+    pub retry: Option<&'static str>,
+    pub confidence: Option<&'static str>,
+    pub reason_code: Option<&'static str>,
+    pub observed_seconds_ago: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -38,6 +44,11 @@ pub struct ModelCooldownView {
     pub provider_name: Option<String>,
     pub model: String,
     pub remaining_seconds: i64,
+    pub scope: Option<&'static str>,
+    pub retry: Option<&'static str>,
+    pub confidence: Option<&'static str>,
+    pub reason_code: Option<&'static str>,
+    pub observed_seconds_ago: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -46,6 +57,23 @@ pub struct ProviderKeyCooldownView {
     pub provider_name: Option<String>,
     pub key_name: Option<String>,
     pub remaining_seconds: i64,
+    pub scope: Option<&'static str>,
+    pub retry: Option<&'static str>,
+    pub confidence: Option<&'static str>,
+    pub reason_code: Option<&'static str>,
+    pub observed_seconds_ago: Option<u64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+pub struct TargetSinkView {
+    pub provider_id: i64,
+    pub provider_name: Option<String>,
+    pub provider_key_id: Option<i64>,
+    pub key_name: Option<String>,
+    pub model: String,
+    pub remaining_seconds: i64,
+    pub reason_code: &'static str,
+    pub observed_seconds_ago: u64,
 }
 
 pub async fn list_cooldowns(State(state): State<AppState>) -> AppResult<Json<CooldownSnapshot>> {
@@ -74,6 +102,7 @@ pub struct ClearCooldownsResult {
     pub cleared_provider_cooldowns: usize,
     pub cleared_model_cooldowns: usize,
     pub cleared_provider_key_cooldowns: usize,
+    pub cleared_target_sinks: usize,
 }
 
 pub async fn clear_cooldowns(
@@ -94,13 +123,21 @@ pub async fn clear_cooldowns(
                 .await
                 .remove(&provider_key_id)
                 .is_some();
+            state
+                .provider_key_failure_meta
+                .lock()
+                .await
+                .remove(&provider_key_id);
             if removed {
                 state.mark_provider_key_resilience_dirty(provider_key_id);
             }
+            let cleared_target_sinks =
+                clear_target_sinks(&state, |_, key_id, _| key_id == Some(provider_key_id)).await;
             let cleared = ClearCooldownsResult {
                 cleared_provider_cooldowns: 0,
                 cleared_model_cooldowns: 0,
                 cleared_provider_key_cooldowns: usize::from(removed),
+                cleared_target_sinks,
             };
             record_audit(
                 &state,
@@ -143,6 +180,7 @@ pub async fn clear_cooldowns(
         cleared_provider_cooldowns: cleared_all.providers,
         cleared_model_cooldowns: cleared_all.models,
         cleared_provider_key_cooldowns: cleared_all.provider_keys,
+        cleared_target_sinks: cleared_all.sinks,
     };
     record_audit(
         &state,
@@ -154,6 +192,7 @@ pub async fn clear_cooldowns(
             "providers": cleared.cleared_provider_cooldowns,
             "models": cleared.cleared_model_cooldowns,
             "provider_keys": cleared.cleared_provider_key_cooldowns,
+            "target_sinks": cleared.cleared_target_sinks,
         })),
     )
     .await;
@@ -187,6 +226,12 @@ async fn clear_provider_scope(
         removed
     };
     let cleared_model_cooldowns = cleared_models.len();
+    {
+        let mut metadata = state.target_failure_meta.lock().await;
+        for (provider_id, model) in &cleared_models {
+            metadata.remove(&(*provider_id, model.clone()));
+        }
+    }
     for (provider_id, model) in cleared_models {
         state.mark_target_resilience_dirty(provider_id, &model);
     }
@@ -197,7 +242,16 @@ async fn clear_provider_scope(
     let cleared_provider_cooldowns = if model.is_some() {
         0
     } else {
-        state.provider_failure_streak.lock().await.remove(&provider_id);
+        state
+            .provider_failure_meta
+            .lock()
+            .await
+            .remove(&provider_id);
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .remove(&provider_id);
         state.provider_probe.lock().await.remove(&provider_id);
         state.mark_provider_resilience_dirty(provider_id);
         usize::from(
@@ -209,12 +263,41 @@ async fn clear_provider_scope(
                 .is_some(),
         )
     };
+    let cleared_target_sinks = clear_target_sinks(state, |target_provider_id, _, target_model| {
+        target_provider_id == provider_id && model.is_none_or(|model| model == target_model)
+    })
+    .await;
 
     ClearCooldownsResult {
         cleared_provider_cooldowns,
         cleared_model_cooldowns,
         cleared_provider_key_cooldowns: 0,
+        cleared_target_sinks,
     }
+}
+
+async fn clear_target_sinks(
+    state: &AppState,
+    should_remove: impl Fn(i64, Option<i64>, &str) -> bool,
+) -> usize {
+    let removed = {
+        let mut sinks = state.target_sink.lock().await;
+        let keys = sinks
+            .keys()
+            .filter(|(provider_id, provider_key_id, model)| {
+                should_remove(*provider_id, *provider_key_id, model)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &keys {
+            sinks.remove(key);
+        }
+        keys
+    };
+    for key in &removed {
+        state.mark_target_sink_dirty(key);
+    }
+    removed.len()
 }
 
 /// Drops expired entries and resolves display names for the surviving ones.
@@ -272,6 +355,54 @@ pub(crate) async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSna
         entries.sort_by_key(|(key_id, _)| *key_id);
         entries
     };
+    let target_sinks = {
+        let mut sinks = state.target_sink.lock().await;
+        sinks.retain(|_, entry| entry.until > now);
+        let mut entries = sinks
+            .iter()
+            .map(|((provider_id, provider_key_id, model), entry)| {
+                (
+                    *provider_id,
+                    *provider_key_id,
+                    model.clone(),
+                    remaining_seconds(entry.until, now),
+                    entry.reason_code,
+                    entry.observed_at.elapsed().as_secs(),
+                )
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            (left.0, left.1, left.2.clone()).cmp(&(right.0, right.1, right.2.clone()))
+        });
+        entries
+    };
+    let provider_failure_meta = {
+        let active = provider_cooldowns
+            .iter()
+            .map(|(provider_id, _, _)| *provider_id)
+            .collect::<HashSet<_>>();
+        let mut metadata = state.provider_failure_meta.lock().await;
+        metadata.retain(|provider_id, _| active.contains(provider_id));
+        metadata.clone()
+    };
+    let target_failure_meta = {
+        let active = model_cooldowns
+            .iter()
+            .map(|(provider_id, model, _)| (*provider_id, model.clone()))
+            .collect::<HashSet<_>>();
+        let mut metadata = state.target_failure_meta.lock().await;
+        metadata.retain(|key, _| active.contains(key));
+        metadata.clone()
+    };
+    let provider_key_failure_meta = {
+        let active = provider_key_cooldowns
+            .iter()
+            .map(|(provider_key_id, _)| *provider_key_id)
+            .collect::<HashSet<_>>();
+        let mut metadata = state.provider_key_failure_meta.lock().await;
+        metadata.retain(|provider_key_id, _| active.contains(provider_key_id));
+        metadata.clone()
+    };
     let provider_names = provider_name_map(state).await?;
     let key_names = provider_key_name_map(state).await?;
 
@@ -285,19 +416,46 @@ pub(crate) async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSna
                     provider_id,
                     remaining_seconds,
                     state,
+                    scope: provider_failure_meta
+                        .get(&provider_id)
+                        .map(|metadata| metadata.scope),
+                    retry: provider_failure_meta
+                        .get(&provider_id)
+                        .map(|metadata| metadata.retry),
+                    confidence: provider_failure_meta
+                        .get(&provider_id)
+                        .map(|metadata| metadata.confidence),
+                    reason_code: provider_failure_meta
+                        .get(&provider_id)
+                        .map(|metadata| metadata.reason_code),
+                    observed_seconds_ago: provider_failure_meta
+                        .get(&provider_id)
+                        .map(|metadata| metadata.observed_at.elapsed().as_secs()),
                 },
             )
             .collect(),
         model_cooldowns: model_cooldowns
             .into_iter()
-            .map(
-                |(provider_id, model, remaining_seconds)| ModelCooldownView {
+            .map(|(provider_id, model, remaining_seconds)| {
+                let key = (provider_id, model.clone());
+                ModelCooldownView {
                     provider_name: provider_names.get(&provider_id).cloned(),
                     provider_id,
                     model,
                     remaining_seconds,
-                },
-            )
+                    scope: target_failure_meta.get(&key).map(|metadata| metadata.scope),
+                    retry: target_failure_meta.get(&key).map(|metadata| metadata.retry),
+                    confidence: target_failure_meta
+                        .get(&key)
+                        .map(|metadata| metadata.confidence),
+                    reason_code: target_failure_meta
+                        .get(&key)
+                        .map(|metadata| metadata.reason_code),
+                    observed_seconds_ago: target_failure_meta
+                        .get(&key)
+                        .map(|metadata| metadata.observed_at.elapsed().as_secs()),
+                }
+            })
             .collect(),
         provider_key_cooldowns: provider_key_cooldowns
             .into_iter()
@@ -311,8 +469,50 @@ pub(crate) async fn cooldown_snapshot(state: &AppState) -> AppResult<CooldownSna
                     provider_name,
                     key_name,
                     remaining_seconds,
+                    scope: provider_key_failure_meta
+                        .get(&provider_key_id)
+                        .map(|metadata| metadata.scope),
+                    retry: provider_key_failure_meta
+                        .get(&provider_key_id)
+                        .map(|metadata| metadata.retry),
+                    confidence: provider_key_failure_meta
+                        .get(&provider_key_id)
+                        .map(|metadata| metadata.confidence),
+                    reason_code: provider_key_failure_meta
+                        .get(&provider_key_id)
+                        .map(|metadata| metadata.reason_code),
+                    observed_seconds_ago: provider_key_failure_meta
+                        .get(&provider_key_id)
+                        .map(|metadata| metadata.observed_at.elapsed().as_secs()),
                 }
             })
+            .collect(),
+        target_sinks: target_sinks
+            .into_iter()
+            .map(
+                |(
+                    provider_id,
+                    provider_key_id,
+                    model,
+                    remaining_seconds,
+                    reason_code,
+                    observed_seconds_ago,
+                )| {
+                    let (_, key_name) = provider_key_id
+                        .and_then(|key_id| key_names.get(&key_id).cloned())
+                        .unwrap_or((None, None));
+                    TargetSinkView {
+                        provider_name: provider_names.get(&provider_id).cloned(),
+                        provider_id,
+                        provider_key_id,
+                        key_name,
+                        model,
+                        remaining_seconds,
+                        reason_code,
+                        observed_seconds_ago,
+                    }
+                },
+            )
             .collect(),
         provider_open_threshold: threshold,
         generated_at: Utc::now().to_rfc3339(),
@@ -343,8 +543,6 @@ async fn provider_key_name_map(
     .await?;
     Ok(rows
         .into_iter()
-        .map(|(key_id, provider_name, key_name)| {
-            (key_id, (Some(provider_name), Some(key_name)))
-        })
+        .map(|(key_id, provider_name, key_name)| (key_id, (Some(provider_name), Some(key_name))))
         .collect())
 }

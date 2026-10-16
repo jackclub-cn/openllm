@@ -79,3 +79,62 @@ export function formatCostMicros(value?: number | null): string {
   if (Math.abs(usd) < 0.01) return `$${usd.toFixed(4)}`
   return `$${usd.toFixed(2)}`
 }
+
+type FailureClassification = {
+  scope?: string | null
+  retry?: string | null
+  confidence?: string | null
+  reason_code?: string | null
+}
+
+const FAILURE_SCOPE_LABELS: Record<string, string> = {
+  transport: '传输',
+  provider: '提供商',
+  credential: '上游凭证',
+  model: '模型',
+  endpoint: '端点',
+  request_shape: '请求格式',
+  request_content: '请求内容',
+  client: '客户端',
+}
+
+const FAILURE_RETRY_LABELS: Record<string, string> = {
+  do_not_retry: '不重试',
+  next_target: '切换目标',
+}
+
+const FAILURE_REASON_LABELS: Record<string, string> = {
+  upstream_unavailable: '上游不可用',
+  upstream_timeout: '上游超时',
+  credential_rejected: '凭证被拒绝',
+  context_limit_exceeded: '上下文超限',
+  model_not_found: '模型不存在',
+  quota_exhausted: '额度耗尽',
+  rate_limited: '限流',
+  content_policy_refusal: '内容策略拒绝',
+  request_shape_incompatible: '请求格式不兼容',
+  request_conflict: '请求状态冲突',
+  invalid_request: '请求无效',
+  endpoint_or_model_not_found: '端点或模型不存在',
+  unsupported_upstream_error: '未知上游错误',
+}
+
+export function formatFailureClassification(value?: FailureClassification | null): string {
+  if (!value) return ''
+  return [
+    value.scope ? FAILURE_SCOPE_LABELS[value.scope] || value.scope : '',
+    value.reason_code
+      ? FAILURE_REASON_LABELS[value.reason_code] || value.reason_code
+      : '',
+    value.confidence === 'exact'
+      ? '明确'
+      : value.confidence === 'inferred'
+        ? '推断'
+        : value.confidence === 'unknown'
+          ? '未知'
+          : '',
+    value.retry ? FAILURE_RETRY_LABELS[value.retry] || value.retry : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+}

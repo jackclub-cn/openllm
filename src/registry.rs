@@ -239,9 +239,9 @@ pub fn validate_route_capability_overrides(
                 "route context override must be greater than zero".to_string(),
             ));
         }
-        if let Some(base) = capabilities.and_then(|caps| {
-            caps.total_context_tokens.or(caps.context_limit)
-        }) && limit > base
+        if let Some(base) =
+            capabilities.and_then(|caps| caps.total_context_tokens.or(caps.context_limit))
+            && limit > base
         {
             return Err(AppError::BadRequest(format!(
                 "route context override {limit} cannot exceed the target capability bucket {base}"

@@ -4,7 +4,10 @@ pub async fn list_routes(State(state): State<AppState>) -> AppResult<Json<Vec<Ro
     let routes = sqlx::query_as::<_, Route>(
         "SELECT id, name, model_pattern, \
                 CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy, \
-                enabled, context_override, output_override, created_at, updated_at \
+                enabled, context_override, output_override, \
+                all_targets_busy_wait_seconds, retry_jitter_ms, \
+                max_waiting_requests, keepalive_during_wait, \
+                created_at, updated_at \
          FROM routes ORDER BY enabled DESC, model_pattern COLLATE NOCASE",
     )
     .fetch_all(&state.pool)
@@ -33,13 +36,20 @@ pub async fn create_route(
     validate_route_input(&input)?;
     let context_override = normalize_route_override(input.context_override, "context")?;
     let output_override = normalize_route_override(input.output_override, "output")?;
+    let all_targets_busy_wait_seconds =
+        normalize_busy_wait_seconds(input.all_targets_busy_wait_seconds)?;
+    let retry_jitter_ms = normalize_retry_jitter(input.retry_jitter_ms)?;
+    let max_waiting_requests = normalize_max_waiting_requests(input.max_waiting_requests)?;
+    let keepalive_during_wait = input.keepalive_during_wait.unwrap_or(true);
     validate_route_overrides(&state, &input.targets, context_override, output_override).await?;
     let mut tx = state.pool.begin().await?;
     let (strategy, strategy_ext) = input.strategy.storage_values();
     let result = sqlx::query(
         "INSERT INTO routes (name, model_pattern, strategy, strategy_ext, enabled, \
-                             context_override, output_override) \
-         VALUES (?, ?, ?, ?, ?, ?, ?)",
+                             context_override, output_override, \
+                             all_targets_busy_wait_seconds, retry_jitter_ms, \
+                             max_waiting_requests, keepalive_during_wait) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.model_pattern.trim())
@@ -48,6 +58,10 @@ pub async fn create_route(
     .bind(input.enabled as i64)
     .bind(context_override)
     .bind(output_override)
+    .bind(all_targets_busy_wait_seconds)
+    .bind(retry_jitter_ms)
+    .bind(max_waiting_requests)
+    .bind(keepalive_during_wait as i64)
     .execute(&mut *tx)
     .await
     .map_err(map_sqlite_conflict)?;
@@ -68,6 +82,10 @@ pub async fn create_route(
             "targets": input.targets.len(),
             "context_override": context_override,
             "output_override": output_override,
+            "all_targets_busy_wait_seconds": all_targets_busy_wait_seconds,
+            "retry_jitter_ms": retry_jitter_ms,
+            "max_waiting_requests": max_waiting_requests,
+            "keepalive_during_wait": keepalive_during_wait,
         })),
     )
     .await;
@@ -82,7 +100,10 @@ pub async fn update_route(
     let current = sqlx::query_as::<_, Route>(
         "SELECT id, name, model_pattern, \
                 CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy, \
-                enabled, context_override, output_override, created_at, updated_at \
+                enabled, context_override, output_override, \
+                all_targets_busy_wait_seconds, retry_jitter_ms, \
+                max_waiting_requests, keepalive_during_wait, \
+                created_at, updated_at \
          FROM routes WHERE id = ?",
     )
     .bind(id)
@@ -108,6 +129,21 @@ pub async fn update_route(
         Some(value) => normalize_route_override(value, "output")?,
         None => current.output_override,
     };
+    let all_targets_busy_wait_seconds = match input.all_targets_busy_wait_seconds {
+        Some(value) => normalize_busy_wait_seconds(Some(value))?,
+        None => current.all_targets_busy_wait_seconds,
+    };
+    let retry_jitter_ms = match input.retry_jitter_ms {
+        Some(value) => normalize_retry_jitter(Some(value))?,
+        None => current.retry_jitter_ms,
+    };
+    let max_waiting_requests = match input.max_waiting_requests {
+        Some(value) => normalize_max_waiting_requests(Some(value))?,
+        None => current.max_waiting_requests,
+    };
+    let keepalive_during_wait = input
+        .keepalive_during_wait
+        .unwrap_or(current.keepalive_during_wait != 0);
 
     if name.is_empty() || model_pattern.is_empty() {
         return Err(AppError::BadRequest(
@@ -146,6 +182,8 @@ pub async fn update_route(
     sqlx::query(
         "UPDATE routes SET name = ?, model_pattern = ?, strategy = ?, strategy_ext = ?, \
          enabled = ?, context_override = ?, output_override = ?, \
+         all_targets_busy_wait_seconds = ?, retry_jitter_ms = ?, \
+         max_waiting_requests = ?, keepalive_during_wait = ?, \
          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name.clone())
@@ -155,6 +193,10 @@ pub async fn update_route(
     .bind(enabled as i64)
     .bind(context_override)
     .bind(output_override)
+    .bind(all_targets_busy_wait_seconds)
+    .bind(retry_jitter_ms)
+    .bind(max_waiting_requests)
+    .bind(keepalive_during_wait as i64)
     .bind(id)
     .execute(&mut *tx)
     .await
@@ -164,6 +206,7 @@ pub async fn update_route(
         replace_route_targets(&mut tx, id, &targets).await?;
     }
     tx.commit().await?;
+    crate::proxy::clear_target_sinks_for_route(&state, id).await;
 
     record_audit(
         &state,
@@ -186,6 +229,48 @@ fn normalize_route_override(value: Option<i64>, label: &str) -> AppResult<Option
     }
 }
 
+fn normalize_busy_wait_seconds(value: Option<i64>) -> AppResult<i64> {
+    const DEFAULT_BUSY_WAIT_SECONDS: i64 = 0;
+    const MAX_BUSY_WAIT_SECONDS: i64 = 300;
+    match value.unwrap_or(DEFAULT_BUSY_WAIT_SECONDS) {
+        value if value < 0 => Err(AppError::BadRequest(
+            "all-targets busy wait must be zero or a positive integer".to_string(),
+        )),
+        value if value > MAX_BUSY_WAIT_SECONDS => Err(AppError::BadRequest(format!(
+            "all-targets busy wait must be at most {MAX_BUSY_WAIT_SECONDS} seconds"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn normalize_retry_jitter(value: Option<i64>) -> AppResult<i64> {
+    const DEFAULT_RETRY_JITTER_MS: i64 = 250;
+    const MAX_RETRY_JITTER_MS: i64 = 10_000;
+    match value.unwrap_or(DEFAULT_RETRY_JITTER_MS) {
+        value if value < 0 => Err(AppError::BadRequest(
+            "retry jitter must be zero or a positive integer".to_string(),
+        )),
+        value if value > MAX_RETRY_JITTER_MS => Err(AppError::BadRequest(format!(
+            "retry jitter must be at most {MAX_RETRY_JITTER_MS} milliseconds"
+        ))),
+        value => Ok(value),
+    }
+}
+
+fn normalize_max_waiting_requests(value: Option<i64>) -> AppResult<i64> {
+    const DEFAULT_MAX_WAITING_REQUESTS: i64 = 32;
+    const MAX_WAITING_REQUESTS: i64 = 1024;
+    match value.unwrap_or(DEFAULT_MAX_WAITING_REQUESTS) {
+        value if value < 0 => Err(AppError::BadRequest(
+            "max waiting requests must be zero or a positive integer".to_string(),
+        )),
+        value if value > MAX_WAITING_REQUESTS => Err(AppError::BadRequest(format!(
+            "max waiting requests must be at most {MAX_WAITING_REQUESTS}"
+        ))),
+        value => Ok(value),
+    }
+}
+
 async fn validate_route_overrides(
     state: &AppState,
     targets: &[RouteTargetInput],
@@ -201,11 +286,7 @@ async fn validate_route_overrides(
         .map(|target| (target.provider_id, target.upstream_model.clone()))
         .collect::<Vec<_>>();
     let barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
-    crate::registry::validate_route_capability_overrides(
-        &barrel,
-        context_override,
-        output_override,
-    )
+    crate::registry::validate_route_capability_overrides(&barrel, context_override, output_override)
 }
 
 pub async fn diagnose_route(
@@ -240,8 +321,14 @@ pub async fn diagnose_route(
     }
     let diagnosis = match input.api_key_id {
         Some(api_key_id) => {
-            crate::proxy::diagnose_route_for_key(&state, model, endpoint, session_id, Some(api_key_id))
-                .await?
+            crate::proxy::diagnose_route_for_key(
+                &state,
+                model,
+                endpoint,
+                session_id,
+                Some(api_key_id),
+            )
+            .await?
         }
         None => crate::proxy::diagnose_route(&state, model, endpoint, session_id).await?,
     };

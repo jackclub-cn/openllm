@@ -194,6 +194,60 @@ pub async fn get_usage_detail(
     Ok(Json(row.into()))
 }
 
+pub async fn get_route_trace(
+    State(state): State<AppState>,
+    Path(request_id): Path<String>,
+) -> AppResult<Json<RouteTraceView>> {
+    let trace = sqlx::query_as::<_, RouteTraceRecord>(
+        "SELECT request_id, created_at, finished_at, route_id, strategy, \
+                session_id, session_decision, candidates_json, attempt_count, \
+                fallback_count, final_provider_id, final_provider_api_key_id, \
+                final_upstream_model, final_status_code, success \
+         FROM routing_traces \
+         WHERE request_id = ?",
+    )
+    .bind(&request_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound("routing trace not found".to_string()))?;
+    let candidates = serde_json::from_str::<Vec<RouteTraceCandidate>>(&trace.candidates_json)
+        .unwrap_or_default();
+    let attempts = sqlx::query_as::<_, RouteTraceAttemptRow>(
+        "SELECT attempt_index, round, candidate_order, provider_id, \
+                provider_api_key_id, upstream_model, started_at, latency_ms, \
+                status_code, success, retryable, reason_code, failure_scope, \
+                failure_retry, failure_confidence \
+         FROM routing_attempts \
+         WHERE request_id = ? \
+         ORDER BY attempt_index",
+    )
+    .bind(&request_id)
+    .fetch_all(&state.pool)
+    .await?
+    .into_iter()
+    .map(Into::into)
+    .collect();
+
+    Ok(Json(RouteTraceView {
+        request_id: trace.request_id,
+        created_at: trace.created_at,
+        finished_at: trace.finished_at,
+        route_id: trace.route_id,
+        strategy: trace.strategy,
+        session_id: trace.session_id,
+        session_decision: trace.session_decision,
+        candidates,
+        attempt_count: trace.attempt_count,
+        fallback_count: trace.fallback_count,
+        final_provider_id: trace.final_provider_id,
+        final_provider_api_key_id: trace.final_provider_api_key_id,
+        final_upstream_model: trace.final_upstream_model,
+        final_status_code: trace.final_status_code,
+        success: trace.success != 0,
+        attempts,
+    }))
+}
+
 pub async fn cleanup_usage(
     State(state): State<AppState>,
     Json(input): Json<UsageCleanup>,

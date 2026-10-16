@@ -65,6 +65,10 @@ export default function RoutesPage() {
             enabled: item.enabled,
             context_override: item.context_override ?? null,
             output_override: item.output_override ?? null,
+            all_targets_busy_wait_seconds: item.all_targets_busy_wait_seconds,
+            retry_jitter_ms: item.retry_jitter_ms,
+            max_waiting_requests: item.max_waiting_requests,
+            keepalive_during_wait: item.keepalive_during_wait,
             targets: item.targets.map((target) => ({ ...target })),
           }
         : ({
@@ -74,6 +78,10 @@ export default function RoutesPage() {
             enabled: true,
             context_override: null,
             output_override: null,
+            all_targets_busy_wait_seconds: 0,
+            retry_jitter_ms: 250,
+            max_waiting_requests: 32,
+            keepalive_during_wait: true,
             targets: [
               {
                 provider_id: providers[0]?.id,

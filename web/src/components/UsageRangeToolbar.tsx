@@ -5,9 +5,12 @@ import {
 } from '@ant-design/icons'
 import { Button, DatePicker, Tag, Tooltip, Typography } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
-import PageHeader from '../../components/PageHeader'
+import type { ReactNode } from 'react'
+import PageHeader from './PageHeader'
 
-type DashboardToolbarProps = {
+type UsageRangeToolbarProps = {
+  title: string
+  description?: string
   dates: [Dayjs, Dayjs]
   lastUpdated?: Date
   refreshing: boolean
@@ -16,9 +19,12 @@ type DashboardToolbarProps = {
   onDatesChange: (dates: [Dayjs, Dayjs]) => void
   onTogglePaused: () => void
   onRefresh: () => void
+  extraActions?: ReactNode
 }
 
-export default function DashboardToolbar({
+export default function UsageRangeToolbar({
+  title,
+  description,
   dates,
   lastUpdated,
   refreshing,
@@ -27,7 +33,8 @@ export default function DashboardToolbar({
   onDatesChange,
   onTogglePaused,
   onRefresh,
-}: DashboardToolbarProps) {
+  extraActions,
+}: UsageRangeToolbarProps) {
   const rangePresets = [
     { label: '今天', value: [dayjs().startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs] },
     {
@@ -55,10 +62,11 @@ export default function DashboardToolbar({
 
   return (
     <PageHeader
-      title="运行概览"
-      description="网关请求、模型令牌与提供商健康状态"
+      title={title}
+      description={description ?? ''}
       extra={
         <>
+          {extraActions}
           <DatePicker.RangePicker
             allowClear={false}
             value={dates}

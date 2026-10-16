@@ -554,9 +554,7 @@ fn mask_sensitive_values(value: &Value) -> Value {
                 })
                 .collect(),
         ),
-        Value::Array(items) => {
-            Value::Array(items.iter().map(mask_sensitive_values).collect())
-        }
+        Value::Array(items) => Value::Array(items.iter().map(mask_sensitive_values).collect()),
         _ => value.clone(),
     }
 }
@@ -794,16 +792,10 @@ pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     let usage = entry.usage.normalized();
     if entry.success
         && entry.streamed
-        && let (Some(provider_id), Some(upstream_model)) =
-            (entry.provider_id, entry.upstream_model)
+        && let (Some(provider_id), Some(upstream_model)) = (entry.provider_id, entry.upstream_model)
     {
-        record_target_latency_success(
-            state,
-            provider_id,
-            upstream_model,
-            entry.first_token_ms,
-        )
-        .await;
+        record_target_latency_success(state, provider_id, upstream_model, entry.first_token_ms)
+            .await;
     }
     // Tokens are exact only once the response is complete, so the pool is
     // charged here rather than at admission (requests are charged then).

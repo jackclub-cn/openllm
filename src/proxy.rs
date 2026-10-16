@@ -31,9 +31,11 @@ use crate::state::AppState;
 mod anthropic_api;
 mod auth;
 mod compat;
+mod failure;
 mod guardrails;
 mod models_api;
 mod openai_api;
+mod route_trace;
 mod routing;
 mod session;
 mod translation;
@@ -43,11 +45,12 @@ mod usage;
 pub(crate) use anthropic_api::*;
 pub(crate) use auth::*;
 pub(crate) use compat::*;
+use failure::*;
 use guardrails::*;
 pub(crate) use models_api::*;
 pub(crate) use openai_api::*;
-pub(crate) use routing::{diagnose_route, diagnose_route_for_key};
 use routing::*;
+pub(crate) use routing::{clear_target_sinks_for_route, diagnose_route, diagnose_route_for_key};
 pub(crate) use session::*;
 use translation::*;
 pub(crate) use upstream::*;
@@ -76,6 +79,7 @@ const PROVIDER_MODEL_COOLDOWN_THRESHOLD: usize = 2;
 pub(super) enum AcquireSlotError {
     Provider(AppError),
     Model(AppError),
+    ProviderApiKey(AppError),
 }
 
 impl AcquireSlotError {
@@ -85,7 +89,7 @@ impl AcquireSlotError {
 
     pub(super) fn into_error(self) -> AppError {
         match self {
-            Self::Provider(error) | Self::Model(error) => error,
+            Self::Provider(error) | Self::Model(error) | Self::ProviderApiKey(error) => error,
         }
     }
 }
@@ -93,11 +97,12 @@ impl AcquireSlotError {
 /// Permits held until the upstream response body has been fully consumed.
 #[derive(Debug)]
 pub(super) struct UpstreamSlots {
+    pub(super) provider_key: Option<OwnedSemaphorePermit>,
     pub(super) provider: Option<OwnedSemaphorePermit>,
     pub(super) model: Option<OwnedSemaphorePermit>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ResolvedRoute {
     route_id: Option<i64>,
     strategy: String,
@@ -106,4 +111,9 @@ struct ResolvedRoute {
     /// meaningful for explicit routes; a directly matched model reports its own
     /// capabilities.
     barrel: Option<BarrelEnvelope>,
+    /// Route-level bounded patience. Zero keeps each target single-shot.
+    all_targets_busy_wait_seconds: i64,
+    retry_jitter_ms: i64,
+    max_waiting_requests: i64,
+    keepalive_during_wait: bool,
 }

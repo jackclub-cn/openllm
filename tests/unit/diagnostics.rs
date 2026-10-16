@@ -113,11 +113,7 @@ async fn self_check_reports_structured_items() {
         );
         assert!(!check.category.is_empty(), "{} has no category", check.id);
         assert!(!check.detail.is_empty(), "{} has no detail", check.id);
-        assert!(
-            ids.insert(check.id),
-            "duplicate self-check id {}",
-            check.id
-        );
+        assert!(ids.insert(check.id), "duplicate self-check id {}", check.id);
         if check.status != CHECK_PASS {
             assert!(
                 check.hint.is_some(),
@@ -162,10 +158,16 @@ async fn self_check_fails_when_nothing_can_route() {
 #[tokio::test]
 async fn missing_provider_credentials_is_a_warning_not_a_failure() {
     let state = healthy_state().await;
-    sqlx::query("DELETE FROM provider_api_keys").execute(&state.pool).await.unwrap();
+    sqlx::query("DELETE FROM provider_api_keys")
+        .execute(&state.pool)
+        .await
+        .unwrap();
 
     let header_only = run_self_check(&state).await;
-    assert_eq!(item(&header_only, "provider_credentials").status, CHECK_PASS);
+    assert_eq!(
+        item(&header_only, "provider_credentials").status,
+        CHECK_PASS
+    );
     assert_eq!(header_only.counts.fail, 0);
 
     sqlx::query("UPDATE providers SET api_key = NULL, headers = '{}'")
@@ -173,7 +175,10 @@ async fn missing_provider_credentials_is_a_warning_not_a_failure() {
         .await
         .unwrap();
     let none_at_all = run_self_check(&state).await;
-    assert_eq!(item(&none_at_all, "provider_credentials").status, CHECK_WARN);
+    assert_eq!(
+        item(&none_at_all, "provider_credentials").status,
+        CHECK_WARN
+    );
     assert!(item(&none_at_all, "provider_credentials").hint.is_some());
     assert_eq!(none_at_all.counts.fail, 0);
 }
@@ -288,10 +293,14 @@ async fn snapshot_exports_a_legacy_only_provider_secret() {
     .execute(&state.pool)
     .await
     .unwrap();
-    let Json(snapshot) =
-        diagnostic_snapshot(State(state.clone()), Query(SnapshotQuery { include_secrets: true }))
-            .await
-            .unwrap();
+    let Json(snapshot) = diagnostic_snapshot(
+        State(state.clone()),
+        Query(SnapshotQuery {
+            include_secrets: true,
+        }),
+    )
+    .await
+    .unwrap();
     let secrets = snapshot.secrets.as_ref().unwrap();
     assert_eq!(secrets.provider_credentials.len(), 1);
     assert_eq!(secrets.provider_credentials[0].key_id, 1);

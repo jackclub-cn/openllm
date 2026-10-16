@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -7,15 +7,70 @@ use reqwest::Client;
 use sqlx::SqlitePool;
 use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
 
-use crate::error::AppResult;
 use crate::allocation::{AllocationLedger, PoolCatalog};
-use crate::models::{GuardrailSettings, InspectorSettings, ResilienceSettings, RuntimeLimits};
+use crate::capabilities::CapabilityCache;
+use crate::error::AppResult;
+use crate::models::{
+    GuardrailSettings, InspectorSettings, ProviderQuotaSnapshotKey, ProviderQuotaSnapshotRecord,
+    ResilienceSettings, RuntimeLimits,
+};
 use crate::resilience_state::DirtyResilienceState;
 use crate::session_affinity::{SessionAffinityConfig, SessionAffinityStore};
 
 pub(crate) const SETTING_GUARDRAILS: &str = "guardrails";
 pub(crate) const SETTING_INSPECTOR: &str = "inspector";
 pub(crate) const SETTING_RESILIENCE: &str = "resilience";
+
+#[derive(Clone, Debug)]
+pub struct FailureMetadata {
+    pub scope: &'static str,
+    pub retry: &'static str,
+    pub confidence: &'static str,
+    pub reason_code: &'static str,
+    pub observed_at: Instant,
+}
+
+/// A short-lived target penalty for 429/rate-limit or local saturation.
+///
+/// A sink is not a failure circuit: the target remains eligible and can clear
+/// itself with a successful request, but it is tried after healthy siblings.
+pub type TargetSinkKey = (i64, Option<i64>, String);
+
+#[derive(Clone, Debug)]
+pub struct TargetSinkEntry {
+    pub until: Instant,
+    pub reason_code: &'static str,
+    pub observed_at: Instant,
+}
+
+/// RAII guard for one bounded all-targets-busy wait.
+///
+/// Counters use a standard mutex because the guard is dropped from synchronous
+/// cancellation paths. The actual wait remains async in the request handler.
+pub struct BusyWaitLease {
+    total: Arc<AtomicUsize>,
+    by_route: Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    route_id: i64,
+}
+
+impl Drop for BusyWaitLease {
+    fn drop(&mut self) {
+        self.total.fetch_sub(1, Ordering::AcqRel);
+        let mut by_route = self
+            .by_route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(count) = by_route.get_mut(&self.route_id) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                by_route.remove(&self.route_id);
+            }
+        }
+    }
+}
+
+/// Process-wide ceiling for requests waiting on an all-busy route.
+pub(crate) const MAX_BUSY_WAITERS: usize = 64;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -29,6 +84,8 @@ pub struct AppState {
     pub provider_key_cursor: Arc<Mutex<HashMap<i64, usize>>>,
     /// In-memory cooldowns for providers that recently failed at runtime.
     pub provider_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Classification of the failure that created each provider cooldown.
+    pub provider_failure_meta: Arc<Mutex<HashMap<i64, FailureMetadata>>>,
     /// Consecutive provider failures, used to escalate runtime cooldowns.
     pub provider_failure_streak: Arc<Mutex<HashMap<i64, u32>>>,
     /// Providers whose circuit is half-open, mapped to the instant the current
@@ -43,6 +100,8 @@ pub struct AppState {
     /// In-memory cooldowns for a specific provider model. This keeps one
     /// overloaded model from removing every sibling model on the provider.
     pub target_cooldown: Arc<Mutex<HashMap<(i64, String), Instant>>>,
+    /// Classification of the failure that created each model cooldown.
+    pub target_failure_meta: Arc<Mutex<HashMap<(i64, String), FailureMetadata>>>,
     /// Successful requests whose first token was slow. These targets are still
     /// routable, but are tried after healthy siblings while the soft penalty
     /// is active. This catches a provider that keeps returning 200 while its
@@ -50,11 +109,32 @@ pub struct AppState {
     pub target_slow: Arc<Mutex<HashMap<(i64, String), TargetSlowState>>>,
     /// In-memory cooldowns for provider keys that recently failed.
     pub provider_key_cooldown: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Classification of the failure that created each key cooldown.
+    pub provider_key_failure_meta: Arc<Mutex<HashMap<i64, FailureMetadata>>>,
+    /// Short-lived target sinks. Unlike cooldowns these remain routable.
+    pub target_sink: Arc<Mutex<HashMap<TargetSinkKey, TargetSinkEntry>>>,
+    /// Number of requests currently waiting because every target was busy.
+    pub busy_waiting_total: Arc<AtomicUsize>,
+    /// Per-route wait counters used to bound one route without a global lock.
+    pub busy_waiting_by_route: Arc<std::sync::Mutex<HashMap<i64, usize>>>,
+    /// Cumulative upstream failure classifications since process start.
+    pub failure_classifications: Arc<Mutex<HashMap<(String, String, String), u64>>>,
+    /// Latest provider-side quota readings. Request routing only reads this
+    /// cache; SQLite is refreshed by explicit management calls or workers.
+    pub quota_snapshots: Arc<Mutex<HashMap<ProviderQuotaSnapshotKey, ProviderQuotaSnapshotRecord>>>,
+    /// Learned upstream request-shape support, scoped by provider/model/endpoint.
+    pub(crate) capability_profiles: Arc<Mutex<CapabilityCache>>,
     /// Provider keys whose latest persisted runtime state contains an error.
     /// A later successful request clears the database field only once.
     pub provider_key_error_state: Arc<Mutex<HashSet<i64>>>,
     /// Throttles provider-key usage timestamps on the request hot path.
     pub provider_key_touched: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Rolling 60-second starts for each upstream credential.
+    pub provider_key_rpm: Arc<Mutex<HashMap<i64, VecDeque<Instant>>>>,
+    /// Shared semaphores enforcing each upstream credential's concurrency cap.
+    pub provider_key_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
+    /// Optional semaphores bounding each credential's waiting queue.
+    pub provider_key_queue: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     /// Shared semaphores enforcing each provider's concurrency cap.
     pub provider_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     /// Shared semaphores enforcing each provider model's concurrency cap.
@@ -364,7 +444,10 @@ pub(crate) fn parse_admission_wait_ms(value: Option<&str>) -> Duration {
     let default = Duration::from_millis(DEFAULT_ADMISSION_WAIT_MS);
     match value.map(str::trim) {
         None | Some("") => default,
-        Some(raw) => raw.parse::<u64>().map(Duration::from_millis).unwrap_or(default),
+        Some(raw) => raw
+            .parse::<u64>()
+            .map(Duration::from_millis)
+            .unwrap_or(default),
     }
 }
 
@@ -454,10 +537,12 @@ pub(crate) fn max_request_body_bytes() -> usize {
 /// Resolves the configured buffered-upstream-response cap in bytes.
 pub(crate) fn max_upstream_body_bytes() -> usize {
     parse_body_mib(
-        std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB").ok().as_deref(),
+        std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB")
+            .ok()
+            .as_deref(),
         DEFAULT_MAX_UPSTREAM_BODY_MIB,
     )
-        .saturating_mul(1024 * 1024)
+    .saturating_mul(1024 * 1024)
 }
 
 /// Resolves the configured hard cap on an upstream stream's total lifetime.
@@ -471,7 +556,9 @@ pub(crate) fn max_stream_lifetime() -> Option<Duration> {
 /// Resolves the configured bound on reading a request body from a client.
 pub(crate) fn body_read_timeout() -> Option<Duration> {
     parse_optional_secs(
-        std::env::var("OPENLLM_BODY_READ_TIMEOUT_SECS").ok().as_deref(),
+        std::env::var("OPENLLM_BODY_READ_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
         DEFAULT_BODY_READ_TIMEOUT_SECS,
     )
 }
@@ -480,7 +567,9 @@ pub(crate) fn body_read_timeout() -> Option<Duration> {
 /// loop.
 pub(crate) fn request_timeout() -> Option<Duration> {
     parse_optional_secs(
-        std::env::var("OPENLLM_REQUEST_TIMEOUT_SECS").ok().as_deref(),
+        std::env::var("OPENLLM_REQUEST_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
         DEFAULT_REQUEST_TIMEOUT_SECS,
     )
 }
@@ -488,7 +577,11 @@ pub(crate) fn request_timeout() -> Option<Duration> {
 /// Resolves the consecutive-failure threshold at which a provider's circuit
 /// hard-opens.
 pub(crate) fn provider_open_threshold() -> u32 {
-    parse_provider_open_threshold(std::env::var("OPENLLM_PROVIDER_OPEN_THRESHOLD").ok().as_deref())
+    parse_provider_open_threshold(
+        std::env::var("OPENLLM_PROVIDER_OPEN_THRESHOLD")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// Parses the provider circuit-open threshold.
@@ -499,7 +592,9 @@ pub(crate) fn provider_open_threshold() -> u32 {
 pub(crate) fn parse_provider_open_threshold(value: Option<&str>) -> u32 {
     match value.map(str::trim) {
         None | Some("") => DEFAULT_PROVIDER_OPEN_THRESHOLD,
-        Some(raw) => raw.parse::<u32>().unwrap_or(DEFAULT_PROVIDER_OPEN_THRESHOLD),
+        Some(raw) => raw
+            .parse::<u32>()
+            .unwrap_or(DEFAULT_PROVIDER_OPEN_THRESHOLD),
     }
 }
 
@@ -561,6 +656,7 @@ pub(crate) struct ClearedCooldowns {
     pub(crate) providers: usize,
     pub(crate) models: usize,
     pub(crate) provider_keys: usize,
+    pub(crate) sinks: usize,
 }
 
 /// One provider circuit transition, delivered to subscribed webhooks.
@@ -931,16 +1027,16 @@ impl AppState {
                 .as_deref(),
         )
         .unwrap_or(0);
-        let request_capacity = (request_capacity_limit > 0)
-            .then(|| Arc::new(Semaphore::new(request_capacity_limit)));
+        let request_capacity =
+            (request_capacity_limit > 0).then(|| Arc::new(Semaphore::new(request_capacity_limit)));
         let request_bytes_limit = parse_inflight_bytes_mib(
             std::env::var("OPENLLM_MAX_INFLIGHT_REQUEST_MIB")
                 .ok()
                 .as_deref(),
         )
         .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUEST_MIB * 1024 * 1024);
-        let inflight_request_bytes =
-            (request_bytes_limit > 0).then(|| Arc::new(RequestByteBudget::new(request_bytes_limit)));
+        let inflight_request_bytes = (request_bytes_limit > 0)
+            .then(|| Arc::new(RequestByteBudget::new(request_bytes_limit)));
         let memory_shed_ratio = parse_shed_ratio(
             std::env::var("OPENLLM_MEMORY_SHED_RATIO").ok().as_deref(),
             DEFAULT_MEMORY_SHED_RATIO,
@@ -948,15 +1044,16 @@ impl AppState {
         let memory_limit_env = std::env::var("OPENLLM_MEMORY_LIMIT_MIB").ok();
         let (memory_limit_bytes, memory_limit_source) =
             resolve_memory_limit(memory_limit_env.as_deref(), cgroup_memory_max_bytes());
-        let memory_pressure = memory_limit_bytes
-            .map(|bytes| Arc::new(MemoryPressure::new(bytes, memory_shed_ratio)));
+        let memory_pressure =
+            memory_limit_bytes.map(|bytes| Arc::new(MemoryPressure::new(bytes, memory_shed_ratio)));
         if memory_limit_source == "cgroup" {
             tracing::info!(
                 limit_mib = memory_limit_bytes.unwrap_or(0) / (1024 * 1024),
                 "memory-pressure guard armed from the container cgroup limit"
             );
         }
-        if memory_pressure.is_some() && !(cfg!(target_os = "linux") || cfg!(target_os = "windows")) {
+        if memory_pressure.is_some() && !(cfg!(target_os = "linux") || cfg!(target_os = "windows"))
+        {
             tracing::warn!(
                 "OPENLLM_MEMORY_LIMIT_MIB is set but memory sampling is only available on Linux \
                  and Windows; the memory-pressure guard will stay inert"
@@ -986,8 +1083,14 @@ impl AppState {
             target_cooldown: Arc::new(Mutex::new(HashMap::new())),
             target_slow: Arc::new(Mutex::new(HashMap::new())),
             provider_key_cooldown: Arc::new(Mutex::new(HashMap::new())),
+            target_sink: Arc::new(Mutex::new(HashMap::new())),
+            busy_waiting_total: Arc::new(AtomicUsize::new(0)),
+            busy_waiting_by_route: Arc::new(std::sync::Mutex::new(HashMap::new())),
             provider_key_error_state: Arc::new(Mutex::new(HashSet::new())),
             provider_key_touched: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_rpm: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_concurrency: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_queue: Arc::new(Mutex::new(HashMap::new())),
             provider_concurrency: Arc::new(Mutex::new(HashMap::new())),
             model_concurrency: Arc::new(Mutex::new(HashMap::new())),
             request_capacity,
@@ -1020,6 +1123,12 @@ impl AppState {
             guardrails: Arc::new(RwLock::new(None)),
             inspector: Arc::new(RwLock::new(None)),
             resilience: Arc::new(RwLock::new(None)),
+            provider_failure_meta: Arc::new(Mutex::new(HashMap::new())),
+            target_failure_meta: Arc::new(Mutex::new(HashMap::new())),
+            provider_key_failure_meta: Arc::new(Mutex::new(HashMap::new())),
+            failure_classifications: Arc::new(Mutex::new(HashMap::new())),
+            quota_snapshots: Arc::new(Mutex::new(HashMap::new())),
+            capability_profiles: Arc::new(Mutex::new(CapabilityCache::default())),
             sse_keepalive: parse_keepalive_secs(
                 std::env::var("OPENLLM_SSE_KEEPALIVE_SECS").ok().as_deref(),
             ),
@@ -1073,6 +1182,13 @@ impl AppState {
         });
     }
 
+    /// Marks one short-lived target sink as needing a persisted update.
+    pub(crate) fn mark_target_sink_dirty(&self, key: &TargetSinkKey) {
+        self.mark_resilience_dirty(|dirty| {
+            dirty.sinks.insert(key.clone());
+        });
+    }
+
     /// Marks one upstream credential's cooldown as needing a persisted update.
     pub(crate) fn mark_provider_key_resilience_dirty(&self, provider_key_id: i64) {
         self.mark_resilience_dirty(|dirty| {
@@ -1112,6 +1228,13 @@ impl AppState {
             .keys()
             .copied()
             .collect::<Vec<_>>();
+        let sinks = self
+            .target_sink
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
 
         let cleared = ClearedCooldowns {
             providers: {
@@ -1132,16 +1255,59 @@ impl AppState {
                 cooldowns.clear();
                 count
             },
+            sinks: {
+                let mut sinks = self.target_sink.lock().await;
+                let count = sinks.len();
+                sinks.clear();
+                count
+            },
         };
         self.provider_failure_streak.lock().await.clear();
         self.provider_probe.lock().await.clear();
+        self.provider_failure_meta.lock().await.clear();
+        self.target_failure_meta.lock().await.clear();
+        self.provider_key_failure_meta.lock().await.clear();
 
         self.mark_resilience_dirty(|dirty| {
             dirty.providers.extend(providers);
             dirty.targets.extend(targets);
             dirty.provider_keys.extend(provider_keys);
+            dirty.sinks.extend(sinks);
         });
         cleared
+    }
+
+    /// Attempts to reserve one bounded-wait slot for a route.
+    ///
+    /// Both the route-specific limit and the process-wide ceiling apply. A
+    /// missing slot means the request should fail/shed immediately instead of
+    /// adding pressure to the busy route.
+    pub(crate) fn try_acquire_busy_wait(
+        &self,
+        route_id: i64,
+        route_limit: usize,
+    ) -> Option<BusyWaitLease> {
+        let route_limit = route_limit.min(MAX_BUSY_WAITERS);
+        if route_limit == 0 {
+            return None;
+        }
+        let mut by_route = self
+            .busy_waiting_by_route
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let route_waiters = by_route.get(&route_id).copied().unwrap_or(0);
+        if route_waiters >= route_limit
+            || self.busy_waiting_total.load(Ordering::Acquire) >= MAX_BUSY_WAITERS
+        {
+            return None;
+        }
+        *by_route.entry(route_id).or_default() += 1;
+        self.busy_waiting_total.fetch_add(1, Ordering::AcqRel);
+        Some(BusyWaitLease {
+            total: self.busy_waiting_total.clone(),
+            by_route: self.busy_waiting_by_route.clone(),
+            route_id,
+        })
     }
 
     fn mark_resilience_dirty(&self, mark: impl FnOnce(&mut DirtyResilienceState)) {
@@ -1272,7 +1438,9 @@ impl AppState {
                 std::env::var("OPENLLM_MAX_BODY_MIB").ok().as_deref(),
             ),
             max_upstream_body_mib: parse_body_mib(
-                std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB").ok().as_deref(),
+                std::env::var("OPENLLM_MAX_UPSTREAM_BODY_MIB")
+                    .ok()
+                    .as_deref(),
                 DEFAULT_MAX_UPSTREAM_BODY_MIB,
             ),
             sse_keepalive_secs: self.sse_keepalive.map(|interval| interval.as_secs()),
@@ -1280,18 +1448,11 @@ impl AppState {
             max_inflight_request_mib: self.request_bytes_limit / (1024 * 1024),
             admission_wait_ms: self.admission_wait.as_millis() as u64,
             stream_max_secs: max_stream_lifetime().map(|lifetime| lifetime.as_secs()),
-            body_read_timeout_secs: self
-                .body_read_timeout
-                .map(|timeout| timeout.as_secs()),
-            request_timeout_secs: self
-                .request_timeout
-                .map(|timeout| timeout.as_secs()),
+            body_read_timeout_secs: self.body_read_timeout.map(|timeout| timeout.as_secs()),
+            request_timeout_secs: self.request_timeout.map(|timeout| timeout.as_secs()),
             provider_open_threshold: provider_open_threshold(),
             resilience_state_persist: self.resilience_state_persist,
-            session_affinity_ttl_secs: self
-                .session_affinity
-                .as_ref()
-                .map(|store| store.ttl_secs()),
+            session_affinity_ttl_secs: self.session_affinity.as_ref().map(|store| store.ttl_secs()),
             session_affinity_capacity: self
                 .session_affinity
                 .as_ref()

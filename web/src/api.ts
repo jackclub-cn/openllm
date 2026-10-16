@@ -96,6 +96,10 @@ export type ProviderApiKey = {
   avg_latency_ms: number
   prompt_tokens: number
   completion_tokens: number
+  max_concurrency?: number | null
+  requests_per_minute?: number | null
+  queue_limit?: number | null
+  queue_wait_ms?: number | null
   cooldown_seconds?: number
   created_at: string
 }
@@ -105,6 +109,10 @@ export type ProviderApiKeyInput = {
   name: string
   api_key?: string
   enabled: boolean
+  max_concurrency?: number | null
+  requests_per_minute?: number | null
+  queue_limit?: number | null
+  queue_wait_ms?: number | null
 }
 
 export type Provider = {
@@ -123,6 +131,7 @@ export type Provider = {
   models: string[]
   models_synced_at?: string
   models_sync_error?: string
+  model_auto_include_rules: string[]
   last_test_at?: string | null
   last_test_ok?: boolean | null
   last_test_latency_ms?: number | null
@@ -167,6 +176,24 @@ export type ProviderQuotaModel = {
   note?: string | null
 }
 
+export type ProviderQuotaSnapshot = {
+  provider_id: number
+  provider_key_id?: number | null
+  model: string
+  window_key: string
+  used?: number | null
+  limit?: number | null
+  remaining?: number | null
+  unit: string
+  percent?: number | null
+  reset_at?: string | null
+  source: string
+  confidence: string
+  observed_at: string
+  valid_until: string
+  state: 'unknown' | 'healthy' | 'low' | 'exhausted' | 'reset_due'
+}
+
 export type ProviderPrice = {
   model_name: string
   input?: number | null
@@ -187,6 +214,7 @@ export type ProviderQuota = {
   model_quotas: ProviderQuotaModel[]
   details: ProviderQuotaDetail[]
   prices: ProviderPrice[]
+  snapshots: ProviderQuotaSnapshot[]
   fetched_at: string
 }
 
@@ -230,6 +258,7 @@ export type ProviderInput = {
   headers: Record<string, string>
   auto_sync_models: boolean
   models: string[]
+  model_auto_include_rules: string[]
   health_check_interval_minutes?: number | null
   health_check_model?: string | null
   models_sync_interval_minutes?: number | null
@@ -327,6 +356,7 @@ export type GatewayRoute = {
     | 'latency_optimized'
     | 'p95_latency_optimized'
     | 'least_used'
+    | 'quota_paced'
   enabled: boolean
   context_limit?: number | null
   input_limit?: number | null
@@ -335,6 +365,10 @@ export type GatewayRoute = {
   output_limit_base?: number | null
   context_override?: number | null
   output_override?: number | null
+  all_targets_busy_wait_seconds: number
+  retry_jitter_ms: number
+  max_waiting_requests: number
+  keepalive_during_wait: boolean
   limits_verified: boolean
   targets: RouteTarget[]
   created_at: string
@@ -384,6 +418,11 @@ export type RouteDiagnoseCandidate = {
   eligible: boolean
   exclusion?: string | null
   deprioritized: boolean
+  failure_scope?: string | null
+  failure_retry?: string | null
+  failure_confidence?: string | null
+  failure_reason_code?: string | null
+  failure_observed_seconds_ago?: number | null
   factors: RouteDiagnoseFactor[]
 }
 
@@ -527,6 +566,53 @@ export type UsageLog = {
   response_preview?: string
   warning_message?: string
   created_at: string
+}
+
+export type RouteTraceCandidate = {
+  order: number
+  provider_id: number
+  provider_api_key_id?: number | null
+  upstream_model: string
+  eligible: boolean
+  deprioritized: boolean
+  reason_code: string
+}
+
+export type RouteTraceAttempt = {
+  attempt_index: number
+  round: number
+  candidate_order: number
+  provider_id?: number | null
+  provider_api_key_id?: number | null
+  upstream_model?: string | null
+  started_at: string
+  latency_ms: number
+  status_code?: number | null
+  success: boolean
+  retryable: boolean
+  reason_code: string
+  failure_scope?: string | null
+  failure_retry?: string | null
+  failure_confidence?: string | null
+}
+
+export type RouteTrace = {
+  request_id: string
+  created_at: string
+  finished_at: string
+  route_id?: number | null
+  strategy: string
+  session_id?: string | null
+  session_decision: string
+  candidates: RouteTraceCandidate[]
+  attempt_count: number
+  fallback_count: number
+  final_provider_id?: number | null
+  final_provider_api_key_id?: number | null
+  final_upstream_model?: string | null
+  final_status_code?: number | null
+  success: boolean
+  attempts: RouteTraceAttempt[]
 }
 
 export type Overview = {
@@ -700,6 +786,11 @@ export type ProviderCooldown = {
   remaining_seconds: number
   failure_streak: number
   state: 'closed' | 'open' | 'half_open'
+  scope?: string | null
+  retry?: string | null
+  confidence?: string | null
+  reason_code?: string | null
+  observed_seconds_ago?: number | null
 }
 
 export type ModelCooldown = {
@@ -707,6 +798,11 @@ export type ModelCooldown = {
   provider_name?: string | null
   model: string
   remaining_seconds: number
+  scope?: string | null
+  retry?: string | null
+  confidence?: string | null
+  reason_code?: string | null
+  observed_seconds_ago?: number | null
 }
 
 export type ProviderKeyCooldown = {
@@ -714,6 +810,11 @@ export type ProviderKeyCooldown = {
   provider_name?: string | null
   key_name?: string | null
   remaining_seconds: number
+  scope?: string | null
+  retry?: string | null
+  confidence?: string | null
+  reason_code?: string | null
+  observed_seconds_ago?: number | null
 }
 
 export type CooldownSnapshot = {

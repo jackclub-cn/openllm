@@ -30,8 +30,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use sqlx::SqlitePool;
 use serde::Serialize;
+use sqlx::SqlitePool;
 
 use crate::error::{AppError, AppResult};
 use crate::models::{ApiKeyRecord, ProviderPool, ProviderPoolAllocation, RouteTarget};
@@ -135,12 +135,15 @@ impl PoolSpec {
             name: pool.name.clone(),
             window,
             bucket_width_ms: (window.as_millis() as u64 / BUCKETS_PER_WINDOW).max(1),
-            request_limit: pool.request_limit.filter(|limit| *limit > 0).map(|limit| limit as u64),
-            token_limit: pool.token_limit.filter(|limit| *limit > 0).map(|limit| limit as u64),
-            saturation_threshold_pct: pool
-                .saturation_threshold_pct
-                .clamp(1, 100)
-                .unsigned_abs(),
+            request_limit: pool
+                .request_limit
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit as u64),
+            token_limit: pool
+                .token_limit
+                .filter(|limit| *limit > 0)
+                .map(|limit| limit as u64),
+            saturation_threshold_pct: pool.saturation_threshold_pct.clamp(1, 100).unsigned_abs(),
             allocations,
         }
     }
@@ -224,7 +227,9 @@ pub(crate) enum PoolDecision {
     Allow,
     /// The key is above its share while the pool is saturated. The request may
     /// proceed, but it should be tried after traffic that is inside its share.
-    Penalize { reason: String },
+    Penalize {
+        reason: String,
+    },
     /// The request must not use this provider right now.
     Deny {
         reason: String,
@@ -566,7 +571,10 @@ pub(crate) async fn apply_allocation_filter(
                 PoolDecision::Penalize { reason } => {
                     penalty.get_or_insert(reason);
                 }
-                PoolDecision::Deny { reason, retry_after } => {
+                PoolDecision::Deny {
+                    reason,
+                    retry_after,
+                } => {
                     denial = Some((reason, retry_after));
                     break;
                 }
@@ -641,7 +649,11 @@ pub(crate) async fn charge_target_attempt(
     let mut ledger = state.allocation_ledger.lock().await;
     let mut denial: Option<(String, Duration)> = None;
     for spec in pools {
-        if let PoolDecision::Deny { reason, retry_after } = ledger.decide(spec, api_key_id, now) {
+        if let PoolDecision::Deny {
+            reason,
+            retry_after,
+        } = ledger.decide(spec, api_key_id, now)
+        {
             ledger.record_denial(spec.id);
             denial = Some((reason, retry_after));
             break;

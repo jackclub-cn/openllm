@@ -42,7 +42,12 @@ import {
   type Settings,
 } from '../api'
 import PageHeader from '../components/PageHeader'
-import { formatBytes, formatCompact, formatExact } from '../format'
+import {
+  formatBytes,
+  formatCompact,
+  formatExact,
+  formatFailureClassification,
+} from '../format'
 
 export default function SettingsPage({ onSave }: { onSave: (value: string) => void }) {
   const { message } = App.useApp()
@@ -153,6 +158,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       detail: [
         item.failure_streak ? `连续失败 ${item.failure_streak} 次` : '',
         item.state === 'open' ? '已熔断' : item.state === 'half_open' ? '探测恢复中' : '',
+        formatFailureClassification(item),
       ]
         .filter(Boolean)
         .join(' · '),
@@ -164,7 +170,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       key: `model-${item.provider_id}-${item.model}`,
       scope: '模型',
       target: `${item.provider_name ?? `#${item.provider_id}`} · ${item.model}`,
-      detail: '',
+      detail: formatFailureClassification(item),
       remaining: item.remaining_seconds,
       clear: { provider_id: item.provider_id, model: item.model },
     })),
@@ -172,7 +178,7 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
       key: `key-${item.provider_key_id}`,
       scope: '上游密钥',
       target: `${item.provider_name ?? '-'} · ${item.key_name ?? `#${item.provider_key_id}`}`,
-      detail: '',
+      detail: formatFailureClassification(item),
       remaining: item.remaining_seconds,
       clear: { provider_key_id: item.provider_key_id },
     })),

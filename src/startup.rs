@@ -121,7 +121,11 @@ pub(crate) fn parse_lease_ttl_secs(value: Option<&str>) -> i64 {
 }
 
 pub(crate) fn lease_ttl_secs() -> i64 {
-    parse_lease_ttl_secs(std::env::var("OPENLLM_INSTANCE_LEASE_TTL_SECS").ok().as_deref())
+    parse_lease_ttl_secs(
+        std::env::var("OPENLLM_INSTANCE_LEASE_TTL_SECS")
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// How often to refresh the lease.
@@ -405,10 +409,12 @@ pub(crate) async fn claim_instance_lease(
     }
 
     // Remove anything that has already expired so the table stays tiny.
-    sqlx::query("DELETE FROM instance_leases WHERE heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)")
-        .bind(&cutoff)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "DELETE FROM instance_leases WHERE heartbeat_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?)",
+    )
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
 
     Ok(blocking)
 }
@@ -732,13 +738,15 @@ async fn move_sidecars(from: &Path, to: &Path) -> anyhow::Result<()> {
         if destination.exists() {
             tokio::fs::remove_file(&destination).await.ok();
         }
-        tokio::fs::rename(&source, &destination).await.with_context(|| {
-            format!(
-                "failed to move the sidecar {} to {}",
-                source.display(),
-                destination.display()
-            )
-        })?;
+        tokio::fs::rename(&source, &destination)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to move the sidecar {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -746,13 +754,15 @@ async fn move_sidecars(from: &Path, to: &Path) -> anyhow::Result<()> {
 /// Put a set-aside database (and its sidecars) back where it came from.
 async fn restore_previous(previous: &Path, database_path: &Path) -> anyhow::Result<()> {
     let _ = tokio::fs::remove_file(database_path).await;
-    tokio::fs::rename(previous, database_path).await.with_context(|| {
-        format!(
-            "failed to move {} back to {}",
-            previous.display(),
-            database_path.display()
-        )
-    })?;
+    tokio::fs::rename(previous, database_path)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to move {} back to {}",
+                previous.display(),
+                database_path.display()
+            )
+        })?;
     move_sidecars(previous, database_path).await
 }
 
@@ -819,12 +829,12 @@ pub(crate) async fn verify_database_file(
                 .map(|required| required.to_string())
                 .collect();
             let has = |table: &str| report.tables.iter().any(|name| name == table);
-            if has("_sqlx_migrations") {                report.applied_migrations = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM _sqlx_migrations",
-                )
-                .fetch_one(&pool)
-                .await
-                .unwrap_or(0);
+            if has("_sqlx_migrations") {
+                report.applied_migrations =
+                    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM _sqlx_migrations")
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap_or(0);
                 report.schema_version = sqlx::query_scalar::<_, i64>(
                     "SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations",
                 )
@@ -923,7 +933,8 @@ pub(crate) fn resolve_backup_path(
     if trimmed.is_empty() {
         anyhow::bail!("a backup name is required");
     }
-    let looks_like_a_path = trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..");
+    let looks_like_a_path =
+        trimmed.contains('/') || trimmed.contains('\\') || trimmed.contains("..");
     if looks_like_a_path && !allow_path {
         anyhow::bail!("the backup name must be a plain file name inside the backups directory");
     }
@@ -1059,9 +1070,13 @@ pub(crate) async fn restore_backup(
     // Stage next to the target so the final step is an atomic rename on the
     // same filesystem.
     let staging = sidecar(database_path, ".restoring");
-    tokio::fs::copy(backup, &staging)
-        .await
-        .with_context(|| format!("failed to copy {} to {}", backup.display(), staging.display()))?;
+    tokio::fs::copy(backup, &staging).await.with_context(|| {
+        format!(
+            "failed to copy {} to {}",
+            backup.display(),
+            staging.display()
+        )
+    })?;
 
     // Set the current database aside *with* its WAL sidecars before the restore
     // lands. Deleting the sidecars first would lose committed-but-not-yet-
@@ -1077,7 +1092,10 @@ pub(crate) async fn restore_backup(
         tokio::fs::rename(database_path, &previous)
             .await
             .with_context(|| {
-                format!("failed to set the current database aside at {}", previous.display())
+                format!(
+                    "failed to set the current database aside at {}",
+                    previous.display()
+                )
             })?;
         move_sidecars(database_path, &previous).await?;
         Some(previous)
@@ -1182,10 +1200,16 @@ pub(crate) async fn migration_report(
             description: migration.description.to_string(),
         })
         .collect();
-    report.pending.retain(|migration| !applied.contains(&migration.version));
+    report
+        .pending
+        .retain(|migration| !applied.contains(&migration.version));
     report.unknown_applied = applied
         .iter()
-        .filter(|version| !migrator.iter().any(|migration| migration.version == **version))
+        .filter(|version| {
+            !migrator
+                .iter()
+                .any(|migration| migration.version == **version)
+        })
         .copied()
         .collect();
     report.unknown_applied.sort_unstable();

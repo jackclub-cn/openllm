@@ -7,6 +7,10 @@ export type RouteFormValues = {
   enabled: boolean
   context_override?: number | null
   output_override?: number | null
+  all_targets_busy_wait_seconds: number
+  retry_jitter_ms: number
+  max_waiting_requests: number
+  keepalive_during_wait: boolean
   targets: RouteTarget[]
 }
 
@@ -18,6 +22,7 @@ export const strategyLabels = {
   latency_optimized: '延迟优先',
   p95_latency_optimized: 'P95 延迟优先',
   least_used: '负载最少',
+  quota_paced: '额度节奏优先',
 }
 
 export const matchTypeLabels = {

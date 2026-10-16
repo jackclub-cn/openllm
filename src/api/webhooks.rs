@@ -318,12 +318,7 @@ pub async fn update_webhook(
         Some(value) => normalize_webhook_headers(Some(value))?,
         None => current.headers.clone(),
     };
-    let kind = normalize_channel_kind(
-        input
-            .kind
-            .as_deref()
-            .or(Some(current.kind.as_str())),
-    )?;
+    let kind = normalize_channel_kind(input.kind.as_deref().or(Some(current.kind.as_str())))?;
     // Validate the extra fields against the kind that will actually be stored,
     // so switching a webhook to a kind that needs one without supplying it is
     // rejected here instead of failing every delivery afterwards.

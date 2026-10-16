@@ -71,6 +71,10 @@ pub(super) async fn resolve_route(
             strategy: route.strategy,
             targets,
             barrel: Some(barrel),
+            all_targets_busy_wait_seconds: route.all_targets_busy_wait_seconds,
+            retry_jitter_ms: route.retry_jitter_ms,
+            max_waiting_requests: route.max_waiting_requests,
+            keepalive_during_wait: route.keepalive_during_wait != 0,
         });
     }
 
@@ -90,6 +94,10 @@ pub(super) async fn resolve_route(
         strategy: "priority".to_string(),
         targets,
         barrel: Some(barrel),
+        all_targets_busy_wait_seconds: 0,
+        retry_jitter_ms: 250,
+        max_waiting_requests: 32,
+        keepalive_during_wait: true,
     })
 }
 
@@ -121,7 +129,10 @@ pub async fn diagnose_route_for_key(
         r#"
         SELECT id, name, model_pattern,
                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy,
-               enabled, context_override, output_override, created_at, updated_at
+               enabled, context_override, output_override,
+               all_targets_busy_wait_seconds, retry_jitter_ms,
+               max_waiting_requests, keepalive_during_wait,
+               created_at, updated_at
         FROM routes
         ORDER BY
             CASE WHEN instr(model_pattern, '*') = 0 AND instr(model_pattern, '?') = 0 THEN 0 ELSE 1 END,
@@ -597,6 +608,10 @@ fn diagnostic_route_target(row: &DiagnosticTargetRow, route_id: Option<i64>) -> 
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     }
 }
@@ -623,15 +638,14 @@ pub(super) async fn diagnostic_candidates(
         .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
     let route_id = route_id.unwrap_or(-1);
-    let affinity =
-        session_affinity_context(state, route_id, session_id, api_key_id, false).await;
+    let affinity = session_affinity_context(state, route_id, session_id, api_key_id, false).await;
     let assessments =
         assess_targets(state, strategy, &eligible, api_key_id, affinity.as_ref()).await?;
     let ordered = order_targets_with_context(
         state,
         route_id,
         strategy.as_str(),
-        eligible,
+        eligible.clone(),
         session_id,
         api_key_id,
         affinity.as_ref(),
@@ -648,6 +662,26 @@ pub(super) async fn diagnostic_candidates(
             candidate_view(index + 1, target, &assessment)
         })
         .collect::<Vec<_>>();
+    let ordered_keys = ordered
+        .iter()
+        .map(|target| (target.provider_id, target.upstream_model.clone()))
+        .collect::<HashSet<_>>();
+    for target in &eligible {
+        if ordered_keys.contains(&(target.provider_id, target.upstream_model.clone())) {
+            continue;
+        }
+        let assessment = assessments
+            .get(&(target.provider_id, target.upstream_model.clone()))
+            .cloned()
+            .unwrap_or_else(|| TargetAssessment::new(Vec::new()));
+        let mut candidate = candidate_view(0, target, &assessment);
+        if candidate.exclusion.is_none() {
+            candidate.exclusion = Some("当前运行时状态使该候选暂不可用".to_string());
+        }
+        candidate.eligible = false;
+        candidate.deprioritized = true;
+        candidates.push(candidate);
+    }
     // Rows that fail the eligibility pre-checks can never be tried, so they are
     // listed with the reason instead of silently disappearing from the preview.
     for (row, (target, eligible)) in rows.iter().zip(diagnosed) {
@@ -663,8 +697,53 @@ pub(super) async fn diagnostic_candidates(
             eligible: false,
             exclusion: Some(target.reason.clone()),
             deprioritized: true,
+            failure_scope: None,
+            failure_retry: None,
+            failure_confidence: None,
+            failure_reason_code: None,
+            failure_observed_seconds_ago: None,
             factors: Vec::new(),
         });
+    }
+    let now = Instant::now();
+    let target_failure_meta = {
+        let active = state
+            .target_cooldown
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(key, _)| key.clone())
+            .collect::<HashSet<_>>();
+        let mut metadata = state.target_failure_meta.lock().await;
+        metadata.retain(|key, _| active.contains(key));
+        metadata.clone()
+    };
+    let provider_failure_meta = {
+        let active = state
+            .provider_cooldown
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(provider_id, _)| *provider_id)
+            .collect::<HashSet<_>>();
+        let mut metadata = state.provider_failure_meta.lock().await;
+        metadata.retain(|provider_id, _| active.contains(provider_id));
+        metadata.clone()
+    };
+    for candidate in &mut candidates {
+        let target_key = (candidate.provider_id, candidate.upstream_model.clone());
+        let metadata = target_failure_meta
+            .get(&target_key)
+            .or_else(|| provider_failure_meta.get(&candidate.provider_id));
+        if let Some(metadata) = metadata {
+            candidate.failure_scope = Some(metadata.scope);
+            candidate.failure_retry = Some(metadata.retry);
+            candidate.failure_confidence = Some(metadata.confidence);
+            candidate.failure_reason_code = Some(metadata.reason_code);
+            candidate.failure_observed_seconds_ago = Some(metadata.observed_at.elapsed().as_secs());
+        }
     }
     // The request path removes excluded candidates before ordering, so the
     // preview must not show one ahead of a candidate it would actually use.
@@ -695,9 +774,12 @@ pub(super) async fn diagnostic_runtime_targets(
         .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
-    let metrics =
-        runtime_target_metrics(state, &targets, strategy == RouteStrategy::P95LatencyOptimized)
-            .await?;
+    let metrics = runtime_target_metrics(
+        state,
+        &targets,
+        strategy == RouteStrategy::P95LatencyOptimized,
+    )
+    .await?;
     let route_id = route_id.unwrap_or(-1);
     let affinity =
         session_affinity_context(state, route_id, Some(session_id), api_key_id, false).await;
@@ -711,6 +793,7 @@ pub(super) async fn diagnostic_runtime_targets(
         affinity.as_ref(),
     )
     .await?;
+    let quota_states = crate::quota::target_scope_states(state, &ordered).await;
     Ok(Some(
         ordered
             .into_iter()
@@ -725,7 +808,14 @@ pub(super) async fn diagnostic_runtime_targets(
                 let decision_reason = if index == 0 && session_pinned {
                     "session_affinity".to_string()
                 } else {
-                    target_decision_reason(strategy, &target, metric, index == 0).to_string()
+                    target_decision_reason(
+                        strategy,
+                        &target,
+                        metric,
+                        quota_states.get(&crate::quota::quota_target_key(&target)),
+                        index == 0,
+                    )
+                    .to_string()
                 };
                 RouteDiagnoseRuntimeTarget {
                     order: index + 1,
@@ -795,7 +885,10 @@ pub(super) async fn find_explicit_route(state: &AppState, model: &str) -> AppRes
         r#"
         SELECT id, name, model_pattern,
                CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy,
-               enabled, context_override, output_override, created_at, updated_at
+               enabled, context_override, output_override,
+               all_targets_busy_wait_seconds, retry_jitter_ms,
+               max_waiting_requests, keepalive_during_wait,
+               created_at, updated_at
         FROM routes
         WHERE enabled = 1
         ORDER BY
@@ -986,9 +1079,7 @@ pub(super) fn retry_backoff_with_draw(
     let multiplier = 1u64 << retry_index.min(6);
     let delay = base.saturating_mul(multiplier).min(cap);
     let jitter_percent = (draw.clamp(0.0, 1.0) * 25.0).round() as u64;
-    let jittered = delay
-        .saturating_mul(100u64.saturating_add(jitter_percent))
-        / 100;
+    let jittered = delay.saturating_mul(100u64.saturating_add(jitter_percent)) / 100;
     Duration::from_millis(jittered.min(cap))
 }
 
@@ -1024,12 +1115,9 @@ pub(super) fn retry_after_from_headers(headers: &HeaderMap) -> Option<Duration> 
 /// compatible upstreams. When several windows are present, wait for the latest
 /// one so the next attempt does not immediately hit another active limit.
 fn retry_after_from_reset_headers(headers: &HeaderMap) -> Option<Duration> {
-    const RESET_AFTER_HEADERS: [&str; 2] =
-        ["x-ratelimit-reset-after", "ratelimit-reset-after"];
-    const RESET_DURATION_HEADERS: [&str; 2] = [
-        "x-ratelimit-reset-requests",
-        "x-ratelimit-reset-tokens",
-    ];
+    const RESET_AFTER_HEADERS: [&str; 2] = ["x-ratelimit-reset-after", "ratelimit-reset-after"];
+    const RESET_DURATION_HEADERS: [&str; 2] =
+        ["x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"];
     const RESET_TIMESTAMP_HEADERS: [&str; 3] = [
         "anthropic-ratelimit-unified-reset",
         "x-ratelimit-reset",
@@ -1127,7 +1215,11 @@ fn parse_reset_timestamp(value: &str) -> Option<Duration> {
     let value = value.trim();
     if let Ok(raw) = value.parse::<i64>() {
         // Unix reset timestamps may be seconds or milliseconds.
-        let seconds = if raw > 10_000_000_000 { raw / 1000 } else { raw };
+        let seconds = if raw > 10_000_000_000 {
+            raw / 1000
+        } else {
+            raw
+        };
         let now = Utc::now().timestamp();
         return (seconds > now).then(|| Duration::from_secs((seconds - now) as u64));
     }
@@ -1178,6 +1270,158 @@ pub(super) fn provider_key_cooldown(status: StatusCode, retry_after: Option<Dura
         .min(MAX_PROVIDER_KEY_COOLDOWN)
 }
 
+pub(super) fn target_sink_key(target: &RouteTarget) -> crate::state::TargetSinkKey {
+    (
+        target.provider_id,
+        target.provider_api_key_id,
+        target.upstream_model.clone(),
+    )
+}
+
+fn target_sink_ttl(retry_after: Option<Duration>) -> Duration {
+    const DEFAULT_SINK: Duration = Duration::from_secs(30);
+    const MIN_SINK: Duration = Duration::from_secs(1);
+    const MAX_SINK: Duration = Duration::from_secs(5 * 60);
+    retry_after
+        .unwrap_or(DEFAULT_SINK)
+        .clamp(MIN_SINK, MAX_SINK)
+}
+
+pub(super) async fn mark_target_sink(
+    state: &AppState,
+    target: &RouteTarget,
+    reason_code: &'static str,
+    retry_after: Option<Duration>,
+) {
+    let now = Instant::now();
+    let key = target_sink_key(target);
+    let deadline = now + target_sink_ttl(retry_after);
+    state
+        .target_sink
+        .lock()
+        .await
+        .entry(key.clone())
+        .and_modify(|entry| {
+            entry.until = entry.until.max(deadline);
+            entry.reason_code = reason_code;
+            entry.observed_at = now;
+        })
+        .or_insert(crate::state::TargetSinkEntry {
+            until: deadline,
+            reason_code,
+            observed_at: now,
+        });
+    state.mark_target_sink_dirty(&key);
+}
+
+async fn clear_target_sinks_for_provider_model(
+    state: &AppState,
+    provider_id: i64,
+    upstream_model: &str,
+) {
+    let removed = {
+        let mut sinks = state.target_sink.lock().await;
+        let keys = sinks
+            .keys()
+            .filter(|(target_provider_id, _, model)| {
+                *target_provider_id == provider_id && model == upstream_model
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &keys {
+            sinks.remove(key);
+        }
+        keys
+    };
+    for key in &removed {
+        state.mark_target_sink_dirty(key);
+    }
+}
+
+pub(crate) async fn clear_target_sinks_for_route(state: &AppState, route_id: i64) -> usize {
+    let pairs = sqlx::query_as::<_, (i64, String)>(
+        "SELECT provider_id, upstream_model FROM route_targets WHERE route_id = ?",
+    )
+    .bind(route_id)
+    .fetch_all(&state.pool)
+    .await
+    .unwrap_or_default();
+    let pairs = pairs.into_iter().collect::<HashSet<_>>();
+    let removed = {
+        let mut sinks = state.target_sink.lock().await;
+        let keys = sinks
+            .keys()
+            .filter(|(provider_id, _, model)| pairs.contains(&(*provider_id, model.clone())))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &keys {
+            sinks.remove(key);
+        }
+        keys
+    };
+    for key in &removed {
+        state.mark_target_sink_dirty(key);
+    }
+    removed.len()
+}
+
+pub(super) async fn target_sink_active(state: &AppState, target: &RouteTarget) -> bool {
+    let now = Instant::now();
+    let mut sinks = state.target_sink.lock().await;
+    sinks.retain(|_, entry| entry.until > now);
+    sinks.contains_key(&target_sink_key(target))
+}
+
+pub(super) async fn busy_waitable_error(
+    state: &AppState,
+    target: &RouteTarget,
+    error: &AppError,
+) -> bool {
+    match error {
+        AppError::Upstream(_) => true,
+        AppError::UpstreamStatus { status, .. } => match *status {
+            StatusCode::TOO_MANY_REQUESTS => target_sink_active(state, target).await,
+            StatusCode::REQUEST_TIMEOUT => true,
+            status if status.as_u16() == 425 => true,
+            status if status.is_server_error() => true,
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+pub(super) fn busy_wait_retry_after(error: &AppError) -> Option<Duration> {
+    match error {
+        AppError::UpstreamStatus { retry_after, .. } => *retry_after,
+        _ => None,
+    }
+}
+
+pub(super) fn busy_wait_delay(
+    jitter_ms: i64,
+    retry_after: Option<Duration>,
+    round: u32,
+) -> Duration {
+    const MIN_DELAY: Duration = Duration::from_millis(50);
+    const MAX_DELAY: Duration = Duration::from_secs(5);
+    let jitter_ms = u64::try_from(jitter_ms.max(0)).unwrap_or(0);
+    let jitter = if jitter_ms == 0 {
+        Duration::ZERO
+    } else {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.subsec_nanos() as u64)
+            .unwrap_or(0);
+        Duration::from_millis(nanos % jitter_ms.saturating_add(1))
+    };
+    let hinted = retry_after.unwrap_or_default().min(MAX_DELAY);
+    let backoff = MIN_DELAY
+        .checked_mul(1u32.checked_shl(round.min(16)).unwrap_or(u32::MAX))
+        .unwrap_or(MAX_DELAY)
+        .min(MAX_DELAY);
+    (backoff.max(hinted) + jitter).min(MAX_DELAY)
+}
+
 /// Minimum probe reservation margin, added on top of a configured provider
 /// header timeout so the probe lease cannot expire while the upstream is still
 /// allowed to answer.
@@ -1188,7 +1432,9 @@ pub(super) fn provider_probe_lease(timeout_seconds: Option<i64>) -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(|seconds| Duration::from_secs(seconds.unsigned_abs()));
     configured
-        .map(|timeout| PROVIDER_PROBE_LEASE.max(timeout.saturating_add(PROVIDER_PROBE_TIMEOUT_MARGIN)))
+        .map(|timeout| {
+            PROVIDER_PROBE_LEASE.max(timeout.saturating_add(PROVIDER_PROBE_TIMEOUT_MARGIN))
+        })
         .unwrap_or(PROVIDER_PROBE_LEASE)
 }
 
@@ -1288,17 +1534,19 @@ pub(super) async fn mark_provider_error(
     // Mirror the trip so a restart still knows this provider is unhealthy.
     state.mark_provider_resilience_dirty(provider_id);
     if opened {
-        let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
-            provider_id,
-            state: "open",
-            reason: if probe_was_in_flight {
-                "probe_failed"
-            } else {
-                "failure_threshold"
-            },
-            failure_streak: failures,
-            cooldown_seconds: cooldown.as_secs(),
-        });
+        let _ = state
+            .circuit_events
+            .send(crate::state::ProviderCircuitEvent {
+                provider_id,
+                state: "open",
+                reason: if probe_was_in_flight {
+                    "probe_failed"
+                } else {
+                    "failure_threshold"
+                },
+                failure_streak: failures,
+                cooldown_seconds: cooldown.as_secs(),
+            });
     }
 }
 
@@ -1333,9 +1581,15 @@ pub(super) async fn mark_target_success(state: &AppState, provider_id: i64, upst
         .lock()
         .await
         .remove(&(provider_id, upstream_model.to_string()));
+    state
+        .target_failure_meta
+        .lock()
+        .await
+        .remove(&(provider_id, upstream_model.to_string()));
     if removed.is_some() {
         state.mark_target_resilience_dirty(provider_id, upstream_model);
     }
+    clear_target_sinks_for_provider_model(state, provider_id, upstream_model).await;
 }
 
 /// Records a successful request's first-token latency as a soft routing signal.
@@ -1365,9 +1619,9 @@ pub(super) async fn record_target_latency_success(
     let mut targets = state.target_slow.lock().await;
     targets.retain(|_, entry| {
         entry.until.is_some_and(|until| until > now)
-            || entry
-                .last_slow_at
-                .is_some_and(|last| now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW)
+            || entry.last_slow_at.is_some_and(|last| {
+                now.saturating_duration_since(last) <= SLOW_TARGET_STREAK_WINDOW
+            })
     });
 
     let entry = targets
@@ -1429,8 +1683,65 @@ pub(super) async fn mark_stream_failure(state: &AppState, target: &RouteTarget, 
         %message,
         "upstream stream failed before it finished; cooling the provider"
     );
-    mark_provider_error(state, target.provider_id, None, None, target.cooldown_seconds).await;
+    record_transport_failure(state, target, "upstream_stream_failed", message).await;
+}
+
+/// Records a transport fault that happened before an upstream response was
+/// received. Transport failures are provider-wide by nature, but the target
+/// still gets a model cooldown so the request path does not immediately choose
+/// the same broken connection again.
+pub(super) async fn record_transport_failure(
+    state: &AppState,
+    target: &RouteTarget,
+    reason_code: &'static str,
+    message: &str,
+) -> UpstreamFailure {
+    let failure = UpstreamFailure::transport(reason_code);
+    count_failure_classification(state, failure).await;
+    tracing::warn!(
+        provider = %target.provider_name,
+        model = %target.upstream_model,
+        provider_key_id = target.provider_api_key_id,
+        scope = failure.scope.as_str(),
+        retry = failure.retry.as_str(),
+        confidence = failure.confidence.as_str(),
+        reason = failure.reason_code,
+        %message,
+        "classified upstream transport failure"
+    );
+    mark_provider_error(
+        state,
+        target.provider_id,
+        None,
+        None,
+        target.cooldown_seconds,
+    )
+    .await;
     mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
+    let metadata = failure.metadata();
+    state.target_failure_meta.lock().await.insert(
+        (target.provider_id, target.upstream_model.clone()),
+        metadata.clone(),
+    );
+    state
+        .provider_failure_meta
+        .lock()
+        .await
+        .insert(target.provider_id, metadata);
+    failure
+}
+
+async fn count_failure_classification(state: &AppState, failure: UpstreamFailure) {
+    *state
+        .failure_classifications
+        .lock()
+        .await
+        .entry((
+            failure.scope.as_str().to_string(),
+            failure.retry.as_str().to_string(),
+            failure.reason_code.to_string(),
+        ))
+        .or_default() += 1;
 }
 
 pub(super) async fn record_upstream_failure(
@@ -1439,10 +1750,36 @@ pub(super) async fn record_upstream_failure(
     status: StatusCode,
     response_headers: &HeaderMap,
     message: &str,
-) {
+) -> UpstreamFailure {
     let retry_after = retry_after_from_headers(response_headers);
-    if retryable_status(status) {
+    let failure = classify_upstream_failure(target, status, message.as_bytes());
+    crate::quota::observe_response_headers(state, target, response_headers).await;
+    if status == StatusCode::TOO_MANY_REQUESTS && failure.reason_code == "quota_exhausted" {
+        crate::quota::observe_runtime_quota_failure(state, target, retry_after).await;
+    }
+    tracing::warn!(
+        provider = %target.provider_name,
+        model = %target.upstream_model,
+        provider_key_id = target.provider_api_key_id,
+        status = status.as_u16(),
+        scope = failure.scope.as_str(),
+        retry = failure.retry.as_str(),
+        confidence = failure.confidence.as_str(),
+        reason = failure.reason_code,
+        "classified upstream failure"
+    );
+    count_failure_classification(state, failure).await;
+    if failure.should_sink() {
+        mark_target_sink(state, target, failure.reason_code, retry_after).await;
+    }
+    let metadata = failure.metadata();
+    let mut provider_rested = false;
+    if failure.should_rest_target() {
         let active_model_cooldowns = mark_target_error(state, target, status, retry_after).await;
+        state.target_failure_meta.lock().await.insert(
+            (target.provider_id, target.upstream_model.clone()),
+            metadata.clone(),
+        );
         // A model-level error must not remove every healthy sibling model on
         // the provider. Only escalate to provider-wide isolation after enough
         // distinct models have failed; transport errors take the direct path
@@ -1456,12 +1793,20 @@ pub(super) async fn record_upstream_failure(
                 target.cooldown_seconds,
             )
             .await;
+            provider_rested = true;
         }
     }
     if provider_reachable_status(status) {
         mark_provider_reachable(state, target.provider_id).await;
     }
-    if provider_key_failure(status) {
+    if failure.should_rest_credential() {
+        if let Some(provider_api_key_id) = target.provider_api_key_id {
+            state
+                .provider_key_failure_meta
+                .lock()
+                .await
+                .insert(provider_api_key_id, metadata.clone());
+        }
         mark_provider_api_key_error(
             state,
             target.provider_api_key_id,
@@ -1471,6 +1816,14 @@ pub(super) async fn record_upstream_failure(
         )
         .await;
     }
+    if provider_rested {
+        state
+            .provider_failure_meta
+            .lock()
+            .await
+            .insert(target.provider_id, metadata);
+    }
+    failure
 }
 
 pub(super) fn provider_circuit_should_open(
@@ -1479,8 +1832,7 @@ pub(super) fn provider_circuit_should_open(
 ) -> bool {
     // A 409 usually describes this request's resource state, not the
     // provider's health, so it should fall through without opening a circuit.
-    status != StatusCode::CONFLICT
-        && active_model_cooldowns >= PROVIDER_MODEL_COOLDOWN_THRESHOLD
+    status != StatusCode::CONFLICT && active_model_cooldowns >= PROVIDER_MODEL_COOLDOWN_THRESHOLD
 }
 
 pub(super) async fn mark_provider_api_key_used(state: &AppState, provider_api_key_id: Option<i64>) {
@@ -1536,6 +1888,11 @@ pub(super) async fn mark_provider_reachable(state: &AppState, provider_id: i64) 
 
 async fn close_provider_circuit(state: &AppState, provider_id: i64, reason: &'static str) {
     state.provider_cooldown.lock().await.remove(&provider_id);
+    state
+        .provider_failure_meta
+        .lock()
+        .await
+        .remove(&provider_id);
     let streak = state
         .provider_failure_streak
         .lock()
@@ -1549,13 +1906,15 @@ async fn close_provider_circuit(state: &AppState, provider_id: i64, reason: &'st
     let threshold = provider_open_threshold();
     if threshold > 0 && streak >= threshold {
         tracing::info!(provider_id, reason, "provider circuit closed");
-        let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
-            provider_id,
-            state: "closed",
-            reason,
-            failure_streak: 0,
-            cooldown_seconds: 0,
-        });
+        let _ = state
+            .circuit_events
+            .send(crate::state::ProviderCircuitEvent {
+                provider_id,
+                state: "closed",
+                reason,
+                failure_streak: 0,
+                cooldown_seconds: 0,
+            });
     }
 }
 
@@ -1667,7 +2026,11 @@ impl std::fmt::Display for SendError {
         match self {
             Self::Http(error) => write!(formatter, "{error}"),
             Self::HeaderTimeout(budget) => {
-                write!(formatter, "no response headers within {}s", budget.as_secs())
+                write!(
+                    formatter,
+                    "no response headers within {}s",
+                    budget.as_secs()
+                )
             }
         }
     }
@@ -1709,12 +2072,19 @@ pub(super) async fn send_provider_request(
                 Ok(result) => result.map_err(SendError::Http),
                 Err(_) => Err(SendError::HeaderTimeout(budget)),
             },
-            Some(budget) => request.timeout(budget).send().await.map_err(SendError::Http),
+            Some(budget) => request
+                .timeout(budget)
+                .send()
+                .await
+                .map_err(SendError::Http),
             None => request.send().await.map_err(SendError::Http),
         };
 
         match outcome {
-            Ok(response) => return Ok(response),
+            Ok(response) => {
+                crate::quota::observe_response_headers(state, target, response.headers()).await;
+                return Ok(response);
+            }
             Err(error) => {
                 let retryable = match &error {
                     SendError::Http(error) => retryable_transport_error(error),
@@ -1737,15 +2107,13 @@ pub(super) async fn send_provider_request(
                     tokio::time::sleep(delay).await;
                     continue;
                 }
-                mark_provider_error(
+                record_transport_failure(
                     state,
-                    target.provider_id,
-                    None,
-                    None,
-                    target.cooldown_seconds,
+                    target,
+                    "upstream_transport_error",
+                    &error.to_string(),
                 )
                 .await;
-                mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
                 return Err(AppError::Upstream(format!(
                     "{} request failed: {error}",
                     target.provider_name
@@ -1786,13 +2154,188 @@ async fn acquire_limit_slot(
     }
 }
 
+const PROVIDER_KEY_RPM_WINDOW: Duration = Duration::from_secs(60);
+
+async fn provider_key_rpm_window(
+    state: &AppState,
+    provider_api_key_id: i64,
+) -> (usize, Option<Duration>) {
+    let now = Instant::now();
+    let mut windows = state.provider_key_rpm.lock().await;
+    let starts = windows.entry(provider_api_key_id).or_default();
+    while starts
+        .front()
+        .is_some_and(|started| now.saturating_duration_since(*started) >= PROVIDER_KEY_RPM_WINDOW)
+    {
+        starts.pop_front();
+    }
+    let retry_after = starts.front().map(|started| {
+        PROVIDER_KEY_RPM_WINDOW.saturating_sub(now.saturating_duration_since(*started))
+    });
+    (starts.len(), retry_after)
+}
+
+async fn check_provider_key_rpm(
+    state: &AppState,
+    provider_api_key_id: i64,
+    limit: usize,
+) -> AppResult<()> {
+    let (used, retry_after) = provider_key_rpm_window(state, provider_api_key_id).await;
+    if used < limit {
+        return Ok(());
+    }
+    Err(AppError::UpstreamStatus {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        message: format!("provider API key is at its rolling 60-second request limit ({limit})"),
+        retry_after: Some(
+            retry_after
+                .unwrap_or(Duration::from_secs(1))
+                .max(Duration::from_millis(1)),
+        ),
+    })
+}
+
+async fn record_provider_key_rpm(
+    state: &AppState,
+    provider_api_key_id: i64,
+    limit: usize,
+) -> AppResult<()> {
+    let now = Instant::now();
+    let mut windows = state.provider_key_rpm.lock().await;
+    let starts = windows.entry(provider_api_key_id).or_default();
+    while starts
+        .front()
+        .is_some_and(|started| now.saturating_duration_since(*started) >= PROVIDER_KEY_RPM_WINDOW)
+    {
+        starts.pop_front();
+    }
+    if starts.len() >= limit {
+        let retry_after = starts
+            .front()
+            .map(|started| {
+                PROVIDER_KEY_RPM_WINDOW.saturating_sub(now.saturating_duration_since(*started))
+            })
+            .unwrap_or(Duration::from_secs(1))
+            .max(Duration::from_millis(1));
+        return Err(AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "provider API key is at its rolling 60-second request limit ({limit})"
+            ),
+            retry_after: Some(retry_after),
+        });
+    }
+    starts.push_back(now);
+    Ok(())
+}
+
+async fn acquire_provider_key_slot(
+    state: &AppState,
+    target: &RouteTarget,
+) -> Result<Option<OwnedSemaphorePermit>, AcquireSlotError> {
+    let Some(provider_api_key_id) = target.provider_api_key_id else {
+        return Ok(None);
+    };
+    let Some(limit) = target
+        .provider_key_max_concurrency
+        .filter(|limit| *limit > 0)
+    else {
+        return Ok(None);
+    };
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let semaphore = {
+        let mut semaphores = state.provider_key_concurrency.lock().await;
+        semaphores
+            .entry(provider_api_key_id)
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(limit.max(1))))
+            .clone()
+    };
+    let wait = target
+        .provider_key_queue_wait_ms
+        .map(|milliseconds| Duration::from_millis(milliseconds.unsigned_abs()))
+        .unwrap_or(DEFAULT_PROVIDER_QUEUE_TIMEOUT);
+    let label = target
+        .provider_api_key_name
+        .clone()
+        .unwrap_or_else(|| format!("provider API key {provider_api_key_id}"));
+
+    if let Ok(permit) = semaphore.clone().try_acquire_owned() {
+        return Ok(Some(permit));
+    }
+    if wait.is_zero() {
+        return Err(AcquireSlotError::ProviderApiKey(AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: format!(
+                "provider API key {label} is at its concurrency limit ({limit}); retry shortly"
+            ),
+            retry_after: Some(Duration::from_secs(1)),
+        }));
+    }
+
+    let _queue_guard = if let Some(queue_limit) = target.provider_key_queue_limit {
+        if queue_limit <= 0 {
+            return Err(AcquireSlotError::ProviderApiKey(AppError::UpstreamStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: format!(
+                    "provider API key {label} is at its concurrency limit ({limit}) and queueing is disabled"
+                ),
+                retry_after: Some(Duration::from_secs(1)),
+            }));
+        }
+        let queue_limit = usize::try_from(queue_limit).unwrap_or(usize::MAX);
+        let queue = {
+            let mut queues = state.provider_key_queue.lock().await;
+            queues
+                .entry(provider_api_key_id)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Semaphore::new(queue_limit)))
+                .clone()
+        };
+        Some(queue.try_acquire_owned().map_err(|_| {
+            AcquireSlotError::ProviderApiKey(AppError::UpstreamStatus {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                message: format!(
+                    "provider API key {label} queue is full ({queue_limit}); retry shortly"
+                ),
+                retry_after: Some(Duration::from_secs(1)),
+            })
+        })?)
+    } else {
+        None
+    };
+
+    acquire_limit_slot(
+        semaphore,
+        limit,
+        wait,
+        format!("provider API key {label}"),
+        "provider API key concurrency gate closed",
+    )
+    .await
+    .map(Some)
+    .map_err(AcquireSlotError::ProviderApiKey)
+}
+
 /// Waits for model and provider concurrency slots. Model slots are acquired
 /// first so a queue of requests for one hot model cannot occupy every provider
-/// slot and starve healthy sibling models.
+/// slot and starve healthy sibling models. The selected upstream credential is
+/// checked before either provider-wide or model-wide gates.
 pub(super) async fn acquire_upstream_slots(
     state: &AppState,
     target: &RouteTarget,
 ) -> Result<Option<UpstreamSlots>, AcquireSlotError> {
+    if let (Some(provider_api_key_id), Some(limit)) = (
+        target.provider_api_key_id,
+        target
+            .provider_key_requests_per_minute
+            .filter(|limit| *limit > 0),
+    ) {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        check_provider_key_rpm(state, provider_api_key_id, limit)
+            .await
+            .map_err(AcquireSlotError::ProviderApiKey)?;
+    }
+    let provider_key = acquire_provider_key_slot(state, target).await?;
+
     let model = match target.model_max_concurrency.filter(|limit| *limit > 0) {
         Some(limit) => {
             let limit_usize = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -1814,10 +2357,7 @@ pub(super) async fn acquire_upstream_slots(
                     semaphore,
                     limit_usize,
                     wait,
-                    format!(
-                        "{}/{}",
-                        target.provider_name, target.upstream_model
-                    ),
+                    format!("{}/{}", target.provider_name, target.upstream_model),
                     "model concurrency gate closed",
                 )
                 .await
@@ -1858,10 +2398,26 @@ pub(super) async fn acquire_upstream_slots(
         None => None,
     };
 
-    if model.is_none() && provider.is_none() {
+    if let (Some(provider_api_key_id), Some(limit)) = (
+        target.provider_api_key_id,
+        target
+            .provider_key_requests_per_minute
+            .filter(|limit| *limit > 0),
+    ) {
+        let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+        record_provider_key_rpm(state, provider_api_key_id, limit)
+            .await
+            .map_err(AcquireSlotError::ProviderApiKey)?;
+    }
+
+    if provider_key.is_none() && model.is_none() && provider.is_none() {
         Ok(None)
     } else {
-        Ok(Some(UpstreamSlots { provider, model }))
+        Ok(Some(UpstreamSlots {
+            provider_key,
+            provider,
+            model,
+        }))
     }
 }
 
@@ -1873,6 +2429,9 @@ pub(super) async fn acquire_upstream_slots(
 ///   internal channel failed rather than a bad request;
 /// - if an upstream still rejects `tool_search`, strip it, remember that the
 ///   provider does not support it, and retry the same target once without it.
+/// - if an upstream rejects replayed reasoning history or strict tool fields,
+///   repair the request once, retry the same target, and persist the learned
+///   capability for the provider/model/endpoint scope.
 ///
 /// `body` is the exact body sent upstream, so compatibility retries update the
 /// request rather than replaying the rejected payload.
@@ -1887,6 +2446,7 @@ pub(super) async fn send_provider_request_with_compat_retry<F>(
     api_key_id: Option<i64>,
     request_id: &str,
     endpoint: &str,
+    shape: UpstreamShape,
     streamed: bool,
     body: &mut Value,
     build: F,
@@ -1929,10 +2489,7 @@ where
         release_provider_probe(state, target.provider_id).await;
         return Err(AppError::UpstreamStatus {
             status: StatusCode::TOO_MANY_REQUESTS,
-            message: format!(
-                "excluded provider '{}': {reason}",
-                target.provider_name
-            ),
+            message: format!("excluded provider '{}': {reason}", target.provider_name),
             retry_after: Some(retry_after),
         });
     }
@@ -1952,6 +2509,8 @@ where
         send_provider_request(state, target, streamed, || build(body)).await?,
     );
     let mut transient_retry_used = false;
+    let mut reasoning_retry_used = false;
+    let mut strict_tools_retry_used = false;
 
     loop {
         let status = response.status();
@@ -1980,15 +2539,13 @@ where
                         continue;
                     }
                     Err(error) => {
-                        mark_provider_error(
+                        record_transport_failure(
                             state,
-                            target.provider_id,
-                            Some(StatusCode::BAD_GATEWAY),
-                            None,
-                            target.cooldown_seconds,
+                            target,
+                            "upstream_stream_failed",
+                            &error.to_string(),
                         )
                         .await;
-                        mark_target_error(state, target, StatusCode::BAD_GATEWAY, None).await;
                         return Err(AppError::Upstream(format!(
                             "{} stream ended before commit: {error}",
                             target.provider_name
@@ -2041,6 +2598,81 @@ where
                 has_tool_search = strip_tool_search_tools(body).is_some(),
                 "upstream returned an opaque 4xx; retrying once"
             );
+            response = UpstreamResponse::new(
+                send_provider_request(state, target, streamed, || build(body)).await?,
+            );
+            continue;
+        }
+
+        if !reasoning_retry_used
+            && (status == StatusCode::BAD_REQUEST || status == StatusCode::UNPROCESSABLE_ENTITY)
+            && compat_thinking_history_error(status, &response_body)
+        {
+            let repaired = match shape {
+                UpstreamShape::Responses => {
+                    super::compat::normalize_responses_reasoning_history(body)
+                }
+                UpstreamShape::Chat => super::compat::normalize_chat_reasoning_history(body),
+                UpstreamShape::Anthropic => {
+                    super::compat::normalize_anthropic_thinking_history(body)
+                }
+            };
+            if repaired > 0 {
+                reasoning_retry_used = true;
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    request_id,
+                    endpoint,
+                    repaired,
+                    "upstream rejected reasoning history; retrying with repaired history"
+                );
+                crate::capabilities::record_capability(
+                    state,
+                    target.provider_id,
+                    &target.upstream_model,
+                    endpoint,
+                    crate::capabilities::CAPABILITY_REASONING_HISTORY,
+                    true,
+                    crate::capabilities::SOURCE_RUNTIME,
+                    "exact",
+                )
+                .await;
+                response = UpstreamResponse::new(
+                    send_provider_request(state, target, streamed, || build(body)).await?,
+                );
+                continue;
+            }
+        }
+
+        if !strict_tools_retry_used
+            && matches!(
+                status,
+                StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+            )
+            && super::compat::upstream_rejects_strict_tools(&response_body)
+            && let Some(compat_body) = super::compat::strip_strict_tools(body)
+        {
+            strict_tools_retry_used = true;
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                endpoint,
+                "upstream rejected strict tool fields; retrying without them"
+            );
+            crate::capabilities::record_capability(
+                state,
+                target.provider_id,
+                &target.upstream_model,
+                endpoint,
+                crate::capabilities::CAPABILITY_STRICT_TOOLS,
+                false,
+                crate::capabilities::SOURCE_RUNTIME,
+                "exact",
+            )
+            .await;
+            *body = compat_body;
             response = UpstreamResponse::new(
                 send_provider_request(state, target, streamed, || build(body)).await?,
             );
@@ -2143,6 +2775,11 @@ pub(super) async fn mark_provider_api_key_success(
     };
     state
         .provider_key_cooldown
+        .lock()
+        .await
+        .remove(&provider_api_key_id);
+    state
+        .provider_key_failure_meta
         .lock()
         .await
         .remove(&provider_api_key_id);
@@ -2268,7 +2905,8 @@ pub(super) fn order_targets_for_session(
         RouteStrategy::CostOptimized
         | RouteStrategy::LatencyOptimized
         | RouteStrategy::P95LatencyOptimized
-        | RouteStrategy::LeastUsed => {}
+        | RouteStrategy::LeastUsed
+        | RouteStrategy::QuotaPaced => {}
     }
 }
 
@@ -2277,6 +2915,9 @@ struct RuntimeTargetMetricRow {
     provider_id: i64,
     upstream_model: String,
     requests: i64,
+    prompt_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
     avg_latency_ms: Option<f64>,
     /// Nearest-rank 95th percentile first-token (or total) latency.
     p95_latency_ms: Option<f64>,
@@ -2294,6 +2935,31 @@ impl RuntimeTargetMetricRow {
     fn success_rate(&self) -> Option<f64> {
         let sample = self.successes + self.upstream_faults;
         (sample > 0).then(|| self.successes as f64 / sample as f64)
+    }
+
+    fn has_cache_evidence(&self) -> bool {
+        self.cache_roi().is_some()
+    }
+
+    fn cache_hit_rate(&self) -> Option<f64> {
+        (self.prompt_tokens > 0 && self.cache_read_tokens > 0)
+            .then(|| (self.cache_read_tokens as f64 / self.prompt_tokens as f64).clamp(0.0, 1.0))
+    }
+
+    /// Estimates whether recent prompt-cache traffic is likely to be useful.
+    ///
+    /// A high hit rate means more prompt tokens were served from cache, while
+    /// the read/write ratio keeps a target from looking attractive when it
+    /// mostly paid to establish a cache that was rarely reused.
+    fn cache_roi(&self) -> Option<f64> {
+        let reads = self.cache_read_tokens.max(0) as f64;
+        if reads <= 0.0 {
+            return None;
+        }
+        let writes = self.cache_write_tokens.max(0) as f64;
+        let hit_rate = self.cache_hit_rate()?;
+        let reuse_ratio = reads / (reads + writes).max(1.0);
+        Some((hit_rate * 0.7 + reuse_ratio * 0.3).clamp(0.0, 1.0))
     }
 }
 
@@ -2314,6 +2980,9 @@ async fn runtime_target_metrics(
         SELECT provider_id,
                upstream_model,
                COUNT(*) AS requests,
+               SUM(prompt_tokens) AS prompt_tokens,
+               SUM(cache_read_tokens) AS cache_read_tokens,
+               SUM(cache_write_tokens) AS cache_write_tokens,
                AVG(
                    CASE
                        WHEN success = 1
@@ -2503,7 +3172,9 @@ impl RequestRoutingOverrides {
 ///
 /// A malformed or absent policy yields no overrides so a bad row can never
 /// block traffic; write-time validation is what keeps stored values clean.
-pub(super) fn routing_overrides_from_key(api_key: Option<&ApiKeyRecord>) -> RequestRoutingOverrides {
+pub(super) fn routing_overrides_from_key(
+    api_key: Option<&ApiKeyRecord>,
+) -> RequestRoutingOverrides {
     let policy = crate::models::parse_routing_policy(
         api_key.and_then(|api_key| api_key.routing_policy.as_deref()),
     );
@@ -2752,6 +3423,7 @@ fn target_decision_reason(
     strategy: RouteStrategy,
     target: &RouteTarget,
     metric: Option<&RuntimeTargetMetricRow>,
+    quota: Option<&crate::quota::QuotaScopeState>,
     first: bool,
 ) -> &'static str {
     if target.provider_health == Some(0) {
@@ -2773,7 +3445,8 @@ fn target_decision_reason(
             Some(_) => "recent_latency",
             None => "no_recent_latency",
         },
-        RouteStrategy::P95LatencyOptimized => match metric.and_then(|metric| metric.p95_latency_ms) {
+        RouteStrategy::P95LatencyOptimized => match metric.and_then(|metric| metric.p95_latency_ms)
+        {
             Some(_) if first => "lowest_recent_p95_latency",
             Some(_) => "recent_p95_latency",
             None => "no_recent_p95_latency",
@@ -2782,6 +3455,14 @@ fn target_decision_reason(
             Some(_) if first => "least_recent_traffic",
             Some(_) => "recent_traffic",
             None => "no_recent_traffic",
+        },
+        RouteStrategy::QuotaPaced => match quota.map(|quota| quota.state) {
+            Some("healthy") if first => "quota_healthy",
+            Some("healthy") => "quota_healthy",
+            Some("low") => "quota_low",
+            Some("exhausted") => "quota_exhausted",
+            Some("reset_due") => "quota_reset_due",
+            _ => "quota_unknown",
         },
         RouteStrategy::Priority => "priority_order",
         RouteStrategy::Weighted | RouteStrategy::RoundRobin => "session_affinity",
@@ -2843,7 +3524,92 @@ fn sort_targets_by_strategy_metrics(
                     .then_with(|| left.id.cmp(&right.id))
             });
         }
+        RouteStrategy::QuotaPaced => {}
         RouteStrategy::Priority | RouteStrategy::Weighted | RouteStrategy::RoundRobin => {}
+    }
+}
+
+fn quota_reset_at(
+    quota: Option<&crate::quota::QuotaScopeState>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    quota
+        .and_then(|quota| quota.reset_at.as_deref())
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&chrono::Utc))
+}
+
+fn compare_quota_reset(
+    left: Option<&crate::quota::QuotaScopeState>,
+    right: Option<&crate::quota::QuotaScopeState>,
+) -> std::cmp::Ordering {
+    match (quota_reset_at(left), quota_reset_at(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+fn quota_affinity_rank(target: &RouteTarget, affinity: Option<&SessionAffinityContext>) -> u8 {
+    match affinity.and_then(|affinity| affinity.pinned.as_ref()) {
+        Some(pinned) if same_affinity_target(target, pinned) => 0,
+        Some(_) => 1,
+        None => 0,
+    }
+}
+
+fn quota_detail(quota: Option<&crate::quota::QuotaScopeState>) -> String {
+    let Some(quota) = quota else {
+        return "额度状态未知，按中性值处理".to_string();
+    };
+    let pressure = quota
+        .pressure_pct
+        .map(|value| format!("{value:.1}%"))
+        .unwrap_or_else(|| "未知".to_string());
+    let reset = quota.reset_at.as_deref().unwrap_or("未知");
+    match quota.state {
+        "healthy" => format!("已用 {pressure}，{reset} 重置"),
+        "low" => format!("已用 {pressure}，接近低水位，{reset} 重置"),
+        "exhausted" => format!("额度已耗尽，{reset} 重置"),
+        "reset_due" => "重置时间已到，等待下次额度刷新".to_string(),
+        _ => "额度状态未知，按中性值处理".to_string(),
+    }
+}
+
+async fn apply_quota_pacing(
+    state: &AppState,
+    targets: &mut Vec<RouteTarget>,
+    affinity: Option<&SessionAffinityContext>,
+) {
+    if targets.is_empty() {
+        return;
+    }
+    let quota_states = crate::quota::target_scope_states(state, targets).await;
+    let quota_for =
+        |target: &RouteTarget| quota_states.get(&crate::quota::quota_target_key(target));
+    let now = chrono::Utc::now();
+    targets.sort_by(|left, right| {
+        let left_quota = quota_for(left);
+        let right_quota = quota_for(right);
+        crate::quota::quota_pacing_score(right_quota, now)
+            .total_cmp(&crate::quota::quota_pacing_score(left_quota, now))
+            .then_with(|| compare_quota_reset(left_quota, right_quota))
+            .then_with(|| {
+                quota_affinity_rank(left, affinity).cmp(&quota_affinity_rank(right, affinity))
+            })
+            .then_with(|| {
+                target_cost_score(left)
+                    .unwrap_or(f64::INFINITY)
+                    .total_cmp(&target_cost_score(right).unwrap_or(f64::INFINITY))
+            })
+            .then_with(|| left.priority.cmp(&right.priority))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    if targets
+        .iter()
+        .any(|target| !quota_for(target).is_some_and(|quota| quota.state == "exhausted"))
+    {
+        targets.retain(|target| !quota_for(target).is_some_and(|quota| quota.state == "exhausted"));
     }
 }
 
@@ -2857,8 +3623,20 @@ pub(super) async fn expand_target_provider_keys(
         if keys_by_provider.contains_key(&target.provider_id) {
             continue;
         }
-        let keys = sqlx::query_as::<_, (i64, String, String)>(
-            "SELECT id, name, secret FROM provider_api_keys \
+        let keys = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT id, name, secret, max_concurrency, requests_per_minute, \
+                    queue_limit, queue_wait_ms FROM provider_api_keys \
              WHERE provider_id = ? AND enabled = 1 \
              ORDER BY id",
         )
@@ -2885,7 +3663,7 @@ pub(super) async fn expand_target_provider_keys(
 
         let available = keys
             .iter()
-            .filter(|(id, _, _)| !cooldowns.contains_key(id))
+            .filter(|(id, _, _, _, _, _, _)| !cooldowns.contains_key(id))
             .cloned()
             .collect::<Vec<_>>();
         let mut keys = if available.is_empty() {
@@ -2913,11 +3691,24 @@ pub(super) async fn expand_target_provider_keys(
             *cursor = cursor.wrapping_add(1);
         }
 
-        for (key_id, key_name, secret) in keys {
+        for (
+            key_id,
+            key_name,
+            secret,
+            max_concurrency,
+            requests_per_minute,
+            queue_limit,
+            queue_wait_ms,
+        ) in keys
+        {
             let mut candidate = target.clone();
             candidate.api_key = Some(secret);
             candidate.provider_api_key_id = Some(key_id);
             candidate.provider_api_key_name = Some(key_name);
+            candidate.provider_key_max_concurrency = max_concurrency;
+            candidate.provider_key_requests_per_minute = requests_per_minute;
+            candidate.provider_key_queue_limit = queue_limit;
+            candidate.provider_key_queue_wait_ms = queue_wait_ms;
             expanded.push(candidate);
         }
     }
@@ -3036,6 +3827,40 @@ fn headroom_ratio(headroom: &(usize, usize)) -> f64 {
 /// means every slot is free — not that the target is saturated.
 async fn concurrency_headroom(state: &AppState, target: &RouteTarget) -> Option<(usize, usize)> {
     let mut worst: Option<(usize, usize)> = None;
+    if let Some(provider_api_key_id) = target.provider_api_key_id {
+        if let Some(limit) = target
+            .provider_key_max_concurrency
+            .filter(|limit| *limit > 0)
+        {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let available = {
+                let semaphores = state.provider_key_concurrency.lock().await;
+                semaphores
+                    .get(&provider_api_key_id)
+                    .map(|semaphore| semaphore.available_permits())
+                    .unwrap_or(limit)
+            };
+            let candidate = (available, limit);
+            if headroom_ratio(&candidate)
+                < worst.map_or(f64::INFINITY, |current| headroom_ratio(&current))
+            {
+                worst = Some(candidate);
+            }
+        }
+        if let Some(limit) = target
+            .provider_key_requests_per_minute
+            .filter(|limit| *limit > 0)
+        {
+            let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+            let (used, _) = provider_key_rpm_window(state, provider_api_key_id).await;
+            let candidate = (limit.saturating_sub(used), limit);
+            if headroom_ratio(&candidate)
+                < worst.map_or(f64::INFINITY, |current| headroom_ratio(&current))
+            {
+                worst = Some(candidate);
+            }
+        }
+    }
     if let Some(limit) = target.max_concurrency.filter(|limit| *limit > 0) {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let available = {
@@ -3045,7 +3870,12 @@ async fn concurrency_headroom(state: &AppState, target: &RouteTarget) -> Option<
                 .map(|semaphore| semaphore.available_permits())
                 .unwrap_or(limit)
         };
-        worst = Some((available, limit));
+        let candidate = (available, limit);
+        if headroom_ratio(&candidate)
+            < worst.map_or(f64::INFINITY, |current| headroom_ratio(&current))
+        {
+            worst = Some(candidate);
+        }
     }
     if let Some(limit) = target.model_max_concurrency.filter(|limit| *limit > 0) {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
@@ -3153,12 +3983,11 @@ async fn session_affinity_context(
     record_metrics: bool,
 ) -> Option<SessionAffinityContext> {
     let store = state.session_affinity.as_ref()?;
-    let session_key = session_key.map(str::trim).filter(|value| !value.is_empty())?;
-    let scope = crate::session_affinity::SessionAffinityScope::new(
-        api_key_id,
-        route_id,
-        session_key,
-    );
+    let session_key = session_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let scope =
+        crate::session_affinity::SessionAffinityScope::new(api_key_id, route_id, session_key);
     let pinned = if record_metrics {
         store.lookup(&state.pool, &scope).await
     } else {
@@ -3175,8 +4004,7 @@ fn same_affinity_target(
     target: &RouteTarget,
     affinity: &crate::session_affinity::SessionAffinityTarget,
 ) -> bool {
-    target.provider_id == affinity.provider_id
-        && target.upstream_model == affinity.upstream_model
+    target.provider_id == affinity.provider_id && target.upstream_model == affinity.upstream_model
 }
 
 fn affinity_target(target: &RouteTarget) -> crate::session_affinity::SessionAffinityTarget {
@@ -3189,29 +4017,60 @@ fn affinity_target(target: &RouteTarget) -> crate::session_affinity::SessionAffi
 fn session_factor(
     context: &SessionAffinityContext,
     target: &RouteTarget,
+    cache_metrics: Option<&RuntimeTargetMetricRow>,
 ) -> TargetScoreFactor {
+    let cache_roi = cache_metrics.and_then(RuntimeTargetMetricRow::cache_roi);
+    let cache_evidence = cache_roi.is_some();
+    let weight = cache_roi.map_or(0.25, |roi| 0.75 + roi * 1.75);
+    let cache_detail = cache_metrics
+        .zip(cache_roi)
+        .map(|(metrics, roi)| {
+            format!(
+                "，近一天缓存收益估值约 {:.1}%（命中率 {:.1}%，读取 {} / 写入 {} / 输入 {}）",
+                roi * 100.0,
+                metrics.cache_hit_rate().unwrap_or(0.0) * 100.0,
+                metrics.cache_read_tokens,
+                metrics.cache_write_tokens,
+                metrics.prompt_tokens
+            )
+        })
+        .unwrap_or_default();
     match &context.pinned {
         Some(pinned) if same_affinity_target(target, pinned) => score_factor(
             "session",
-            1.25,
+            weight,
             Some(1.0),
-            format!(
-                "命中会话粘性，优先回到 {} / {}",
-                target.provider_name, target.upstream_model
-            ),
+            if cache_evidence {
+                format!(
+                    "命中会话粘性与缓存收益{cache_detail}，优先回到 {} / {}",
+                    target.provider_name, target.upstream_model,
+                )
+            } else {
+                format!(
+                    "命中会话粘性（暂无缓存收益证据），{} / {} 只保留普通优先级",
+                    target.provider_name, target.upstream_model
+                )
+            },
         ),
         Some(pinned) => score_factor(
             "session",
-            1.25,
+            weight,
             Some(0.0),
-            format!(
-                "本会话已固定到 provider {} / {}",
-                pinned.provider_id, pinned.upstream_model
-            ),
+            if cache_evidence {
+                format!(
+                    "本会话已有缓存收益{cache_detail}，优先回到 provider {} / {}",
+                    pinned.provider_id, pinned.upstream_model,
+                )
+            } else {
+                format!(
+                    "本会话原先在 provider {} / {}，但没有缓存收益证据，不阻塞策略排序",
+                    pinned.provider_id, pinned.upstream_model
+                )
+            },
         ),
         None => score_factor(
             "session",
-            1.25,
+            0.25,
             None,
             "该会话尚未建立粘性目标；首个健康候选会被记住",
         ),
@@ -3232,9 +4091,14 @@ pub(crate) async fn assess_targets(
     if targets.is_empty() {
         return Ok(HashMap::new());
     }
-    let metrics =
-        runtime_target_metrics(state, targets, strategy == RouteStrategy::P95LatencyOptimized)
-            .await?;
+    let metrics = runtime_target_metrics(
+        state,
+        targets,
+        strategy == RouteStrategy::P95LatencyOptimized,
+    )
+    .await?;
+    let quota_states = crate::quota::target_scope_states(state, targets).await;
+    let quota_now = chrono::Utc::now();
     let key_of = |target: &RouteTarget| (target.provider_id, target.upstream_model.clone());
 
     // Relative signals are only meaningful next to the other candidates.
@@ -3271,7 +4135,11 @@ pub(crate) async fn assess_targets(
         .map(|target| target.priority)
         .min()
         .unwrap_or(0);
-    let highest_weight = targets.iter().map(|target| target.weight).max().unwrap_or(1);
+    let highest_weight = targets
+        .iter()
+        .map(|target| target.weight)
+        .max()
+        .unwrap_or(1);
 
     let now = Instant::now();
     let threshold = provider_open_threshold();
@@ -3296,12 +4164,27 @@ pub(crate) async fn assess_targets(
         });
         targets.clone()
     };
+    let target_sinks = {
+        let mut sinks = state.target_sink.lock().await;
+        sinks.retain(|_, entry| entry.until > now);
+        sinks.clone()
+    };
 
     let mut assessments = HashMap::with_capacity(targets.len());
     for target in targets {
         let key = key_of(target);
         let metric = metrics.get(&key);
         let mut factors = Vec::new();
+        let target_sink_key = target_sink_key(target);
+        let sink_penalized = target_sinks.contains_key(&target_sink_key);
+        if sink_penalized {
+            factors.push(score_factor(
+                "sink",
+                1.25,
+                Some(0.0),
+                "短期限流 sink，仍可重试但排在健康目标之后",
+            ));
+        }
 
         // 1. Circuit state: an open provider is short-circuited before any
         //    upstream call, so it must score at the bottom.
@@ -3323,7 +4206,12 @@ pub(crate) async fn assess_targets(
             ),
             _ => (1.0, "熔断关闭".to_string()),
         };
-        factors.push(score_factor("circuit", 2.5, Some(circuit_score), circuit_detail));
+        factors.push(score_factor(
+            "circuit",
+            2.5,
+            Some(circuit_score),
+            circuit_detail,
+        ));
 
         // 2. Live concurrency capacity.
         let capacity = concurrency_headroom(state, target).await;
@@ -3333,7 +4221,12 @@ pub(crate) async fn assess_targets(
             None => "未设置并发上限".to_string(),
         };
         let saturated = capacity.is_some_and(|(available, _)| available == 0);
-        factors.push(score_factor("capacity", 2.0, capacity_score, capacity_detail));
+        factors.push(score_factor(
+            "capacity",
+            2.0,
+            capacity_score,
+            capacity_detail,
+        ));
 
         // 3. Pool allocation: denial is a hard exclusion, a soft share only
         //    deprioritises.
@@ -3346,7 +4239,12 @@ pub(crate) async fn assess_targets(
             Some(_) => (1.0, "最近一次健康检查通过".to_string(), false),
             None => (NEUTRAL_FACTOR_SCORE, "尚未做过健康检查".to_string(), false),
         };
-        factors.push(score_factor("health", 2.5, Some(health_score), health_detail));
+        factors.push(score_factor(
+            "health",
+            2.5,
+            Some(health_score),
+            health_detail,
+        ));
 
         // 5. Recent upstream-caused success rate.
         let reliability = metric.and_then(|metric| metric.success_rate());
@@ -3359,7 +4257,12 @@ pub(crate) async fn assess_targets(
             ),
             _ => "近期没有可判定的上游结果".to_string(),
         };
-        factors.push(score_factor("reliability", 2.0, reliability, reliability_detail));
+        factors.push(score_factor(
+            "reliability",
+            2.0,
+            reliability,
+            reliability_detail,
+        ));
 
         // 6. Latency relative to the fastest known candidate.
         let latency = metric
@@ -3401,8 +4304,7 @@ pub(crate) async fn assess_targets(
         // reshuffle the order; every other strategy keeps the order the
         // operator configured.
         let slow_state = slow_targets.get(&key).filter(|entry| {
-            strategy.is_latency_first()
-                && entry.until.is_some_and(|until| until > now)
+            strategy.is_latency_first() && entry.until.is_some_and(|until| until > now)
         });
         if let Some(slow_state) = slow_state {
             factors.push(score_factor(
@@ -3432,6 +4334,25 @@ pub(crate) async fn assess_targets(
         };
         factors.push(score_factor("cost", 1.0, cost_score, cost_detail.clone()));
 
+        let quota = quota_states.get(&crate::quota::quota_target_key(target));
+        let quota_score = crate::quota::quota_pacing_score(quota, quota_now);
+        let quota_detail = quota_detail(quota);
+        let quota_low = quota.is_some_and(|quota| quota.state == "low");
+        let quota_exhausted = quota.is_some_and(|quota| quota.state == "exhausted");
+        let quota_alternative = targets.iter().any(|other| {
+            !quota_states
+                .get(&crate::quota::quota_target_key(other))
+                .is_some_and(|quota| quota.state == "exhausted")
+        });
+        if strategy == RouteStrategy::QuotaPaced {
+            factors.push(score_factor(
+                "quota",
+                2.0,
+                Some(quota_score),
+                quota_detail.clone(),
+            ));
+        }
+
         // 8. The strategy's own preference, so the score agrees with the order
         //    the request path will use.
         let (strategy_score, strategy_detail) = match strategy {
@@ -3449,9 +4370,7 @@ pub(crate) async fn assess_targets(
             RouteStrategy::RoundRobin => (Some(1.0), "按轮询游标顺序".to_string()),
             RouteStrategy::CostOptimized => (cost_score, cost_detail.clone()),
             RouteStrategy::LatencyOptimized => (latency_score, latency_detail.clone()),
-            RouteStrategy::P95LatencyOptimized => {
-                (p95_latency_score, p95_latency_detail.clone())
-            }
+            RouteStrategy::P95LatencyOptimized => (p95_latency_score, p95_latency_detail.clone()),
             RouteStrategy::LeastUsed => {
                 let requests = metric.map(|metric| metric.requests).unwrap_or(0);
                 (
@@ -3459,14 +4378,29 @@ pub(crate) async fn assess_targets(
                     format!("近期 {requests} 次请求（最多 {busiest} 次）"),
                 )
             }
+            RouteStrategy::QuotaPaced => (Some(quota_score), quota_detail),
         };
-        factors.push(score_factor("strategy", 1.5, strategy_score, strategy_detail));
+        factors.push(score_factor(
+            "strategy",
+            1.5,
+            strategy_score,
+            strategy_detail,
+        ));
         if let Some(affinity) = affinity {
-            factors.push(session_factor(affinity, target));
+            let pinned_metrics = affinity.pinned.as_ref().and_then(|pinned| {
+                metrics.get(&(pinned.provider_id, pinned.upstream_model.clone()))
+            });
+            factors.push(session_factor(affinity, target, pinned_metrics));
         }
 
         let mut assessment = TargetAssessment::new(factors);
-        if health_failed || saturated || allocation_penalized || slow_state.is_some() {
+        if health_failed
+            || saturated
+            || allocation_penalized
+            || slow_state.is_some()
+            || quota_low
+            || sink_penalized
+        {
             assessment = assessment.penalized();
         }
 
@@ -3478,20 +4412,19 @@ pub(crate) async fn assess_targets(
             .copied();
         let model_cooling = model_until.is_some_and(|until| until > now);
         let sibling_exists = targets.iter().any(|other| {
-            other.provider_id != target.provider_id
-                || other.upstream_model != target.upstream_model
+            other.provider_id != target.provider_id || other.upstream_model != target.upstream_model
         });
         if let Some(reason) = allocation_denied {
             assessment = assessment.excluded(format!("提供商配额池拒绝：{reason}"));
         } else if circuit_state == "open" {
-            assessment = assessment.excluded(
-                "提供商熔断中，请求会被立即短路".to_string(),
-            );
+            assessment = assessment.excluded("提供商熔断中，请求会被立即短路".to_string());
         } else if model_cooling && sibling_exists {
             assessment = assessment.excluded(format!(
                 "该模型正在冷却（剩余 {}s），存在可用替代目标",
                 cooldown_remaining_seconds(model_until.unwrap_or(now), now)
             ));
+        } else if strategy == RouteStrategy::QuotaPaced && quota_exhausted && quota_alternative {
+            assessment = assessment.excluded("额度已耗尽，存在可用替代目标".to_string());
         }
         if let Some(factor) = allocation_factor {
             // Keep the factor list in a stable order for the UI.
@@ -3511,13 +4444,13 @@ pub(crate) async fn assess_targets(
 /// circuit/cooldown maps), so it adds no query to a normal request. The
 /// recent first-token signal is folded in only for `latency_optimized` routes;
 /// every other strategy keeps its own configured order.
-async fn deprioritized_target_keys(
+pub(super) async fn deprioritized_target_keys(
     state: &AppState,
     strategy: RouteStrategy,
     targets: &[RouteTarget],
     api_key_id: Option<i64>,
-) -> HashSet<(i64, String)> {
-    let mut keys = HashSet::new();
+) -> HashMap<(i64, Option<i64>, String), &'static str> {
+    let mut keys = HashMap::new();
     if targets.is_empty() {
         return keys;
     }
@@ -3525,6 +4458,11 @@ async fn deprioritized_target_keys(
     let threshold = provider_open_threshold();
     let streaks = state.provider_failure_streak.lock().await.clone();
     let provider_cooldowns = state.provider_cooldown.lock().await.clone();
+    let target_sinks = {
+        let mut sinks = state.target_sink.lock().await;
+        sinks.retain(|_, entry| entry.until > now);
+        sinks.clone()
+    };
     let slow_targets = if strategy.is_latency_first() {
         let mut targets = state.target_slow.lock().await;
         targets.retain(|_, entry| {
@@ -3542,22 +4480,37 @@ async fn deprioritized_target_keys(
         HashSet::new()
     };
     for target in targets {
-        let key = (target.provider_id, target.upstream_model.clone());
-        if slow_targets.contains(&key) {
-            keys.insert(key);
+        let slow_key = (target.provider_id, target.upstream_model.clone());
+        let target_key = (
+            target.provider_id,
+            target.provider_api_key_id,
+            target.upstream_model.clone(),
+        );
+        if target_sinks.contains_key(&target_key) {
+            keys.insert(target_key, "target_sink");
+            continue;
+        }
+        if slow_targets.contains(&slow_key) {
+            keys.insert(target_key, "slow_first_token");
             continue;
         }
         let streak = streaks.get(&target.provider_id).copied().unwrap_or(0);
         let cooling = provider_cooldowns
             .get(&target.provider_id)
             .is_some_and(|until| *until > now);
-        if crate::state::provider_circuit_state(streak, cooling, threshold) == "open"
-            || target.provider_health == Some(0)
-            || concurrency_headroom(state, target)
-                .await
-                .is_some_and(|(available, _)| available == 0)
+        if crate::state::provider_circuit_state(streak, cooling, threshold) == "open" {
+            keys.insert(target_key, "provider_circuit_open");
+            continue;
+        }
+        if target.provider_health == Some(0) {
+            keys.insert(target_key, "provider_health_failed");
+            continue;
+        }
+        if concurrency_headroom(state, target)
+            .await
+            .is_some_and(|(available, _)| available == 0)
         {
-            keys.insert(key);
+            keys.insert(target_key, "concurrency_saturated");
             continue;
         }
         let Ok(catalog) = state.pool_catalog().await else {
@@ -3582,7 +4535,7 @@ async fn deprioritized_target_keys(
             })
         };
         if penalized {
-            keys.insert(key);
+            keys.insert(target_key, "pool_share");
         }
     }
     keys
@@ -3603,6 +4556,11 @@ pub(crate) fn candidate_view(
         eligible: assessment.exclusion.is_none(),
         exclusion: assessment.exclusion.clone(),
         deprioritized: assessment.deprioritized,
+        failure_scope: None,
+        failure_retry: None,
+        failure_confidence: None,
+        failure_reason_code: None,
+        failure_observed_seconds_ago: None,
         factors: assessment
             .factors
             .iter()
@@ -3625,8 +4583,7 @@ pub(super) async fn order_targets(
     session_id: Option<&str>,
     api_key_id: Option<i64>,
 ) -> AppResult<Vec<RouteTarget>> {
-    let affinity =
-        session_affinity_context(state, route_id, session_id, api_key_id, true).await;
+    let affinity = session_affinity_context(state, route_id, session_id, api_key_id, true).await;
     order_targets_with_context(
         state,
         route_id,
@@ -3650,21 +4607,28 @@ async fn order_targets_with_context(
 ) -> AppResult<Vec<RouteTarget>> {
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
-    let runtime_metrics = match strategy {
+    let cache_aware = !matches!(
+        strategy,
+        RouteStrategy::Priority | RouteStrategy::Weighted | RouteStrategy::RoundRobin
+    );
+    let needs_runtime_metrics = matches!(
+        strategy,
         RouteStrategy::LatencyOptimized
-        | RouteStrategy::P95LatencyOptimized
-        | RouteStrategy::LeastUsed => {
-            runtime_target_metrics(
-                state,
-                &targets,
-                strategy == RouteStrategy::P95LatencyOptimized,
-            )
-            .await?
-        }
-        RouteStrategy::Priority
-        | RouteStrategy::Weighted
-        | RouteStrategy::RoundRobin
-        | RouteStrategy::CostOptimized => HashMap::new(),
+            | RouteStrategy::P95LatencyOptimized
+            | RouteStrategy::LeastUsed
+    ) || (cache_aware
+        && affinity
+            .and_then(|context| context.pinned.as_ref())
+            .is_some());
+    let runtime_metrics = if needs_runtime_metrics {
+        runtime_target_metrics(
+            state,
+            &targets,
+            strategy == RouteStrategy::P95LatencyOptimized,
+        )
+        .await?
+    } else {
+        HashMap::new()
     };
     if let Some(session_id) = session_id {
         if strategy == RouteStrategy::Priority {
@@ -3701,7 +4665,8 @@ async fn order_targets_with_context(
             RouteStrategy::CostOptimized
             | RouteStrategy::LatencyOptimized
             | RouteStrategy::P95LatencyOptimized
-            | RouteStrategy::LeastUsed => {}
+            | RouteStrategy::LeastUsed
+            | RouteStrategy::QuotaPaced => {}
         }
     }
     sort_targets_by_strategy_metrics(strategy, &mut targets, &runtime_metrics);
@@ -3733,6 +4698,8 @@ async fn order_targets_with_context(
     }
     drop(provider_cooldowns);
 
+    let mut targets = expand_target_provider_keys(state, targets, session_id).await?;
+
     // Try soft-degraded candidates last even when their last health probe
     // passed: a successful response that took too long is newer evidence than
     // an older health check. Within each soft bucket, unknown health stays
@@ -3742,27 +4709,60 @@ async fn order_targets_with_context(
     let deprioritized = deprioritized_target_keys(state, strategy, &targets, api_key_id).await;
     targets.sort_by_key(|target| {
         (
-            u8::from(
-                deprioritized.contains(&(target.provider_id, target.upstream_model.clone())),
-            ),
+            u8::from(deprioritized.contains_key(&(
+                target.provider_id,
+                target.provider_api_key_id,
+                target.upstream_model.clone(),
+            ))),
             provider_health_rank(target.provider_health),
         )
     });
     if let Some(affinity) = affinity {
+        let pinned_quota_impaired = if let Some(pinned) = affinity.pinned.as_ref() {
+            let quota_states = crate::quota::target_scope_states(state, &targets).await;
+            let mut matching = targets
+                .iter()
+                .filter(|target| same_affinity_target(target, pinned))
+                .peekable();
+            matching.peek().is_some()
+                && matching.all(|target| {
+                    quota_states
+                        .get(&crate::quota::quota_target_key(target))
+                        .is_some_and(|quota| {
+                            quota.state == "low"
+                                || quota.state == "exhausted"
+                                || quota.state == "reset_due"
+                        })
+                })
+        } else {
+            false
+        };
+        let pinned_has_cache = affinity.pinned.as_ref().is_some_and(|pinned| {
+            runtime_metrics
+                .get(&(pinned.provider_id, pinned.upstream_model.clone()))
+                .is_some_and(RuntimeTargetMetricRow::has_cache_evidence)
+        });
         let pinned_index = affinity.pinned.as_ref().and_then(|pinned| {
             targets.iter().position(|target| {
                 same_affinity_target(target, pinned)
-                    && !deprioritized
-                        .contains(&(target.provider_id, target.upstream_model.clone()))
+                    && !deprioritized.contains_key(&(
+                        target.provider_id,
+                        target.provider_api_key_id,
+                        target.upstream_model.clone(),
+                    ))
             })
         });
         if let Some(index) = pinned_index {
-            if index > 0 {
+            if !pinned_quota_impaired && (!cache_aware || pinned_has_cache) && index > 0 {
                 targets[..=index].rotate_right(1);
             }
         } else if affinity.record_bind {
             let healthy_index = targets.iter().position(|target| {
-                !deprioritized.contains(&(target.provider_id, target.upstream_model.clone()))
+                !deprioritized.contains_key(&(
+                    target.provider_id,
+                    target.provider_api_key_id,
+                    target.upstream_model.clone(),
+                ))
             });
             if let (Some(index), Some(store)) = (healthy_index, state.session_affinity.as_ref()) {
                 let target = affinity_target(&targets[index]);
@@ -3772,5 +4772,8 @@ async fn order_targets_with_context(
             }
         }
     }
-    expand_target_provider_keys(state, targets, session_id).await
+    if strategy == RouteStrategy::QuotaPaced {
+        apply_quota_pacing(state, &mut targets, affinity).await;
+    }
+    Ok(targets)
 }

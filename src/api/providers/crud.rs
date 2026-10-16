@@ -22,6 +22,10 @@ pub async fn create_provider(
     validate_provider_input(&input)?;
     let headers = serde_json::to_string(&input.headers).unwrap_or_else(|_| "{}".to_string());
     let model_prefix = normalize_model_prefix(&input.model_prefix)?;
+    let model_auto_include_rules =
+        normalize_model_auto_include_rules(&input.model_auto_include_rules)?;
+    let model_auto_include_rules_json =
+        serde_json::to_string(&model_auto_include_rules).unwrap_or_else(|_| "[]".to_string());
     let api_key = normalize_optional(input.api_key.clone());
     let mut api_keys = input.api_keys.clone();
     if api_keys.is_empty()
@@ -38,8 +42,7 @@ pub async fn create_provider(
     let timeout_seconds = normalize_provider_timeout(input.timeout_seconds)?;
     let cooldown_seconds = normalize_provider_cooldown(input.configured_cooldown_seconds)?;
     let max_concurrency = normalize_provider_concurrency(input.max_concurrency)?;
-    let queue_timeout_seconds =
-        normalize_provider_queue_timeout(input.queue_timeout_seconds)?;
+    let queue_timeout_seconds = normalize_provider_queue_timeout(input.queue_timeout_seconds)?;
     // Resolve metadata before opening the transaction: the catalog fetch may
     // hit the network, and holding a SQLite write transaction across it would
     // block every other writer.
@@ -52,17 +55,18 @@ pub async fn create_provider(
     let result = sqlx::query(
         "INSERT INTO providers (
             name, provider_type, base_url, model_prefix, models_dev_id,
-            api_key, headers, enabled, tool_search_supported,
+            model_auto_include_rules, api_key, headers, enabled, tool_search_supported,
             health_check_interval_minutes, health_check_model,
             models_sync_interval_minutes, timeout_seconds, cooldown_seconds,
             max_concurrency, queue_timeout_seconds
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(input.name.trim())
     .bind(input.provider_type.as_str())
     .bind(base_url)
     .bind(model_prefix)
     .bind(models_dev_id.as_deref())
+    .bind(model_auto_include_rules_json)
     .bind(api_key)
     .bind(headers)
     .bind(input.enabled as i64)
@@ -91,7 +95,7 @@ pub async fn create_provider(
     tx.commit().await?;
 
     if input.auto_sync_models
-        && let Err(error) = sync_provider(state.clone(), id).await
+        && let Err(error) = sync_provider_auto(state.clone(), id).await
     {
         tracing::warn!(provider_id = id, %error, "automatic model sync failed");
     }
@@ -105,6 +109,7 @@ pub async fn create_provider(
             "name": input.name.trim(),
             "base_url": input.base_url,
             "enabled": input.enabled,
+            "model_auto_include_rules": model_auto_include_rules,
         })),
     )
     .await;
@@ -142,6 +147,15 @@ pub async fn update_provider(
             .as_deref()
             .unwrap_or(current.model_prefix.as_str()),
     )?;
+    let model_auto_include_rules = match input.model_auto_include_rules.as_ref() {
+        Some(rules) => normalize_model_auto_include_rules(rules)?,
+        None => serde_json::from_str(&current.model_auto_include_rules).unwrap_or_default(),
+    };
+    let model_auto_include_rules_changed = model_auto_include_rules
+        != serde_json::from_str::<Vec<String>>(&current.model_auto_include_rules)
+            .unwrap_or_default();
+    let model_auto_include_rules_json =
+        serde_json::to_string(&model_auto_include_rules).unwrap_or_else(|_| "[]".to_string());
     let enabled = input.enabled.unwrap_or(current.enabled != 0);
     let health_check_interval_minutes = match input.health_check_interval_minutes {
         Some(value) => normalize_health_interval(Some(value))?,
@@ -182,15 +196,6 @@ pub async fn update_provider(
             .map(|secret| vec![provider_api_key_input(None, "Default", Some(secret), true)])
     };
     let api_keys_changed = api_keys_update.is_some();
-    let previous_key_ids = if api_keys_changed {
-        provider_api_key_records(&state.pool, id)
-            .await?
-            .into_iter()
-            .map(|record| record.id)
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
     let headers = match input.headers {
         Some(value) => serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string()),
         None => current.headers.clone(),
@@ -226,13 +231,14 @@ pub async fn update_provider(
 
     let mut tx = state.pool.begin().await?;
     sqlx::query(
-        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, timeout_seconds = ?, cooldown_seconds = ?, max_concurrency = ?, queue_timeout_seconds = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
+        "UPDATE providers SET name = ?, provider_type = ?, base_url = ?, model_prefix = ?, models_dev_id = ?, model_auto_include_rules = ?, headers = ?, enabled = ?, health_check_interval_minutes = ?, health_check_model = ?, models_sync_interval_minutes = ?, timeout_seconds = ?, cooldown_seconds = ?, max_concurrency = ?, queue_timeout_seconds = ?, tool_search_supported = CASE WHEN ? THEN 1 ELSE tool_search_supported END, tool_search_checked_at = CASE WHEN ? THEN NULL ELSE tool_search_checked_at END, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
     )
     .bind(name.clone())
     .bind(provider_type.as_str())
     .bind(base_url)
     .bind(model_prefix)
     .bind(models_dev_id.as_deref())
+    .bind(model_auto_include_rules_json)
     .bind(headers)
     .bind(enabled as i64)
     .bind(health_check_interval_minutes)
@@ -249,9 +255,11 @@ pub async fn update_provider(
     .await
     .map_err(map_sqlite_conflict)?;
 
-    if let Some(api_keys) = api_keys_update {
-        replace_provider_api_keys(&mut tx, id, &api_keys).await?;
-    }
+    let key_mutation = if let Some(api_keys) = api_keys_update {
+        replace_provider_api_keys(&mut tx, id, &api_keys).await?
+    } else {
+        ProviderApiKeyMutation::default()
+    };
 
     if let Some(models) = input.models {
         let entries = names_to_entries(&models);
@@ -277,27 +285,49 @@ pub async fn update_provider(
         .retain(|(provider_id, _), _| *provider_id != id);
 
     if api_keys_changed {
-        let current_key_ids =
-            sqlx::query_scalar::<_, i64>("SELECT id FROM provider_api_keys WHERE provider_id = ?")
-                .bind(id)
-                .fetch_all(&state.pool)
-                .await?;
-        clear_provider_key_cooldowns(&state, previous_key_ids.into_iter().chain(current_key_ids))
-            .await;
+        clear_provider_key_cooldowns(
+            &state,
+            key_mutation
+                .changed_secret_ids
+                .iter()
+                .chain(key_mutation.removed_ids.iter())
+                .copied(),
+        )
+        .await;
     }
 
     if input.auto_sync_models == Some(true)
-        && let Err(error) = sync_provider(state.clone(), id).await
+        && let Err(error) = sync_provider_auto(state.clone(), id).await
     {
         tracing::warn!(provider_id = id, %error, "automatic model sync failed");
     }
+    let mut audit_details = serde_json::Map::new();
+    if model_auto_include_rules_changed {
+        audit_details.insert(
+            "model_auto_include_rules".to_string(),
+            json!(model_auto_include_rules),
+        );
+    }
+    if !key_mutation.changed_secret_ids.is_empty() {
+        audit_details.insert(
+            "replaced_provider_key_ids".to_string(),
+            json!(key_mutation.changed_secret_ids),
+        );
+    }
+    if !key_mutation.removed_ids.is_empty() {
+        audit_details.insert(
+            "removed_provider_key_ids".to_string(),
+            json!(key_mutation.removed_ids),
+        );
+    }
+    let audit_details = (!audit_details.is_empty()).then_some(Value::Object(audit_details));
     record_audit(
         &state,
         "update",
         "provider",
         Some(&id.to_string()),
         &format!("updated provider '{}'", name.trim()),
-        None,
+        audit_details,
     )
     .await;
     Ok(Json(get_provider(&state, id).await?))
@@ -317,6 +347,11 @@ pub async fn delete_provider(
             "provider is still used by one or more routes".to_string(),
         ));
     }
+    let provider_key_ids =
+        sqlx::query_scalar::<_, i64>("SELECT id FROM provider_api_keys WHERE provider_id = ?")
+            .bind(id)
+            .fetch_all(&state.pool)
+            .await?;
 
     let result = sqlx::query("DELETE FROM providers WHERE id = ?")
         .bind(id)
@@ -326,7 +361,19 @@ pub async fn delete_provider(
         return Err(AppError::NotFound("provider not found".to_string()));
     }
     state.provider_cooldown.lock().await.remove(&id);
+    state.provider_failure_meta.lock().await.remove(&id);
+    state
+        .target_failure_meta
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
+    state
+        .target_sink
+        .lock()
+        .await
+        .retain(|(provider_id, _, _), _| *provider_id != id);
     state.mark_provider_resilience_dirty(id);
+    clear_provider_key_cooldowns(&state, provider_key_ids).await;
     state.provider_concurrency.lock().await.remove(&id);
     state
         .model_concurrency

@@ -112,6 +112,7 @@ export default function Providers() {
       queue_timeout_seconds: 30,
       headersText: '{}',
       modelsText: '',
+      modelAutoIncludeRulesText: '',
     } as never)
   }
 
@@ -132,6 +133,10 @@ export default function Providers() {
         api_key: '',
         api_key_suffix: key.api_key_suffix,
         enabled: key.enabled,
+        max_concurrency: key.max_concurrency ?? 0,
+        requests_per_minute: key.requests_per_minute ?? 0,
+        queue_limit: key.queue_limit ?? undefined,
+        queue_wait_ms: key.queue_wait_ms ?? 30000,
       })),
       // Never re-sync implicitly while editing: doing so would overwrite a
       // manually curated model list. The user must opt in explicitly.
@@ -144,6 +149,7 @@ export default function Providers() {
       queue_timeout_seconds: item.queue_timeout_seconds ?? 30,
       headersText: JSON.stringify(item.headers || {}, null, 2),
       modelsText: item.models.join('\n'),
+      modelAutoIncludeRulesText: item.model_auto_include_rules.join('\n'),
     } as never)
     setPresetKey(undefined)
     setOpen(true)
@@ -174,6 +180,10 @@ export default function Providers() {
       name: key.name?.trim() || '',
       api_key: key.api_key?.trim() || undefined,
       enabled: key.enabled,
+      max_concurrency: key.max_concurrency ?? 0,
+      requests_per_minute: key.requests_per_minute ?? 0,
+      queue_limit: key.queue_limit ?? undefined,
+      queue_wait_ms: key.queue_wait_ms ?? 30000,
     }))
     const missingSecret = apiKeys.findIndex((key) => !key.id && !key.api_key)
     if (missingSecret >= 0) {
@@ -189,6 +199,10 @@ export default function Providers() {
       headers,
       auto_sync_models: values.auto_sync_models,
       models: values.modelsText.split('\n').map((item) => item.trim()).filter(Boolean),
+      model_auto_include_rules: values.modelAutoIncludeRulesText
+        .split('\n')
+        .map((item) => item.trim())
+        .filter(Boolean),
       health_check_interval_minutes: values.health_check_interval_minutes ?? 0,
       health_check_model: values.health_check_model?.trim() || '',
       models_sync_interval_minutes: values.models_sync_interval_minutes ?? 0,

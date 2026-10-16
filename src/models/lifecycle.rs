@@ -67,6 +67,8 @@ pub struct ConfigProvider {
     /// would silently re-enable everything.
     #[serde(default)]
     pub disabled_models: Vec<String>,
+    #[serde(default)]
+    pub model_auto_include_rules: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_interval_minutes: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -99,6 +101,14 @@ pub struct ConfigProviderKey {
     pub name: String,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrency: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requests_per_minute: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_limit: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_wait_ms: Option<i64>,
     /// Only present when secrets were exported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -116,7 +126,23 @@ pub struct ConfigRoute {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_override: Option<i64>,
     #[serde(default)]
+    pub all_targets_busy_wait_seconds: i64,
+    #[serde(default = "default_retry_jitter_ms")]
+    pub retry_jitter_ms: i64,
+    #[serde(default = "default_max_waiting_requests")]
+    pub max_waiting_requests: i64,
+    #[serde(default = "default_true")]
+    pub keepalive_during_wait: bool,
+    #[serde(default)]
     pub targets: Vec<ConfigRouteTarget>,
+}
+
+fn default_retry_jitter_ms() -> i64 {
+    250
+}
+
+fn default_max_waiting_requests() -> i64 {
+    32
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -18,12 +18,40 @@ import {
   type Provider,
   type ProviderQuota,
   type ProviderQuotaModel,
+  type ProviderQuotaSnapshot,
 } from '../../api'
 import { formatUnitPrice } from './types'
 
 type ProviderQuotaModalProps = {
   provider?: Provider
   onClose: () => void
+}
+
+const quotaStateLabels: Record<ProviderQuotaSnapshot['state'], string> = {
+  unknown: '未知',
+  healthy: '充足',
+  low: '偏低',
+  exhausted: '已耗尽',
+  reset_due: '待重置',
+}
+
+const quotaStateColors: Record<ProviderQuotaSnapshot['state'], string> = {
+  unknown: 'default',
+  healthy: 'success',
+  low: 'warning',
+  exhausted: 'error',
+  reset_due: 'processing',
+}
+
+function quotaValue(snapshot: ProviderQuotaSnapshot) {
+  const unit = snapshot.unit === 'usd' ? '$' : ''
+  const suffix = snapshot.unit === 'usd' ? '' : ` ${snapshot.unit}`
+  const values = []
+  if (snapshot.used != null) values.push(`已用 ${unit}${snapshot.used.toFixed(2)}${suffix}`)
+  if (snapshot.limit != null) values.push(`上限 ${unit}${snapshot.limit.toFixed(2)}${suffix}`)
+  if (snapshot.remaining != null)
+    values.push(`剩余 ${unit}${snapshot.remaining.toFixed(2)}${suffix}`)
+  return values.join(' · ') || '-'
 }
 
 export default function ProviderQuotaModal({
@@ -184,6 +212,81 @@ export default function ProviderQuotaModal({
                 </Tag>
               ))}
             </Space>
+          )}
+
+          {quota.snapshots.length > 0 && (
+            <div>
+              <Typography.Title level={5}>额度快照</Typography.Title>
+              <Table
+                rowKey={(record) =>
+                  `${record.provider_key_id ?? 0}-${record.model}-${record.window_key}-${record.unit}`
+                }
+                size="small"
+                pagination={false}
+                dataSource={quota.snapshots}
+                scroll={{ x: 900 }}
+                columns={[
+                  {
+                    title: '范围',
+                    width: 180,
+                    render: (_, record) => (
+                      <Space direction="vertical" size={0}>
+                        <Typography.Text code>
+                          {record.model || '提供商 / Key'}
+                        </Typography.Text>
+                        <Typography.Text type="secondary">
+                          {record.provider_key_id ? `Key #${record.provider_key_id}` : '默认凭证'}
+                        </Typography.Text>
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: '窗口',
+                    dataIndex: 'window_key',
+                    width: 100,
+                  },
+                  {
+                    title: '状态',
+                    dataIndex: 'state',
+                    width: 100,
+                    render: (value: ProviderQuotaSnapshot['state']) => (
+                      <Tag color={quotaStateColors[value]}>{quotaStateLabels[value]}</Tag>
+                    ),
+                  },
+                  {
+                    title: '读数',
+                    width: 300,
+                    render: (_, record) => quotaValue(record),
+                  },
+                  {
+                    title: '恢复时间',
+                    dataIndex: 'reset_at',
+                    width: 160,
+                    render: (value?: string | null) =>
+                      value ? dayjs(value).format('MM-DD HH:mm') : '-',
+                  },
+                  {
+                    title: '来源',
+                    dataIndex: 'source',
+                    width: 150,
+                    render: (value: string, record) => (
+                      <Space direction="vertical" size={0}>
+                        <Typography.Text>{value}</Typography.Text>
+                        <Typography.Text type="secondary">
+                          {record.confidence}
+                        </Typography.Text>
+                      </Space>
+                    ),
+                  },
+                  {
+                    title: '有效期',
+                    dataIndex: 'valid_until',
+                    width: 160,
+                    render: (value: string) => dayjs(value).format('MM-DD HH:mm'),
+                  },
+                ]}
+              />
+            </div>
           )}
 
           {quota.model_quotas.length > 0 && (

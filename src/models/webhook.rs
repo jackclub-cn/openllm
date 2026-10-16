@@ -15,8 +15,9 @@ pub const WEBHOOK_EVENT_TYPES: [&str; 4] = [
 /// `generic` is the gateway's own event envelope; every other kind renders a
 /// message for that chat platform, so an operator can point a webhook straight
 /// at a channel instead of writing an adapter.
-pub const WEBHOOK_CHANNEL_KINDS: [&str; 6] =
-    ["generic", "slack", "discord", "telegram", "feishu", "dingtalk"];
+pub const WEBHOOK_CHANNEL_KINDS: [&str; 6] = [
+    "generic", "slack", "discord", "telegram", "feishu", "dingtalk",
+];
 
 /// The kind used when a webhook does not name one.
 pub const WEBHOOK_DEFAULT_CHANNEL_KIND: &str = "generic";

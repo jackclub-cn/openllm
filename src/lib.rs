@@ -1,12 +1,14 @@
-mod api;
 mod allocation;
-pub mod cli;
+mod api;
 mod assets;
+mod capabilities;
+pub mod cli;
 mod db;
 mod error;
 mod models;
 mod models_dev;
 mod proxy;
+mod quota;
 mod registry;
 mod resilience_state;
 mod session_affinity;
@@ -31,25 +33,22 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api::{
-    admin_auth, backup_database, cleanup_usage, clear_cooldowns, create_api_key, create_provider,
-    create_provider_pool, create_route,
-    create_webhook, delete_api_key, delete_provider, delete_provider_pool, delete_route, delete_webhook, diagnose_route,
-    diagnostic_snapshot,
-    event_stream, export_audit_logs, export_config, export_usage, get_guardrails_settings, get_inspector_settings,
-    get_resilience_settings, get_runtime_settings, get_settings, get_status, get_usage_detail, health,
-    list_api_keys, list_audit_logs, list_backups, list_cooldowns, list_model_inventory, list_models,
-    list_provider_model_limits,
-    list_providers, list_provider_pools, list_routes, list_usage, list_webhook_deliveries, list_webhooks, overview,
-    preview_provider_model_sync, prometheus_metrics, provider_pool_usage, provider_quota, ready, rotate_api_key,
-    run_maintenance,
-    self_check,
+    admin_auth, backup_database, cleanup_usage, clear_cooldowns, create_api_key, create_backup,
+    create_provider, create_provider_pool, create_route, create_webhook, delete_api_key,
+    delete_provider, delete_provider_pool, delete_route, delete_webhook, diagnose_route,
+    diagnostic_snapshot, event_stream, export_audit_logs, export_config, export_usage,
+    get_guardrails_settings, get_inspector_settings, get_resilience_settings, get_route_trace,
+    get_runtime_settings, get_settings, get_status, get_usage_detail, health, import_config,
+    list_api_keys, list_audit_logs, list_backups, list_cooldowns, list_model_inventory,
+    list_models, list_provider_model_limits, list_provider_pools, list_provider_quota_snapshots,
+    list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks,
+    migration_status, overview, preview_provider_model_sync, prometheus_metrics,
+    provider_pool_usage, provider_quota, ready, rotate_api_key, run_maintenance, self_check,
     sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
     test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
-    update_inspector_settings, update_provider, update_provider_model_limits,
-    update_resilience_settings, update_route, update_runtime_settings, update_webhook,
-    update_provider_pool,
-    vacuum_database,
-    create_backup, import_config, migration_status, upgrade_check, verify_backup,
+    update_inspector_settings, update_provider, update_provider_model_limits, update_provider_pool,
+    update_provider_quota_snapshots, update_resilience_settings, update_route,
+    update_runtime_settings, update_webhook, upgrade_check, vacuum_database, verify_backup,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -136,6 +135,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
     if let Err(error) = crate::resilience_state::restore(&state).await {
         tracing::warn!(%error, "failed to restore persisted resilience state");
+    }
+    if let Err(error) = crate::quota::restore(&state).await {
+        tracing::warn!(%error, "failed to restore provider quota snapshots");
+    }
+    if let Err(error) = crate::capabilities::restore(&state).await {
+        tracing::warn!(%error, "failed to restore provider capability profiles");
     }
     if let Err(error) = state.load_provider_key_error_state().await {
         tracing::warn!(%error, "failed to load provider key error state");
@@ -277,7 +282,10 @@ where
     let (signal_tx, signal_rx) = tokio::sync::oneshot::channel::<()>();
     let shutdown = async move {
         shutdown.await;
-        tracing::info!(grace_secs, "shutdown signal received; draining in-flight requests");
+        tracing::info!(
+            grace_secs,
+            "shutdown signal received; draining in-flight requests"
+        );
         let _ = signal_tx.send(());
     };
     let serve = axum::serve(listener, app)
@@ -344,6 +352,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/providers/{id}/quota", get(provider_quota))
         .route(
+            "/providers/{id}/quota-snapshots",
+            get(list_provider_quota_snapshots).post(update_provider_quota_snapshots),
+        )
+        .route(
             "/provider-pools",
             get(list_provider_pools).post(create_provider_pool),
         )
@@ -353,10 +365,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/providers/{id}/pool-usage", get(provider_pool_usage))
         .route("/resilience/cooldowns", get(list_cooldowns))
-        .route(
-            "/resilience/cooldowns/clear",
-            post(clear_cooldowns),
-        )
+        .route("/resilience/cooldowns/clear", post(clear_cooldowns))
         .route("/model-inventory", get(list_model_inventory))
         .route("/routes", get(list_routes).post(create_route))
         .route("/routes/diagnose", post(diagnose_route))
@@ -369,6 +378,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/usage", get(list_usage))
         .route("/usage/export", get(export_usage))
         .route("/usage/cleanup", post(cleanup_usage))
+        .route("/usage/{request_id}/route-trace", get(get_route_trace))
         .route("/usage/{request_id}", get(get_usage_detail))
         .route(
             "/settings/runtime",

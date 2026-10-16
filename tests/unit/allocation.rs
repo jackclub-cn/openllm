@@ -22,7 +22,12 @@ fn pool_row(
     }
 }
 
-fn allocation_row(pool_id: i64, api_key_id: i64, weight_pct: i64, policy: &str) -> ProviderPoolAllocation {
+fn allocation_row(
+    pool_id: i64,
+    api_key_id: i64,
+    weight_pct: i64,
+    policy: &str,
+) -> ProviderPoolAllocation {
     ProviderPoolAllocation {
         id: api_key_id,
         pool_id,
@@ -85,7 +90,10 @@ fn saturated_pool_holds_a_hard_share_for_a_quiet_key() {
     // refused; it already borrowed 5, so the refusal is not a lock-out, it is
     // the pool protecting the rest of the capacity.
     match ledger.decide(&spec, 1, base + Duration::from_secs(6)) {
-        PoolDecision::Deny { reason, retry_after } => {
+        PoolDecision::Deny {
+            reason,
+            retry_after,
+        } => {
             assert!(
                 reason.contains("fair share exceeded"),
                 "the denial must name the fair share, got: {reason}"
@@ -151,7 +159,8 @@ fn burst_allocation_uses_headroom_but_respects_the_pool_limit() {
         ledger.decide(&spec, 9, base + Duration::from_millis(1)),
         PoolDecision::Allow,
         "a burst key may still use the remaining pool headroom"
-    );    ledger.charge_requests(&spec, 9, 1, base + Duration::from_millis(1));
+    );
+    ledger.charge_requests(&spec, 9, 1, base + Duration::from_millis(1));
 
     match ledger.decide(&spec, 9, base + Duration::from_millis(2)) {
         PoolDecision::Deny { reason, .. } => assert!(
@@ -198,9 +207,16 @@ fn usage_expires_with_the_rolling_window() {
     let mut ledger = AllocationLedger::new(base);
 
     ledger.charge_requests(&spec, 1, 10, base);
-    assert_eq!(ledger.usage(&spec, 1, base + Duration::from_secs(1)).requests, 10);
     assert_eq!(
-        ledger.usage(&spec, 1, base + Duration::from_secs(120)).requests,
+        ledger
+            .usage(&spec, 1, base + Duration::from_secs(1))
+            .requests,
+        10
+    );
+    assert_eq!(
+        ledger
+            .usage(&spec, 1, base + Duration::from_secs(120))
+            .requests,
         0,
         "usage older than the window must not count"
     );
@@ -259,6 +275,10 @@ fn test_target(provider_id: i64, provider_name: &str) -> RouteTarget {
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     }
 }
@@ -289,7 +309,10 @@ async fn pool_test_state() -> AppState {
     AppState::new(pool, None)
 }
 
-async fn create_pool(state: &AppState, input: serde_json::Value) -> crate::models::ProviderPoolView {
+async fn create_pool(
+    state: &AppState,
+    input: serde_json::Value,
+) -> crate::models::ProviderPoolView {
     let axum::Json(view) = crate::api::create_provider_pool(
         axum::extract::State(state.clone()),
         axum::Json(serde_json::from_value::<ProviderPoolInput>(input).unwrap()),
@@ -337,7 +360,10 @@ async fn denied_provider_is_excluded_and_the_decision_is_recorded() {
     assert_eq!(targets.len(), 1);
     assert_eq!(targets[0].provider_id, 2, "the backup provider is kept");
     assert!(
-        outcome.notes.iter().any(|note| note.contains("fair share exceeded")),
+        outcome
+            .notes
+            .iter()
+            .any(|note| note.contains("fair share exceeded")),
         "the decision must be recorded for the request log: {:?}",
         outcome.notes
     );
@@ -376,7 +402,9 @@ async fn every_candidate_denied_returns_429_with_retry_after() {
         .expect_err("a fully denied request must fail");
     match error {
         AppError::UpstreamStatus {
-            status, message, retry_after,
+            status,
+            message,
+            retry_after,
         } => {
             assert_eq!(status, axum::http::StatusCode::TOO_MANY_REQUESTS);
             assert!(
@@ -556,10 +584,12 @@ async fn pool_update_keeps_or_replaces_allocations() {
     let axum::Json(updated) = crate::api::update_provider_pool(
         axum::extract::State(state.clone()),
         axum::extract::Path(view.id),
-        axum::Json(serde_json::from_value::<crate::models::ProviderPoolUpdate>(
-            serde_json::json!({ "request_limit": 20 }),
-        )
-        .unwrap()),
+        axum::Json(
+            serde_json::from_value::<crate::models::ProviderPoolUpdate>(
+                serde_json::json!({ "request_limit": 20 }),
+            )
+            .unwrap(),
+        ),
     )
     .await
     .unwrap();
@@ -652,10 +682,7 @@ async fn pool_update_can_clear_a_limit_with_an_explicit_null() {
         axum::Json(update(serde_json::json!({ "token_limit": null }))),
     )
     .await;
-    assert!(
-        all_cleared.is_err(),
-        "a pool must keep at least one limit"
-    );
+    assert!(all_cleared.is_err(), "a pool must keep at least one limit");
 }
 
 /// Denials counted on the request path surface through the usage snapshot and

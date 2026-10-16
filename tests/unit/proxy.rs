@@ -576,8 +576,42 @@ fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) 
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     }
+}
+
+async fn insert_test_quota_snapshot(
+    state: &AppState,
+    provider_id: i64,
+    provider_key_id: Option<i64>,
+    model: &str,
+    used: Option<f64>,
+    limit: Option<f64>,
+    remaining: Option<f64>,
+    reset_in: Option<chrono::Duration>,
+) {
+    let now = chrono::Utc::now();
+    let record = crate::models::ProviderQuotaSnapshotRecord {
+        provider_id,
+        provider_key_id,
+        model: model.to_string(),
+        window_key: "5h".to_string(),
+        used,
+        limit,
+        remaining,
+        unit: "request".to_string(),
+        reset_at: reset_in.map(|duration| (now + duration).to_rfc3339()),
+        source: "manual".to_string(),
+        confidence: "exact".to_string(),
+        observed_at: now.to_rfc3339(),
+        valid_until: (now + chrono::Duration::hours(1)).to_rfc3339(),
+    };
+    let key = record.key();
+    state.quota_snapshots.lock().await.insert(key, record);
 }
 
 #[test]
@@ -886,8 +920,7 @@ async fn per_request_routing_overrides_apply_and_echo() {
         excluded_providers: vec!["cheap".to_string()],
         ..Default::default()
     };
-    let removed =
-        apply_routing_overrides(&mut excluded, "override-model", &overrides).unwrap();
+    let removed = apply_routing_overrides(&mut excluded, "override-model", &overrides).unwrap();
     assert_eq!(removed, 1);
     assert_eq!(excluded.targets.len(), 1);
     assert!(
@@ -959,7 +992,6 @@ async fn spawn_chat_upstream() -> (
 
 #[tokio::test]
 async fn proxy_openai_applies_per_request_provider_pin_and_echoes_headers() {
-
     let (fast_address, fast_requests, fast_server) = spawn_chat_upstream().await;
     let (cheap_address, cheap_requests, cheap_server) = spawn_chat_upstream().await;
 
@@ -2733,6 +2765,178 @@ fn retries_only_transient_statuses() {
 }
 
 #[test]
+fn upstream_failure_classifier_separates_failure_scopes() {
+    let target = endpoint_test_target("openai", None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::SERVICE_UNAVAILABLE,
+        br#"{"error":{"message":"upstream unavailable"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::Provider);
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::Target);
+
+    let failure =
+        classify_upstream_failure(&target, StatusCode::REQUEST_TIMEOUT, b"upstream timed out");
+    assert_eq!(failure.scope, FailureScope::Transport);
+    assert_eq!(failure.rest, RestAction::Target);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::UNAUTHORIZED,
+        br#"{"error":{"message":"invalid api key"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::Credential);
+    assert_eq!(failure.retry, RetryDecision::DoNotRetry);
+    assert_eq!(failure.rest, RestAction::Credential);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::FORBIDDEN,
+        b"The request was rejected because it was considered high risk",
+    );
+    assert_eq!(failure.scope, FailureScope::RequestContent);
+    assert_eq!(failure.reason_code, "content_policy_refusal");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::BAD_REQUEST,
+        b"prompt is too long: maximum context length exceeded",
+    );
+    assert_eq!(failure.scope, FailureScope::Model);
+    assert_eq!(failure.reason_code, "context_limit_exceeded");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::NOT_FOUND,
+        br#"{"error":{"message":"model not found"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::Model);
+    assert_eq!(failure.reason_code, "model_not_found");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::TOO_MANY_REQUESTS,
+        br#"{"error":{"message":"monthly quota exhausted"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::Credential);
+    assert_eq!(failure.confidence, FailureConfidence::Exact);
+    assert_eq!(failure.reason_code, "quota_exhausted");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::TargetAndCredential);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::TOO_MANY_REQUESTS,
+        br#"{"error":{"message":"rate limit reached"}}"#,
+    );
+    assert_eq!(failure.confidence, FailureConfidence::Inferred);
+    assert_eq!(failure.reason_code, "rate_limited");
+    assert_eq!(failure.retry, RetryDecision::WaitThenRetry);
+    assert_eq!(failure.rest, RestAction::None);
+    assert!(failure.should_sink());
+    assert!(failure.should_retry_next_target());
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::CONFLICT,
+        br#"{"error":{"message":"request state conflict"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::RequestContent);
+    assert_eq!(failure.reason_code, "request_conflict");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::BAD_REQUEST,
+        br#"{"error":{"message":"invalid parameter"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::RequestShape);
+    assert_eq!(failure.retry, RetryDecision::DoNotRetry);
+    assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::BAD_REQUEST,
+        b"The reasoning_text in the thinking mode must be passed back to the API",
+    );
+    assert_eq!(failure.scope, FailureScope::RequestShape);
+    assert_eq!(failure.reason_code, "request_shape_incompatible");
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+}
+
+#[tokio::test]
+async fn provider_failures_do_not_rest_the_selected_credential() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.provider_api_key_id = Some(11);
+
+    let failure = record_upstream_failure(
+        &state,
+        &target,
+        StatusCode::SERVICE_UNAVAILABLE,
+        &HeaderMap::new(),
+        "upstream unavailable",
+    )
+    .await;
+
+    assert_eq!(failure.scope, FailureScope::Provider);
+    assert!(
+        state
+            .target_cooldown
+            .lock()
+            .await
+            .contains_key(&(7, target.upstream_model.clone()))
+    );
+    assert!(
+        !state.provider_key_cooldown.lock().await.contains_key(&11),
+        "a provider-wide failure must not mark the selected key unhealthy"
+    );
+}
+
+#[tokio::test]
+async fn content_policy_failures_do_not_rest_any_local_target() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    let state = AppState::new(pool, None);
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 7;
+    target.provider_api_key_id = Some(11);
+
+    let failure = record_upstream_failure(
+        &state,
+        &target,
+        StatusCode::FORBIDDEN,
+        &HeaderMap::new(),
+        "The request was rejected because it was considered high risk",
+    )
+    .await;
+
+    assert_eq!(failure.scope, FailureScope::RequestContent);
+    assert_eq!(failure.retry, RetryDecision::NextTarget);
+    assert!(state.target_cooldown.lock().await.is_empty());
+    assert!(state.provider_key_cooldown.lock().await.is_empty());
+    assert!(state.provider_cooldown.lock().await.is_empty());
+}
+
+#[test]
 fn same_target_retry_skips_rate_limits_and_client_errors() {
     for status in [408, 425, 500, 502, 503, 504, 529] {
         assert!(
@@ -3279,6 +3483,56 @@ async fn retries_can_be_disabled_and_then_fall_back() {
     assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
     assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
 
+    let mut trace = None;
+    for _ in 0..50 {
+        trace = sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT candidates_json, attempt_count, fallback_count, success
+             FROM routing_traces WHERE request_id = 'no-retry-request'",
+        )
+        .fetch_optional(&state.pool)
+        .await
+        .unwrap();
+        if trace.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (candidates_json, attempt_count, fallback_count, success) =
+        trace.expect("the completed request should persist a routing trace");
+    assert_eq!(attempt_count, 2);
+    assert_eq!(fallback_count, 1);
+    assert_eq!(success, 1);
+    assert!(candidates_json.contains("\"deprioritized\":false"));
+    assert!(
+        !candidates_json.contains("hello"),
+        "routing traces must not contain request bodies"
+    );
+    let attempts = sqlx::query_as::<_, (i64, Option<i64>, i64, String)>(
+        "SELECT attempt_index, status_code, success, reason_code
+         FROM routing_attempts WHERE request_id = 'no-retry-request'
+         ORDER BY attempt_index",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        attempts,
+        vec![
+            (
+                1,
+                Some(StatusCode::BAD_GATEWAY.as_u16() as i64),
+                0,
+                "upstream_unavailable".to_string()
+            ),
+            (
+                2,
+                Some(StatusCode::OK.as_u16() as i64),
+                1,
+                "upstream_success".to_string()
+            )
+        ]
+    );
+
     flaky_server.abort();
     healthy_server.abort();
 }
@@ -3415,6 +3669,15 @@ async fn quota_exhaustion_reported_as_403_falls_back_to_a_healthy_provider() {
             .await
             .contains_key(&(1, "quota-model".to_string())),
         "a misreported quota refusal must cool the exhausted model"
+    );
+    assert!(
+        state.quota_snapshots.lock().await.values().any(|record| {
+            record.provider_id == 1
+                && record.model == "quota-model"
+                && record.source == "runtime_429"
+                && record.remaining == Some(0.0)
+        }),
+        "an explicit quota refusal must leave a short-lived runtime snapshot"
     );
 
     exhausted_server.abort();
@@ -3557,6 +3820,158 @@ async fn reasoning_text_rejection_falls_back_to_a_healthy_provider() {
 
     rejected_server.abort();
     healthy_server.abort();
+}
+
+#[tokio::test]
+async fn reasoning_history_rejection_is_repaired_and_learned_on_the_same_target() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        OPENAI_RESPONSES,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move |Json(body): Json<Value>| {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "The `reasoning_text` in the thinking mode must be passed back to the API.",
+                                    "type": "invalid_request_error"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    let has_reasoning = body["input"].as_array().is_some_and(|items| {
+                        items.iter().any(|item| {
+                            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                                && item
+                                    .get("content")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(|parts| {
+                                        parts.iter().any(|part| {
+                                            part.get("type").and_then(Value::as_str)
+                                                == Some("reasoning_text")
+                                                && part
+                                                    .get("text")
+                                                    .and_then(Value::as_str)
+                                                    .is_some_and(|text| !text.is_empty())
+                                        })
+                                    })
+                        })
+                    });
+                    assert!(has_reasoning, "the retry must include repaired reasoning");
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "resp_repaired",
+                            "status": "completed",
+                            "output": [{
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [{"type": "output_text", "text": "ok"}]
+                            }],
+                            "usage": {"input_tokens": 3, "output_tokens": 1, "total_tokens": 4}
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'shape-learning', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, enabled)
+         VALUES (1, 'shape route', 'reasoning-model', 'priority', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'reasoning-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool.clone(), None);
+    let body = Bytes::from(
+        json!({
+            "model": "reasoning-model",
+            "input": [
+                {"type": "message", "role": "user", "content": "hello"},
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "lookup",
+                    "arguments": "{}"
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": "result"
+                }
+            ]
+        })
+        .to_string(),
+    );
+
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/responses".parse().unwrap(),
+        &body,
+        "shape-learning",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let learned: (i64, String, String, String) = sqlx::query_as(
+        "SELECT supported, source, model, endpoint
+         FROM provider_capability_profiles
+         WHERE provider_id = 1 AND capability = 'reasoning_history'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        learned,
+        (
+            1,
+            "runtime".to_string(),
+            "reasoning-model".to_string(),
+            "/v1/responses".to_string()
+        )
+    );
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -3929,7 +4344,10 @@ async fn sse_keepalive_is_injected_only_into_event_streams() {
     // An idle SSE body gets a comment frame so proxies do not drop it.
     let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
     let response = Response::builder()
-        .header(reqwest::header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
+        .header(
+            reqwest::header::CONTENT_TYPE,
+            "text/event-stream; charset=utf-8",
+        )
         .body(Body::from_stream(stream))
         .unwrap();
     let response = attach_provider_slot(response, None, Some(Duration::from_millis(20)));
@@ -4184,7 +4602,10 @@ fn prompt_affinity_key_uses_explicit_ids_then_a_stable_first_prompt_prefix() {
     });
 
     let first_key = session_affinity_key(&headers, &first).unwrap();
-    assert_eq!(first_key, session_affinity_key(&headers, &later_turn).unwrap());
+    assert_eq!(
+        first_key,
+        session_affinity_key(&headers, &later_turn).unwrap()
+    );
     assert!(first_key.starts_with("prompt:sha256:"));
     assert_ne!(
         first_key,
@@ -4195,8 +4616,11 @@ fn prompt_affinity_key_uses_explicit_ids_then_a_stable_first_prompt_prefix() {
         .unwrap()
     );
     assert!(
-        session_affinity_key(&headers, &json!({"messages": [{"role": "user", "content": "short"}]}))
-            .is_none(),
+        session_affinity_key(
+            &headers,
+            &json!({"messages": [{"role": "user", "content": "short"}]})
+        )
+        .is_none(),
         "short prompts should not create global affinity churn"
     );
 
@@ -4530,16 +4954,9 @@ async fn p95_latency_optimized_prefers_a_better_tail_over_a_lower_average() {
         "the spiky provider still has the better average"
     );
 
-    let p95 = order_targets(
-        &state,
-        1,
-        "p95_latency_optimized",
-        targets,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let p95 = order_targets(&state, 1, "p95_latency_optimized", targets, None, None)
+        .await
+        .unwrap();
     assert_eq!(
         p95[0].provider_id, 2,
         "P95 routing must avoid the provider with 5s tail samples"
@@ -4590,6 +5007,262 @@ async fn least_used_prefers_the_target_with_less_recent_traffic() {
         .await
         .unwrap();
     assert_eq!(ordered[0].provider_id, 2);
+}
+
+#[tokio::test]
+async fn quota_paced_orders_known_states_and_keeps_a_sole_exhausted_target() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+    let target = |id| {
+        let mut target = endpoint_test_target("openai", None);
+        target.id = id;
+        target.provider_id = id;
+        target
+    };
+    let exhausted = target(1);
+    let healthy = target(2);
+    let low = target(3);
+    let unknown = target(4);
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        None,
+        "model",
+        Some(100.0),
+        Some(100.0),
+        Some(0.0),
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+    insert_test_quota_snapshot(
+        &state,
+        2,
+        None,
+        "model",
+        Some(10.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(4)),
+    )
+    .await;
+    insert_test_quota_snapshot(
+        &state,
+        3,
+        None,
+        "model",
+        Some(95.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(4)),
+    )
+    .await;
+
+    let ordered = order_targets(
+        &state,
+        1,
+        "quota_paced",
+        vec![exhausted.clone(), healthy, low, unknown],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ordered
+            .into_iter()
+            .map(|target| target.provider_id)
+            .collect::<Vec<_>>(),
+        vec![2, 4, 3],
+        "healthy, unknown and low pressure should remain while exhaustion is skipped"
+    );
+
+    let sole = order_targets(&state, 1, "quota_paced", vec![exhausted], None, None)
+        .await
+        .unwrap();
+    assert_eq!(sole.len(), 1);
+    assert_eq!(sole[0].provider_id, 1);
+}
+
+#[tokio::test]
+async fn quota_paced_prefers_the_earlier_reset_when_remaining_is_equal() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+    let target = |id| {
+        let mut target = endpoint_test_target("openai", None);
+        target.id = id;
+        target.provider_id = id;
+        target
+    };
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        None,
+        "model",
+        Some(50.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+    insert_test_quota_snapshot(
+        &state,
+        2,
+        None,
+        "model",
+        Some(50.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(4)),
+    )
+    .await;
+
+    let ordered = order_targets(
+        &state,
+        1,
+        "quota_paced",
+        vec![target(2), target(1)],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ordered
+            .into_iter()
+            .map(|target| target.provider_id)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+}
+
+#[tokio::test]
+async fn quota_paced_keeps_model_level_exhaustion_scoped() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool, None);
+    let mut exhausted = endpoint_test_target("openai", None);
+    exhausted.id = 1;
+    exhausted.provider_id = 1;
+    exhausted.upstream_model = "model-a".to_string();
+    let mut healthy = endpoint_test_target("openai", None);
+    healthy.id = 2;
+    healthy.provider_id = 1;
+    healthy.upstream_model = "model-b".to_string();
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        None,
+        "model-a",
+        Some(100.0),
+        Some(100.0),
+        Some(0.0),
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        None,
+        "model-b",
+        Some(5.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+
+    let ordered = order_targets(
+        &state,
+        1,
+        "quota_paced",
+        vec![exhausted, healthy],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ordered
+            .into_iter()
+            .map(|target| target.upstream_model)
+            .collect::<Vec<_>>(),
+        vec!["model-b"]
+    );
+}
+
+#[tokio::test]
+async fn quota_paced_applies_key_snapshots_after_key_expansion() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Quota', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+         VALUES (11, 1, 'Exhausted', 'sk-exhausted', 1),
+                (12, 1, 'Healthy', 'sk-healthy', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        Some(11),
+        "model",
+        Some(100.0),
+        Some(100.0),
+        Some(0.0),
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+    insert_test_quota_snapshot(
+        &state,
+        1,
+        Some(12),
+        "model",
+        Some(10.0),
+        Some(100.0),
+        None,
+        Some(chrono::Duration::hours(1)),
+    )
+    .await;
+
+    let ordered = order_targets(
+        &state,
+        1,
+        "quota_paced",
+        vec![endpoint_test_target("openai", None)],
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(ordered.len(), 1);
+    assert_eq!(ordered[0].provider_api_key_id, Some(12));
 }
 
 #[tokio::test]
@@ -4909,11 +5582,11 @@ async fn slow_success_deprioritizes_only_latency_optimized_routes() {
             None,
             None,
         )
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|target| target.provider_id)
-            .collect::<Vec<_>>(),
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|target| target.provider_id)
+        .collect::<Vec<_>>(),
         vec![1, 2]
     );
     assert_eq!(
@@ -5007,12 +5680,11 @@ async fn non_streaming_latency_is_not_treated_as_a_slow_first_token() {
         state.target_slow.lock().await.is_empty(),
         "a buffered response has no real first-token measurement"
     );
-    let status: i64 =
-        sqlx::query_scalar("SELECT status_code FROM usage_logs WHERE request_id = ?")
-            .bind("non-streaming-slow-latency")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let status: i64 = sqlx::query_scalar("SELECT status_code FROM usage_logs WHERE request_id = ?")
+        .bind("non-streaming-slow-latency")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(status, 200);
 }
 
@@ -5221,21 +5893,17 @@ async fn concurrent_failures_never_shorten_key_or_model_cooldowns() {
         Some(Duration::from_secs(120)),
     )
     .await;
-    let key_deadline = *state
-        .provider_key_cooldown
-        .lock()
-        .await
-        .get(&11)
-        .unwrap();
-    mark_provider_api_key_error(&state, Some(11), StatusCode::SERVICE_UNAVAILABLE, "boom", None)
-        .await;
+    let key_deadline = *state.provider_key_cooldown.lock().await.get(&11).unwrap();
+    mark_provider_api_key_error(
+        &state,
+        Some(11),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "boom",
+        None,
+    )
+    .await;
     assert_eq!(
-        state
-            .provider_key_cooldown
-            .lock()
-            .await
-            .get(&11)
-            .copied(),
+        state.provider_key_cooldown.lock().await.get(&11).copied(),
         Some(key_deadline),
         "a shorter key failure must not cut an active cooldown short"
     );
@@ -5295,6 +5963,19 @@ async fn provider_timeout_aborts_slow_upstreams_and_opens_cooldowns() {
             .contains_key(&(7, target.upstream_model.clone()))
     );
     assert!(state.provider_cooldown.lock().await.contains_key(&7));
+    assert_eq!(
+        state
+            .failure_classifications
+            .lock()
+            .await
+            .get(&(
+                "transport".to_string(),
+                "next_target".to_string(),
+                "upstream_transport_error".to_string(),
+            ))
+            .copied(),
+        Some(1)
+    );
 
     server.abort();
 }
@@ -5393,13 +6074,7 @@ async fn a_mid_stream_upstream_failure_cools_the_provider() {
         })
         .to_string(),
     );
-    let response = proxy_openai(
-        State(state.clone()),
-        HeaderMap::new(),
-        uri,
-        body,
-    )
-    .await;
+    let response = proxy_openai(State(state.clone()), HeaderMap::new(), uri, body).await;
     let status = response.status();
     if status != StatusCode::OK {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -5451,6 +6126,19 @@ async fn mark_stream_failure_cools_target_and_provider() {
             .contains_key(&(11, "m".to_string()))
     );
     assert!(state.provider_cooldown.lock().await.contains_key(&11));
+    assert_eq!(
+        state
+            .failure_classifications
+            .lock()
+            .await
+            .get(&(
+                "transport".to_string(),
+                "next_target".to_string(),
+                "upstream_stream_failed".to_string(),
+            ))
+            .copied(),
+        Some(1)
+    );
 }
 
 /// A provider request timeout must not become a total timeout for a stream:
@@ -5532,6 +6220,946 @@ async fn provider_timeout_does_not_truncate_a_stream() {
 }
 
 #[tokio::test]
+async fn provider_key_rpm_full_orders_a_ready_sibling_key_first() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, max_concurrency)
+         VALUES (1, 'RPM', 'openai', 'https://example.com/v1', 10)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (
+            id, provider_id, name, secret, enabled, requests_per_minute
+         ) VALUES
+            (11, 1, 'Full', 'sk-full', 1, 1),
+            (12, 1, 'Ready', 'sk-ready', 1, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    state
+        .provider_key_rpm
+        .lock()
+        .await
+        .entry(11)
+        .or_default()
+        .push_back(Instant::now());
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_id = 1;
+    target.upstream_model = "model".to_string();
+
+    let ordered = order_targets(&state, 1, "priority", vec![target], None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ordered
+            .into_iter()
+            .map(|target| target.provider_api_key_id)
+            .collect::<Vec<_>>(),
+        vec![Some(12), Some(11)]
+    );
+}
+
+#[tokio::test]
+async fn target_sink_moves_a_rate_limited_candidate_behind_a_healthy_sibling() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES
+            (1, 'Sinked', 'openai', 'https://sinked.example/v1'),
+            (2, 'Healthy', 'openai', 'https://healthy.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    state.target_sink.lock().await.insert(
+        (1, None, "model".to_string()),
+        crate::state::TargetSinkEntry {
+            until: Instant::now() + Duration::from_secs(30),
+            reason_code: "rate_limited",
+            observed_at: Instant::now(),
+        },
+    );
+    let mut sinked = endpoint_test_target("openai", None);
+    sinked.provider_id = 1;
+    sinked.provider_name = "Sinked".to_string();
+    sinked.upstream_model = "model".to_string();
+    let mut healthy = endpoint_test_target("openai", None);
+    healthy.provider_id = 2;
+    healthy.provider_name = "Healthy".to_string();
+    healthy.upstream_model = "model".to_string();
+
+    let ordered = order_targets(&state, 1, "priority", vec![sinked, healthy], None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|target| target.provider_id)
+            .collect::<Vec<_>>(),
+        vec![2, 1]
+    );
+}
+
+#[tokio::test]
+async fn target_success_clears_its_short_lived_sink() {
+    let state = AppState::new(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap(),
+        None,
+    );
+    let key = (1, Some(11), "model".to_string());
+    state.target_sink.lock().await.insert(
+        key.clone(),
+        crate::state::TargetSinkEntry {
+            until: Instant::now() + Duration::from_secs(30),
+            reason_code: "rate_limited",
+            observed_at: Instant::now(),
+        },
+    );
+    mark_target_success(&state, 1, "model").await;
+    assert!(!state.target_sink.lock().await.contains_key(&key));
+}
+
+#[tokio::test]
+async fn busy_wait_lease_enforces_the_route_limit_and_releases_on_drop() {
+    let state = AppState::new(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap(),
+        None,
+    );
+    let first = state.try_acquire_busy_wait(7, 1).unwrap();
+    assert!(state.try_acquire_busy_wait(7, 1).is_none());
+    drop(first);
+    assert!(state.try_acquire_busy_wait(7, 1).is_some());
+
+    let process_wide = (0..crate::state::MAX_BUSY_WAITERS)
+        .map(|route_id| {
+            state
+                .try_acquire_busy_wait(route_id as i64, crate::state::MAX_BUSY_WAITERS)
+                .expect("each process-wide slot should be available")
+        })
+        .collect::<Vec<_>>();
+    assert!(state.try_acquire_busy_wait(999, 1).is_none());
+    drop(process_wide);
+    assert!(state.try_acquire_busy_wait(999, 1).is_some());
+}
+
+#[tokio::test]
+async fn target_sinks_survive_the_resilience_state_restore() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Sinked', 'openai', 'https://sinked.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let deadline = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+        + 30_000;
+    sqlx::query(
+        "INSERT INTO target_sink_state (
+             provider_id, provider_key_id, model, sink_until_unix_ms, reason_code
+         ) VALUES (1, 0, 'model', ?, 'rate_limited')",
+    )
+    .bind(deadline)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool, None);
+    crate::resilience_state::restore(&state).await.unwrap();
+    let sinks = state.target_sink.lock().await;
+    let sink = sinks
+        .get(&(1, None, "model".to_string()))
+        .expect("the persisted sink must be restored");
+    assert_eq!(
+        sink.reason_code, "rate_limited",
+        "the persisted reason must survive a restart"
+    );
+}
+
+#[tokio::test]
+async fn busy_wait_route_absorbs_a_short_rate_limit() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "0")],
+                            Json(json!({
+                                "error": {
+                                    "message": "temporarily busy",
+                                    "type": "rate_limit_error"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-busy-wait",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {
+                                "prompt_tokens": 3,
+                                "completion_tokens": 1,
+                                "total_tokens": 4
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'busy', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests
+         ) VALUES (1, 'patient', 'patient-model', 'priority', 1, 2, 0, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'patient-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "patient-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "busy-wait-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert_eq!(response.headers()["x-openllm-fallback-count"], "1");
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&bytes).contains("\"content\":\"ok\""));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn busy_wait_route_respects_the_waiting_request_cap() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "0")],
+                        Json(json!({
+                            "error": {
+                                "message": "still busy",
+                                "type": "rate_limit_error"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'busy', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests
+         ) VALUES (1, 'capped', 'capped-model', 'priority', 1, 5, 0, 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'capped-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "capped-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let error = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "busy-wait-cap-request",
+        None,
+    )
+    .await
+    .expect_err("a zero waiting-request cap must fail immediately");
+
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            ..
+        }
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn busy_wait_route_returns_the_real_rate_limit_after_the_budget() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    (
+                        StatusCode::TOO_MANY_REQUESTS,
+                        [("retry-after", "1")],
+                        Json(json!({
+                            "error": {
+                                "message": "still busy",
+                                "type": "rate_limit_error"
+                            }
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'busy', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests
+         ) VALUES (1, 'budgeted', 'budgeted-model', 'priority', 1, 1, 0, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'budgeted-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "budgeted-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let started = Instant::now();
+    let error = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "busy-wait-budget-request",
+        None,
+    )
+    .await
+    .expect_err("the budget must end with the real upstream error");
+
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            ..
+        }
+    ));
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    assert!(started.elapsed() >= Duration::from_millis(800));
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn incompatible_openai_endpoint_does_not_enter_busy_wait() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'anthropic-only', 'anthropic', 'https://example.invalid/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests
+         ) VALUES (1, 'incompatible', 'incompatible-model', 'priority', 1, 5, 0, 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'incompatible-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "incompatible-model",
+            "input": "hello"
+        })
+        .to_string(),
+    );
+    let started = Instant::now();
+    let error = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/embeddings".parse().unwrap(),
+        &body,
+        "incompatible-request",
+        None,
+    )
+    .await
+    .expect_err("an endpoint incompatibility must fail immediately");
+
+    assert!(
+        matches!(error, AppError::Upstream(_) | AppError::BadRequest(_)),
+        "unexpected error: {error:?}"
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn streaming_busy_wait_commits_an_sse_response_before_retrying() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "0")],
+                            Json(json!({
+                                "error": {
+                                    "message": "temporarily busy",
+                                    "type": "rate_limit_error"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'busy', 'openai', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests,
+             keepalive_during_wait
+         ) VALUES (1, 'streaming', 'streaming-model', 'priority', 1, 2, 0, 2, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'streaming-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "streaming-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_openai_inner(
+        &state,
+        &HeaderMap::new(),
+        &"/v1/chat/completions".parse().unwrap(),
+        &body,
+        "streaming-busy-wait-request",
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(&first[..], b": keep-alive\n\n");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "the SSE response must be committed before the retry wait finishes"
+    );
+    let mut body = String::from_utf8_lossy(&first).into_owned();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if body.contains("\"content\":\"ok\"") {
+            break;
+        }
+    }
+    assert!(
+        body.contains("\"content\":\"ok\""),
+        "unexpected SSE body: {body}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn anthropic_streaming_busy_wait_commits_keepalive_before_retrying() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let upstream = axum::Router::new().route(
+        ANTHROPIC_MESSAGES,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move || {
+                let attempts = attempts.clone();
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            [("retry-after", "0")],
+                            Json(json!({
+                                "type": "error",
+                                "error": {
+                                    "type": "rate_limit_error",
+                                    "message": "temporarily busy"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [("content-type", "text/event-stream")],
+                        "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n",
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'busy-anthropic', 'anthropic', ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (
+             id, name, model_pattern, strategy, enabled,
+             all_targets_busy_wait_seconds, retry_jitter_ms, max_waiting_requests,
+             keepalive_during_wait
+         ) VALUES (1, 'anthropic-streaming', 'claude-test', 'priority', 1, 2, 0, 2, 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority)
+         VALUES (1, 1, 'claude-test', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let body = Bytes::from(
+        json!({
+            "model": "claude-test",
+            "max_tokens": 16,
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        })
+        .to_string(),
+    );
+    let response = proxy_anthropic_inner(
+        &state,
+        &HeaderMap::new(),
+        &ANTHROPIC_MESSAGES.parse().unwrap(),
+        &body,
+        "anthropic-streaming-busy-wait-request",
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "text/event-stream"
+    );
+    let mut stream = response.into_body().into_data_stream();
+    let first = stream.next().await.unwrap().unwrap();
+    assert_eq!(&first[..], b": keep-alive\n\n");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    let mut body = String::from_utf8_lossy(&first).into_owned();
+    while let Some(chunk) = stream.next().await {
+        body.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if body.contains("\"text\":\"ok\"") {
+            break;
+        }
+    }
+    assert!(
+        body.contains("\"text\":\"ok\""),
+        "unexpected SSE body: {body}"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn provider_key_rpm_limit_rejects_with_retry_after() {
+    let state = AppState::new(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap(),
+        None,
+    );
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_api_key_id = Some(11);
+    target.provider_api_key_name = Some("Primary".to_string());
+    target.provider_key_requests_per_minute = Some(1);
+
+    assert!(
+        acquire_upstream_slots(&state, &target)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let error = acquire_upstream_slots(&state, &target)
+        .await
+        .unwrap_err()
+        .into_error();
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(_),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn provider_key_queue_limit_bounds_waiters_and_releases_slots() {
+    let state = AppState::new(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap(),
+        None,
+    );
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_api_key_id = Some(11);
+    target.provider_api_key_name = Some("Primary".to_string());
+    target.provider_key_max_concurrency = Some(1);
+    target.provider_key_queue_limit = Some(1);
+    target.provider_key_queue_wait_ms = Some(200);
+
+    let first = acquire_upstream_slots(&state, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let waiter_state = state.clone();
+    let waiter_target = target.clone();
+    let waiter =
+        tokio::spawn(async move { acquire_upstream_slots(&waiter_state, &waiter_target).await });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let error = acquire_upstream_slots(&state, &target)
+        .await
+        .unwrap_err()
+        .into_error();
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(_),
+            ..
+        }
+    ));
+
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(2), waiter)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state
+            .provider_key_concurrency
+            .lock()
+            .await
+            .get(&11)
+            .unwrap()
+            .available_permits(),
+        0
+    );
+    drop(second);
+    assert_eq!(
+        state
+            .provider_key_concurrency
+            .lock()
+            .await
+            .get(&11)
+            .unwrap()
+            .available_permits(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn provider_key_zero_queue_limit_rejects_without_waiting() {
+    let state = AppState::new(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .connect("sqlite::memory:")
+            .await
+            .unwrap(),
+        None,
+    );
+    let mut target = endpoint_test_target("openai", None);
+    target.provider_api_key_id = Some(11);
+    target.provider_api_key_name = Some("Primary".to_string());
+    target.provider_key_max_concurrency = Some(1);
+    target.provider_key_queue_limit = Some(0);
+    target.provider_key_queue_wait_ms = Some(30_000);
+
+    let first = acquire_upstream_slots(&state, &target)
+        .await
+        .unwrap()
+        .unwrap();
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        acquire_upstream_slots(&state, &target),
+    )
+    .await
+    .expect("a disabled queue must reject immediately")
+    .unwrap_err()
+    .into_error();
+    assert!(matches!(
+        error,
+        AppError::UpstreamStatus {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            retry_after: Some(_),
+            ..
+        }
+    ));
+    drop(first);
+}
+
+#[tokio::test]
 async fn provider_concurrency_gate_queues_then_releases_slots() {
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
@@ -5559,9 +7187,10 @@ async fn provider_concurrency_gate_queues_then_releases_slots() {
 
     let state_for_waiter = state.clone();
     let target_for_waiter = target.clone();
-    let waiter = tokio::spawn(async move {
-        acquire_upstream_slots(&state_for_waiter, &target_for_waiter).await
-    });
+    let waiter =
+        tokio::spawn(
+            async move { acquire_upstream_slots(&state_for_waiter, &target_for_waiter).await },
+        );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!waiter.is_finished());
 
@@ -5720,7 +7349,8 @@ async fn saturated_model_falls_back_to_healthy_provider_sibling() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.headers()["x-openllm-fallback-count"], "0",
+        response.headers()["x-openllm-fallback-count"],
+        "0",
         "a model at its concurrency cap is skipped in favour of a sibling with \
          headroom, instead of waiting out its queue"
     );
@@ -5839,11 +7469,7 @@ async fn saturated_provider_falls_back_without_opening_its_circuit() {
     let state = AppState::new(pool, None);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     let held = semaphore.clone().acquire_owned().await.unwrap();
-    state
-        .provider_concurrency
-        .lock()
-        .await
-        .insert(1, semaphore);
+    state.provider_concurrency.lock().await.insert(1, semaphore);
     let body = Bytes::from(
         json!({
             "model": "ha-model",
@@ -5865,7 +7491,8 @@ async fn saturated_provider_falls_back_without_opening_its_circuit() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(response.headers()["x-openllm-routed-provider"], "healthy");
     assert_eq!(
-        response.headers()["x-openllm-fallback-count"], "0",
+        response.headers()["x-openllm-fallback-count"],
+        "0",
         "live capacity is part of the candidate score, so a provider at its \
          concurrency cap ranks behind one with headroom and no queue wait is spent"
     );
@@ -5880,7 +7507,10 @@ async fn saturated_provider_falls_back_without_opening_its_circuit() {
 
 #[tokio::test]
 async fn model_scoped_failures_isolate_before_opening_the_provider_circuit() {
-    for status in [StatusCode::TOO_MANY_REQUESTS, StatusCode::SERVICE_UNAVAILABLE] {
+    for status in [
+        StatusCode::TOO_MANY_REQUESTS,
+        StatusCode::SERVICE_UNAVAILABLE,
+    ] {
         let pool = sqlx::sqlite::SqlitePoolOptions::new()
             .max_connections(1)
             .connect("sqlite::memory:")
@@ -5895,23 +7525,56 @@ async fn model_scoped_failures_isolate_before_opening_the_provider_circuit() {
 
         let headers = HeaderMap::new();
         record_upstream_failure(&state, &first, status, &headers, "model failed").await;
-        assert!(
-            state
-                .target_cooldown
-                .lock()
-                .await
-                .contains_key(&(7, "model-a".to_string()))
-        );
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert!(
+                state
+                    .target_sink
+                    .lock()
+                    .await
+                    .contains_key(&(7, None, "model-a".to_string())),
+                "a short rate limit must sink the model without cooling it"
+            );
+            assert!(
+                !state
+                    .target_cooldown
+                    .lock()
+                    .await
+                    .contains_key(&(7, "model-a".to_string()))
+            );
+        } else {
+            assert!(
+                state
+                    .target_cooldown
+                    .lock()
+                    .await
+                    .contains_key(&(7, "model-a".to_string()))
+            );
+        }
         assert!(
             !state.provider_cooldown.lock().await.contains_key(&7),
             "one model-specific {status} must not remove healthy sibling models"
         );
 
         record_upstream_failure(&state, &second, status, &headers, "model failed").await;
-        assert!(
-            state.provider_cooldown.lock().await.contains_key(&7),
-            "multiple cooling models should open the provider circuit"
-        );
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            assert!(
+                state
+                    .target_sink
+                    .lock()
+                    .await
+                    .contains_key(&(7, None, "model-b".to_string())),
+                "each short rate limit should track the affected model"
+            );
+            assert!(
+                !state.provider_cooldown.lock().await.contains_key(&7),
+                "short model rate limits must not open the provider circuit"
+            );
+        } else {
+            assert!(
+                state.provider_cooldown.lock().await.contains_key(&7),
+                "multiple cooling models should open the provider circuit"
+            );
+        }
     }
 }
 
@@ -6427,6 +8090,152 @@ fn strips_tool_search_for_compat_retry() {
 }
 
 #[test]
+fn strips_strict_tool_fields_for_compat_retry() {
+    let body = json!({
+        "tools": [
+            {"type": "function", "name": "lookup", "strict": true},
+            {
+                "type": "function",
+                "function": {"name": "search", "strict": true, "parameters": {}}
+            }
+        ]
+    });
+    let stripped = strip_strict_tools(&body).unwrap();
+    assert!(stripped["tools"][0].get("strict").is_none());
+    assert!(stripped["tools"][1]["function"].get("strict").is_none());
+    assert!(stripped["tools"][0].get("name").is_some());
+    assert!(strip_strict_tools(&json!({"tools": []})).is_none());
+}
+
+#[test]
+fn recognizes_unsupported_strict_tool_error() {
+    for error in [
+        r#"{"error":{"message":"Invalid parameter: unknown strict field on tool schema"}}"#,
+        r#"{"error":{"message":"tool function strict is not supported by this model"}}"#,
+        r#"{"error":{"message":"additional property strict is not allowed for tools"}}"#,
+    ] {
+        assert!(upstream_rejects_strict_tools(error.as_bytes()));
+    }
+    for error in [
+        r#"{"error":{"message":"strict mode is enabled for the request"}}"#,
+        r#"{"error":{"message":"rate limit exceeded for tool calls"}}"#,
+    ] {
+        assert!(!upstream_rejects_strict_tools(error.as_bytes()));
+    }
+}
+
+#[tokio::test]
+async fn strict_tool_rejection_is_retried_and_learned_on_the_same_target() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        OPENAI_CHAT_COMPLETIONS,
+        axum::routing::post({
+            let attempts = attempts.clone();
+            move |Json(body): Json<Value>| {
+                let attempts = attempts.clone();
+                async move {
+                    let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        assert_eq!(body["tools"][0]["strict"], true);
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(json!({
+                                "error": {
+                                    "message": "Invalid parameter: unknown strict field on tool schema"
+                                }
+                            })),
+                        )
+                            .into_response();
+                    }
+                    assert!(body["tools"][0].get("strict").is_none());
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "chatcmpl-strict",
+                            "object": "chat.completion",
+                            "choices": [{
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop"
+                            }],
+                            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4}
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'strict-learning', 'openai', ?)",
+    )
+    .bind(format!("http://{address}"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let state = AppState::new(pool.clone(), None);
+    let request_json = json!({
+        "model": "strict-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [{
+            "type": "function",
+            "name": "lookup",
+            "strict": true,
+            "parameters": {"type": "object", "properties": {}}
+        }]
+    });
+    let mut target = endpoint_test_target("openai", None);
+    target.base_url = format!("http://{address}");
+    target.upstream_model = "strict-model".to_string();
+
+    let response = forward_to_target(
+        &state,
+        "strict-learning",
+        OPENAI_CHAT_COMPLETIONS,
+        "strict-model",
+        &request_json,
+        &Bytes::new(),
+        None,
+        target,
+        false,
+        10,
+        None,
+        Instant::now(),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let learned: (i64, String) = sqlx::query_as(
+        "SELECT supported, source FROM provider_capability_profiles
+         WHERE provider_id = 1 AND capability = 'strict_tools'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(learned, (0, "runtime".to_string()));
+
+    server.abort();
+}
+
+#[test]
 fn repairs_orphaned_responses_tool_items() {
     let mut body = json!({
         "input": [
@@ -6670,6 +8479,10 @@ async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() 
             enabled: 1,
             provider_api_key_id: None,
             provider_api_key_name: None,
+            provider_key_max_concurrency: None,
+            provider_key_requests_per_minute: None,
+            provider_key_queue_limit: None,
+            provider_key_queue_wait_ms: None,
             auth_retryable: false,
         };
 
@@ -6829,6 +8642,10 @@ async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     };
 
@@ -6979,6 +8796,10 @@ async fn anthropic_forward_repairs_orphan_tool_calls_for_openai_upstream() {
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     };
     // OpenAI chat shape, as produced from an Anthropic caller, carrying an
@@ -7139,6 +8960,10 @@ async fn anthropic_forward_retries_openai_upstream_without_tool_search() {
         enabled: 1,
         provider_api_key_id: None,
         provider_api_key_name: None,
+        provider_key_max_concurrency: None,
+        provider_key_requests_per_minute: None,
+        provider_key_queue_limit: None,
+        provider_key_queue_wait_ms: None,
         auth_retryable: false,
     };
     let request_json = json!({
@@ -8008,10 +9833,7 @@ async fn api_key_routing_policy_pins_the_provider_end_to_end() {
     // A request header that contradicts the key's pin leaves no target, which
     // is a client error rather than a silent fallback to the pinned provider.
     let mut headers = HeaderMap::new();
-    headers.insert(
-        EXCLUDE_PROVIDERS_HEADER,
-        HeaderValue::from_static("beta"),
-    );
+    headers.insert(EXCLUDE_PROVIDERS_HEADER, HeaderValue::from_static("beta"));
     let error = proxy_openai_inner(
         &state,
         &headers,
@@ -9121,7 +10943,10 @@ fn chat_reasoning_text_becomes_responses_reasoning() {
     );
     assert_eq!(converted["output"][0]["type"], "reasoning");
     assert_eq!(converted["output"][0]["summary"][0]["text"], "thought");
-    assert_eq!(converted["output"][0]["content"][0]["type"], "reasoning_text");
+    assert_eq!(
+        converted["output"][0]["content"][0]["type"],
+        "reasoning_text"
+    );
     assert_eq!(converted["output"][0]["content"][0]["text"], "thought");
 }
 
@@ -9304,6 +11129,7 @@ async fn deepseek_responses_compat_inserts_reasoning_before_forwarding() {
         &state,
         "req_test",
         &target,
+        OPENAI_RESPONSES,
         UpstreamShape::Responses,
         &mut body,
     )
@@ -9389,7 +11215,11 @@ fn deepseek_anthropic_replaces_redacted_thinking() {
     assert_eq!(content[0]["type"], "thinking");
     assert_eq!(content[0]["thinking"], " ");
     assert_eq!(content[1]["type"], "tool_use");
-    assert!(!content.iter().any(|block| block["type"] == "redacted_thinking"));
+    assert!(
+        !content
+            .iter()
+            .any(|block| block["type"] == "redacted_thinking")
+    );
 }
 
 /// The mirror case: a chat client talking to a Responses-wire thinking
@@ -9661,7 +11491,10 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
         Some(Duration::from_secs(DEFAULT_SSE_KEEPALIVE_SECS))
     );
     assert_eq!(parse_keepalive_secs(Some("0")), None);
-    assert_eq!(parse_keepalive_secs(Some(" 5 ")), Some(Duration::from_secs(5)));
+    assert_eq!(
+        parse_keepalive_secs(Some(" 5 ")),
+        Some(Duration::from_secs(5))
+    );
 
     // The global cap is opt-in: only a positive integer turns it on.
     assert_eq!(parse_concurrency_limit(None), None);
@@ -9679,16 +11512,14 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
         DEFAULT_MAX_UPSTREAM_BODY_MIB
     );
     assert_eq!(parse_body_mib(Some("0"), DEFAULT_MAX_UPSTREAM_BODY_MIB), 64);
-    assert_eq!(parse_body_mib(Some("128"), DEFAULT_MAX_UPSTREAM_BODY_MIB), 128);
+    assert_eq!(
+        parse_body_mib(Some("128"), DEFAULT_MAX_UPSTREAM_BODY_MIB),
+        128
+    );
 
     // The shutdown grace defaults to 30s; an explicit 0 means "wait forever".
-    use crate::state::{
-        DEFAULT_SHUTDOWN_GRACE_SECS, parse_shutdown_grace_secs,
-    };
-    assert_eq!(
-        parse_shutdown_grace_secs(None),
-        DEFAULT_SHUTDOWN_GRACE_SECS
-    );
+    use crate::state::{DEFAULT_SHUTDOWN_GRACE_SECS, parse_shutdown_grace_secs};
+    assert_eq!(parse_shutdown_grace_secs(None), DEFAULT_SHUTDOWN_GRACE_SECS);
     assert_eq!(
         parse_shutdown_grace_secs(Some("  ")),
         DEFAULT_SHUTDOWN_GRACE_SECS
@@ -9796,11 +11627,17 @@ fn overloaded_response_is_a_retryable_429_with_limit_headers() {
     let response = overloaded_response(4, false);
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .unwrap(),
         "5"
     );
     assert_eq!(response.headers().get("x-ratelimit-limit").unwrap(), "4");
-    assert_eq!(response.headers().get("x-ratelimit-remaining").unwrap(), "0");
+    assert_eq!(
+        response.headers().get("x-ratelimit-remaining").unwrap(),
+        "0"
+    );
 }
 
 #[tokio::test]
@@ -9833,8 +11670,7 @@ async fn request_capacity_slot_is_held_until_the_body_completes() {
     state.request_capacity = Some(semaphore.clone());
     state.request_capacity_limit = 1;
 
-    let RequestCapacity::Acquired(permit) =
-        acquire_request_capacity(&state, Duration::ZERO).await
+    let RequestCapacity::Acquired(permit) = acquire_request_capacity(&state, Duration::ZERO).await
     else {
         panic!("the first request must take the only slot");
     };
@@ -9944,7 +11780,11 @@ async fn global_request_cap_sheds_excess_streams_with_429() {
     };
 
     let first = router.clone().oneshot(request()).await.unwrap();
-    assert_eq!(first.status(), StatusCode::OK, "the first request is admitted");
+    assert_eq!(
+        first.status(),
+        StatusCode::OK,
+        "the first request is admitted"
+    );
 
     let second = router.clone().oneshot(request()).await.unwrap();
     assert_eq!(
@@ -9983,8 +11823,9 @@ async fn admission_rejects_before_reading_the_body() {
 
     // A body that never produces data. If the handler tried to buffer it, this
     // request would hang instead of being shed.
-    let hanging =
-        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let hanging = Body::from_stream(futures_util::stream::pending::<
+        Result<Bytes, std::convert::Infallible>,
+    >());
     let request = axum::http::Request::builder()
         .method("POST")
         .uri(OPENAI_CHAT_COMPLETIONS)
@@ -10030,7 +11871,10 @@ async fn admission_uses_the_anthropic_envelope_for_message_routes() {
 #[test]
 fn request_byte_budget_tracks_and_releases_reservations() {
     let budget = std::sync::Arc::new(RequestByteBudget::new(100));
-    assert!(budget.reserve(0).is_some(), "empty bodies never trip the guard");
+    assert!(
+        budget.reserve(0).is_some(),
+        "empty bodies never trip the guard"
+    );
 
     let first = budget.reserve(60).expect("60 fits in the 100-byte budget");
     assert_eq!(budget.used(), 60);
@@ -10049,7 +11893,11 @@ fn request_byte_budget_tracks_and_releases_reservations() {
     drop(first);
     assert_eq!(budget.used(), 10);
     drop(second);
-    assert_eq!(budget.used(), 0, "dropping the guard frees every reserved byte");
+    assert_eq!(
+        budget.used(),
+        0,
+        "dropping the guard frees every reserved byte"
+    );
 }
 
 #[tokio::test]
@@ -10057,16 +11905,9 @@ async fn inflight_byte_guard_is_held_until_the_response_body_completes() {
     let budget = std::sync::Arc::new(RequestByteBudget::new(64));
     let guard = budget.reserve(64).expect("the whole budget is available");
     let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
-    let response = attach_request_guards(
-        Response::new(Body::from_stream(stream)),
-        None,
-        Some(guard),
-    );
-    assert_eq!(
-        budget.used(),
-        64,
-        "a live body must keep holding its bytes"
-    );
+    let response =
+        attach_request_guards(Response::new(Body::from_stream(stream)), None, Some(guard));
+    assert_eq!(budget.used(), 64, "a live body must keep holding its bytes");
     drop(response);
     assert_eq!(budget.used(), 0, "completing the body releases the bytes");
 }
@@ -10089,8 +11930,9 @@ async fn admission_sheds_bodies_over_the_inflight_byte_budget() {
 
     // A body that never produces data. If admission tried to read it, this
     // request would hang instead of being shed.
-    let hanging =
-        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let hanging = Body::from_stream(futures_util::stream::pending::<
+        Result<Bytes, std::convert::Infallible>,
+    >());
     let request = axum::http::Request::builder()
         .method("POST")
         .uri(OPENAI_CHAT_COMPLETIONS)
@@ -10105,7 +11947,10 @@ async fn admission_sheds_bodies_over_the_inflight_byte_budget() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(
-        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .unwrap(),
         "5"
     );
     assert_eq!(
@@ -10134,9 +11979,7 @@ async fn admission_wait_takes_a_slot_as_soon_as_one_frees() {
 
     let holder = semaphore.clone().acquire_owned().await.unwrap();
     let waiter =
-        tokio::spawn(
-            async move { acquire_request_capacity(&state, Duration::from_secs(2)).await },
-        );
+        tokio::spawn(async move { acquire_request_capacity(&state, Duration::from_secs(2)).await });
     // Free the slot shortly after the waiter parks on it.
     tokio::time::sleep(Duration::from_millis(50)).await;
     drop(holder);
@@ -10305,8 +12148,9 @@ async fn admission_bounds_a_hanging_request_body() {
     state.body_read_timeout = Some(Duration::from_millis(80));
     let router = crate::build_router(state);
 
-    let hanging =
-        Body::from_stream(futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let hanging = Body::from_stream(futures_util::stream::pending::<
+        Result<Bytes, std::convert::Infallible>,
+    >());
     let request = axum::http::Request::builder()
         .method("POST")
         .uri(OPENAI_CHAT_COMPLETIONS)
@@ -10356,7 +12200,9 @@ async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
         .await
         .unwrap();
     let mut state = AppState::new(pool, None);
-    state.memory_pressure = Some(std::sync::Arc::new(MemoryPressure::with_usage(1_000, 0.9, 950)));
+    state.memory_pressure = Some(std::sync::Arc::new(MemoryPressure::with_usage(
+        1_000, 0.9, 950,
+    )));
     let shed = state.memory_shed.clone();
     let router = crate::build_router(state);
 
@@ -10369,7 +12215,10 @@ async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
     let response = router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        response.headers().get(reqwest::header::RETRY_AFTER).unwrap(),
+        response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .unwrap(),
         "5"
     );
     assert_eq!(
@@ -10634,11 +12483,7 @@ fn provider_open_threshold_parsing_keeps_a_safe_default() {
 #[tokio::test]
 async fn provider_circuit_stays_soft_below_the_open_threshold() {
     let state = circuit_state().await;
-    state
-        .provider_failure_streak
-        .lock()
-        .await
-        .insert(1, 1);
+    state.provider_failure_streak.lock().await.insert(1, 1);
     state
         .provider_cooldown
         .lock()
@@ -10658,11 +12503,7 @@ async fn provider_circuit_stays_soft_below_the_open_threshold() {
 #[tokio::test]
 async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
     let state = circuit_state().await;
-    state
-        .provider_failure_streak
-        .lock()
-        .await
-        .insert(1, 3);
+    state.provider_failure_streak.lock().await.insert(1, 3);
     state
         .provider_cooldown
         .lock()
@@ -10750,6 +12591,7 @@ async fn a_pool_denial_releases_the_half_open_probe() {
         None,
         "pool-denied-probe",
         OPENAI_CHAT_COMPLETIONS,
+        UpstreamShape::Chat,
         false,
         &mut body,
         |_body: &Value| -> AppResult<RequestBuilder> {
@@ -10794,6 +12636,7 @@ async fn a_build_failure_releases_the_half_open_probe() {
         None,
         "build-failure-probe",
         OPENAI_CHAT_COMPLETIONS,
+        UpstreamShape::Chat,
         false,
         &mut body,
         |_body: &Value| -> AppResult<RequestBuilder> {
@@ -10877,22 +12720,12 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         .unwrap();
     mark_provider_error(&state, 1, Some(failure), None, None).await;
     assert_eq!(
-        state
-            .provider_failure_streak
-            .lock()
-            .await
-            .get(&1)
-            .copied(),
+        state.provider_failure_streak.lock().await.get(&1).copied(),
         Some(opened_streak),
         "concurrent follower failures must not inflate the streak"
     );
     assert_eq!(
-        state
-            .provider_cooldown
-            .lock()
-            .await
-            .get(&1)
-            .copied(),
+        state.provider_cooldown.lock().await.get(&1).copied(),
         Some(opened_until),
         "concurrent follower failures must not extend the cooldown"
     );
@@ -10955,12 +12788,7 @@ async fn a_failed_half_open_probe_still_escalates_the_open_circuit() {
     mark_provider_error(&state, 1, Some(StatusCode::SERVICE_UNAVAILABLE), None, None).await;
 
     assert_eq!(
-        state
-            .provider_failure_streak
-            .lock()
-            .await
-            .get(&1)
-            .copied(),
+        state.provider_failure_streak.lock().await.get(&1).copied(),
         Some(4),
         "a failed half-open probe must advance the streak"
     );
@@ -11059,10 +12887,9 @@ async fn persisted_provider_circuit_survives_a_restart() {
 
     // The cooldown manager must show the restored remainder, or an operator
     // cannot tell an outage from a cooldown that survived the restart.
-    let axum::Json(snapshot) =
-        crate::api::list_cooldowns(axum::extract::State(restarted.clone()))
-            .await
-            .unwrap();
+    let axum::Json(snapshot) = crate::api::list_cooldowns(axum::extract::State(restarted.clone()))
+        .await
+        .unwrap();
     let restored = snapshot
         .provider_cooldowns
         .iter()
@@ -11070,7 +12897,10 @@ async fn persisted_provider_circuit_survives_a_restart() {
         .expect("the restored cooldown must be listed");
     assert_eq!(restored.state, "open");
     assert!(restored.remaining_seconds > 0);
-    assert_eq!(restored.failure_streak, crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD);
+    assert_eq!(
+        restored.failure_streak,
+        crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD
+    );
 }
 
 /// A cooldown that elapsed while the process was down must come back as
@@ -11084,13 +12914,18 @@ async fn restored_expired_cooldown_stays_half_open() {
     }
     crate::resilience_state::flush(&state).await.unwrap();
     // Simulate the cooldown elapsing while nothing was running.
-    sqlx::query("UPDATE provider_circuit_state SET cooldown_until_unix_ms = 0 WHERE provider_id = 1")
-        .execute(&state.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE provider_circuit_state SET cooldown_until_unix_ms = 0 WHERE provider_id = 1",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
 
     let restarted = AppState::new(state.pool.clone(), None);
-    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 1);
+    assert_eq!(
+        crate::resilience_state::restore(&restarted).await.unwrap(),
+        1
+    );
     assert!(
         admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
             .await
@@ -11154,7 +12989,10 @@ async fn expired_persisted_state_is_dropped_and_purged() {
     assert!(restarted.provider_key_cooldown.lock().await.is_empty());
     assert_eq!(count_rows(&restarted, "provider_circuit_state").await, 0);
     assert_eq!(count_rows(&restarted, "target_cooldown_state").await, 0);
-    assert_eq!(count_rows(&restarted, "provider_key_cooldown_state").await, 0);
+    assert_eq!(
+        count_rows(&restarted, "provider_key_cooldown_state").await,
+        0
+    );
 }
 
 /// Model and credential cooldowns are restored too, so a restart does not
@@ -11164,14 +13002,23 @@ async fn persisted_model_and_key_cooldowns_survive_a_restart() {
     let (_directory, state) = restartable_circuit_state().await;
     let target = endpoint_test_target("openai", None);
     mark_target_error(&state, &target, StatusCode::TOO_MANY_REQUESTS, None).await;
-    mark_provider_api_key_error(&state, Some(11), StatusCode::TOO_MANY_REQUESTS, "busy", None)
-        .await;
+    mark_provider_api_key_error(
+        &state,
+        Some(11),
+        StatusCode::TOO_MANY_REQUESTS,
+        "busy",
+        None,
+    )
+    .await;
     crate::resilience_state::flush(&state).await.unwrap();
     assert_eq!(count_rows(&state, "target_cooldown_state").await, 1);
     assert_eq!(count_rows(&state, "provider_key_cooldown_state").await, 1);
 
     let restarted = AppState::new(state.pool.clone(), None);
-    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 2);
+    assert_eq!(
+        crate::resilience_state::restore(&restarted).await.unwrap(),
+        2
+    );
     assert!(
         restarted
             .target_cooldown
@@ -11179,7 +13026,13 @@ async fn persisted_model_and_key_cooldowns_survive_a_restart() {
             .await
             .contains_key(&(1, target.upstream_model.clone()))
     );
-    assert!(restarted.provider_key_cooldown.lock().await.contains_key(&11));
+    assert!(
+        restarted
+            .provider_key_cooldown
+            .lock()
+            .await
+            .contains_key(&11)
+    );
 
     // Recovery must clear the persisted mirror as well, so the next restart
     // does not resurrect a cooldown that a successful request lifted.
@@ -11187,7 +13040,10 @@ async fn persisted_model_and_key_cooldowns_survive_a_restart() {
     mark_provider_api_key_success(&restarted, Some(11)).await;
     crate::resilience_state::flush(&restarted).await.unwrap();
     assert_eq!(count_rows(&restarted, "target_cooldown_state").await, 0);
-    assert_eq!(count_rows(&restarted, "provider_key_cooldown_state").await, 0);
+    assert_eq!(
+        count_rows(&restarted, "provider_key_cooldown_state").await,
+        0
+    );
 }
 
 /// An operator clearing cooldowns must also clear the persisted mirror; a
@@ -11200,8 +13056,14 @@ async fn cleared_cooldowns_do_not_come_back_after_a_restart() {
     }
     let target = endpoint_test_target("openai", None);
     mark_target_error(&state, &target, StatusCode::TOO_MANY_REQUESTS, None).await;
-    mark_provider_api_key_error(&state, Some(11), StatusCode::TOO_MANY_REQUESTS, "busy", None)
-        .await;
+    mark_provider_api_key_error(
+        &state,
+        Some(11),
+        StatusCode::TOO_MANY_REQUESTS,
+        "busy",
+        None,
+    )
+    .await;
     crate::resilience_state::flush(&state).await.unwrap();
 
     let axum::Json(result) = crate::api::clear_cooldowns(
@@ -11220,7 +13082,10 @@ async fn cleared_cooldowns_do_not_come_back_after_a_restart() {
     assert_eq!(count_rows(&state, "provider_key_cooldown_state").await, 0);
 
     let restarted = AppState::new(state.pool.clone(), None);
-    assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 0);
+    assert_eq!(
+        crate::resilience_state::restore(&restarted).await.unwrap(),
+        0
+    );
     assert!(
         admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
             .await
@@ -11335,11 +13200,7 @@ async fn hard_open_provider_fails_fast_without_an_upstream_call() {
 
     let state = AppState::new(pool, None);
     // Three consecutive failures with an active cooldown: the provider is open.
-    state
-        .provider_failure_streak
-        .lock()
-        .await
-        .insert(1, 3);
+    state.provider_failure_streak.lock().await.insert(1, 3);
     state
         .provider_cooldown
         .lock()
@@ -11371,7 +13232,10 @@ async fn hard_open_provider_fails_fast_without_an_upstream_call() {
             ..
         } => {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(retry_after.is_some(), "a short-circuit must set Retry-After");
+            assert!(
+                retry_after.is_some(),
+                "a short-circuit must set Retry-After"
+            );
         }
         other => panic!("expected a 503 short-circuit, got {other:?}"),
     }
@@ -11444,11 +13308,7 @@ async fn non_retryable_probe_response_closes_half_open_circuit() {
     .unwrap();
 
     let state = AppState::new(pool, None);
-    state
-        .provider_failure_streak
-        .lock()
-        .await
-        .insert(1, 3);
+    state.provider_failure_streak.lock().await.insert(1, 3);
     state
         .provider_cooldown
         .lock()
@@ -11590,11 +13450,7 @@ async fn half_open_probe_recovers_before_trying_the_next_key() {
     .unwrap();
 
     let state = AppState::new(pool, None);
-    state
-        .provider_failure_streak
-        .lock()
-        .await
-        .insert(1, 3);
+    state.provider_failure_streak.lock().await.insert(1, 3);
     state
         .provider_cooldown
         .lock()

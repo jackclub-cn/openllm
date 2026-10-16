@@ -10,7 +10,10 @@ async fn memory_pool() -> SqlitePool {
         .connect("sqlite::memory:")
         .await
         .unwrap();
-    sqlx::raw_sql(INSTANCE_LEASE_DDL).execute(&pool).await.unwrap();
+    sqlx::raw_sql(INSTANCE_LEASE_DDL)
+        .execute(&pool)
+        .await
+        .unwrap();
     pool
 }
 
@@ -35,7 +38,10 @@ async fn lease_count(pool: &SqlitePool) -> i64 {
 
 #[test]
 fn multi_instance_policy_defaults_to_refusing() {
-    assert_eq!(parse_multi_instance_policy(None), MultiInstancePolicy::Refuse);
+    assert_eq!(
+        parse_multi_instance_policy(None),
+        MultiInstancePolicy::Refuse
+    );
     assert_eq!(
         parse_multi_instance_policy(Some("")),
         MultiInstancePolicy::Refuse
@@ -61,11 +67,23 @@ fn multi_instance_policy_defaults_to_refusing() {
 #[test]
 fn lease_ttl_parsing_stays_in_a_sane_range() {
     assert_eq!(parse_lease_ttl_secs(None), DEFAULT_INSTANCE_LEASE_TTL_SECS);
-    assert_eq!(parse_lease_ttl_secs(Some("oops")), DEFAULT_INSTANCE_LEASE_TTL_SECS);
-    assert_eq!(parse_lease_ttl_secs(Some("0")), DEFAULT_INSTANCE_LEASE_TTL_SECS);
-    assert_eq!(parse_lease_ttl_secs(Some("29")), DEFAULT_INSTANCE_LEASE_TTL_SECS);
+    assert_eq!(
+        parse_lease_ttl_secs(Some("oops")),
+        DEFAULT_INSTANCE_LEASE_TTL_SECS
+    );
+    assert_eq!(
+        parse_lease_ttl_secs(Some("0")),
+        DEFAULT_INSTANCE_LEASE_TTL_SECS
+    );
+    assert_eq!(
+        parse_lease_ttl_secs(Some("29")),
+        DEFAULT_INSTANCE_LEASE_TTL_SECS
+    );
     assert_eq!(parse_lease_ttl_secs(Some("600")), 600);
-    assert_eq!(parse_lease_ttl_secs(Some("999999")), DEFAULT_INSTANCE_LEASE_TTL_SECS);
+    assert_eq!(
+        parse_lease_ttl_secs(Some("999999")),
+        DEFAULT_INSTANCE_LEASE_TTL_SECS
+    );
 }
 
 #[test]
@@ -236,7 +254,11 @@ async fn pre_migration_backup_is_written_only_when_migrations_are_pending() {
         .unwrap()
         .expect("a pending migration must produce a backup");
     assert!(backup.exists());
-    assert!(std::fs::read(&backup).unwrap().starts_with(b"SQLite format 3\0"));
+    assert!(
+        std::fs::read(&backup)
+            .unwrap()
+            .starts_with(b"SQLite format 3\0")
+    );
     // The copy must be a working database with the real data in it.
     let restored = file_pool(&backup).await;
     let providers: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM providers")
@@ -249,7 +271,9 @@ async fn pre_migration_backup_is_written_only_when_migrations_are_pending() {
     let backups_dir = directory.path().join(MIGRATION_BACKUP_DIR);
     for index in 0..(MAX_MIGRATION_BACKUPS + 3) {
         tokio::fs::write(
-            backups_dir.join(format!("{MIGRATION_BACKUP_PREFIX}44-2026010{index}-000000.db")),
+            backups_dir.join(format!(
+                "{MIGRATION_BACKUP_PREFIX}44-2026010{index}-000000.db"
+            )),
             b"x",
         )
         .await
@@ -289,7 +313,10 @@ async fn a_fresh_database_with_only_the_lease_table_needs_no_backup() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("openllm.db");
     let pool = file_pool(&path).await;
-    sqlx::raw_sql(INSTANCE_LEASE_DDL).execute(&pool).await.unwrap();
+    sqlx::raw_sql(INSTANCE_LEASE_DDL)
+        .execute(&pool)
+        .await
+        .unwrap();
     let migrator = sqlx::migrate!("./migrations");
     let pending = pending_migrations(&pool, &migrator).await.unwrap();
     assert!(
@@ -359,11 +386,15 @@ async fn a_failed_migration_aborts_startup_and_keeps_the_data() {
         .await
         .unwrap();
     assert_eq!(name, "precious");
-    let recorded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 43")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(recorded, 0, "a failed migration must not be recorded as applied");
+    let recorded: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM _sqlx_migrations WHERE version = 43")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        recorded, 0,
+        "a failed migration must not be recorded as applied"
+    );
     assert_eq!(
         lease_count(&pool).await,
         0,
@@ -516,7 +547,10 @@ async fn two_instances_cannot_claim_the_lease_at_the_same_instant() {
     let path = directory.path().join("openllm.db");
     let first = file_pool(&path).await;
     sqlx::migrate!("./migrations").run(&first).await.unwrap();
-    sqlx::raw_sql(INSTANCE_LEASE_DDL).execute(&first).await.unwrap();
+    sqlx::raw_sql(INSTANCE_LEASE_DDL)
+        .execute(&first)
+        .await
+        .unwrap();
     // A second connection to the same file, with a busy timeout so the loser
     // waits for the winner's write lock instead of failing on SQLITE_BUSY.
     let second = SqlitePoolOptions::new()
@@ -545,7 +579,11 @@ async fn two_instances_cannot_claim_the_lease_at_the_same_instant() {
         .fetch_all(&first)
         .await
         .unwrap();
-    assert_eq!(held.len(), 1, "only the winner leaves a lease behind: {held:?}");
+    assert_eq!(
+        held.len(),
+        1,
+        "only the winner leaves a lease behind: {held:?}"
+    );
 }
 
 /// A restore must not run against a live instance. A lease from another host is
@@ -574,10 +612,12 @@ async fn a_recent_lease_from_another_host_still_counts_as_serving() {
 
     // An expired lease from another host is free to be taken over.
     let pool = file_pool(&path).await;
-    sqlx::query("UPDATE instance_leases SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour')")
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE instance_leases SET heartbeat_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-1 hour')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     pool.close().await;
     assert!(!database_is_served(&path).await.unwrap());
 }
@@ -630,7 +670,9 @@ async fn restoring_moves_the_previous_database_and_its_wal_together() {
     let previous = outcome.previous.clone().expect("the old file is kept");
     assert!(previous.exists(), "the previous database is set aside");
     assert!(
-        previous.with_file_name("openllm.db.pre-restore-wal").exists(),
+        previous
+            .with_file_name("openllm.db.pre-restore-wal")
+            .exists(),
         "the previous database keeps its WAL next to it"
     );
     assert!(

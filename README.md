@@ -219,8 +219,8 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 GitHub Actions 在 Pull Request 和手动触发时执行测试与构建；推送 `v*` 标签时创建 Release，并上传三平台二进制和校验文件。
 
 ```bash
-git tag v0.3.25
-git push origin v0.3.25
+git tag v0.3.26
+git push origin v0.3.26
 ```
 
 Release 页面：<https://github.com/jackclub-cn/openllm/releases>

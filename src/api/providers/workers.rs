@@ -99,7 +99,7 @@ pub async fn run_due_provider_model_syncs(state: AppState) {
     futures_util::stream::iter(due.into_iter().map(|id| {
         let state = state.clone();
         async move {
-            if let Err(error) = sync_provider(state, id).await {
+            if let Err(error) = sync_provider_auto(state, id).await {
                 tracing::warn!(provider_id = id, %error, "scheduled provider model sync failed");
             }
         }

@@ -33,6 +33,7 @@ import {
   type SelfCheckItem,
   type SelfCheckStatus,
 } from '../api'
+import { formatFailureClassification } from '../format'
 
 const statusMeta: Record<SelfCheckStatus, { label: string; color: string }> = {
   pass: { label: '通过', color: 'success' },
@@ -157,21 +158,29 @@ export default function DiagnosticsPage() {
       kind: '提供商熔断',
       target: item.provider_name || `#${item.provider_id}`,
       remaining: item.remaining_seconds,
-      detail: `失败 ${item.failure_streak} 次 · ${item.state}`,
+      detail: [
+        `失败 ${item.failure_streak} 次`,
+        item.state,
+        formatFailureClassification(item),
+      ]
+        .filter(Boolean)
+        .join(' · '),
     })),
     ...(snapshot?.resilience.model_cooldowns || []).map((item) => ({
       key: `model-${item.provider_id}-${item.model}`,
       kind: '模型冷却',
       target: `${item.provider_name || `#${item.provider_id}`} · ${item.model}`,
       remaining: item.remaining_seconds,
-      detail: '该模型暂不参与路由',
+      detail:
+        formatFailureClassification(item) || '该模型暂不参与路由',
     })),
     ...(snapshot?.resilience.provider_key_cooldowns || []).map((item) => ({
       key: `key-${item.provider_key_id}`,
       kind: '上游密钥冷却',
       target: `${item.provider_name || '未知提供商'} · ${item.key_name || `#${item.provider_key_id}`}`,
       remaining: item.remaining_seconds,
-      detail: '该上游密钥暂不参与路由',
+      detail:
+        formatFailureClassification(item) || '该上游密钥暂不参与路由',
     })),
   ].sort((a, b) => b.remaining - a.remaining)
 

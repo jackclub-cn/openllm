@@ -3,8 +3,8 @@ use super::*;
 use tempfile::tempdir;
 
 const SEED_SQL: &str = r#"
-INSERT INTO providers (id, name, provider_type, base_url, model_prefix, headers, api_key, enabled, timeout_seconds, cooldown_seconds, max_concurrency, queue_timeout_seconds)
-VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1', '', '{"Authorization":"Bearer sk-alpha-secret","X-Custom":"keep-me"}', 'sk-alpha-secret', 1, 30, 120, 4, 5);
+INSERT INTO providers (id, name, provider_type, base_url, model_prefix, model_auto_include_rules, headers, api_key, enabled, timeout_seconds, cooldown_seconds, max_concurrency, queue_timeout_seconds)
+VALUES (1, 'alpha', 'openai', 'https://alpha.example/v1', '', '["gpt-*","re:^claude-"]', '{"Authorization":"Bearer sk-alpha-secret","X-Custom":"keep-me"}', 'sk-alpha-secret', 1, 30, 120, 4, 5);
 INSERT INTO provider_api_keys (provider_id, name, secret, enabled)
 VALUES (1, 'Default', 'sk-alpha-secret', 1), (1, 'backup', 'sk-alpha-backup', 1);
 INSERT INTO provider_models (provider_id, model_name, enabled)
@@ -78,7 +78,10 @@ async fn file_state(directory: &std::path::Path) -> (AppState, PathBuf) {
 }
 
 async fn count(state: &AppState, sql: &str) -> i64 {
-    sqlx::query_scalar(sql).fetch_one(&state.pool).await.unwrap()
+    sqlx::query_scalar(sql)
+        .fetch_one(&state.pool)
+        .await
+        .unwrap()
 }
 
 async fn export(state: &AppState, include_secrets: bool) -> ConfigDocument {
@@ -134,7 +137,12 @@ async fn a_masked_export_documents_credentials_without_carrying_them() {
     assert_eq!(provider.headers["Authorization"], "***");
     assert_eq!(provider.headers["X-Custom"], "keep-me");
     assert_eq!(provider.provider_keys.len(), 2);
-    assert!(provider.provider_keys.iter().all(|key| key.api_key.is_none()));
+    assert!(
+        provider
+            .provider_keys
+            .iter()
+            .all(|key| key.api_key.is_none())
+    );
     assert!(document.webhooks[0].secret_set);
     assert_eq!(document.webhooks[0].secret, None);
     assert!(
@@ -159,6 +167,10 @@ async fn the_export_carries_everything_needed_to_rebuild_the_configuration() {
     assert_eq!(provider.headers["Authorization"], "Bearer sk-alpha-secret");
     assert_eq!(provider.models, vec!["gpt-4o".to_string()]);
     assert_eq!(provider.disabled_models, vec!["gpt-4o-mini".to_string()]);
+    assert_eq!(
+        provider.model_auto_include_rules,
+        vec!["gpt-*".to_string(), "re:^claude-".to_string()]
+    );
     assert_eq!(provider.timeout_seconds, Some(30));
     assert_eq!(provider.configured_cooldown_seconds, Some(120));
     assert_eq!(provider.max_concurrency, Some(4));
@@ -191,10 +203,7 @@ async fn the_export_carries_everything_needed_to_rebuild_the_configuration() {
     assert_eq!(key.name, "caller");
     assert!(key.enabled);
     assert!(
-        document
-            .notes
-            .iter()
-            .any(|note| note.contains("API Key")),
+        document.notes.iter().any(|note| note.contains("API Key")),
         "the document must say that gateway keys cannot be restored: {:?}",
         document.notes
     );
@@ -224,12 +233,17 @@ async fn a_config_document_round_trips_into_an_empty_database() {
     .unwrap();
     assert_eq!(base_url, "https://alpha.example/v1");
     assert_eq!((timeout, cooldown, concurrency), (30, 120, 4));
-
-    let headers: String =
-        sqlx::query_scalar("SELECT headers FROM providers WHERE name = 'alpha'")
+    let rules: String =
+        sqlx::query_scalar("SELECT model_auto_include_rules FROM providers WHERE name = 'alpha'")
             .fetch_one(&target.pool)
             .await
             .unwrap();
+    assert_eq!(rules, r#"["gpt-*","re:^claude-"]"#);
+
+    let headers: String = sqlx::query_scalar("SELECT headers FROM providers WHERE name = 'alpha'")
+        .fetch_one(&target.pool)
+        .await
+        .unwrap();
     let headers: Value = serde_json::from_str(&headers).unwrap();
     assert_eq!(headers["Authorization"], "Bearer sk-alpha-secret");
     assert_eq!(headers["X-Custom"], "keep-me");
@@ -264,10 +278,7 @@ async fn a_config_document_round_trips_into_an_empty_database() {
     .unwrap();
     assert_eq!(
         models,
-        vec![
-            ("gpt-4o".to_string(), 1),
-            ("gpt-4o-mini".to_string(), 0),
-        ]
+        vec![("gpt-4o".to_string(), 1), ("gpt-4o-mini".to_string(), 0),]
     );
 
     // The route target points at the freshly created provider id.
@@ -303,11 +314,10 @@ async fn a_config_document_round_trips_into_an_empty_database() {
     .unwrap();
     assert_eq!(allocation, (caller_id, 100, "hard".to_string()));
 
-    let (url, secret) =
-        sqlx::query_as::<_, (String, String)>("SELECT url, secret FROM webhooks")
-            .fetch_one(&target.pool)
-            .await
-            .unwrap();
+    let (url, secret) = sqlx::query_as::<_, (String, String)>("SELECT url, secret FROM webhooks")
+        .fetch_one(&target.pool)
+        .await
+        .unwrap();
     assert_eq!(url, "https://hook.example/x");
     assert_eq!(secret, "whsec-1");
 
@@ -346,7 +356,10 @@ async fn reimporting_the_same_document_changes_nothing() {
         "every entity should report as unchanged: {:#?}",
         second.items
     );
-    assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, snapshot);
+    assert_eq!(
+        count(&target, "SELECT COUNT(*) FROM providers").await,
+        snapshot
+    );
 }
 
 /// A chat channel is configuration, not a credential: its kind and extra body
@@ -455,16 +468,26 @@ async fn a_dry_run_reports_a_plan_without_writing_anything() {
     );
     assert_eq!(item(&plan, "provider", "alpha").action, "create");
     assert_eq!(item(&plan, "route", "default").action, "create");
-    assert_eq!(item(&plan, "provider_pool", "alpha / shared").action, "create");
+    assert_eq!(
+        item(&plan, "provider_pool", "alpha / shared").action,
+        "create"
+    );
     assert_eq!(item(&plan, "webhook", "hook").action, "create");
     assert_eq!(item(&plan, "gateway_key", "caller").action, "skip");
 
     assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, 0);
     assert_eq!(count(&target, "SELECT COUNT(*) FROM routes").await, 0);
-    assert_eq!(count(&target, "SELECT COUNT(*) FROM provider_pools").await, 0);
+    assert_eq!(
+        count(&target, "SELECT COUNT(*) FROM provider_pools").await,
+        0
+    );
     assert_eq!(count(&target, "SELECT COUNT(*) FROM webhooks").await, 0);
     assert_eq!(
-        count(&target, "SELECT COUNT(*) FROM settings WHERE key = 'guardrails'").await,
+        count(
+            &target,
+            "SELECT COUNT(*) FROM settings WHERE key = 'guardrails'"
+        )
+        .await,
         0
     );
 }
@@ -480,13 +503,18 @@ async fn an_import_skips_references_it_cannot_resolve() {
     let plan = import(&target, document, true).await;
 
     assert!(plan.applied);
-    assert!(!plan.valid, "a document with skipped references is not clean");
+    assert!(
+        !plan.valid,
+        "a document with skipped references is not clean"
+    );
     assert_eq!(plan.counts.error, 0, "{:#?}", plan.items);
     let route = item(&plan, "route", "default");
     assert_eq!(route.action, "skip");
     assert!(route.detail.contains("ghost"), "{}", route.detail);
     assert!(
-        plan.problems.iter().any(|problem| problem.contains("nobody")),
+        plan.problems
+            .iter()
+            .any(|problem| problem.contains("nobody")),
         "{:#?}",
         plan.problems
     );
@@ -495,7 +523,10 @@ async fn an_import_skips_references_it_cannot_resolve() {
     // webhook were still created; only the broken route was dropped.
     assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, 1);
     assert_eq!(count(&target, "SELECT COUNT(*) FROM routes").await, 0);
-    assert_eq!(count(&target, "SELECT COUNT(*) FROM provider_pools").await, 1);
+    assert_eq!(
+        count(&target, "SELECT COUNT(*) FROM provider_pools").await,
+        1
+    );
     assert_eq!(
         count(&target, "SELECT COUNT(*) FROM provider_pool_allocations").await,
         0
@@ -528,7 +559,10 @@ async fn a_newer_document_version_is_rejected_before_any_write() {
         "SELECT COUNT(*) FROM audit_logs WHERE action = 'import' AND entity = 'config'",
     )
     .await;
-    assert_eq!(audits, 0, "a rejected document must not be audited as applied");
+    assert_eq!(
+        audits, 0,
+        "a rejected document must not be audited as applied"
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -568,7 +602,11 @@ async fn a_backup_is_created_listed_verified_and_still_restorable() {
     assert!(report.ok, "{:#?}", report.problems);
     assert_eq!(report.integrity, "ok");
     assert!(report.size_bytes > 0);
-    assert!(report.missing_tables.is_empty(), "{:#?}", report.missing_tables);
+    assert!(
+        report.missing_tables.is_empty(),
+        "{:#?}",
+        report.missing_tables
+    );
     assert!(report.applied_migrations > 0);
     assert!(report.schema_version > 0);
     assert_eq!(report.providers, 1);
@@ -624,8 +662,11 @@ async fn backup_verification_rejects_traversal_and_unknown_names() {
     assert!(matches!(missing, Err(AppError::NotFound(_))));
 
     // A file that is not a database is rejected, not reported as healthy.
-    std::fs::write(directory.path().join("backups").join("junk.db"), b"not a database")
-        .unwrap();
+    std::fs::write(
+        directory.path().join("backups").join("junk.db"),
+        b"not a database",
+    )
+    .unwrap();
     let junk = verify_backup(
         State(state.clone()),
         Json(VerifyBackupRequest {
@@ -680,18 +721,15 @@ async fn old_backups_are_pruned_but_the_newest_are_kept() {
 
     let (_, Json(_)) = create_backup(State(state.clone())).await.unwrap();
     let listed = list_backups(State(state.clone())).await.unwrap().0;
-    let manual = listed
-        .iter()
-        .filter(|info| info.kind == "manual")
-        .count();
+    let manual = listed.iter().filter(|info| info.kind == "manual").count();
     assert!(
         manual <= crate::startup::MAX_MANUAL_BACKUPS,
         "manual backups must be pruned: {manual}"
     );
     assert!(
-        listed
-            .iter()
-            .any(|info| info.name.contains(&chrono::Utc::now().format("%Y").to_string())),
+        listed.iter().any(|info| info
+            .name
+            .contains(&chrono::Utc::now().format("%Y").to_string())),
         "the newest backup must survive: {:#?}",
         listed
     );
@@ -722,7 +760,10 @@ async fn the_migration_precheck_reports_pending_migrations_without_touching_the_
     let config = crate::Config {
         bind: "127.0.0.1:0".parse().unwrap(),
         data_dir: directory.path().to_path_buf(),
-        database_url: Some(format!("sqlite://{}", path.to_string_lossy().replace('\\', "/"))),
+        database_url: Some(format!(
+            "sqlite://{}",
+            path.to_string_lossy().replace('\\', "/")
+        )),
         admin_token: None,
     };
     let report = crate::startup::migration_report(&config).await.unwrap();
@@ -730,7 +771,10 @@ async fn the_migration_precheck_reports_pending_migrations_without_touching_the_
     assert!(report.applied.is_empty());
     assert!(!report.pending.is_empty());
     assert!(!report.data_present);
-    assert!(!report.backup_would_be_written, "an empty file needs no backup");
+    assert!(
+        !report.backup_would_be_written,
+        "an empty file needs no backup"
+    );
     assert!(report.problems.is_empty(), "{:#?}", report.problems);
     assert!(
         report.pending.iter().any(|entry| entry.version == 1),
@@ -857,10 +901,13 @@ async fn the_upgrade_check_compares_against_a_given_version() {
     assert_eq!(older.status, "ahead");
 
     if std::env::var("OPENLLM_UPGRADE_FEED_URL").is_err() {
-        let unknown = upgrade_check(State(state.clone()), Query(UpgradeCheckQuery { latest: None }))
-            .await
-            .unwrap()
-            .0;
+        let unknown = upgrade_check(
+            State(state.clone()),
+            Query(UpgradeCheckQuery { latest: None }),
+        )
+        .await
+        .unwrap()
+        .0;
         assert_eq!(unknown.status, "unknown");
         assert_eq!(unknown.source, "none");
         assert!(unknown.latest_version.is_none());
@@ -988,9 +1035,10 @@ async fn importing_secrets_keeps_the_existing_key_rows() {
         Some("marker"),
         "columns the import does not touch must survive"
     );
-    let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_api_keys WHERE provider_id = 1")
-        .fetch_one(&state.pool)
-        .await
-        .unwrap();
+    let keys: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM provider_api_keys WHERE provider_id = 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
     assert_eq!(keys, 2, "no duplicate key was created");
 }

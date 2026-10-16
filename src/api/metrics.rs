@@ -1,6 +1,6 @@
 use super::*;
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, sqlx::FromRow)]
 struct LifetimeMetricsRow {
@@ -71,6 +71,8 @@ struct ProviderKeyMetricsRow {
     id: i64,
     provider: String,
     name: String,
+    max_concurrency: Option<i64>,
+    requests_per_minute: Option<i64>,
 }
 
 pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Response> {
@@ -169,7 +171,8 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     .fetch_all(&state.pool);
     let provider_keys_fut = sqlx::query_as::<_, ProviderKeyMetricsRow>(
         r#"
-        SELECT k.id, p.name AS provider, k.name
+        SELECT k.id, p.name AS provider, k.name,
+               k.max_concurrency, k.requests_per_minute
         FROM provider_api_keys k
         JOIN providers p ON p.id = k.provider_id
         ORDER BY p.name COLLATE NOCASE, k.name COLLATE NOCASE, k.id
@@ -217,6 +220,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     };
     let failure_streaks = state.provider_failure_streak.lock().await.clone();
     let circuit_trips = state.provider_circuit_trips.lock().await.clone();
+    let failure_classifications = state.failure_classifications.lock().await.clone();
     let provider_open_threshold = crate::state::provider_open_threshold();
     let concurrency_available = {
         let semaphores = state.provider_concurrency.lock().await;
@@ -241,12 +245,52 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .map(|(key_id, _)| *key_id)
             .collect::<HashSet<_>>()
     };
+    let (model_sinks, provider_key_sink_counts) = {
+        let mut models = HashSet::new();
+        let mut keys = HashMap::<i64, usize>::new();
+        for (provider_id, provider_key_id, model) in state
+            .target_sink
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, entry)| entry.until > now)
+            .map(|(key, _)| key.clone())
+        {
+            models.insert((provider_id, model));
+            if let Some(provider_key_id) = provider_key_id {
+                *keys.entry(provider_key_id).or_default() += 1;
+            }
+        }
+        (models, keys)
+    };
     let model_concurrency_available = {
         let semaphores = state.model_concurrency.lock().await;
         semaphores
             .iter()
             .map(|((provider_id, model), semaphore)| {
                 ((*provider_id, model.clone()), semaphore.available_permits())
+            })
+            .collect::<HashMap<_, _>>()
+    };
+    let provider_key_concurrency_available = {
+        let semaphores = state.provider_key_concurrency.lock().await;
+        semaphores
+            .iter()
+            .map(|(key_id, semaphore)| (*key_id, semaphore.available_permits()))
+            .collect::<HashMap<_, _>>()
+    };
+    let provider_key_rpm = {
+        let windows = state.provider_key_rpm.lock().await;
+        windows
+            .iter()
+            .map(|(key_id, starts)| {
+                let used = starts
+                    .iter()
+                    .filter(|started| {
+                        now.saturating_duration_since(**started) < Duration::from_secs(60)
+                    })
+                    .count();
+                (*key_id, used)
             })
             .collect::<HashMap<_, _>>()
     };
@@ -277,7 +321,11 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         &mut body,
         "openllm_ready",
         &[],
-        u8::from(!state.shutting_down.load(std::sync::atomic::Ordering::Relaxed)),
+        u8::from(
+            !state
+                .shutting_down
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ),
     );
     metric_header(
         &mut body,
@@ -465,7 +513,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         .memory_pressure
         .as_ref()
         .is_some_and(|pressure| pressure.is_shedding()) as i64;
-    push_metric(&mut body, "openllm_memory_pressure", &[], memory_pressure_active);
+    push_metric(
+        &mut body,
+        "openllm_memory_pressure",
+        &[],
+        memory_pressure_active,
+    );
     metric_header(
         &mut body,
         "openllm_memory_shed_total",
@@ -475,9 +528,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         &mut body,
         "openllm_memory_shed_total",
         &[],
-        state
-            .memory_shed
-            .load(std::sync::atomic::Ordering::Relaxed) as i64,
+        state.memory_shed.load(std::sync::atomic::Ordering::Relaxed) as i64,
     );
     metric_header(
         &mut body,
@@ -727,6 +778,23 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
     );
     metric_header(
         &mut body,
+        "openllm_upstream_failures_total",
+        "Classified upstream failures since startup",
+    );
+    for ((scope, retry, reason), count) in &failure_classifications {
+        push_metric(
+            &mut body,
+            "openllm_upstream_failures_total",
+            &[
+                ("scope", scope.as_str()),
+                ("retry", retry.as_str()),
+                ("reason", reason.as_str()),
+            ],
+            *count,
+        );
+    }
+    metric_header(
+        &mut body,
         "openllm_provider_models",
         "Enabled upstream models per provider",
     );
@@ -787,7 +855,12 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             .get(&provider.id)
             .map(|available| limit.saturating_sub(*available as i64))
             .unwrap_or(0);
-        push_metric(&mut body, "openllm_provider_concurrency_limit", &label, limit);
+        push_metric(
+            &mut body,
+            "openllm_provider_concurrency_limit",
+            &label,
+            limit,
+        );
         push_metric(&mut body, "openllm_provider_inflight", &label, in_flight);
         push_metric(
             &mut body,
@@ -807,12 +880,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             &[("provider", &provider.name), ("state", circuit_state)],
             1,
         );
-        push_metric(
-            &mut body,
-            "openllm_provider_failure_streak",
-            &label,
-            streak,
-        );
+        push_metric(&mut body, "openllm_provider_failure_streak", &label, streak);
         push_metric(
             &mut body,
             "openllm_provider_circuit_trips_total",
@@ -892,6 +960,11 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
         "openllm_model_inflight",
         "Current upstream requests holding a per-model concurrency slot",
     );
+    metric_header(
+        &mut body,
+        "openllm_model_sink",
+        "Whether a model target is temporarily sinked after a short rate limit",
+    );
     for model in &provider_models {
         let label = [
             ("provider", model.provider.as_str()),
@@ -908,19 +981,45 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             &label,
             model_cooling.contains(&(model.provider_id, model.model.clone())) as u8,
         );
+        push_metric(&mut body, "openllm_model_concurrency_limit", &label, limit);
+        push_metric(&mut body, "openllm_model_inflight", &label, in_flight);
         push_metric(
             &mut body,
-            "openllm_model_concurrency_limit",
+            "openllm_model_sink",
             &label,
-            limit,
+            model_sinks.contains(&(model.provider_id, model.model.clone())) as u8,
         );
-        push_metric(&mut body, "openllm_model_inflight", &label, in_flight);
     }
 
     metric_header(
         &mut body,
         "openllm_provider_key_cooling",
         "Current provider key cooldown state",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_key_concurrency_limit",
+        "Configured per-credential upstream concurrency limit; zero means unlimited",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_key_inflight",
+        "Current upstream requests holding a per-credential concurrency slot",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_key_rpm_limit",
+        "Configured per-credential rolling 60-second request limit; zero means unlimited",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_key_rpm_window",
+        "Requests started by a provider credential in the current rolling 60-second window",
+    );
+    metric_header(
+        &mut body,
+        "openllm_provider_key_sink_count",
+        "Model targets currently sinked for a provider credential",
     );
     for key in &provider_keys {
         let key_id = key.id.to_string();
@@ -929,11 +1028,47 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> AppResult<Resp
             ("key", key.name.as_str()),
             ("key_id", key_id.as_str()),
         ];
+        let concurrency_limit = key.max_concurrency.unwrap_or(0).max(0);
+        let in_flight = provider_key_concurrency_available
+            .get(&key.id)
+            .map(|available| concurrency_limit.saturating_sub(*available as i64))
+            .unwrap_or(0);
+        let rpm_limit = key.requests_per_minute.unwrap_or(0).max(0);
         push_metric(
             &mut body,
             "openllm_provider_key_cooling",
             &label,
             provider_key_cooling.contains(&key.id) as u8,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_key_concurrency_limit",
+            &label,
+            concurrency_limit,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_key_inflight",
+            &label,
+            in_flight,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_key_rpm_limit",
+            &label,
+            rpm_limit,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_key_rpm_window",
+            &label,
+            provider_key_rpm.get(&key.id).copied().unwrap_or(0) as i64,
+        );
+        push_metric(
+            &mut body,
+            "openllm_provider_key_sink_count",
+            &label,
+            provider_key_sink_counts.get(&key.id).copied().unwrap_or(0) as i64,
         );
     }
 

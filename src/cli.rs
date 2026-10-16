@@ -31,7 +31,10 @@ pub async fn check_migrations(config: &Config, json: bool) -> anyhow::Result<i32
         println!("已应用迁移:     {}", report.applied.len());
         println!("待执行迁移:     {}", report.pending.len());
         for migration in &report.pending {
-            println!("                {} {}", migration.version, migration.description);
+            println!(
+                "                {} {}",
+                migration.version, migration.description
+            );
         }
         println!("未知迁移:       {}", report.unknown_applied.len());
         if !report.unknown_applied.is_empty() {
@@ -82,7 +85,9 @@ pub async fn list_backups(config: &Config, json: bool) -> anyhow::Result<i32> {
     } else {
         println!("数据库: {}", database_path.display());
         if backups.is_empty() {
-            println!("没有备份。可用 `openllm --backup` 生成一份，或等待下一次启动时的自动预迁移备份。");
+            println!(
+                "没有备份。可用 `openllm --backup` 生成一份，或等待下一次启动时的自动预迁移备份。"
+            );
         }
         for backup in &backups {
             println!(
@@ -215,7 +220,11 @@ pub async fn import_config(
     } else {
         println!(
             "{}配置导入（create {} / update {} / unchanged {} / skip {} / error {}）",
-            if plan.applied { "已应用" } else { "仅校验" },
+            if plan.applied {
+                "已应用"
+            } else {
+                "仅校验"
+            },
             plan.counts.create,
             plan.counts.update,
             plan.counts.unchanged,
@@ -311,20 +320,25 @@ pub async fn create_backup(config: &Config, json: bool) -> anyhow::Result<i32> {
     let metadata = std::fs::metadata(&path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "path": path.to_string_lossy().replace('\\', "/"),
-            "size_bytes": metadata.len(),
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "path": path.to_string_lossy().replace('\\', "/"),
+                "size_bytes": metadata.len(),
+            }))?
+        );
     } else {
         println!(
             "已写入备份: {} ({})",
             path.display(),
             human_size(metadata.len())
         );
-        println!("恢复命令:   openllm --restore-backup {}", path
-            .file_name()
-            .map(|name| name.to_string_lossy().to_string())
-            .unwrap_or_default());
+        println!(
+            "恢复命令:   openllm --restore-backup {}",
+            path.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
     }
     Ok(0)
 }
@@ -344,16 +358,19 @@ pub async fn restore_backup(config: &Config, backup: &str, json: bool) -> anyhow
     let backup_path = crate::startup::resolve_backup_path(&database_path, backup, true)?;
     let outcome = crate::startup::restore_backup(&database_path, &backup_path).await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "restored_from": outcome.restored_from.to_string_lossy().replace('\\', "/"),
-            "restored_to": outcome.restored_to.to_string_lossy().replace('\\', "/"),
-            "previous": outcome.previous.as_ref().map(|path| path.to_string_lossy().replace('\\', "/")),
-            "integrity": outcome.report.integrity,
-            "providers": outcome.report.providers,
-            "routes": outcome.report.routes,
-            "api_keys": outcome.report.api_keys,
-            "cleared_leases": outcome.cleared_leases,
-        }))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "restored_from": outcome.restored_from.to_string_lossy().replace('\\', "/"),
+                "restored_to": outcome.restored_to.to_string_lossy().replace('\\', "/"),
+                "previous": outcome.previous.as_ref().map(|path| path.to_string_lossy().replace('\\', "/")),
+                "integrity": outcome.report.integrity,
+                "providers": outcome.report.providers,
+                "routes": outcome.report.routes,
+                "api_keys": outcome.report.api_keys,
+                "cleared_leases": outcome.cleared_leases,
+            }))?
+        );
     } else {
         println!("已从备份恢复: {}", outcome.restored_from.display());
         println!("恢复目标:     {}", outcome.restored_to.display());
@@ -381,7 +398,8 @@ pub async fn restore_backup(config: &Config, backup: &str, json: bool) -> anyhow
 }
 
 /// Render a byte count for humans.
-fn human_size(bytes: u64) -> String {    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut value = bytes as f64;
     let mut unit = 0;
     while value >= 1024.0 && unit + 1 < UNITS.len() {

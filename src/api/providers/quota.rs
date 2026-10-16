@@ -42,7 +42,43 @@ pub async fn provider_quota(
     view.key_name = Some(credential.key_name);
     view.key_suffix = Some(credential.key_suffix);
     view.prices = prices;
+    view.snapshots =
+        crate::quota::store_provider_quota_view(&state, provider.id, credential.key_id, &view)
+            .await?;
     Ok(Json(view))
+}
+
+pub async fn list_provider_quota_snapshots(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(query): Query<ProviderQuotaQuery>,
+) -> AppResult<Json<Vec<ProviderQuotaSnapshotView>>> {
+    ensure_provider_exists(&state, id).await?;
+    Ok(Json(
+        crate::quota::views_for_scope(&state, id, query.key_id).await?,
+    ))
+}
+
+pub async fn update_provider_quota_snapshots(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(request): Json<ProviderQuotaSnapshotRequest>,
+) -> AppResult<Json<Vec<ProviderQuotaSnapshotView>>> {
+    ensure_provider_exists(&state, id).await?;
+    Ok(Json(
+        crate::quota::upsert_manual_snapshots(&state, id, &request.snapshots).await?,
+    ))
+}
+
+async fn ensure_provider_exists(state: &AppState, id: i64) -> AppResult<()> {
+    let exists = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM providers WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.pool)
+        .await?;
+    if exists == 0 {
+        return Err(AppError::NotFound("provider not found".to_string()));
+    }
+    Ok(())
 }
 
 pub(crate) struct ProviderQuotaCredential {
@@ -290,6 +326,7 @@ pub(crate) async fn fetch_command_code_quota(
         model_quotas,
         details,
         prices: Vec::new(),
+        snapshots: Vec::new(),
         fetched_at: Utc::now().to_rfc3339(),
     })
 }
@@ -573,6 +610,7 @@ pub(crate) async fn fetch_opencode_go_quota(
         model_quotas: Vec::new(),
         details: Vec::new(),
         prices: Vec::new(),
+        snapshots: Vec::new(),
         fetched_at: Utc::now().to_rfc3339(),
     })
 }
@@ -639,6 +677,7 @@ pub(crate) async fn fetch_deepseek_quota(
         model_quotas: Vec::new(),
         details,
         prices: Vec::new(),
+        snapshots: Vec::new(),
         fetched_at: Utc::now().to_rfc3339(),
     })
 }

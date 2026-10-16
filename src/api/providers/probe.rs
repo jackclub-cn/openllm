@@ -500,13 +500,15 @@ async fn clear_provider_runtime_failure(state: &AppState, provider_id: i64) {
             provider_id,
             "provider circuit closed after a successful health probe"
         );
-        let _ = state.circuit_events.send(crate::state::ProviderCircuitEvent {
-            provider_id,
-            state: "closed",
-            reason: "health_check",
-            failure_streak: 0,
-            cooldown_seconds: 0,
-        });
+        let _ = state
+            .circuit_events
+            .send(crate::state::ProviderCircuitEvent {
+                provider_id,
+                state: "closed",
+                reason: "health_check",
+                failure_streak: 0,
+                cooldown_seconds: 0,
+            });
     }
 }
 

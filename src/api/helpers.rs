@@ -21,7 +21,10 @@ pub(super) async fn get_route(state: &AppState, id: i64) -> AppResult<RouteView>
     let route = sqlx::query_as::<_, Route>(
         "SELECT id, name, model_pattern, \
                 CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END AS strategy, \
-                enabled, context_override, output_override, created_at, updated_at \
+                enabled, context_override, output_override, \
+                all_targets_busy_wait_seconds, retry_jitter_ms, \
+                max_waiting_requests, keepalive_during_wait, \
+                created_at, updated_at \
          FROM routes WHERE id = ?",
     )
     .bind(id)
@@ -137,6 +140,10 @@ pub(super) fn build_route_view(route: Route, targets: Vec<RouteTarget>) -> Route
         output_limit_base,
         context_override: route.context_override,
         output_override: route.output_override,
+        all_targets_busy_wait_seconds: route.all_targets_busy_wait_seconds,
+        retry_jitter_ms: route.retry_jitter_ms,
+        max_waiting_requests: route.max_waiting_requests,
+        keepalive_during_wait: route.keepalive_during_wait != 0,
         limits_verified: !barrel.incomplete,
         targets: targets
             .into_iter()
@@ -176,6 +183,71 @@ pub(super) fn names_to_entries(models: &[String]) -> Vec<(String, UpstreamModelI
         .collect()
 }
 
+enum ModelAutoIncludeMatcher {
+    Glob(globset::GlobMatcher),
+    Regex(regex::Regex),
+}
+
+fn compile_model_auto_include_rule(rule: &str) -> AppResult<ModelAutoIncludeMatcher> {
+    if let Some(pattern) = rule.strip_prefix("re:") {
+        if pattern.is_empty() {
+            return Err(AppError::BadRequest(
+                "model auto-include regex must not be empty".to_string(),
+            ));
+        }
+        return regex::Regex::new(pattern)
+            .map(ModelAutoIncludeMatcher::Regex)
+            .map_err(|error| {
+                AppError::BadRequest(format!("invalid model auto-include regex: {error}"))
+            });
+    }
+    globset::GlobBuilder::new(rule)
+        .literal_separator(false)
+        .build()
+        .map(|glob| ModelAutoIncludeMatcher::Glob(glob.compile_matcher()))
+        .map_err(|error| AppError::BadRequest(format!("invalid model auto-include glob: {error}")))
+}
+
+fn compile_model_auto_include_rules(rules: &[String]) -> AppResult<Vec<ModelAutoIncludeMatcher>> {
+    rules
+        .iter()
+        .map(|rule| compile_model_auto_include_rule(rule))
+        .collect()
+}
+
+pub(super) fn normalize_model_auto_include_rules(rules: &[String]) -> AppResult<Vec<String>> {
+    if rules.len() > 64 {
+        return Err(AppError::BadRequest(
+            "at most 64 model auto-include rules are allowed".to_string(),
+        ));
+    }
+    let mut normalized = Vec::new();
+    let mut seen = HashSet::new();
+    for raw in rules {
+        let rule = raw.trim();
+        if rule.is_empty() {
+            continue;
+        }
+        if rule.chars().count() > 256 {
+            return Err(AppError::BadRequest(
+                "model auto-include rules must be at most 256 characters".to_string(),
+            ));
+        }
+        if seen.insert(rule.to_string()) {
+            normalized.push(rule.to_string());
+        }
+    }
+    compile_model_auto_include_rules(&normalized)?;
+    Ok(normalized)
+}
+
+fn model_matches_auto_include_rules(model: &str, rules: &[ModelAutoIncludeMatcher]) -> bool {
+    rules.iter().any(|rule| match rule {
+        ModelAutoIncludeMatcher::Glob(glob) => glob.is_match(model),
+        ModelAutoIncludeMatcher::Regex(regex) => regex.is_match(model),
+    })
+}
+
 /// Serialises the split modality fields back into the nested shape used for
 /// storage, keeping one canonical on-disk representation.
 pub(super) fn modalities_to_storage(capabilities: &ModelCapabilities) -> Option<String> {
@@ -199,6 +271,41 @@ pub(super) async fn replace_provider_models(
     catalog: Option<&models_dev::Catalog>,
     provider_hint: Option<&str>,
 ) -> AppResult<()> {
+    write_provider_models(tx, provider_id, models, catalog, provider_hint, true, &[])
+        .await
+        .map(|_| ())
+}
+
+pub(super) async fn merge_provider_models(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    provider_id: i64,
+    models: &[(String, UpstreamModelInfo)],
+    catalog: Option<&models_dev::Catalog>,
+    provider_hint: Option<&str>,
+    auto_include_rules: &[String],
+) -> AppResult<usize> {
+    write_provider_models(
+        tx,
+        provider_id,
+        models,
+        catalog,
+        provider_hint,
+        false,
+        auto_include_rules,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn write_provider_models(
+    tx: &mut sqlx::Transaction<'_, Sqlite>,
+    provider_id: i64,
+    models: &[(String, UpstreamModelInfo)],
+    catalog: Option<&models_dev::Catalog>,
+    provider_hint: Option<&str>,
+    replace: bool,
+    auto_include_rules: &[String],
+) -> AppResult<usize> {
     let existing_overrides = sqlx::query_as::<_, ProviderModelOverride>(
         "SELECT model_name, enabled, context_override, input_override, output_override, \
                 supported_endpoints_override, cost_input_override, cost_output_override, \
@@ -211,15 +318,29 @@ pub(super) async fn replace_provider_models(
     .into_iter()
     .map(|row| (row.model_name.clone(), row))
     .collect::<HashMap<_, _>>();
-    sqlx::query("DELETE FROM provider_models WHERE provider_id = ?")
-        .bind(provider_id)
-        .execute(&mut **tx)
-        .await?;
+    if replace {
+        sqlx::query("DELETE FROM provider_models WHERE provider_id = ?")
+            .bind(provider_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+    let auto_include_matchers = if replace {
+        Vec::new()
+    } else {
+        compile_model_auto_include_rules(auto_include_rules)?
+    };
     let mut seen = HashSet::new();
+    let mut written = 0;
     let synced_at = Utc::now().to_rfc3339();
     for (model, upstream) in models {
         let model = model.trim();
         if model.is_empty() || !seen.insert(model.to_string()) {
+            continue;
+        }
+        if !replace
+            && !existing_overrides.contains_key(model)
+            && !model_matches_auto_include_rules(model, &auto_include_matchers)
+        {
             continue;
         }
         let found = catalog.and_then(|catalog| catalog.lookup(provider_hint, model));
@@ -245,6 +366,36 @@ pub(super) async fn replace_provider_models(
                 supported_endpoints_override, cost_input_override, cost_output_override,
                 cost_cache_read_override, cost_cache_write_override
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_id, model_name) DO UPDATE SET
+                enabled = excluded.enabled,
+                context_limit = excluded.context_limit,
+                output_limit = excluded.output_limit,
+                input_limit = excluded.input_limit,
+                attachment = excluded.attachment,
+                reasoning = excluded.reasoning,
+                tool_call = excluded.tool_call,
+                structured_output = excluded.structured_output,
+                temperature = excluded.temperature,
+                open_weights = excluded.open_weights,
+                modalities = excluded.modalities,
+                cost = excluded.cost,
+                family = excluded.family,
+                knowledge = excluded.knowledge,
+                release_date = excluded.release_date,
+                last_updated = excluded.last_updated,
+                canonical_model_id = excluded.canonical_model_id,
+                capabilities_synced_at = excluded.capabilities_synced_at,
+                upstream_context_limit = excluded.upstream_context_limit,
+                supported_endpoints = excluded.supported_endpoints,
+                display_name = excluded.display_name,
+                context_override = excluded.context_override,
+                input_override = excluded.input_override,
+                output_override = excluded.output_override,
+                supported_endpoints_override = excluded.supported_endpoints_override,
+                cost_input_override = excluded.cost_input_override,
+                cost_output_override = excluded.cost_output_override,
+                cost_cache_read_override = excluded.cost_cache_read_override,
+                cost_cache_write_override = excluded.cost_cache_write_override
             "#,
         )
         .bind(provider_id)
@@ -293,8 +444,9 @@ pub(super) async fn replace_provider_models(
         .bind(overrides.cost_cache_write_override)
         .execute(&mut **tx)
         .await?;
+        written += 1;
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Extra facts a provider reports about a model in its own `/models` response.
@@ -488,6 +640,10 @@ impl From<ProviderApiKeyRecord> for ProviderApiKeyView {
             },
             prompt_tokens: value.lifetime_prompt_tokens,
             completion_tokens: value.lifetime_completion_tokens,
+            max_concurrency: value.max_concurrency,
+            requests_per_minute: value.requests_per_minute,
+            queue_limit: value.queue_limit,
+            queue_wait_ms: value.queue_wait_ms,
             cooldown_seconds: None,
             created_at: value.created_at,
         }
@@ -515,19 +671,61 @@ pub(super) async fn clear_provider_key_cooldowns(
     state: &AppState,
     provider_api_key_ids: impl IntoIterator<Item = i64>,
 ) {
+    let provider_api_key_ids = provider_api_key_ids.into_iter().collect::<Vec<_>>();
     let mut removed = Vec::new();
     {
         let mut cooldowns = state.provider_key_cooldown.lock().await;
-        for provider_api_key_id in provider_api_key_ids {
-            if cooldowns.remove(&provider_api_key_id).is_some() {
-                removed.push(provider_api_key_id);
+        for provider_api_key_id in &provider_api_key_ids {
+            if cooldowns.remove(provider_api_key_id).is_some() {
+                removed.push(*provider_api_key_id);
             }
         }
     }
+    {
+        let mut metadata = state.provider_key_failure_meta.lock().await;
+        for provider_api_key_id in &provider_api_key_ids {
+            metadata.remove(provider_api_key_id);
+        }
+    }
+    {
+        let mut rpm = state.provider_key_rpm.lock().await;
+        for provider_api_key_id in &provider_api_key_ids {
+            rpm.remove(provider_api_key_id);
+        }
+    }
+    {
+        let mut concurrency = state.provider_key_concurrency.lock().await;
+        for provider_api_key_id in &provider_api_key_ids {
+            concurrency.remove(provider_api_key_id);
+        }
+    }
+    {
+        let mut queues = state.provider_key_queue.lock().await;
+        for provider_api_key_id in &provider_api_key_ids {
+            queues.remove(provider_api_key_id);
+        }
+    }
+    let removed_sinks = {
+        let mut sinks = state.target_sink.lock().await;
+        let keys = sinks
+            .keys()
+            .filter(|(_, provider_key_id, _)| {
+                provider_key_id.is_some_and(|key_id| provider_api_key_ids.contains(&key_id))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in &keys {
+            sinks.remove(key);
+        }
+        keys
+    };
     // Cleared cooldowns must be removed from the persisted mirror as well, or a
     // restart would restore a cooldown an operator explicitly lifted.
     for provider_api_key_id in removed {
         state.mark_provider_key_resilience_dirty(provider_api_key_id);
+    }
+    for key in &removed_sinks {
+        state.mark_target_sink_dirty(key);
     }
 }
 
@@ -698,14 +896,24 @@ pub(super) fn provider_api_key_input(
         name: name.into(),
         api_key,
         enabled,
+        max_concurrency: None,
+        requests_per_minute: None,
+        queue_limit: None,
+        queue_wait_ms: None,
     }
+}
+
+#[derive(Default)]
+pub(super) struct ProviderApiKeyMutation {
+    pub(super) changed_secret_ids: Vec<i64>,
+    pub(super) removed_ids: Vec<i64>,
 }
 
 pub(super) async fn replace_provider_api_keys(
     tx: &mut sqlx::Transaction<'_, Sqlite>,
     provider_id: i64,
     inputs: &[ProviderApiKeyInput],
-) -> AppResult<()> {
+) -> AppResult<ProviderApiKeyMutation> {
     let existing = sqlx::query_as::<_, ProviderApiKeyRecord>(
         "SELECT * FROM provider_api_keys WHERE provider_id = ? ORDER BY id",
     )
@@ -717,6 +925,7 @@ pub(super) async fn replace_provider_api_keys(
     .collect::<HashMap<_, _>>();
     let mut retained = HashSet::new();
     let mut secrets = HashSet::new();
+    let mut mutation = ProviderApiKeyMutation::default();
 
     for (index, input) in inputs.iter().enumerate() {
         let current = match input.id {
@@ -757,10 +966,31 @@ pub(super) async fn replace_provider_api_keys(
                 "provider API key name must be at most 80 characters".to_string(),
             ));
         }
+        let max_concurrency = normalize_provider_concurrency(
+            input
+                .max_concurrency
+                .or_else(|| current.as_ref().and_then(|key| key.max_concurrency)),
+        )?;
+        let requests_per_minute = normalize_provider_key_rpm(
+            input
+                .requests_per_minute
+                .or_else(|| current.as_ref().and_then(|key| key.requests_per_minute)),
+        )?;
+        let queue_limit = normalize_provider_key_queue_limit(
+            input
+                .queue_limit
+                .or_else(|| current.as_ref().and_then(|key| key.queue_limit)),
+        )?;
+        let queue_wait_ms = normalize_provider_key_queue_wait(
+            input
+                .queue_wait_ms
+                .or_else(|| current.as_ref().and_then(|key| key.queue_wait_ms)),
+        )?;
 
         if let Some(current) = current {
             retained.insert(current.id);
             if current.secret != secret {
+                mutation.changed_secret_ids.push(current.id);
                 sqlx::query(
                     "UPDATE provider_api_keys \
                      SET name = ?, secret = ?, enabled = ?, \
@@ -768,12 +998,18 @@ pub(super) async fn replace_provider_api_keys(
                          last_test_at = NULL, last_test_ok = NULL, \
                          last_test_latency_ms = NULL, last_test_checked = NULL, \
                          last_test_message = NULL, \
+                         max_concurrency = ?, requests_per_minute = ?, \
+                         queue_limit = ?, queue_wait_ms = ?, \
                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                      WHERE id = ? AND provider_id = ?",
                 )
                 .bind(name)
                 .bind(secret)
                 .bind(input.enabled as i64)
+                .bind(max_concurrency)
+                .bind(requests_per_minute)
+                .bind(queue_limit)
+                .bind(queue_wait_ms)
                 .bind(current.id)
                 .bind(provider_id)
                 .execute(&mut **tx)
@@ -783,12 +1019,18 @@ pub(super) async fn replace_provider_api_keys(
                 sqlx::query(
                     "UPDATE provider_api_keys \
                      SET name = ?, secret = ?, enabled = ?, \
+                         max_concurrency = ?, requests_per_minute = ?, \
+                         queue_limit = ?, queue_wait_ms = ?, \
                          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                      WHERE id = ? AND provider_id = ?",
                 )
                 .bind(name)
                 .bind(secret)
                 .bind(input.enabled as i64)
+                .bind(max_concurrency)
+                .bind(requests_per_minute)
+                .bind(queue_limit)
+                .bind(queue_wait_ms)
                 .bind(current.id)
                 .bind(provider_id)
                 .execute(&mut **tx)
@@ -797,13 +1039,19 @@ pub(super) async fn replace_provider_api_keys(
             }
         } else {
             let result = sqlx::query(
-                "INSERT INTO provider_api_keys (provider_id, name, secret, enabled) \
-                 VALUES (?, ?, ?, ?)",
+                "INSERT INTO provider_api_keys ( \
+                    provider_id, name, secret, enabled, max_concurrency, \
+                    requests_per_minute, queue_limit, queue_wait_ms \
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(provider_id)
             .bind(name)
             .bind(secret)
             .bind(input.enabled as i64)
+            .bind(max_concurrency)
+            .bind(requests_per_minute)
+            .bind(queue_limit)
+            .bind(queue_wait_ms)
             .execute(&mut **tx)
             .await
             .map_err(map_sqlite_conflict)?;
@@ -817,6 +1065,7 @@ pub(super) async fn replace_provider_api_keys(
             .bind(provider_id)
             .execute(&mut **tx)
             .await?;
+        mutation.removed_ids.push(*id);
     }
 
     let first_secret = sqlx::query_scalar::<_, String>(
@@ -831,7 +1080,7 @@ pub(super) async fn replace_provider_api_keys(
         .bind(provider_id)
         .execute(&mut **tx)
         .await?;
-    Ok(())
+    Ok(mutation)
 }
 
 pub(super) fn validate_route_input(input: &RouteInput) -> AppResult<()> {
@@ -1011,6 +1260,47 @@ pub(super) fn normalize_provider_queue_timeout(value: Option<i64>) -> AppResult<
         )),
         Some(value) if value > MAX_QUEUE_TIMEOUT_SECONDS => Err(AppError::BadRequest(format!(
             "queue timeout must be at most {MAX_QUEUE_TIMEOUT_SECONDS} seconds"
+        ))),
+        value => Ok(value),
+    }
+}
+
+pub(super) fn normalize_provider_key_rpm(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_REQUESTS_PER_MINUTE: i64 = 1_000_000;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "requests per minute must be zero or a positive integer".to_string(),
+        )),
+        Some(0) | None => Ok(None),
+        Some(value) if value > MAX_REQUESTS_PER_MINUTE => Err(AppError::BadRequest(format!(
+            "requests per minute must be at most {MAX_REQUESTS_PER_MINUTE}"
+        ))),
+        Some(value) => Ok(Some(value)),
+    }
+}
+
+/// `None` leaves the provider-key queue unbounded; `0` disables queueing.
+pub(super) fn normalize_provider_key_queue_limit(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_QUEUE_LIMIT: i64 = 10_000;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "queue limit must be zero or a positive integer".to_string(),
+        )),
+        Some(value) if value > MAX_QUEUE_LIMIT => Err(AppError::BadRequest(format!(
+            "queue limit must be at most {MAX_QUEUE_LIMIT}"
+        ))),
+        value => Ok(value),
+    }
+}
+
+pub(super) fn normalize_provider_key_queue_wait(value: Option<i64>) -> AppResult<Option<i64>> {
+    const MAX_QUEUE_WAIT_MS: i64 = 300_000;
+    match value {
+        Some(value) if value < 0 => Err(AppError::BadRequest(
+            "queue wait must be zero or a positive integer".to_string(),
+        )),
+        Some(value) if value > MAX_QUEUE_WAIT_MS => Err(AppError::BadRequest(format!(
+            "queue wait must be at most {MAX_QUEUE_WAIT_MS} milliseconds"
         ))),
         value => Ok(value),
     }

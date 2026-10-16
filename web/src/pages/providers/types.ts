@@ -42,6 +42,7 @@ export function formatUnitPrice(value?: number | null) {
 export type ProviderForm = Omit<ProviderInput, 'api_keys'> & {
   headersText: string
   modelsText: string
+  modelAutoIncludeRulesText: string
   api_keys?: Array<ProviderApiKeyInput & { api_key_suffix?: string }>
 }
 

@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Alert, Skeleton } from 'antd'
+import { Alert, Button, Skeleton } from 'antd'
+import { LineChartOutlined } from '@ant-design/icons'
 import dayjs, { type Dayjs } from 'dayjs'
+import { useNavigate } from 'react-router-dom'
 import { api, formatError, type Overview } from '../api'
+import UsageRangeToolbar from '../components/UsageRangeToolbar'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
-import DashboardCharts from './dashboard/DashboardCharts'
 import DashboardDetails from './dashboard/DashboardDetails'
 import DashboardMetrics from './dashboard/DashboardMetrics'
-import DashboardModelUsage from './dashboard/DashboardModelUsage'
 import DashboardRuntimeStatus from './dashboard/DashboardRuntimeStatus'
-import DashboardToolbar from './dashboard/DashboardToolbar'
 
 export default function Dashboard() {
+  const navigate = useNavigate()
   const [data, setData] = useState<Overview>()
   const [error, setError] = useState('')
   const [dates, setDates] = useState<[Dayjs, Dayjs]>(() => [
@@ -60,7 +61,9 @@ export default function Dashboard() {
 
   return (
     <>
-      <DashboardToolbar
+      <UsageRangeToolbar
+        title="运行概览"
+        description="所选时间范围内的流量、运行健康与最近请求"
         dates={dates}
         lastUpdated={autoRefresh.lastUpdated}
         refreshing={autoRefresh.refreshing}
@@ -69,12 +72,18 @@ export default function Dashboard() {
         onDatesChange={setDates}
         onTogglePaused={() => autoRefresh.setPaused((value) => !value)}
         onRefresh={() => void autoRefresh.manualRefresh()}
+        extraActions={
+          <Button
+            icon={<LineChartOutlined />}
+            onClick={() => navigate('/analytics')}
+          >
+            用量分析
+          </Button>
+        }
       />
       <DashboardMetrics data={data} />
       <DashboardRuntimeStatus />
-      <DashboardCharts data={data} />
       <DashboardDetails data={data} />
-      <DashboardModelUsage data={data} />
     </>
   )
 }

@@ -152,12 +152,11 @@ pub(crate) async fn collect_status(state: &AppState) -> RuntimeStatus {
 
     // A failing DB probe must not take the whole status down: report zero and
     // let the readiness probe be the one that fails loudly.
-    let in_flight = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1",
-    )
-    .fetch_one(&state.pool)
-    .await
-    .unwrap_or(0);
+    let in_flight =
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(0);
 
     let threshold = crate::state::provider_open_threshold();
     let (mut open, mut half_open) = (0usize, 0usize);

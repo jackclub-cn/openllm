@@ -79,9 +79,31 @@ pub(crate) async fn build_config_document(
     // document is built from one ordered row per key: collapsing the rows into
     // a name-keyed map would drop the secret of a second key with the same
     // name.
-    for (provider_id, name, enabled, secret) in sqlx::query_as::<_, (i64, String, i64, String)>(
-        "SELECT provider_id, name, enabled, secret FROM provider_api_keys \
-         ORDER BY provider_id, id",
+    for (
+        provider_id,
+        name,
+        enabled,
+        secret,
+        max_concurrency,
+        requests_per_minute,
+        queue_limit,
+        queue_wait_ms,
+    ) in sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            i64,
+            String,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+            Option<i64>,
+        ),
+    >(
+        "SELECT provider_id, name, enabled, secret, max_concurrency, \
+                requests_per_minute, queue_limit, queue_wait_ms \
+         FROM provider_api_keys ORDER BY provider_id, id",
     )
     .fetch_all(&state.pool)
     .await?
@@ -92,6 +114,10 @@ pub(crate) async fn build_config_document(
             .push(ConfigProviderKey {
                 name,
                 enabled: enabled != 0,
+                max_concurrency,
+                requests_per_minute,
+                queue_limit,
+                queue_wait_ms,
                 api_key: include_secrets.then_some(secret),
             });
     }
@@ -130,6 +156,7 @@ pub(crate) async fn build_config_document(
             auto_sync_models: false,
             models: view.models.clone(),
             disabled_models: disabled_models.remove(&view.id).unwrap_or_default(),
+            model_auto_include_rules: view.model_auto_include_rules.clone(),
             health_check_interval_minutes: view.health_check_interval_minutes,
             health_check_model: view.health_check_model.clone(),
             models_sync_interval_minutes: view.models_sync_interval_minutes,
@@ -191,10 +218,27 @@ pub(crate) async fn build_config_document(
             });
     }
 
-    let routes = sqlx::query_as::<_, (i64, String, String, String, i64, Option<i64>, Option<i64>)>(
+    let routes = sqlx::query_as::<
+        _,
+        (
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            Option<i64>,
+            Option<i64>,
+            i64,
+            i64,
+            i64,
+            i64,
+        ),
+    >(
         "SELECT id, name, model_pattern, \
                 CASE WHEN strategy_ext <> '' THEN strategy_ext ELSE strategy END, enabled, \
-                context_override, output_override \
+                context_override, output_override, \
+                all_targets_busy_wait_seconds, retry_jitter_ms, \
+                max_waiting_requests, keepalive_during_wait \
          FROM routes ORDER BY id",
     )
     .fetch_all(&state.pool)
@@ -209,14 +253,24 @@ pub(crate) async fn build_config_document(
             enabled,
             context_override,
             output_override,
-        )| ConfigRoute {
-            name,
-            model_pattern,
-            strategy,
-            enabled: enabled != 0,
-            context_override,
-            output_override,
-            targets: route_targets.remove(&id).unwrap_or_default(),
+            all_targets_busy_wait_seconds,
+            retry_jitter_ms,
+            max_waiting_requests,
+            keepalive_during_wait,
+        )| {
+            ConfigRoute {
+                name,
+                model_pattern,
+                strategy,
+                enabled: enabled != 0,
+                context_override,
+                output_override,
+                all_targets_busy_wait_seconds,
+                retry_jitter_ms,
+                max_waiting_requests,
+                keepalive_during_wait: keepalive_during_wait != 0,
+                targets: route_targets.remove(&id).unwrap_or_default(),
+            }
         },
     )
     .collect();
@@ -242,32 +296,42 @@ pub(crate) async fn build_config_document(
             });
     }
 
-    let provider_pools = sqlx::query_as::<_, (i64, i64, String, i64, i64, Option<i64>, Option<i64>, i64)>(
-        "SELECT id, provider_id, name, enabled, window_seconds, request_limit, token_limit, \
+    let provider_pools =
+        sqlx::query_as::<_, (i64, i64, String, i64, i64, Option<i64>, Option<i64>, i64)>(
+            "SELECT id, provider_id, name, enabled, window_seconds, request_limit, token_limit, \
                 saturation_threshold_pct \
          FROM provider_pools ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await?
-    .into_iter()
-    .map(
-        |(id, provider_id, name, enabled, window_seconds, request_limit, token_limit, threshold)| {
-            ConfigPool {
-                provider: provider_names
-                    .get(&provider_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("provider #{provider_id}")),
+        )
+        .fetch_all(&state.pool)
+        .await?
+        .into_iter()
+        .map(
+            |(
+                id,
+                provider_id,
                 name,
-                enabled: enabled != 0,
+                enabled,
                 window_seconds,
                 request_limit,
                 token_limit,
-                saturation_threshold_pct: threshold,
-                allocations: pool_allocations.remove(&id).unwrap_or_default(),
-            }
-        },
-    )
-    .collect();
+                threshold,
+            )| {
+                ConfigPool {
+                    provider: provider_names
+                        .get(&provider_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("provider #{provider_id}")),
+                    name,
+                    enabled: enabled != 0,
+                    window_seconds,
+                    request_limit,
+                    token_limit,
+                    saturation_threshold_pct: threshold,
+                    allocations: pool_allocations.remove(&id).unwrap_or_default(),
+                }
+            },
+        )
+        .collect();
 
     let mut webhook_secrets = HashMap::<i64, String>::new();
     let mut webhook_headers = HashMap::<i64, String>::new();
@@ -470,8 +534,7 @@ pub async fn import_config(
 
     let plan = run.finish(document.openllm_config_version);
     if plan.applied {
-        let has_secrets = plan.secrets_included
-            && (plan.counts.create + plan.counts.update) > 0;
+        let has_secrets = plan.secrets_included && (plan.counts.create + plan.counts.update) > 0;
         record_audit(
             &state,
             "import",
@@ -512,6 +575,7 @@ struct ProviderFacts {
     health_check_interval_minutes: Option<i64>,
     health_check_model: Option<String>,
     models_sync_interval_minutes: Option<i64>,
+    model_auto_include_rules: Vec<String>,
     timeout_seconds: Option<i64>,
     configured_cooldown_seconds: Option<i64>,
     max_concurrency: Option<i64>,
@@ -527,6 +591,14 @@ struct ProviderFacts {
     /// Existing key rows by secret, used to keep a key's identity (and with it
     /// its lifetime statistics and usage attribution) across an import.
     key_ids_by_secret: HashMap<String, i64>,
+    key_channels: Vec<(
+        String,
+        bool,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+        Option<i64>,
+    )>,
 }
 
 /// A webhook as it currently exists, reduced to the fields the importer
@@ -554,7 +626,17 @@ struct ImportRun<'a> {
     blocked: bool,
     providers: HashMap<String, i64>,
     api_keys: HashMap<String, Vec<i64>>,
-    routes: Vec<(i64, String, String, Option<i64>, Option<i64>)>,
+    routes: Vec<(
+        i64,
+        String,
+        String,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+    )>,
     pools: Vec<(i64, i64, String)>,
     webhooks: Vec<(i64, String, String)>,
 }
@@ -592,8 +674,23 @@ impl<'a> ImportRun<'a> {
         {
             self.api_keys.entry(name).or_default().push(id);
         }
-        self.routes = sqlx::query_as::<_, (i64, String, String, Option<i64>, Option<i64>)>(
-            "SELECT id, name, model_pattern, context_override, output_override \
+        self.routes = sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                String,
+                Option<i64>,
+                Option<i64>,
+                i64,
+                i64,
+                i64,
+                i64,
+            ),
+        >(
+            "SELECT id, name, model_pattern, context_override, output_override, \
+                    all_targets_busy_wait_seconds, retry_jitter_ms, \
+                    max_waiting_requests, keepalive_during_wait \
              FROM routes ORDER BY id",
         )
         .fetch_all(&self.state.pool)
@@ -636,15 +733,23 @@ impl<'a> ImportRun<'a> {
                 .map(|current| current == guardrails)
                 .unwrap_or(false);
             if unchanged {
-                self.record("setting", "guardrails", ACTION_UNCHANGED, "护栏设置未变化".to_string());
+                self.record(
+                    "setting",
+                    "guardrails",
+                    ACTION_UNCHANGED,
+                    "护栏设置未变化".to_string(),
+                );
             } else if !self.apply {
-                self.record("setting", "guardrails", ACTION_UPDATE, "将更新护栏设置".to_string());
+                self.record(
+                    "setting",
+                    "guardrails",
+                    ACTION_UPDATE,
+                    "将更新护栏设置".to_string(),
+                );
             } else {
-                let result = super::update_guardrails_settings(
-                    State(self.state.clone()),
-                    Json(guardrails),
-                )
-                .await;
+                let result =
+                    super::update_guardrails_settings(State(self.state.clone()), Json(guardrails))
+                        .await;
                 self.settings_result("guardrails", "护栏设置", result);
             }
         }
@@ -740,12 +845,7 @@ impl<'a> ImportRun<'a> {
         result: AppResult<T>,
     ) {
         match result {
-            Ok(_) => self.record(
-                "setting",
-                key,
-                ACTION_UPDATE,
-                format!("已更新{label}"),
-            ),
+            Ok(_) => self.record("setting", key, ACTION_UPDATE, format!("已更新{label}")),
             Err(error) => {
                 let detail = format!("更新{label}失败：{error}");
                 self.record("setting", key, ACTION_ERROR, detail.clone());
@@ -778,9 +878,32 @@ impl<'a> ImportRun<'a> {
         let mut key_names = Vec::new();
         let mut key_secrets: HashMap<String, Vec<String>> = HashMap::new();
         let mut key_ids_by_secret = HashMap::new();
-        for (id, name, enabled, secret) in sqlx::query_as::<_, (i64, String, i64, String)>(
-            "SELECT id, name, enabled, secret FROM provider_api_keys WHERE provider_id = ? \
-             ORDER BY id",
+        let mut key_channels = Vec::new();
+        for (
+            id,
+            name,
+            enabled,
+            secret,
+            max_concurrency,
+            requests_per_minute,
+            queue_limit,
+            queue_wait_ms,
+        ) in sqlx::query_as::<
+            _,
+            (
+                i64,
+                String,
+                i64,
+                String,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT id, name, enabled, secret, max_concurrency, \
+                    requests_per_minute, queue_limit, queue_wait_ms \
+             FROM provider_api_keys WHERE provider_id = ? ORDER BY id",
         )
         .bind(id)
         .fetch_all(&self.state.pool)
@@ -790,7 +913,15 @@ impl<'a> ImportRun<'a> {
                 key_names.push(name.clone());
             }
             key_ids_by_secret.insert(secret.clone(), id);
-            key_secrets.entry(name).or_default().push(secret);
+            key_secrets.entry(name.clone()).or_default().push(secret);
+            key_channels.push((
+                name,
+                enabled != 0,
+                max_concurrency,
+                requests_per_minute,
+                queue_limit,
+                queue_wait_ms,
+            ));
         }
         Ok(ProviderFacts {
             provider_type: provider.provider_type,
@@ -800,6 +931,8 @@ impl<'a> ImportRun<'a> {
             health_check_interval_minutes: provider.health_check_interval_minutes,
             health_check_model: provider.health_check_model,
             models_sync_interval_minutes: provider.models_sync_interval_minutes,
+            model_auto_include_rules: serde_json::from_str(&provider.model_auto_include_rules)
+                .unwrap_or_default(),
             timeout_seconds: provider.timeout_seconds,
             configured_cooldown_seconds: provider.cooldown_seconds,
             max_concurrency: provider.max_concurrency,
@@ -811,6 +944,7 @@ impl<'a> ImportRun<'a> {
             legacy_api_key: provider.api_key.filter(|key| !key.is_empty()),
             key_secrets,
             key_ids_by_secret,
+            key_channels,
         })
     }
 
@@ -819,8 +953,14 @@ impl<'a> ImportRun<'a> {
             && facts.base_url == doc.base_url
             && facts.model_prefix == doc.model_prefix
             && facts.enabled == doc.enabled
-            && opt_matches(facts.health_check_interval_minutes, doc.health_check_interval_minutes)
-            && opt_matches(facts.health_check_model.as_deref(), doc.health_check_model.as_deref())
+            && opt_matches(
+                facts.health_check_interval_minutes,
+                doc.health_check_interval_minutes,
+            )
+            && opt_matches(
+                facts.health_check_model.as_deref(),
+                doc.health_check_model.as_deref(),
+            )
             && opt_matches(
                 facts.models_sync_interval_minutes,
                 doc.models_sync_interval_minutes,
@@ -834,9 +974,28 @@ impl<'a> ImportRun<'a> {
             && opt_matches(facts.queue_timeout_seconds, doc.queue_timeout_seconds)
             && same_set(&facts.models_enabled, &doc.models)
             && same_set(&facts.models_disabled, &doc.disabled_models)
+            && same_set(
+                &facts.model_auto_include_rules,
+                &doc.model_auto_include_rules,
+            )
             && same_set(&facts.key_names, &self.document_key_names(doc))
-            && (!self.secrets_included
-                || header_values_match(&facts.headers, &doc.headers))
+            && (doc.provider_keys.is_empty()
+                || facts.key_channels
+                    == doc
+                        .provider_keys
+                        .iter()
+                        .map(|key| {
+                            (
+                                key.name.clone(),
+                                key.enabled,
+                                key.max_concurrency,
+                                key.requests_per_minute,
+                                key.queue_limit,
+                                key.queue_wait_ms,
+                            )
+                        })
+                        .collect::<Vec<_>>())
+            && (!self.secrets_included || header_values_match(&facts.headers, &doc.headers))
             && self.credentials_match(facts, doc)
     }
 
@@ -887,9 +1046,7 @@ impl<'a> ImportRun<'a> {
             .iter()
             .map(|key| {
                 let secret = if self.secrets_included {
-                    key.api_key
-                        .clone()
-                        .filter(|value| !value.is_empty())
+                    key.api_key.clone().filter(|value| !value.is_empty())
                 } else {
                     None
                 };
@@ -902,6 +1059,10 @@ impl<'a> ImportRun<'a> {
                     name: key.name.clone(),
                     api_key: secret,
                     enabled: key.enabled,
+                    max_concurrency: key.max_concurrency,
+                    requests_per_minute: key.requests_per_minute,
+                    queue_limit: key.queue_limit,
+                    queue_wait_ms: key.queue_wait_ms,
                 }
             })
             .collect()
@@ -911,7 +1072,12 @@ impl<'a> ImportRun<'a> {
         for (index, doc) in providers.iter().enumerate() {
             let name = doc.name.trim().to_string();
             if name.is_empty() {
-                self.record("provider", "(未命名)", ACTION_ERROR, "提供商名称为空".to_string());
+                self.record(
+                    "provider",
+                    "(未命名)",
+                    ACTION_ERROR,
+                    "提供商名称为空".to_string(),
+                );
                 continue;
             }
             let provider_type = match ProviderType::from_str(&doc.provider_type) {
@@ -986,6 +1152,7 @@ impl<'a> ImportRun<'a> {
                         enabled: Some(doc.enabled),
                         auto_sync_models: Some(false),
                         models: Some(models.clone()),
+                        model_auto_include_rules: Some(doc.model_auto_include_rules.clone()),
                         health_check_interval_minutes: doc.health_check_interval_minutes,
                         health_check_model: doc.health_check_model.clone(),
                         models_sync_interval_minutes: doc.models_sync_interval_minutes,
@@ -1019,8 +1186,7 @@ impl<'a> ImportRun<'a> {
                         // Remember a placeholder id so routes and pools later in
                         // the same document can still resolve this provider by
                         // name: a preview must show what *would* be linked.
-                        self.providers
-                            .insert(name.clone(), -(index as i64) - 1);
+                        self.providers.insert(name.clone(), -(index as i64) - 1);
                         self.record(
                             "provider",
                             &name,
@@ -1049,6 +1215,7 @@ impl<'a> ImportRun<'a> {
                         enabled: doc.enabled,
                         auto_sync_models: false,
                         models: models.clone(),
+                        model_auto_include_rules: doc.model_auto_include_rules.clone(),
                         health_check_interval_minutes: doc.health_check_interval_minutes,
                         health_check_model: doc.health_check_model.clone(),
                         models_sync_interval_minutes: doc.models_sync_interval_minutes,
@@ -1153,21 +1320,54 @@ impl<'a> ImportRun<'a> {
             let existing = self
                 .routes
                 .iter()
-                .find(|(_, existing_name, _, _, _)| existing_name == &name)
+                .find(|(_, existing_name, _, _, _, _, _, _, _)| existing_name == &name)
                 .or_else(|| {
                     self.routes
                         .iter()
-                        .find(|(_, _, pattern, _, _)| pattern == &doc.model_pattern)
+                        .find(|(_, _, pattern, _, _, _, _, _, _)| pattern == &doc.model_pattern)
                 })
-                .map(|(id, _, _, context_override, output_override)| {
-                    (*id, *context_override, *output_override)
-                });
+                .map(
+                    |(
+                        id,
+                        _,
+                        _,
+                        context_override,
+                        output_override,
+                        all_targets_busy_wait_seconds,
+                        retry_jitter_ms,
+                        max_waiting_requests,
+                        keepalive_during_wait,
+                    )| {
+                        (
+                            *id,
+                            *context_override,
+                            *output_override,
+                            *all_targets_busy_wait_seconds,
+                            *retry_jitter_ms,
+                            *max_waiting_requests,
+                            *keepalive_during_wait,
+                        )
+                    },
+                );
             match existing {
-                Some((id, current_context_override, current_output_override)) => {
+                Some((
+                    id,
+                    current_context_override,
+                    current_output_override,
+                    current_all_targets_busy_wait_seconds,
+                    current_retry_jitter_ms,
+                    current_max_waiting_requests,
+                    current_keepalive_during_wait,
+                )) => {
                     let current = self.route_targets(id).await.unwrap_or_default();
                     if route_targets_match(&current, &desired)
                         && current_context_override == doc.context_override
                         && current_output_override == doc.output_override
+                        && current_all_targets_busy_wait_seconds
+                            == doc.all_targets_busy_wait_seconds
+                        && current_retry_jitter_ms == doc.retry_jitter_ms
+                        && current_max_waiting_requests == doc.max_waiting_requests
+                        && (current_keepalive_during_wait != 0) == doc.keepalive_during_wait
                     {
                         self.record(
                             "route",
@@ -1193,6 +1393,10 @@ impl<'a> ImportRun<'a> {
                         enabled: Some(doc.enabled),
                         context_override: Some(doc.context_override),
                         output_override: Some(doc.output_override),
+                        all_targets_busy_wait_seconds: Some(doc.all_targets_busy_wait_seconds),
+                        retry_jitter_ms: Some(doc.retry_jitter_ms),
+                        max_waiting_requests: Some(doc.max_waiting_requests),
+                        keepalive_during_wait: Some(doc.keepalive_during_wait),
                         targets: Some(targets),
                     };
                     match super::update_route(State(self.state.clone()), Path(id), Json(update))
@@ -1204,12 +1408,9 @@ impl<'a> ImportRun<'a> {
                             ACTION_UPDATE,
                             format!("已更新路由（{} 个目标）", doc.targets.len()),
                         ),
-                        Err(error) => self.record(
-                            "route",
-                            &name,
-                            ACTION_ERROR,
-                            format!("更新失败：{error}"),
-                        ),
+                        Err(error) => {
+                            self.record("route", &name, ACTION_ERROR, format!("更新失败：{error}"))
+                        }
                     }
                 }
                 None => {
@@ -1229,6 +1430,10 @@ impl<'a> ImportRun<'a> {
                         enabled: doc.enabled,
                         context_override: doc.context_override,
                         output_override: doc.output_override,
+                        all_targets_busy_wait_seconds: Some(doc.all_targets_busy_wait_seconds),
+                        retry_jitter_ms: Some(doc.retry_jitter_ms),
+                        max_waiting_requests: Some(doc.max_waiting_requests),
+                        keepalive_during_wait: Some(doc.keepalive_during_wait),
                         targets,
                     };
                     match super::create_route(State(self.state.clone()), Json(input)).await {
@@ -1239,25 +1444,23 @@ impl<'a> ImportRun<'a> {
                                 doc.model_pattern.clone(),
                                 view.context_override,
                                 view.output_override,
+                                view.all_targets_busy_wait_seconds,
+                                view.retry_jitter_ms,
+                                view.max_waiting_requests,
+                                i64::from(view.keepalive_during_wait),
                             ));
                             self.record("route", &name, ACTION_CREATE, "已新建路由".to_string());
                         }
-                        Err(error) => self.record(
-                            "route",
-                            &name,
-                            ACTION_ERROR,
-                            format!("创建失败：{error}"),
-                        ),
+                        Err(error) => {
+                            self.record("route", &name, ACTION_ERROR, format!("创建失败：{error}"))
+                        }
                     }
                 }
             }
         }
     }
 
-    async fn route_targets(
-        &self,
-        route_id: i64,
-    ) -> AppResult<Vec<(i64, String, i64, i64, bool)>> {
+    async fn route_targets(&self, route_id: i64) -> AppResult<Vec<(i64, String, i64, i64, bool)>> {
         Ok(sqlx::query_as::<_, (i64, String, i64, i64, i64)>(
             "SELECT provider_id, upstream_model, weight, priority, enabled \
              FROM route_targets WHERE route_id = ? ORDER BY priority, id",
@@ -1384,7 +1587,8 @@ impl<'a> ImportRun<'a> {
                         saturation_threshold_pct: doc.saturation_threshold_pct,
                         allocations,
                     };
-                    match super::create_provider_pool(State(self.state.clone()), Json(input)).await {
+                    match super::create_provider_pool(State(self.state.clone()), Json(input)).await
+                    {
                         Ok(Json(view)) => {
                             self.pools.push((view.id, provider_id, doc.name.clone()));
                             self.record(
@@ -1406,10 +1610,7 @@ impl<'a> ImportRun<'a> {
         }
     }
 
-    async fn pool_allocations(
-        &self,
-        pool_id: i64,
-    ) -> AppResult<Vec<(i64, i64, String)>> {
+    async fn pool_allocations(&self, pool_id: i64) -> AppResult<Vec<(i64, i64, String)>> {
         Ok(sqlx::query_as::<_, (i64, i64, String)>(
             "SELECT api_key_id, weight_pct, policy FROM provider_pool_allocations \
              WHERE pool_id = ? ORDER BY api_key_id",
@@ -1427,7 +1628,11 @@ impl<'a> ImportRun<'a> {
                 .webhooks
                 .iter()
                 .find(|(_, _, url)| url == &doc.url)
-                .or_else(|| self.webhooks.iter().find(|(_, existing, _)| existing == &name))
+                .or_else(|| {
+                    self.webhooks
+                        .iter()
+                        .find(|(_, existing, _)| existing == &name)
+                })
                 .map(|(id, _, _)| *id);
             match existing {
                 Some(id) => {
@@ -1494,9 +1699,12 @@ impl<'a> ImportRun<'a> {
                             ACTION_UPDATE,
                             "已更新 Webhook".to_string(),
                         ),
-                        Err(error) => {
-                            self.record("webhook", &name, ACTION_ERROR, format!("更新失败：{error}"))
-                        }
+                        Err(error) => self.record(
+                            "webhook",
+                            &name,
+                            ACTION_ERROR,
+                            format!("更新失败：{error}"),
+                        ),
                     }
                 }
                 None => {
@@ -1525,8 +1733,7 @@ impl<'a> ImportRun<'a> {
                     };
                     match super::create_webhook(State(self.state.clone()), Json(input)).await {
                         Ok((_, Json(view))) => {
-                            self.webhooks
-                                .push((view.id, name.clone(), doc.url.clone()));
+                            self.webhooks.push((view.id, name.clone(), doc.url.clone()));
                             self.record(
                                 "webhook",
                                 &name,
@@ -1549,24 +1756,14 @@ impl<'a> ImportRun<'a> {
     /// Current state of one webhook, used to decide whether a document would
     /// change anything.
     async fn webhook_facts(&self, id: i64) -> AppResult<WebhookFacts> {
-        let (url, enabled, event_types, headers, kind, body_fields, secret) = sqlx::query_as::<
-            _,
-            (
-                String,
-                i64,
-                String,
-                String,
-                String,
-                String,
-                Option<String>,
-            ),
-        >(
-            "SELECT url, enabled, event_types, headers, kind, body_fields, secret \
+        let (url, enabled, event_types, headers, kind, body_fields, secret) =
+            sqlx::query_as::<_, (String, i64, String, String, String, String, Option<String>)>(
+                "SELECT url, enabled, event_types, headers, kind, body_fields, secret \
              FROM webhooks WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&self.state.pool)
-        .await?;
+            )
+            .bind(id)
+            .fetch_one(&self.state.pool)
+            .await?;
         Ok(WebhookFacts {
             url,
             enabled: enabled != 0,
@@ -1655,8 +1852,7 @@ fn route_targets_match(
     current: &[(i64, String, i64, i64, bool)],
     desired: &[(i64, String, i64, i64, bool)],
 ) -> bool {
-    current.len() == desired.len()
-        && current.iter().all(|target| desired.contains(target))
+    current.len() == desired.len() && current.iter().all(|target| desired.contains(target))
 }
 
 fn pool_allocations_match(
@@ -1913,9 +2109,7 @@ pub async fn upgrade_check(
 
     let comparison = match latest.as_deref() {
         Some(latest) if !is_numeric_version(latest) => {
-            problems.push(format!(
-                "无法解析版本号 '{latest}'，请手动核对发布说明"
-            ));
+            problems.push(format!("无法解析版本号 '{latest}'，请手动核对发布说明"));
             None
         }
         Some(latest) => Some(compare_versions(&current, latest)),
@@ -1935,11 +2129,9 @@ pub async fn upgrade_check(
                 }
             ),
         ),
-        Some(std::cmp::Ordering::Equal) => (
-            "up_to_date",
-            false,
-            format!("当前 {current} 已是最新版本"),
-        ),
+        Some(std::cmp::Ordering::Equal) => {
+            ("up_to_date", false, format!("当前 {current} 已是最新版本"))
+        }
         Some(std::cmp::Ordering::Greater) => (
             "ahead",
             false,

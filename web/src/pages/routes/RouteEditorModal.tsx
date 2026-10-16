@@ -129,6 +129,38 @@ export default function RouteEditorModal({
             />
           </Form.Item>
         </div>
+        <Typography.Title level={5}>忙碌等待</Typography.Title>
+        <div className="form-grid">
+          <Form.Item
+            name="all_targets_busy_wait_seconds"
+            label="等待预算（秒）"
+            extra="所有候选暂时忙碌时，最多等待多久；0 表示关闭。"
+          >
+            <InputNumber min={0} max={300} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="retry_jitter_ms"
+            label="重试抖动（毫秒）"
+            extra="避免多个请求同时醒来重试。"
+          >
+            <InputNumber min={0} max={10000} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="max_waiting_requests"
+            label="最大等待请求数"
+            extra="单实例每条路由同时等待的上限，0 表示不允许等待。"
+          >
+            <InputNumber min={0} max={1024} precision={0} style={{ width: '100%' }} />
+          </Form.Item>
+          <Form.Item
+            name="keepalive_during_wait"
+            label="流式等待心跳"
+            valuePropName="checked"
+            extra="流式请求等待期间发送 SSE 心跳，避免客户端空闲超时。"
+          >
+            <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+          </Form.Item>
+        </div>
         <Typography.Title level={5}>上游目标</Typography.Title>
         <Form.List name="targets">
           {(fields, { add, remove: removeTarget }) => (

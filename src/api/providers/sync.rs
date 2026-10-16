@@ -234,7 +234,25 @@ pub(crate) async fn fetch_provider_entries(
     })))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderModelSyncMode {
+    Replace,
+    AutoInclude,
+}
+
 pub(crate) async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
+    sync_provider_with_mode(state, id, ProviderModelSyncMode::Replace).await
+}
+
+pub(crate) async fn sync_provider_auto(state: AppState, id: i64) -> AppResult<ModelSyncResult> {
+    sync_provider_with_mode(state, id, ProviderModelSyncMode::AutoInclude).await
+}
+
+async fn sync_provider_with_mode(
+    state: AppState,
+    id: i64,
+    mode: ProviderModelSyncMode,
+) -> AppResult<ModelSyncResult> {
     {
         let mut running = state.provider_model_sync.lock().await;
         if !running.insert(id) {
@@ -260,7 +278,7 @@ pub(crate) async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSy
         return Err(AppError::Database(error));
     }
 
-    let result = sync_provider_inner(&state, id).await;
+    let result = sync_provider_inner_with_mode(&state, id, mode).await;
     if let Err(error) = &result {
         let _ = sqlx::query(
             "UPDATE providers \
@@ -277,7 +295,11 @@ pub(crate) async fn sync_provider(state: AppState, id: i64) -> AppResult<ModelSy
     result
 }
 
-pub(crate) async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<ModelSyncResult> {
+async fn sync_provider_inner_with_mode(
+    state: &AppState,
+    id: i64,
+    mode: ProviderModelSyncMode,
+) -> AppResult<ModelSyncResult> {
     let provider = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
         .bind(id)
         .fetch_optional(&state.pool)
@@ -295,16 +317,32 @@ pub(crate) async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<
     let models_dev_id = catalog
         .as_ref()
         .and_then(|catalog| catalog.match_provider(&provider.name, &provider.base_url));
+    let auto_include_rules =
+        serde_json::from_str::<Vec<String>>(&provider.model_auto_include_rules).unwrap_or_default();
+    let merge_only = mode == ProviderModelSyncMode::AutoInclude && !auto_include_rules.is_empty();
 
     let mut tx = state.pool.begin().await?;
-    replace_provider_models(
-        &mut tx,
-        id,
-        &entries,
-        catalog.as_deref(),
-        models_dev_id.as_deref(),
-    )
-    .await?;
+    let count = if merge_only {
+        merge_provider_models(
+            &mut tx,
+            id,
+            &entries,
+            catalog.as_deref(),
+            models_dev_id.as_deref(),
+            &auto_include_rules,
+        )
+        .await?
+    } else {
+        replace_provider_models(
+            &mut tx,
+            id,
+            &entries,
+            catalog.as_deref(),
+            models_dev_id.as_deref(),
+        )
+        .await?;
+        models.len()
+    };
     let synced_at = Utc::now().to_rfc3339();
     sqlx::query(
         "UPDATE providers SET models_dev_id = ?, models_synced_at = ?, models_sync_error = NULL, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?",
@@ -319,7 +357,7 @@ pub(crate) async fn sync_provider_inner(state: &AppState, id: i64) -> AppResult<
     Ok(ModelSyncResult {
         ok: true,
         provider_id: id,
-        count: models.len(),
+        count,
         models,
         synced_at,
         message: "models synchronized".to_string(),

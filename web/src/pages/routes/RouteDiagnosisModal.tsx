@@ -30,6 +30,7 @@ import {
   matchTypeLabels,
   strategyLabels,
 } from './types'
+import { formatFailureClassification } from '../../format'
 
 export type RouteDiagnosisRequest = {
   model?: string
@@ -47,9 +48,22 @@ const decisionReasonLabels: Record<string, string> = {
   least_recent_traffic: '近期负载最低',
   recent_traffic: '已有近期负载',
   no_recent_traffic: '无近期负载',
+  quota_healthy: '额度充足',
+  quota_low: '额度偏低',
+  quota_exhausted: '额度已耗尽',
+  quota_reset_due: '额度待重置',
+  quota_unknown: '额度未知',
   priority_order: '优先级顺序',
   session_affinity: '会话粘性',
   provider_health_failed: '提供商健康异常',
+}
+
+const decisionReasonColors: Record<string, string> = {
+  quota_healthy: 'success',
+  quota_low: 'warning',
+  quota_exhausted: 'error',
+  quota_reset_due: 'processing',
+  quota_unknown: 'default',
 }
 
 function factorSummary(record: RouteDiagnoseCandidate) {
@@ -58,6 +72,20 @@ function factorSummary(record: RouteDiagnoseCandidate) {
       factor.score == null ? '未知（按中性值计入）' : `${Math.round(factor.score * 100)}%`
     return `${factor.name}：${value} × 权重 ${factor.weight} —— ${factor.detail}`
   })
+}
+
+function failureSummary(record: RouteDiagnoseCandidate) {
+  if (!record.failure_reason_code) return ''
+  const classification = formatFailureClassification({
+    scope: record.failure_scope,
+    retry: record.failure_retry,
+    confidence: record.failure_confidence,
+    reason_code: record.failure_reason_code,
+  })
+  const observed = record.failure_observed_seconds_ago
+  return [classification, observed != null ? `${observed} 秒前` : '']
+    .filter(Boolean)
+    .join(' · ')
 }
 
 function runtimeMetric(record: RouteDiagnoseRuntimeTarget) {
@@ -260,6 +288,11 @@ export default function RouteDiagnosisModal({
                       width: 300,
                       render: (_, record) => (
                         <Space direction="vertical" size={2}>
+                          {failureSummary(record) && (
+                            <Typography.Text type="warning">
+                              最近失败：{failureSummary(record)}
+                            </Typography.Text>
+                          )}
                           {record.exclusion && (
                             <Typography.Text type="danger">{record.exclusion}</Typography.Text>
                           )}
@@ -353,7 +386,14 @@ export default function RouteDiagnosisModal({
                       dataIndex: 'decision_reason',
                       width: 150,
                       render: (value: string) => (
-                        <Tag color={value.includes('lowest') || value === 'least_recent_traffic' ? 'success' : 'default'}>
+                        <Tag
+                          color={
+                            decisionReasonColors[value] ||
+                            (value.includes('lowest') || value === 'least_recent_traffic'
+                              ? 'success'
+                              : 'default')
+                          }
+                        >
                           {decisionReasonLabels[value] || value}
                         </Tag>
                       ),

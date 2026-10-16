@@ -108,6 +108,37 @@ pub(crate) fn anthropic_error_response(error: AppError) -> Response {
     response
 }
 
+#[derive(Clone)]
+struct AnthropicAttemptContext {
+    request_id: String,
+    endpoint: String,
+    inbound: Value,
+    request_json: Value,
+    requested_model: String,
+    session_id: Option<String>,
+    affinity_key: Option<String>,
+    streamed: bool,
+    request_tokens: i64,
+    api_key: Option<ApiKeyRecord>,
+    route_id: Option<i64>,
+    ordering_key: i64,
+    retry_targets: Vec<RouteTarget>,
+    resolved: ResolvedRoute,
+    budget_usd: Option<f64>,
+    budget_excluded_targets: usize,
+    receipt: Option<Value>,
+    routing_overrides: RequestRoutingOverrides,
+    started: Instant,
+    anthropic_beta: Option<String>,
+    request_deadline: Option<Instant>,
+    busy_wait_deadline: Option<Instant>,
+}
+
+enum AnthropicAttemptOutcome {
+    Response(Response),
+    BusyWait,
+}
+
 pub(crate) async fn proxy_anthropic_inner(
     state: &AppState,
     headers: &HeaderMap,
@@ -241,7 +272,7 @@ pub(crate) async fn proxy_anthropic_inner(
         api_key.as_ref(),
         &mut resolved.targets,
     )
-        .await
+    .await
     {
         Ok(outcome) => outcome,
         Err(error) => {
@@ -270,8 +301,10 @@ pub(crate) async fn proxy_anthropic_inner(
     // The API key's stored policy is the default; per-request headers override
     // individual fields. Only the request's own headers are echoed back.
     let routing_overrides = match request_routing_overrides(headers).and_then(|request| {
-        let overrides =
-            merge_routing_overrides(routing_overrides_from_key(api_key.as_ref()), request.clone());
+        let overrides = merge_routing_overrides(
+            routing_overrides_from_key(api_key.as_ref()),
+            request.clone(),
+        );
         apply_routing_overrides(&mut resolved, &requested_model, &overrides)?;
         Ok(request)
     }) {
@@ -295,15 +328,7 @@ pub(crate) async fn proxy_anthropic_inner(
         }
     };
     let ordering_key = route_id.unwrap_or(-1);
-    let ordered_targets = order_targets(
-        state,
-        ordering_key,
-        &resolved.strategy,
-        resolved.targets,
-        affinity_key.as_deref(),
-        api_key.as_ref().map(|key| key.id),
-    )
-    .await?;
+    let retry_targets = resolved.targets.clone();
     enforce_api_key_rate_limit_or_log(
         state,
         api_key.as_ref(),
@@ -353,150 +378,398 @@ pub(crate) async fn proxy_anthropic_inner(
         log_usage_warning(
             state,
             request_id,
-            &format!(
-                "provider pool allocation: {}",
-                allocation.notes.join("; ")
-            ),
+            &format!("provider pool allocation: {}", allocation.notes.join("; ")),
         )
         .await;
     }
 
-    let mut last_error: Option<AppError> = None;
-    // Mirrors the OpenAI path: a provider 429 is surfaced to the client when no
-    // target could serve, unless a later non-429 failure supersedes it.
-    let mut last_rate_limit: Option<(String, Option<Duration>)> = None;
-    let mut last_target = None;
-    let mut attempts = 0usize;
-    let mut capacity_exhausted_providers = HashSet::new();
     let request_deadline = state.request_deadline();
-    for target in ordered_targets {
-        // Stop *starting* new targets once the budget is spent; an attempt that
-        // is already running is never cut short, so a slow provider is safe.
-        if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            let elapsed = started.elapsed().as_secs();
-            last_error = Some(AppError::UpstreamStatus {
-                status: StatusCode::GATEWAY_TIMEOUT,
-                message: format!(
-                    "request budget exhausted after {elapsed}s and {attempts} attempt(s); giving up"
-                ),
-                retry_after: None,
-            });
-            break;
+    let busy_wait_deadline = (resolved.all_targets_busy_wait_seconds > 0).then(|| {
+        Instant::now()
+            + Duration::from_secs(
+                u64::try_from(resolved.all_targets_busy_wait_seconds).unwrap_or(0),
+            )
+    });
+    let context = AnthropicAttemptContext {
+        request_id: request_id.to_string(),
+        endpoint,
+        inbound,
+        request_json,
+        requested_model,
+        session_id,
+        affinity_key,
+        streamed,
+        request_tokens,
+        api_key,
+        route_id,
+        ordering_key,
+        retry_targets,
+        resolved,
+        budget_usd,
+        budget_excluded_targets,
+        receipt,
+        routing_overrides,
+        started,
+        anthropic_beta: anthropic_beta_of(headers),
+        request_deadline,
+        busy_wait_deadline,
+    };
+    match run_anthropic_attempts(state, &context, true).await? {
+        AnthropicAttemptOutcome::Response(response) => Ok(response),
+        AnthropicAttemptOutcome::BusyWait => {
+            let state = state.clone();
+            let context = context.clone();
+            let interval = state.sse_keepalive.unwrap_or(Duration::from_secs(
+                crate::state::DEFAULT_SSE_KEEPALIVE_SECS,
+            ));
+            Ok(stream_sse_until_response(
+                interval,
+                SseErrorProtocol::Anthropic,
+                async move {
+                    match run_anthropic_attempts(&state, &context, false).await? {
+                        AnthropicAttemptOutcome::Response(response) => Ok(response),
+                        AnthropicAttemptOutcome::BusyWait => Err(AppError::Internal(
+                            anyhow::anyhow!("busy-wait stream did not resume routing"),
+                        )),
+                    }
+                },
+            ))
         }
-        let target_provider_id = target.provider_id;
-        if capacity_exhausted_providers.contains(&target_provider_id) {
-            continue;
-        }
-        let target_provider_name = target.provider_name.clone();
-        let target_provider_key_id = target.provider_api_key_id;
-        let target_upstream_model = target.upstream_model.clone();
-        attempts = attempts.saturating_add(1);
-        let fallback_count = attempts.saturating_sub(1);
-        log_usage_target(
+    }
+}
+
+async fn run_anthropic_attempts(
+    state: &AppState,
+    context: &AnthropicAttemptContext,
+    emit_busy_wait_signal: bool,
+) -> AppResult<AnthropicAttemptOutcome> {
+    let mut last_error: Option<AppError> = None;
+    let mut last_rate_limit: Option<(String, Option<Duration>)> = None;
+    let mut last_target: Option<(i64, Option<i64>, String)> = None;
+    let mut attempts = 0usize;
+    let request_deadline = context.request_deadline;
+    let busy_wait_deadline = context.busy_wait_deadline;
+    let mut wait_round = 0u32;
+    let mut ordered_targets = order_targets(
+        state,
+        context.ordering_key,
+        &context.resolved.strategy,
+        context.retry_targets.clone(),
+        context.affinity_key.as_deref(),
+        context.api_key.as_ref().map(|key| key.id),
+    )
+    .await?;
+    let mut trace = super::route_trace::RouteTraceRecorder::new(
+        context.request_id.clone(),
+        context.route_id,
+        context.resolved.strategy.clone(),
+        context.session_id.clone(),
+    );
+    trace
+        .update_candidates(
             state,
-            request_id,
-            target_provider_id,
-            &target_upstream_model,
-            target_provider_key_id,
+            &context.resolved.strategy,
+            &ordered_targets,
+            context.api_key.as_ref().map(|key| key.id),
         )
         .await;
-        mark_provider_api_key_used(state, target_provider_key_id).await;
-        last_target = Some((target_provider_id, target_upstream_model.clone()));
-        let upstream_slots = match acquire_upstream_slots(state, &target).await {
-            Ok(slots) => slots,
-            Err(error) => {
-                let provider_exhausted = error.provider_exhausted();
-                let error = error.into_error();
-                if provider_exhausted {
-                    capacity_exhausted_providers.insert(target_provider_id);
-                }
-                last_rate_limit = match &error {
-                    AppError::UpstreamStatus {
-                        status,
-                        message,
-                        retry_after,
-                    } if *status == StatusCode::TOO_MANY_REQUESTS => {
-                        Some((message.clone(), *retry_after))
-                    }
-                    _ => None,
-                };
-                last_error = Some(error);
+
+    loop {
+        let mut all_targets_busy = true;
+        let mut attempted_any = false;
+        let mut next_retry_after: Option<Duration> = None;
+        let mut capacity_exhausted_providers = HashSet::new();
+        for (candidate_index, target) in ordered_targets.iter().cloned().enumerate() {
+            let candidate_order = candidate_index as i64 + 1;
+            if request_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let elapsed = context.started.elapsed().as_secs();
+                last_error = Some(AppError::UpstreamStatus {
+                    status: StatusCode::GATEWAY_TIMEOUT,
+                    message: format!(
+                        "request budget exhausted after {elapsed}s and {attempts} attempt(s); giving up"
+                    ),
+                    retry_after: None,
+                });
+                break;
+            }
+            let target_provider_id = target.provider_id;
+            if capacity_exhausted_providers.contains(&target_provider_id) {
                 continue;
             }
-        };
-        let result = if target.provider_type == "anthropic" {
-            // Native target: forward the caller's Anthropic payload unchanged,
-            // only swapping in the resolved upstream model.
-            let mut native = inbound.clone();
-            native["model"] = json!(target.upstream_model);
-            forward_anthropic_native(
+            let target_provider_name = target.provider_name.clone();
+            let target_provider_key_id = target.provider_api_key_id;
+            let target_upstream_model = target.upstream_model.clone();
+            attempts = attempts.saturating_add(1);
+            let fallback_count = attempts.saturating_sub(1);
+            let attempt_started = Instant::now();
+            log_usage_target(
                 state,
-                request_id,
-                &requested_model,
-                native,
-                target,
-                streamed,
-                request_tokens,
-                api_key.as_ref(),
-                started,
-                receipt.clone(),
-                anthropic_beta_of(headers),
-                session_id.as_deref(),
+                &context.request_id,
+                target_provider_id,
+                &target_upstream_model,
+                target_provider_key_id,
             )
-            .await
-        } else {
-            forward_openai_as_anthropic(
-                state,
-                request_id,
-                &requested_model,
-                &request_json,
-                target,
-                streamed,
-                request_tokens,
-                api_key.as_ref(),
-                started,
-                receipt.clone(),
-                session_id.as_deref(),
-            )
-            .await
-        };
-        match result {
-            Ok(mut response) => {
-                if response.status().is_success() {
-                    mark_provider_success(state, target_provider_id).await;
-                    mark_target_success(state, target_provider_id, &target_upstream_model).await;
-                    mark_provider_api_key_success(state, target_provider_key_id).await;
-                } else {
-                    // A client error still proves the provider is reachable.
-                    // Close a half-open circuit so its probe lease cannot keep
-                    // blocking later requests.
-                    mark_provider_reachable(state, target_provider_id).await;
-                }
-                apply_routing_headers(
-                    &mut response,
-                    attempts,
-                    fallback_count,
-                    &target_provider_name,
-                    &target_upstream_model,
-                );
-                apply_budget_headers(&mut response, budget_usd, budget_excluded_targets);
-                apply_override_headers(&mut response, &routing_overrides);
-                return Ok(attach_provider_slot(response, upstream_slots, state.sse_keepalive));
-            }
-            Err(error) => {
-                last_rate_limit = match &error {
-                    AppError::UpstreamStatus {
-                        status,
-                        message,
-                        retry_after,
-                    } if *status == StatusCode::TOO_MANY_REQUESTS => {
-                        Some((message.clone(), *retry_after))
+            .await;
+            mark_provider_api_key_used(state, target_provider_key_id).await;
+            last_target = Some((
+                target_provider_id,
+                target_provider_key_id,
+                target_upstream_model.clone(),
+            ));
+            attempted_any = true;
+            let upstream_slots = match acquire_upstream_slots(state, &target).await {
+                Ok(slots) => slots,
+                Err(error) => {
+                    let provider_exhausted = error.provider_exhausted();
+                    let error = error.into_error();
+                    let failure = super::route_trace::classify_trace_error(&error);
+                    trace.record_attempt(super::route_trace::TraceAttemptRecord {
+                        attempt_index: attempts as i64,
+                        round: wait_round as i64,
+                        candidate_order,
+                        provider_id: Some(target_provider_id),
+                        provider_api_key_id: target_provider_key_id,
+                        upstream_model: Some(target_upstream_model.clone()),
+                        started_at: Utc::now().to_rfc3339(),
+                        latency_ms: super::route_trace::attempt_elapsed(attempt_started),
+                        status_code: failure.status_code,
+                        success: false,
+                        retryable: failure.retryable,
+                        reason_code: failure.reason_code.to_string(),
+                        failure_scope: failure.failure_scope.map(str::to_string),
+                        failure_retry: failure.failure_retry.map(str::to_string),
+                        failure_confidence: failure.failure_confidence.map(str::to_string),
+                    });
+                    if provider_exhausted {
+                        capacity_exhausted_providers.insert(target_provider_id);
                     }
-                    _ => None,
-                };
-                last_error = Some(error);
+                    if let AppError::UpstreamStatus {
+                        status: StatusCode::TOO_MANY_REQUESTS,
+                        retry_after,
+                        ..
+                    } = &error
+                    {
+                        mark_target_sink(state, &target, "local_capacity", *retry_after).await;
+                    }
+                    if !busy_waitable_error(state, &target, &error).await {
+                        all_targets_busy = false;
+                    }
+                    if let Some(retry_after) = busy_wait_retry_after(&error) {
+                        next_retry_after = Some(
+                            next_retry_after
+                                .map_or(retry_after, |current| current.min(retry_after)),
+                        );
+                    }
+                    last_rate_limit = match &error {
+                        AppError::UpstreamStatus {
+                            status,
+                            message,
+                            retry_after,
+                        } if *status == StatusCode::TOO_MANY_REQUESTS => {
+                            Some((message.clone(), *retry_after))
+                        }
+                        _ => None,
+                    };
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let result = if target.provider_type == "anthropic" {
+                let mut native = context.inbound.clone();
+                native["model"] = json!(target.upstream_model);
+                forward_anthropic_native(
+                    state,
+                    &context.request_id,
+                    &context.requested_model,
+                    native,
+                    target.clone(),
+                    context.streamed,
+                    context.request_tokens,
+                    context.api_key.as_ref(),
+                    context.started,
+                    context.receipt.clone(),
+                    context.anthropic_beta.clone(),
+                    context.session_id.as_deref(),
+                )
+                .await
+            } else {
+                forward_openai_as_anthropic(
+                    state,
+                    &context.request_id,
+                    &context.requested_model,
+                    &context.request_json,
+                    target.clone(),
+                    context.streamed,
+                    context.request_tokens,
+                    context.api_key.as_ref(),
+                    context.started,
+                    context.receipt.clone(),
+                    context.session_id.as_deref(),
+                )
+                .await
+            };
+            match result {
+                Ok(mut response) => {
+                    let response_status = response.status();
+                    trace.record_attempt(super::route_trace::TraceAttemptRecord {
+                        attempt_index: attempts as i64,
+                        round: wait_round as i64,
+                        candidate_order,
+                        provider_id: Some(target_provider_id),
+                        provider_api_key_id: target_provider_key_id,
+                        upstream_model: Some(target_upstream_model.clone()),
+                        started_at: Utc::now().to_rfc3339(),
+                        latency_ms: super::route_trace::attempt_elapsed(attempt_started),
+                        status_code: Some(response_status.as_u16() as i64),
+                        success: response_status.is_success(),
+                        retryable: false,
+                        reason_code: if response_status.is_success() {
+                            "upstream_success"
+                        } else {
+                            "upstream_response"
+                        }
+                        .to_string(),
+                        failure_scope: None,
+                        failure_retry: None,
+                        failure_confidence: None,
+                    });
+                    if response_status.is_success() {
+                        mark_provider_success(state, target_provider_id).await;
+                        mark_target_success(state, target_provider_id, &target_upstream_model)
+                            .await;
+                        mark_provider_api_key_success(state, target_provider_key_id).await;
+                    } else {
+                        mark_provider_reachable(state, target_provider_id).await;
+                    }
+                    apply_routing_headers(
+                        &mut response,
+                        attempts,
+                        fallback_count,
+                        &target_provider_name,
+                        &target_upstream_model,
+                    );
+                    apply_budget_headers(
+                        &mut response,
+                        context.budget_usd,
+                        context.budget_excluded_targets,
+                    );
+                    apply_override_headers(&mut response, &context.routing_overrides);
+                    trace.finish(
+                        state,
+                        super::route_trace::TraceFinal {
+                            final_provider_id: Some(target_provider_id),
+                            final_provider_api_key_id: target_provider_key_id,
+                            final_upstream_model: Some(target_upstream_model),
+                            final_status_code: Some(response_status.as_u16() as i64),
+                            success: response_status.is_success(),
+                            fallback_count: fallback_count as i64,
+                        },
+                    );
+                    return Ok(AnthropicAttemptOutcome::Response(attach_provider_slot(
+                        response,
+                        upstream_slots,
+                        state.sse_keepalive,
+                    )));
+                }
+                Err(error) => {
+                    let failure =
+                        super::route_trace::classify_trace_error_for_target(state, &target, &error)
+                            .await;
+                    trace.record_attempt(super::route_trace::TraceAttemptRecord {
+                        attempt_index: attempts as i64,
+                        round: wait_round as i64,
+                        candidate_order,
+                        provider_id: Some(target_provider_id),
+                        provider_api_key_id: target_provider_key_id,
+                        upstream_model: Some(target_upstream_model),
+                        started_at: Utc::now().to_rfc3339(),
+                        latency_ms: super::route_trace::attempt_elapsed(attempt_started),
+                        status_code: failure.status_code,
+                        success: false,
+                        retryable: failure.retryable,
+                        reason_code: failure.reason_code.to_string(),
+                        failure_scope: failure.failure_scope.map(str::to_string),
+                        failure_retry: failure.failure_retry.map(str::to_string),
+                        failure_confidence: failure.failure_confidence.map(str::to_string),
+                    });
+                    if !busy_waitable_error(state, &target, &error).await {
+                        all_targets_busy = false;
+                    }
+                    if let Some(retry_after) = busy_wait_retry_after(&error) {
+                        next_retry_after = Some(
+                            next_retry_after
+                                .map_or(retry_after, |current| current.min(retry_after)),
+                        );
+                    }
+                    last_rate_limit = match &error {
+                        AppError::UpstreamStatus {
+                            status,
+                            message,
+                            retry_after,
+                        } if *status == StatusCode::TOO_MANY_REQUESTS => {
+                            Some((message.clone(), *retry_after))
+                        }
+                        _ => None,
+                    };
+                    last_error = Some(error);
+                }
             }
         }
+
+        let Some(busy_wait_deadline) = busy_wait_deadline else {
+            break;
+        };
+        if !attempted_any || !all_targets_busy {
+            break;
+        }
+        if context.streamed && !context.resolved.keepalive_during_wait {
+            break;
+        }
+        if context.streamed && context.resolved.keepalive_during_wait && emit_busy_wait_signal {
+            return Ok(AnthropicAttemptOutcome::BusyWait);
+        }
+        let remaining = busy_wait_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let Some(_wait_lease) = state.try_acquire_busy_wait(
+            context.ordering_key,
+            usize::try_from(context.resolved.max_waiting_requests.max(0)).unwrap_or(0),
+        ) else {
+            break;
+        };
+        let delay = busy_wait_delay(
+            context.resolved.retry_jitter_ms,
+            next_retry_after,
+            wait_round,
+        )
+        .min(remaining);
+        wait_round = wait_round.saturating_add(1);
+        tracing::info!(
+            request_id = %context.request_id,
+            route_id = context.ordering_key,
+            wait_ms = delay.as_millis() as u64,
+            attempts,
+            "all route targets are temporarily busy; waiting before reordering candidates"
+        );
+        tokio::time::sleep(delay).await;
+        ordered_targets = order_targets(
+            state,
+            context.ordering_key,
+            &context.resolved.strategy,
+            context.retry_targets.clone(),
+            context.session_id.as_deref(),
+            context.api_key.as_ref().map(|key| key.id),
+        )
+        .await?;
+        trace
+            .update_candidates(
+                state,
+                &context.resolved.strategy,
+                &ordered_targets,
+                context.api_key.as_ref().map(|key| key.id),
+            )
+            .await;
     }
 
     let error = match last_rate_limit {
@@ -514,26 +787,39 @@ pub(crate) async fn proxy_anthropic_inner(
     log_usage(
         state,
         UsageLogEntry {
-            request_id,
-            api_key_id: api_key.as_ref().map(|key| key.id),
-            route_id,
-            provider_id: last_target.as_ref().map(|(provider_id, _)| *provider_id),
-            requested_model: &requested_model,
+            request_id: &context.request_id,
+            api_key_id: context.api_key.as_ref().map(|key| key.id),
+            route_id: context.route_id,
+            provider_id: last_target.as_ref().map(|(provider_id, _, _)| *provider_id),
+            requested_model: &context.requested_model,
             upstream_model: last_target
                 .as_ref()
-                .map(|(_, upstream_model)| upstream_model.as_str()),
-            endpoint: &endpoint,
-            usage: Usage::new(request_tokens, 0),
-            latency_ms: started.elapsed().as_millis() as i64,
+                .map(|(_, _, upstream_model)| upstream_model.as_str()),
+            endpoint: &context.endpoint,
+            usage: Usage::new(context.request_tokens, 0),
+            latency_ms: context.started.elapsed().as_millis() as i64,
             first_token_ms: None,
             status_code,
             success: false,
-            streamed,
+            streamed: context.streamed,
             error_message: Some(&message),
             response_preview: None,
         },
     )
     .await;
+    trace.finish(
+        state,
+        super::route_trace::TraceFinal {
+            final_provider_id: last_target.as_ref().map(|(provider_id, _, _)| *provider_id),
+            final_provider_api_key_id: last_target.as_ref().and_then(|(_, key_id, _)| *key_id),
+            final_upstream_model: last_target
+                .as_ref()
+                .map(|(_, _, upstream_model)| upstream_model.clone()),
+            final_status_code: Some(status_code),
+            success: false,
+            fallback_count: attempts.saturating_sub(1) as i64,
+        },
+    );
     Err(error)
 }
 
@@ -560,6 +846,7 @@ pub(crate) async fn forward_anthropic_native(
         state,
         request_id,
         &target,
+        ANTHROPIC_MESSAGES,
         UpstreamShape::Anthropic,
         &mut body,
     )
@@ -592,6 +879,7 @@ pub(crate) async fn forward_anthropic_native(
         api_key.map(|key| key.id),
         request_id,
         ANTHROPIC_MESSAGES,
+        UpstreamShape::Anthropic,
         streamed,
         &mut body,
         build,
@@ -619,8 +907,9 @@ pub(crate) async fn forward_anthropic_native(
                     "upstream reported quota exhaustion with a non-retryable status; treating it as a rate limit"
                 );
             }
-            record_upstream_failure(state, &target, status, &response_headers, &message).await;
-            if should_try_next_target(&target, status) {
+            let failure =
+                record_upstream_failure(state, &target, status, &response_headers, &message).await;
+            if failure.should_retry_next_target() {
                 return Err(upstream_failure_error(
                     status,
                     format!("{} returned {}: {}", target.provider_name, status, message),
@@ -749,7 +1038,15 @@ pub(crate) async fn forward_openai_as_anthropic(
     } else {
         UpstreamShape::Chat
     };
-    apply_upstream_compat(state, request_id, &target, shape, &mut body).await;
+    apply_upstream_compat(
+        state,
+        request_id,
+        &target,
+        upstream_endpoint,
+        shape,
+        &mut body,
+    )
+    .await;
     let url = join_upstream_url(&target.base_url, upstream_endpoint);
     let build = |body: &Value| {
         let mut request = state
@@ -770,6 +1067,7 @@ pub(crate) async fn forward_openai_as_anthropic(
         api_key.map(|key| key.id),
         request_id,
         ANTHROPIC_MESSAGES,
+        shape,
         streamed,
         &mut body,
         build,
@@ -797,8 +1095,9 @@ pub(crate) async fn forward_openai_as_anthropic(
                     "upstream reported quota exhaustion with a non-retryable status; treating it as a rate limit"
                 );
             }
-            record_upstream_failure(state, &target, status, &response_headers, &message).await;
-            if should_try_next_target(&target, status) {
+            let failure =
+                record_upstream_failure(state, &target, status, &response_headers, &message).await;
+            if failure.should_retry_next_target() {
                 return Err(upstream_failure_error(
                     status,
                     format!("{} returned {}: {}", target.provider_name, status, message),

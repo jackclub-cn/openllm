@@ -109,57 +109,102 @@ export default function ProviderEditorModal({
         </Form.Item>
         <Form.Item
           label="API Keys"
-          extra="支持配置多个上游密钥；请求会轮转使用，遇到 401/403 时自动尝试下一把。已有密钥留空即保留原值。"
+          extra="编辑已有密钥并填入新值会原地替换并保留 Key ID、名称和关联记录；新 Secret 生效后该 Key 的健康与冷却状态会重置。删除行才是移除密钥。"
         >
           <Form.List name="api_keys">
             {(fields, { add, remove }) => (
               <Space direction="vertical" size={8} style={{ width: '100%' }}>
                 {fields.map((field, index) => (
-                  <Space key={field.key} align="start" style={{ width: '100%' }}>
-                    <Form.Item {...field} name={[field.name, 'id']} hidden>
-                      <Input />
-                    </Form.Item>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'name']}
-                      style={{ marginBottom: 0, width: 150 }}
-                    >
-                      <Input placeholder={`Key ${index + 1}`} />
-                    </Form.Item>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'api_key']}
-                      style={{ marginBottom: 0, width: 260 }}
-                    >
-                      <Input.Password
-                        placeholder={
-                          apiKeyRows[index]?.id
-                            ? `留空保留${apiKeyRows[index]?.api_key_suffix ? ` (****${apiKeyRows[index].api_key_suffix})` : ''}`
-                            : 'sk-...'
-                        }
-                        autoComplete="new-password"
+                  <Space key={field.key} direction="vertical" size={4} style={{ width: '100%' }}>
+                    <Space align="start" style={{ width: '100%' }}>
+                      <Form.Item {...field} name={[field.name, 'id']} hidden>
+                        <Input />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'name']}
+                        style={{ marginBottom: 0, width: 150 }}
+                      >
+                        <Input placeholder={`Key ${index + 1}`} />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'api_key']}
+                        style={{ marginBottom: 0, width: 260 }}
+                      >
+                        <Input.Password
+                          placeholder={
+                            apiKeyRows[index]?.id
+                              ? `留空保留${apiKeyRows[index]?.api_key_suffix ? ` (****${apiKeyRows[index].api_key_suffix})` : ''}`
+                              : 'sk-...'
+                          }
+                          autoComplete="new-password"
+                        />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'enabled']}
+                        valuePropName="checked"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <Switch checkedChildren="启用" unCheckedChildren="停用" />
+                      </Form.Item>
+                      <Button
+                        type="text"
+                        danger
+                        icon={<DeleteOutlined />}
+                        onClick={() => remove(field.name)}
                       />
-                    </Form.Item>
-                    <Form.Item
-                      {...field}
-                      name={[field.name, 'enabled']}
-                      valuePropName="checked"
-                      style={{ marginBottom: 0 }}
-                    >
-                      <Switch checkedChildren="启用" unCheckedChildren="停用" />
-                    </Form.Item>
-                    <Button
-                      type="text"
-                      danger
-                      icon={<DeleteOutlined />}
-                      onClick={() => remove(field.name)}
-                    />
+                    </Space>
+                    <Space wrap size={8}>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'max_concurrency']}
+                        label="Key 并发"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <InputNumber min={0} precision={0} style={{ width: 120 }} />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'requests_per_minute']}
+                        label="每分钟请求"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <InputNumber min={0} precision={0} style={{ width: 130 }} />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'queue_limit']}
+                        label="队列上限"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <InputNumber min={0} precision={0} style={{ width: 120 }} />
+                      </Form.Item>
+                      <Form.Item
+                        {...field}
+                        name={[field.name, 'queue_wait_ms']}
+                        label="队列等待 ms"
+                        style={{ marginBottom: 0 }}
+                      >
+                        <InputNumber min={0} max={300000} precision={0} style={{ width: 140 }} />
+                      </Form.Item>
+                    </Space>
                   </Space>
                 ))}
                 <Button
                   type="dashed"
                   icon={<PlusOutlined />}
-                  onClick={() => add({ name: `Key ${fields.length + 1}`, enabled: true })}
+                  onClick={() =>
+                    add({
+                      name: `Key ${fields.length + 1}`,
+                      enabled: true,
+                      max_concurrency: 0,
+                      requests_per_minute: 0,
+                      queue_limit: undefined,
+                      queue_wait_ms: 30000,
+                    })
+                  }
                   block
                 >
                   添加密钥
@@ -199,6 +244,17 @@ export default function ProviderEditorModal({
           extra="0 或留空表示关闭；失败也会记录尝试时间，避免每分钟重复请求。"
         >
           <InputNumber min={0} precision={0} style={{ width: '100%' }} />
+        </Form.Item>
+        <Form.Item
+          name="modelAutoIncludeRulesText"
+          label="模型自动纳入规则"
+          extra="每行一个；支持精确名称和 glob，正则用 re: 开头。留空时沿用原有完整同步；填写后仅自动或定时同步按规则增量纳入，不删除已有或停用模型。"
+        >
+          <Input.TextArea
+            rows={3}
+            className="code-input"
+            placeholder={'gpt-5*\ndeepseek-*\nre:^claude-(opus|sonnet)-'}
+          />
         </Form.Item>
         <div className="form-grid">
           <Form.Item

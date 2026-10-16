@@ -10,6 +10,7 @@ pub enum RouteStrategy {
     LatencyOptimized,
     P95LatencyOptimized,
     LeastUsed,
+    QuotaPaced,
 }
 
 impl RouteStrategy {
@@ -22,6 +23,7 @@ impl RouteStrategy {
             Self::LatencyOptimized => "latency_optimized",
             Self::P95LatencyOptimized => "p95_latency_optimized",
             Self::LeastUsed => "least_used",
+            Self::QuotaPaced => "quota_paced",
         }
     }
 
@@ -33,19 +35,15 @@ impl RouteStrategy {
             Self::CostOptimized
             | Self::LatencyOptimized
             | Self::P95LatencyOptimized
-            | Self::LeastUsed => {
-                ("priority", self.as_str())
-            }
+            | Self::LeastUsed
+            | Self::QuotaPaced => ("priority", self.as_str()),
             _ => (self.as_str(), ""),
         }
     }
 
     /// Strategies that treat recent latency as their primary routing signal.
     pub fn is_latency_first(self) -> bool {
-        matches!(
-            self,
-            Self::LatencyOptimized | Self::P95LatencyOptimized
-        )
+        matches!(self, Self::LatencyOptimized | Self::P95LatencyOptimized)
     }
 }
 
@@ -61,6 +59,7 @@ impl std::str::FromStr for RouteStrategy {
             "latency_optimized" => Ok(Self::LatencyOptimized),
             "p95_latency_optimized" => Ok(Self::P95LatencyOptimized),
             "least_used" => Ok(Self::LeastUsed),
+            "quota_paced" => Ok(Self::QuotaPaced),
             _ => Err(format!("unsupported route strategy: {value}")),
         }
     }
@@ -77,6 +76,19 @@ pub struct Route {
     pub context_override: Option<i64>,
     #[sqlx(default)]
     pub output_override: Option<i64>,
+    /// Opt-in bounded patience when every eligible target is temporarily busy.
+    /// Zero keeps the pre-M5 behavior: each target is attempted once.
+    #[sqlx(default)]
+    pub all_targets_busy_wait_seconds: i64,
+    /// Jitter added between busy-wait rounds, in milliseconds.
+    #[sqlx(default)]
+    pub retry_jitter_ms: i64,
+    /// Maximum simultaneous waiting requests for this route.
+    #[sqlx(default)]
+    pub max_waiting_requests: i64,
+    /// Whether streaming requests may keep their connection warm while waiting.
+    #[sqlx(default)]
+    pub keepalive_during_wait: i64,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -148,6 +160,16 @@ pub struct RouteTarget {
     /// Provider credential name selected for this runtime candidate.
     #[sqlx(default)]
     pub provider_api_key_name: Option<String>,
+    /// Optional limits for the selected upstream credential. They are filled
+    /// while expanding a route target and stay `None` for direct targets.
+    #[sqlx(default)]
+    pub provider_key_max_concurrency: Option<i64>,
+    #[sqlx(default)]
+    pub provider_key_requests_per_minute: Option<i64>,
+    #[sqlx(default)]
+    pub provider_key_queue_limit: Option<i64>,
+    #[sqlx(default)]
+    pub provider_key_queue_wait_ms: Option<i64>,
     /// Whether an authentication failure should fall through to a later
     /// candidate instead of being returned to the caller.
     #[sqlx(default)]
@@ -168,6 +190,10 @@ pub struct RouteView {
     pub output_limit_base: Option<i64>,
     pub context_override: Option<i64>,
     pub output_override: Option<i64>,
+    pub all_targets_busy_wait_seconds: i64,
+    pub retry_jitter_ms: i64,
+    pub max_waiting_requests: i64,
+    pub keepalive_during_wait: bool,
     pub limits_verified: bool,
     pub targets: Vec<RouteTargetView>,
     pub created_at: String,
@@ -206,6 +232,14 @@ pub struct RouteInput {
     pub context_override: Option<i64>,
     #[serde(default)]
     pub output_override: Option<i64>,
+    #[serde(default)]
+    pub all_targets_busy_wait_seconds: Option<i64>,
+    #[serde(default)]
+    pub retry_jitter_ms: Option<i64>,
+    #[serde(default)]
+    pub max_waiting_requests: Option<i64>,
+    #[serde(default)]
+    pub keepalive_during_wait: Option<bool>,
     pub targets: Vec<RouteTargetInput>,
 }
 
@@ -219,6 +253,14 @@ pub struct RouteUpdate {
     pub context_override: Option<Option<i64>>,
     #[serde(default, deserialize_with = "double_option")]
     pub output_override: Option<Option<i64>>,
+    #[serde(default)]
+    pub all_targets_busy_wait_seconds: Option<i64>,
+    #[serde(default)]
+    pub retry_jitter_ms: Option<i64>,
+    #[serde(default)]
+    pub max_waiting_requests: Option<i64>,
+    #[serde(default)]
+    pub keepalive_during_wait: Option<bool>,
     pub targets: Option<Vec<RouteTargetInput>>,
 }
 
@@ -303,6 +345,16 @@ pub struct RouteDiagnoseCandidate {
     pub exclusion: Option<String>,
     /// Usable, but tried after candidates without the penalty.
     pub deprioritized: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_scope: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_retry: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_confidence: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_reason_code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_observed_seconds_ago: Option<u64>,
     pub factors: Vec<RouteDiagnoseFactor>,
 }
 

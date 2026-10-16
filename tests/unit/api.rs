@@ -28,10 +28,7 @@ fn assert_every_metric_family_declares_a_type(body: &str) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let family = line
-            .split(['{', ' '])
-            .next()
-            .unwrap_or_default();
+        let family = line.split(['{', ' ']).next().unwrap_or_default();
         assert!(
             declared.contains(family),
             "metric family '{family}' is exported without a # TYPE declaration"
@@ -98,10 +95,11 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     .await
     .unwrap();
     let state = AppState::new(pool, Some("metrics-secret".to_string()));
-    state.provider_concurrency.lock().await.insert(
-        1,
-        std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
-    );
+    state
+        .provider_concurrency
+        .lock()
+        .await
+        .insert(1, std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
     state.model_concurrency.lock().await.insert(
         (1, "model-a".to_string()),
         std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
@@ -113,6 +111,14 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     state.provider_key_cooldown.lock().await.insert(
         1,
         std::time::Instant::now() + std::time::Duration::from_secs(60),
+    );
+    state.failure_classifications.lock().await.insert(
+        (
+            "provider".to_string(),
+            "next_target".to_string(),
+            "upstream_unavailable".to_string(),
+        ),
+        2,
     );
     let router = crate::build_router(state);
 
@@ -186,29 +192,19 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     ));
     assert!(body.contains("openllm_provider_failure_streak{provider=\"Healthy provider\"} 0"));
     assert!(body.contains("openllm_provider_circuit_trips_total{provider=\"Healthy provider\"} 0"));
-    assert!(
-        body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3")
-    );
+    assert!(body.contains("openllm_provider_concurrency_limit{provider=\"Healthy provider\"} 3"));
     assert!(body.contains("openllm_provider_inflight{provider=\"Healthy provider\"} 2"));
     assert!(
-        body.contains(
-            "openllm_model_cooling{provider=\"Healthy provider\",model=\"model-a\"} 1"
-        )
+        body.contains("openllm_model_cooling{provider=\"Healthy provider\",model=\"model-a\"} 1")
     );
     assert!(
-        body.contains(
-            "openllm_model_cooling{provider=\"Healthy provider\",model=\"model-b\"} 0"
-        )
+        body.contains("openllm_model_cooling{provider=\"Healthy provider\",model=\"model-b\"} 0")
     );
+    assert!(body.contains(
+        "openllm_model_concurrency_limit{provider=\"Healthy provider\",model=\"model-a\"} 2"
+    ));
     assert!(
-        body.contains(
-            "openllm_model_concurrency_limit{provider=\"Healthy provider\",model=\"model-a\"} 2"
-        )
-    );
-    assert!(
-        body.contains(
-            "openllm_model_inflight{provider=\"Healthy provider\",model=\"model-a\"} 1"
-        )
+        body.contains("openllm_model_inflight{provider=\"Healthy provider\",model=\"model-a\"} 1")
     );
     assert!(body.contains(
         "openllm_provider_key_cooling{provider=\"Healthy provider\",key=\"Primary\",key_id=\"1\"} 1"
@@ -237,6 +233,10 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains("# TYPE openllm_provider_circuit_state gauge"));
     assert!(body.contains("# TYPE openllm_provider_failure_streak gauge"));
     assert!(body.contains("# TYPE openllm_provider_circuit_trips_total counter"));
+    assert!(body.contains("# TYPE openllm_upstream_failures_total counter"));
+    assert!(body.contains(
+        "openllm_upstream_failures_total{scope=\"provider\",retry=\"next_target\",reason=\"upstream_unavailable\"} 2"
+    ));
     assert!(body.contains("# TYPE openllm_provider_requests_total counter"));
     assert!(body.contains("# TYPE openllm_provider_average_latency_ms gauge"));
     assert_every_metric_family_declares_a_type(&body);
@@ -254,6 +254,7 @@ fn provider_input(api_key: Option<&str>, api_keys: Vec<ProviderApiKeyInput>) -> 
         enabled: true,
         auto_sync_models: false,
         models: Vec::new(),
+        model_auto_include_rules: Vec::new(),
         health_check_interval_minutes: None,
         health_check_model: None,
         models_sync_interval_minutes: None,
@@ -275,6 +276,10 @@ fn provider_key_input(
         name: name.to_string(),
         api_key: api_key.map(ToOwned::to_owned),
         enabled,
+        max_concurrency: None,
+        requests_per_minute: None,
+        queue_limit: None,
+        queue_wait_ms: None,
     }
 }
 
@@ -291,6 +296,7 @@ fn provider_update_with_keys(api_keys: Option<Vec<ProviderApiKeyInput>>) -> Prov
         enabled: None,
         auto_sync_models: None,
         models: None,
+        model_auto_include_rules: None,
         health_check_interval_minutes: None,
         health_check_model: None,
         models_sync_interval_minutes: None,
@@ -307,6 +313,20 @@ fn normalizes_model_prefix_with_trailing_slash() {
     assert_eq!(normalize_model_prefix("openai/").unwrap(), "openai/");
     assert_eq!(normalize_model_prefix("  /local/  ").unwrap(), "local/");
     assert_eq!(normalize_model_prefix("").unwrap(), "");
+}
+
+#[test]
+fn normalizes_and_validates_model_auto_include_rules() {
+    let rules = normalize_model_auto_include_rules(&[
+        " gpt-* ".to_string(),
+        "gpt-*".to_string(),
+        "re:^deepseek-".to_string(),
+        String::new(),
+    ])
+    .unwrap();
+    assert_eq!(rules, vec!["gpt-*", "re:^deepseek-"]);
+    assert!(normalize_model_auto_include_rules(&["[".to_string()]).is_err());
+    assert!(normalize_model_auto_include_rules(&["re:(".to_string()]).is_err());
 }
 
 #[test]
@@ -716,18 +736,12 @@ fn validates_provider_request_policy() {
 
     assert_eq!(normalize_provider_concurrency(None).unwrap(), None);
     assert_eq!(normalize_provider_concurrency(Some(0)).unwrap(), None);
-    assert_eq!(
-        normalize_provider_concurrency(Some(4)).unwrap(),
-        Some(4)
-    );
+    assert_eq!(normalize_provider_concurrency(Some(4)).unwrap(), Some(4));
     assert!(normalize_provider_concurrency(Some(-1)).is_err());
     assert!(normalize_provider_concurrency(Some(1001)).is_err());
 
     assert_eq!(normalize_provider_queue_timeout(None).unwrap(), None);
-    assert_eq!(
-        normalize_provider_queue_timeout(Some(0)).unwrap(),
-        Some(0)
-    );
+    assert_eq!(normalize_provider_queue_timeout(Some(0)).unwrap(), Some(0));
     assert_eq!(
         normalize_provider_queue_timeout(Some(30)).unwrap(),
         Some(30)
@@ -817,11 +831,12 @@ async fn provider_api_key_pool_supports_create_update_and_clear() {
     assert!(!updated.api_keys[0].enabled);
     assert_eq!(updated.api_keys[1].name, "Replacement");
     assert!(
-        !state
+        state
             .provider_key_cooldown
             .lock()
             .await
-            .contains_key(&first_id)
+            .contains_key(&first_id),
+        "editing metadata without replacing the secret must preserve the key cooldown"
     );
 
     let retained_secret: String =
@@ -847,12 +862,57 @@ async fn provider_api_key_pool_supports_create_update_and_clear() {
     .unwrap();
     assert!(cleared.api_keys.is_empty());
     assert!(!cleared.api_key_set);
+    assert!(
+        !state
+            .provider_key_cooldown
+            .lock()
+            .await
+            .contains_key(&first_id),
+        "removing a key must clear its runtime cooldown"
+    );
     let mirrored: Option<String> = sqlx::query_scalar("SELECT api_key FROM providers WHERE id = ?")
         .bind(created.id)
         .fetch_one(&state.pool)
         .await
         .unwrap();
     assert_eq!(mirrored, None);
+}
+
+#[tokio::test]
+async fn provider_api_key_channel_limits_round_trip_through_the_api() {
+    let state = provider_key_test_state().await;
+    let mut primary = provider_key_input(None, "Primary", Some("sk-limited"), true);
+    primary.max_concurrency = Some(3);
+    primary.requests_per_minute = Some(120);
+    primary.queue_limit = Some(10);
+    primary.queue_wait_ms = Some(1_500);
+    let (_, Json(created)) = create_provider(
+        State(state.clone()),
+        Json(provider_input(None, vec![primary])),
+    )
+    .await
+    .unwrap();
+    assert_eq!(created.api_keys[0].max_concurrency, Some(3));
+    assert_eq!(created.api_keys[0].requests_per_minute, Some(120));
+    assert_eq!(created.api_keys[0].queue_limit, Some(10));
+    assert_eq!(created.api_keys[0].queue_wait_ms, Some(1_500));
+
+    let mut updated_key = provider_key_input(Some(created.api_keys[0].id), "Primary", None, true);
+    updated_key.max_concurrency = Some(5);
+    updated_key.requests_per_minute = Some(240);
+    updated_key.queue_limit = Some(0);
+    updated_key.queue_wait_ms = Some(0);
+    let Json(updated) = update_provider(
+        State(state.clone()),
+        Path(created.id),
+        Json(provider_update_with_keys(Some(vec![updated_key]))),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.api_keys[0].max_concurrency, Some(5));
+    assert_eq!(updated.api_keys[0].requests_per_minute, Some(240));
+    assert_eq!(updated.api_keys[0].queue_limit, Some(0));
+    assert_eq!(updated.api_keys[0].queue_wait_ms, Some(0));
 }
 
 #[tokio::test]
@@ -905,6 +965,129 @@ async fn provider_quota_credential_uses_selected_or_first_enabled_key() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn quota_snapshots_persist_manual_overrides_and_restore_to_cache() {
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) \
+         VALUES (1, 'quota-provider', 'openai', 'https://opencode.ai/zen/go/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret) \
+         VALUES (11, 1, 'Primary', 'sk-quota')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let view = ProviderQuotaView {
+        kind: "opencode_go".to_string(),
+        title: "OpenCode Go 额度".to_string(),
+        plan_name: Some("Go".to_string()),
+        key_id: Some(11),
+        key_name: Some("Primary".to_string()),
+        key_suffix: Some("quota".to_string()),
+        source_url: None,
+        items: vec![ProviderQuotaItem {
+            key: "rolling".to_string(),
+            label: "5 小时".to_string(),
+            used: None,
+            limit: None,
+            remaining: None,
+            unit: "%".to_string(),
+            percent: Some(95.0),
+            reset_at: None,
+        }],
+        model_quotas: vec![ProviderQuotaModel {
+            model_name: "Model A".to_string(),
+            model_id: Some("model-a".to_string()),
+            monthly_credits: Some(80.0),
+            promo_credits: Some(100.0),
+            note: None,
+        }],
+        details: Vec::new(),
+        prices: Vec::new(),
+        snapshots: Vec::new(),
+        fetched_at: Utc::now().to_rfc3339(),
+    };
+
+    let snapshots = crate::quota::store_provider_quota_view(&state, 1, Some(11), &view)
+        .await
+        .unwrap();
+    assert_eq!(snapshots.len(), 2);
+    let window = snapshots
+        .iter()
+        .find(|snapshot| snapshot.model.is_empty())
+        .unwrap();
+    assert_eq!(window.window_key, "5h");
+    assert_eq!(window.state, "low");
+    assert_eq!(window.percent, Some(95.0));
+    let model = snapshots
+        .iter()
+        .find(|snapshot| snapshot.model == "model-a")
+        .unwrap();
+    assert_eq!(model.state, "unknown");
+    assert_eq!(model.limit, Some(100.0));
+
+    let stored: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM provider_quota_snapshots WHERE provider_id = 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, 2);
+
+    let Json(listed) = list_provider_quota_snapshots(
+        State(state.clone()),
+        Path(1),
+        Query(ProviderQuotaQuery { key_id: Some(11) }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(listed.len(), 2);
+
+    let Json(updated) = update_provider_quota_snapshots(
+        State(state.clone()),
+        Path(1),
+        Json(ProviderQuotaSnapshotRequest {
+            snapshots: vec![ProviderQuotaSnapshotInput {
+                key_id: Some(11),
+                model: None,
+                window_key: "5h".to_string(),
+                used: Some(20.0),
+                limit: Some(100.0),
+                remaining: Some(80.0),
+                unit: "percent".to_string(),
+                reset_at: None,
+                valid_seconds: Some(3_600),
+            }],
+        }),
+    )
+    .await
+    .unwrap();
+    let window = updated
+        .iter()
+        .find(|snapshot| snapshot.model.is_empty())
+        .unwrap();
+    assert_eq!(window.source, "manual");
+    assert_eq!(window.state, "healthy");
+    assert_eq!(window.used, Some(20.0));
+
+    let restarted = AppState::new(state.pool.clone(), None);
+    crate::quota::restore(&restarted).await.unwrap();
+    let cache = restarted.quota_snapshots.lock().await;
+    assert!(cache.contains_key(&ProviderQuotaSnapshotKey {
+        provider_id: 1,
+        provider_key_id: Some(11),
+        model: String::new(),
+        window_key: "5h".to_string(),
+        unit: "percent".to_string(),
+        source: "manual".to_string(),
+    }));
 }
 
 #[tokio::test]
@@ -1353,7 +1536,11 @@ async fn provider_key_health_check_tests_every_enabled_key() {
         cooldowns.insert(11, cooldown_until);
         cooldowns.insert(12, cooldown_until);
     }
-    state.provider_cooldown.lock().await.insert(1, cooldown_until);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, cooldown_until);
     state.provider_failure_streak.lock().await.insert(1, 3);
     let mut circuit_events = state.circuit_events.subscribe();
 
@@ -1533,12 +1720,10 @@ async fn inspector_settings_round_trip_validate_and_invalidate_cache() {
     .unwrap_err();
     assert!(matches!(error, AppError::BadRequest(_)));
 
-    let Json(defaults) = update_inspector_settings(
-        State(state.clone()),
-        Json(InspectorSettings::default()),
-    )
-    .await
-    .unwrap();
+    let Json(defaults) =
+        update_inspector_settings(State(state.clone()), Json(InspectorSettings::default()))
+            .await
+            .unwrap();
     assert_eq!(defaults, InspectorSettings::default());
 }
 
@@ -1687,6 +1872,36 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
         .lock()
         .await
         .insert(11, now + std::time::Duration::from_secs(45));
+    state.provider_failure_meta.lock().await.insert(
+        1,
+        crate::state::FailureMetadata {
+            scope: "provider",
+            retry: "next_target",
+            confidence: "inferred",
+            reason_code: "upstream_unavailable",
+            observed_at: now,
+        },
+    );
+    state.target_failure_meta.lock().await.insert(
+        (1, "model-a".to_string()),
+        crate::state::FailureMetadata {
+            scope: "model",
+            retry: "next_target",
+            confidence: "exact",
+            reason_code: "context_limit_exceeded",
+            observed_at: now,
+        },
+    );
+    state.provider_key_failure_meta.lock().await.insert(
+        11,
+        crate::state::FailureMetadata {
+            scope: "credential",
+            retry: "next_target",
+            confidence: "exact",
+            reason_code: "quota_exhausted",
+            observed_at: now,
+        },
+    );
     // An already-expired entry must not leak into the snapshot.
     state.target_cooldown.lock().await.insert(
         (2, "stale".to_string()),
@@ -1702,7 +1917,18 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
     assert_eq!(snapshot.provider_cooldowns[0].failure_streak, 3);
     assert_eq!(snapshot.provider_cooldowns[0].remaining_seconds, 60);
     assert_eq!(snapshot.provider_cooldowns[0].state, "open");
+    assert_eq!(snapshot.provider_cooldowns[0].scope, Some("provider"));
+    assert_eq!(snapshot.provider_cooldowns[0].retry, Some("next_target"));
+    assert_eq!(
+        snapshot.provider_cooldowns[0].reason_code,
+        Some("upstream_unavailable")
+    );
     assert_eq!(snapshot.model_cooldowns.len(), 2);
+    assert_eq!(snapshot.model_cooldowns[0].scope, Some("model"));
+    assert_eq!(
+        snapshot.model_cooldowns[0].reason_code,
+        Some("context_limit_exceeded")
+    );
     assert_eq!(snapshot.provider_key_cooldowns.len(), 1);
     assert_eq!(
         snapshot.provider_key_cooldowns[0].key_name.as_deref(),
@@ -1712,14 +1938,16 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
         snapshot.provider_key_cooldowns[0].provider_name.as_deref(),
         Some("alpha")
     );
+    assert_eq!(snapshot.provider_key_cooldowns[0].scope, Some("credential"));
+    assert_eq!(
+        snapshot.provider_key_cooldowns[0].reason_code,
+        Some("quota_exhausted")
+    );
 
     // An empty body is rejected rather than silently clearing everything.
-    let error = clear_cooldowns(
-        State(state.clone()),
-        Json(ClearCooldownsInput::default()),
-    )
-    .await
-    .unwrap_err();
+    let error = clear_cooldowns(State(state.clone()), Json(ClearCooldownsInput::default()))
+        .await
+        .unwrap_err();
     assert!(matches!(error, AppError::BadRequest(_)));
 
     // Clearing one model leaves the sibling model and the provider circuit alone.
@@ -1742,6 +1970,13 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
             .await
             .contains_key(&(1, "model-a".to_string()))
     );
+    assert!(
+        !state
+            .target_failure_meta
+            .lock()
+            .await
+            .contains_key(&(1, "model-a".to_string()))
+    );
     assert!(state.provider_cooldown.lock().await.contains_key(&1));
 
     // A provider-scoped clear also resets the escalation streak.
@@ -1756,6 +1991,7 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
     .unwrap();
     assert_eq!(cleared.cleared_provider_cooldowns, 1);
     assert!(!state.provider_cooldown.lock().await.contains_key(&1));
+    assert!(!state.provider_failure_meta.lock().await.contains_key(&1));
     assert!(!state.provider_failure_streak.lock().await.contains_key(&1));
 
     let Json(cleared) = clear_cooldowns(
@@ -1769,6 +2005,13 @@ async fn cooldown_manager_lists_and_clears_scoped_cooldowns() {
     .unwrap();
     assert_eq!(cleared.cleared_provider_key_cooldowns, 1);
     assert!(!state.provider_key_cooldown.lock().await.contains_key(&11));
+    assert!(
+        !state
+            .provider_key_failure_meta
+            .lock()
+            .await
+            .contains_key(&11)
+    );
 
     let Json(cleared) = clear_cooldowns(
         State(state.clone()),
@@ -1917,7 +2160,10 @@ async fn api_key_routing_policy_round_trips_and_validates() {
 
     // The list view decodes the stored policy back into a typed object.
     let Json(items) = list_api_keys(State(state.clone())).await.unwrap();
-    let listed = items.iter().find(|item| item.id == created.item.id).unwrap();
+    let listed = items
+        .iter()
+        .find(|item| item.id == created.item.id)
+        .unwrap();
     assert_eq!(listed.routing_policy, created.item.routing_policy);
 
     // An unknown strategy is rejected instead of being stored and ignored.
@@ -1960,6 +2206,72 @@ async fn api_key_routing_policy_round_trips_and_validates() {
     .await
     .unwrap();
     assert!(cleared.routing_policy.is_empty());
+}
+
+#[tokio::test]
+async fn route_trace_api_exposes_candidates_and_attempts() {
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO usage_logs (
+             request_id, requested_model, endpoint, status_code, success, in_flight
+         ) VALUES ('trace-api', 'model-a', '/v1/chat/completions', 200, 1, 0)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    let candidates = serde_json::to_string(&vec![RouteTraceCandidate {
+        order: 1,
+        provider_id: 1,
+        provider_api_key_id: Some(11),
+        upstream_model: "model-a".to_string(),
+        eligible: true,
+        deprioritized: false,
+        reason_code: "ordered".to_string(),
+    }])
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_traces (
+             request_id, route_id, strategy, session_id, session_decision,
+             candidates_json, attempt_count, fallback_count,
+             final_provider_id, final_provider_api_key_id,
+             final_upstream_model, final_status_code, success
+         ) VALUES ('trace-api', 7, 'priority', 'session-a', 'session_key_present',
+                   ?, 1, 0, 1, 11, 'model-a', 200, 1)",
+    )
+    .bind(candidates)
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_attempts (
+             request_id, attempt_index, round, candidate_order,
+             provider_id, provider_api_key_id, upstream_model,
+             started_at, latency_ms, status_code, success, retryable,
+             reason_code, failure_scope, failure_retry, failure_confidence
+         ) VALUES ('trace-api', 1, 0, 1, 1, 11, 'model-a',
+                   '2026-10-16T00:00:00Z', 42, 200, 1, 0,
+                   'upstream_success', NULL, NULL, NULL)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let Json(trace) = get_route_trace(State(state.clone()), Path("trace-api".to_string()))
+        .await
+        .unwrap();
+    assert_eq!(trace.route_id, Some(7));
+    assert_eq!(trace.session_decision, "session_key_present");
+    assert_eq!(trace.candidates.len(), 1);
+    assert_eq!(trace.candidates[0].provider_id, 1);
+    assert!(trace.candidates[0].eligible);
+    assert_eq!(trace.attempts.len(), 1);
+    assert!(trace.attempts[0].success);
+    assert_eq!(trace.attempts[0].reason_code, "upstream_success");
+
+    let error = get_route_trace(State(state), Path("missing-trace".to_string()))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::NotFound(_)));
 }
 
 #[tokio::test]
@@ -2249,7 +2561,10 @@ async fn audit_log_records_mutations_and_supports_filters() {
     assert!(csv.starts_with('\u{feff}'));
     assert!(csv.contains("created_at,id,action,entity,entity_id,actor,summary,detail"));
     assert!(csv.contains("created route 'Audited route'"));
-    assert!(!csv.contains("provider"), "the filter must exclude other entities");
+    assert!(
+        !csv.contains("provider"),
+        "the filter must exclude other entities"
+    );
 
     let Json(page) = list_audit_logs(
         State(state),
@@ -2555,6 +2870,10 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             enabled: true,
             context_override: None,
             output_override: None,
+            all_targets_busy_wait_seconds: None,
+            retry_jitter_ms: None,
+            max_waiting_requests: None,
+            keepalive_during_wait: None,
             targets: vec![RouteTargetInput {
                 id: None,
                 provider_id: 1,
@@ -2587,6 +2906,10 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             enabled: None,
             context_override: None,
             output_override: None,
+            all_targets_busy_wait_seconds: None,
+            retry_jitter_ms: None,
+            max_waiting_requests: None,
+            keepalive_during_wait: None,
             targets: None,
         }),
     )
@@ -2601,6 +2924,100 @@ async fn advanced_route_strategy_round_trips_through_storage() {
             .unwrap();
     assert_eq!(stored, "priority");
     assert_eq!(extension, "latency_optimized");
+}
+
+#[tokio::test]
+async fn route_busy_wait_settings_round_trip_and_validate() {
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Primary', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled)
+         VALUES (1, 'model', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let target = || RouteTargetInput {
+        id: None,
+        provider_id: 1,
+        upstream_model: "model".to_string(),
+        weight: 100,
+        priority: 0,
+        enabled: true,
+    };
+    let (_, created) = create_route(
+        State(state.clone()),
+        Json(RouteInput {
+            name: "Patient route".to_string(),
+            model_pattern: "patient-model".to_string(),
+            strategy: RouteStrategy::Priority,
+            enabled: true,
+            context_override: None,
+            output_override: None,
+            all_targets_busy_wait_seconds: Some(45),
+            retry_jitter_ms: Some(800),
+            max_waiting_requests: Some(9),
+            keepalive_during_wait: Some(false),
+            targets: vec![target()],
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(created.0.all_targets_busy_wait_seconds, 45);
+    assert_eq!(created.0.retry_jitter_ms, 800);
+    assert_eq!(created.0.max_waiting_requests, 9);
+    assert!(!created.0.keepalive_during_wait);
+
+    let updated = update_route(
+        State(state.clone()),
+        Path(created.0.id),
+        Json(RouteUpdate {
+            name: None,
+            model_pattern: None,
+            strategy: None,
+            enabled: None,
+            context_override: None,
+            output_override: None,
+            all_targets_busy_wait_seconds: Some(10),
+            retry_jitter_ms: Some(0),
+            max_waiting_requests: Some(1),
+            keepalive_during_wait: Some(true),
+            targets: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(updated.0.all_targets_busy_wait_seconds, 10);
+    assert_eq!(updated.0.retry_jitter_ms, 0);
+    assert_eq!(updated.0.max_waiting_requests, 1);
+    assert!(updated.0.keepalive_during_wait);
+
+    let invalid = create_route(
+        State(state.clone()),
+        Json(RouteInput {
+            name: "Invalid route".to_string(),
+            model_pattern: "invalid-model".to_string(),
+            strategy: RouteStrategy::Priority,
+            enabled: true,
+            context_override: None,
+            output_override: None,
+            all_targets_busy_wait_seconds: Some(-1),
+            retry_jitter_ms: None,
+            max_waiting_requests: None,
+            keepalive_during_wait: None,
+            targets: vec![target()],
+        }),
+    )
+    .await;
+    assert!(matches!(invalid, Err(AppError::BadRequest(_))));
 }
 
 #[tokio::test]
@@ -2642,6 +3059,10 @@ async fn route_capability_overrides_must_stay_within_the_target_barrel() {
         enabled: true,
         context_override,
         output_override,
+        all_targets_busy_wait_seconds: None,
+        retry_jitter_ms: None,
+        max_waiting_requests: None,
+        keepalive_during_wait: None,
         targets: vec![RouteTargetInput {
             id: None,
             provider_id: 1,
@@ -2652,12 +3073,9 @@ async fn route_capability_overrides_must_stay_within_the_target_barrel() {
         }],
     };
 
-    let (_, created) = create_route(
-        State(state.clone()),
-        Json(input(Some(64_000), Some(8_000))),
-    )
-    .await
-    .unwrap();
+    let (_, created) = create_route(State(state.clone()), Json(input(Some(64_000), Some(8_000))))
+        .await
+        .unwrap();
     assert_eq!(created.0.context_limit_base, Some(100_000));
     assert_eq!(created.0.output_limit_base, Some(20_000));
     assert_eq!(created.0.context_limit, Some(64_000));
@@ -2914,6 +3332,129 @@ fn detects_metadata_changes_during_sync_preview() {
     );
     assert!(changed[0].fields.contains(&"cost".to_string()));
     assert!(changed[0].fields.contains(&"display_name".to_string()));
+}
+
+#[tokio::test]
+async fn automatic_model_sync_adds_only_matching_models_and_preserves_manual_state() {
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "data": [
+                        {"id": "gpt-5"},
+                        {"id": "deepseek-v3"},
+                        {"id": "not-selected"}
+                    ]
+                })),
+            )
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, model_auto_include_rules) \
+         VALUES (1, 'auto-include', 'openai', ?, ?)",
+    )
+    .bind(format!("http://{address}/v1"))
+    .bind(r#"["gpt-*","re:^deepseek-"]"#)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled) VALUES \
+         (1, 'manual-model', 1), \
+         (1, 'disabled-model', 0)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone(), None);
+    let result = sync_provider_auto(state, 1).await.unwrap();
+    assert_eq!(result.count, 2);
+
+    let rows = sqlx::query_as::<_, (String, i64)>(
+        "SELECT model_name, enabled FROM provider_models WHERE provider_id = 1 ORDER BY model_name",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("deepseek-v3".to_string(), 1),
+            ("disabled-model".to_string(), 0),
+            ("gpt-5".to_string(), 1),
+            ("manual-model".to_string(), 1),
+        ]
+    );
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn automatic_model_sync_failure_keeps_the_previous_catalog() {
+    let upstream = axum::Router::new().route(
+        "/v1/models",
+        axum::routing::get(|| async { (StatusCode::SERVICE_UNAVAILABLE, "upstream unavailable") }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, upstream).await.unwrap();
+    });
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, model_auto_include_rules) \
+         VALUES (1, 'auto-include-failure', 'openai', ?, '[\"gpt-*\"]')",
+    )
+    .bind(format!("http://{address}/v1"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled) \
+         VALUES (1, 'existing-model', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool.clone(), None);
+    assert!(sync_provider_auto(state, 1).await.is_err());
+    let models = sqlx::query_scalar::<_, String>(
+        "SELECT model_name FROM provider_models WHERE provider_id = 1",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(models, vec!["existing-model"]);
+    let error: Option<String> =
+        sqlx::query_scalar("SELECT models_sync_error FROM providers WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(error.is_some());
+
+    server.abort();
 }
 
 #[tokio::test]
@@ -4135,7 +4676,10 @@ async fn runtime_settings_expose_effective_limits() {
     assert_eq!(view.limits.max_concurrent_requests, expected_concurrency);
     assert_eq!(view.limits.max_inflight_request_mib, expected_inflight_mib);
     assert_eq!(view.limits.admission_wait_ms, expected_admission_wait_ms);
-    assert_eq!(view.limits.body_read_timeout_secs, expected_body_read_timeout);
+    assert_eq!(
+        view.limits.body_read_timeout_secs,
+        expected_body_read_timeout
+    );
     assert_eq!(view.limits.request_timeout_secs, expected_request_timeout);
     assert_eq!(
         view.limits.provider_open_threshold,
@@ -4157,7 +4701,10 @@ async fn runtime_settings_expose_effective_limits() {
         view.limits.session_affinity_persist,
         expected_affinity_persist
     );
-    assert_eq!(view.limits.db_max_connections, crate::db::db_max_connections());
+    assert_eq!(
+        view.limits.db_max_connections,
+        crate::db::db_max_connections()
+    );
     assert_eq!(
         view.limits.db_busy_timeout_secs,
         crate::db::db_busy_timeout_secs()
@@ -4271,11 +4818,10 @@ async fn runtime_status_reports_circuits_and_runtime_signals() {
             .lock()
             .await
             .insert(1, threshold);
-        state
-            .provider_cooldown
-            .lock()
-            .await
-            .insert(1, std::time::Instant::now() + std::time::Duration::from_secs(60));
+        state.provider_cooldown.lock().await.insert(
+            1,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
         let Json(status) = get_status(State(state.clone())).await;
         assert_eq!(status.circuits.open, 1);
 

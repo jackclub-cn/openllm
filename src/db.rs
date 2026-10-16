@@ -30,7 +30,11 @@ pub(crate) fn parse_db_max_connections(value: Option<&str>) -> u32 {
 pub(crate) fn parse_db_timeout_secs(value: Option<&str>, default: u64) -> u64 {
     match value.map(str::trim) {
         None | Some("") => default,
-        Some(raw) => raw.parse::<u64>().ok().filter(|secs| *secs > 0).unwrap_or(default),
+        Some(raw) => raw
+            .parse::<u64>()
+            .ok()
+            .filter(|secs| *secs > 0)
+            .unwrap_or(default),
     }
 }
 
@@ -42,7 +46,9 @@ pub(crate) fn db_max_connections() -> u32 {
 /// Configured `busy_timeout` for contended SQLite writes.
 pub(crate) fn db_busy_timeout_secs() -> u64 {
     parse_db_timeout_secs(
-        std::env::var("OPENLLM_DB_BUSY_TIMEOUT_SECS").ok().as_deref(),
+        std::env::var("OPENLLM_DB_BUSY_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
         DEFAULT_DB_BUSY_TIMEOUT_SECS,
     )
 }
@@ -50,7 +56,9 @@ pub(crate) fn db_busy_timeout_secs() -> u64 {
 /// Configured wait for a pooled connection before a request fails.
 pub(crate) fn db_acquire_timeout_secs() -> u64 {
     parse_db_timeout_secs(
-        std::env::var("OPENLLM_DB_ACQUIRE_TIMEOUT_SECS").ok().as_deref(),
+        std::env::var("OPENLLM_DB_ACQUIRE_TIMEOUT_SECS")
+            .ok()
+            .as_deref(),
         DEFAULT_DB_ACQUIRE_TIMEOUT_SECS,
     )
 }
@@ -122,8 +130,9 @@ impl Database {
             .as_deref()
             .map(crate::startup::sqlite_file_path)
             .unwrap_or_else(|| Some(config.data_dir.join("openllm.db")));
-        let backup = crate::startup::backup_before_migrations(&pool, database_path.as_deref(), &migrator)
-            .await?;
+        let backup =
+            crate::startup::backup_before_migrations(&pool, database_path.as_deref(), &migrator)
+                .await?;
         if let Err(error) = migrator.run(&pool).await {
             // Fail closed: never serve on a half-migrated schema. The lease is
             // released so a retry after the operator fixes the problem is not
@@ -136,9 +145,9 @@ impl Database {
                 ),
                 None => "; the database was not changed".to_string(),
             };
-            return Err(anyhow::Error::new(error).context(format!(
-                "database migration failed{hint}"
-            )));
+            return Err(
+                anyhow::Error::new(error).context(format!("database migration failed{hint}"))
+            );
         }
 
         Ok(Self { pool, instance_id })

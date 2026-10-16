@@ -11,13 +11,25 @@ import {
   Button,
   Descriptions,
   Drawer,
+  Empty,
   Space,
+  Spin,
   Tag,
+  Table,
+  Tabs,
   Tooltip,
   Typography,
 } from 'antd'
+import type { TableColumnsType } from 'antd'
 import dayjs from 'dayjs'
-import type { UsageLog } from '../../api'
+import { useEffect, useState } from 'react'
+import {
+  api,
+  type RouteTrace,
+  type RouteTraceAttempt,
+  type RouteTraceCandidate,
+  type UsageLog,
+} from '../../api'
 import { formatCompact, formatCostMicros, formatExact } from '../../format'
 
 type UsageDetailDrawerProps = {
@@ -27,6 +39,163 @@ type UsageDetailDrawerProps = {
   onDiagnose: (detail: UsageLog) => void
 }
 
+const traceReasonLabels: Record<string, string> = {
+  ordered: '按策略排序',
+  target_sink: '短期限流',
+  slow_first_token: '首字偏慢',
+  provider_circuit_open: '提供商熔断',
+  provider_health_failed: '健康检查失败',
+  concurrency_saturated: '并发已满',
+  pool_share: '配额池降权',
+  endpoint_unsupported: '端点不支持',
+  upstream_success: '上游成功',
+  upstream_response: '上游返回错误',
+  upstream_transport_error: '上游连接失败',
+  upstream_status_error: '上游状态错误',
+  upstream_unavailable: '上游不可用',
+  upstream_rate_limited: '上游限流',
+  rate_limited: '上游限流',
+  quota_exhausted: '额度耗尽',
+  credential_rejected: '凭证被拒绝',
+  model_not_found: '模型不存在',
+  endpoint_or_model_not_found: '端点或模型不存在',
+  request_shape_incompatible: '请求格式不兼容',
+  invalid_request: '上游拒绝请求',
+  context_limit_exceeded: '上下文超限',
+  content_policy_refusal: '内容策略拒绝',
+  request_conflict: '请求冲突',
+  upstream_timeout: '上游超时',
+  unsupported_upstream_error: '未识别上游错误',
+  provider_short_circuit: '提供商短路',
+  local_capacity_exhausted: '本地容量已满',
+  local_request_rejected: '本地请求被拒绝',
+  gateway_rejected: '网关拒绝',
+  internal_error: '网关内部错误',
+}
+
+function traceReasonLabel(code: string) {
+  return traceReasonLabels[code] || code
+}
+
+function RouteTracePanel({
+  trace,
+  loading,
+  error,
+}: {
+  trace?: RouteTrace
+  loading: boolean
+  error?: string
+}) {
+  const candidateColumns: TableColumnsType<RouteTraceCandidate> = [
+    { title: '顺序', dataIndex: 'order', width: 64 },
+    {
+      title: '候选',
+      key: 'candidate',
+      render: (_, item) => `#${item.provider_id} / ${item.upstream_model}`,
+    },
+    {
+      title: '状态',
+      key: 'state',
+      width: 96,
+      render: (_, item) =>
+        item.deprioritized ? <Tag color="orange">降权</Tag> : <Tag color="green">候选</Tag>,
+    },
+    {
+      title: '原因',
+      dataIndex: 'reason_code',
+      render: traceReasonLabel,
+    },
+  ]
+  const attemptColumns: TableColumnsType<RouteTraceAttempt> = [
+    { title: '序号', dataIndex: 'attempt_index', width: 64 },
+    {
+      title: '候选',
+      key: 'candidate',
+      render: (_, item) => `#${item.provider_id ?? '-'} / ${item.upstream_model || '-'}`,
+    },
+    {
+      title: '结果',
+      key: 'result',
+      width: 110,
+      render: (_, item) =>
+        item.success ? (
+          <Tag color="green">{item.status_code ?? '成功'}</Tag>
+        ) : (
+          <Tag color={item.retryable ? 'orange' : 'red'}>
+            {item.status_code ?? traceReasonLabel(item.reason_code)}
+          </Tag>
+        ),
+    },
+    {
+      title: '耗时',
+      dataIndex: 'latency_ms',
+      width: 88,
+      render: (value: number) => `${value} ms`,
+    },
+    {
+      title: '分类',
+      key: 'failure',
+      render: (_, item) =>
+        item.success ? '-' : `${item.failure_scope || '-'} / ${traceReasonLabel(item.reason_code)}`,
+    },
+  ]
+
+  if (loading) {
+    return (
+      <div style={{ padding: 32, textAlign: 'center' }}>
+        <Spin />
+      </div>
+    )
+  }
+  if (error) {
+    return <Alert type="info" showIcon message="暂无路由轨迹" description={error} />
+  }
+  if (!trace) return <Empty description="暂无路由轨迹" />
+
+  return (
+    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+      <Descriptions column={2} size="small" bordered>
+        <Descriptions.Item label="策略">{trace.strategy}</Descriptions.Item>
+        <Descriptions.Item label="尝试次数">{trace.attempt_count}</Descriptions.Item>
+        <Descriptions.Item label="回退次数">{trace.fallback_count}</Descriptions.Item>
+        <Descriptions.Item label="会话粘性">
+          {trace.session_decision === 'no_affinity' ? '未启用' : '已识别会话'}
+        </Descriptions.Item>
+        <Descriptions.Item label="最终提供商">
+          {trace.final_provider_id ? `#${trace.final_provider_id}` : '-'}
+        </Descriptions.Item>
+        <Descriptions.Item label="最终模型">
+          {trace.final_upstream_model || '-'}
+        </Descriptions.Item>
+      </Descriptions>
+      <div>
+        <Typography.Text strong>候选顺序</Typography.Text>
+        <Table
+          rowKey="order"
+          size="small"
+          pagination={false}
+          columns={candidateColumns}
+          dataSource={trace.candidates}
+        />
+      </div>
+      <div>
+        <Typography.Text strong>实际尝试</Typography.Text>
+        {trace.attempts.length === 0 ? (
+          <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="没有上游尝试" />
+        ) : (
+          <Table
+            rowKey="attempt_index"
+            size="small"
+            pagination={false}
+            columns={attemptColumns}
+            dataSource={trace.attempts}
+          />
+        )}
+      </div>
+    </Space>
+  )
+}
+
 export default function UsageDetailDrawer({
   detail,
   loading,
@@ -34,6 +203,35 @@ export default function UsageDetailDrawer({
   onDiagnose,
 }: UsageDetailDrawerProps) {
   const { message } = App.useApp()
+  const [trace, setTrace] = useState<RouteTrace>()
+  const [traceLoading, setTraceLoading] = useState(false)
+  const [traceError, setTraceError] = useState<string>()
+
+  useEffect(() => {
+    if (!detail) {
+      setTrace(undefined)
+      setTraceError(undefined)
+      return
+    }
+    let cancelled = false
+    setTrace(undefined)
+    setTraceError(undefined)
+    setTraceLoading(true)
+    void api
+      .get<RouteTrace>(`/api/usage/${encodeURIComponent(detail.request_id)}/route-trace`)
+      .then((value) => {
+        if (!cancelled) setTrace(value)
+      })
+      .catch((error: Error) => {
+        if (!cancelled) setTraceError(error.message)
+      })
+      .finally(() => {
+        if (!cancelled) setTraceLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [detail])
 
   return (
     <Drawer
@@ -44,7 +242,13 @@ export default function UsageDetailDrawer({
       loading={loading}
     >
       {detail && (
-        <Space direction="vertical" size={16} style={{ width: '100%' }}>
+        <Tabs
+          items={[
+            {
+              key: 'overview',
+              label: '请求详情',
+              children: (
+                <Space direction="vertical" size={16} style={{ width: '100%' }}>
           <div
             className={`detail-status ${
               detail.in_flight
@@ -229,7 +433,18 @@ export default function UsageDetailDrawer({
               <pre className="response-block">{detail.response_preview}</pre>
             </div>
           )}
-        </Space>
+                </Space>
+              ),
+            },
+            {
+              key: 'trace',
+              label: '路由轨迹',
+              children: (
+                <RouteTracePanel trace={trace} loading={traceLoading} error={traceError} />
+              ),
+            },
+          ]}
+        />
       )}
     </Drawer>
   )

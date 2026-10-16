@@ -13,8 +13,7 @@ async fn shutdown_deadline_drops_a_stalled_stream() {
     let app = Router::new().route(
         "/hang",
         get(|| async {
-            let stream =
-                futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
+            let stream = futures_util::stream::pending::<Result<Bytes, std::convert::Infallible>>();
             Response::new(Body::from_stream(stream))
         }),
     );
@@ -94,7 +93,11 @@ fn database_pool_size_parsing_clamps_to_a_sane_range() {
     assert_eq!(parse_db_max_connections(None), 10);
     assert_eq!(parse_db_max_connections(Some("")), 10);
     assert_eq!(parse_db_max_connections(Some("oops")), 10);
-    assert_eq!(parse_db_max_connections(Some("0")), 1, "at least one connection");
+    assert_eq!(
+        parse_db_max_connections(Some("0")),
+        1,
+        "at least one connection"
+    );
     assert_eq!(parse_db_max_connections(Some("24")), 24);
     assert_eq!(
         parse_db_max_connections(Some("100000")),
@@ -108,7 +111,11 @@ fn database_timeout_parsing_keeps_a_positive_default() {
     use crate::db::parse_db_timeout_secs;
     assert_eq!(parse_db_timeout_secs(None, 15), 15);
     assert_eq!(parse_db_timeout_secs(Some(""), 15), 15);
-    assert_eq!(parse_db_timeout_secs(Some("0"), 15), 15, "zero is not a timeout");
+    assert_eq!(
+        parse_db_timeout_secs(Some("0"), 15),
+        15,
+        "zero is not a timeout"
+    );
     assert_eq!(parse_db_timeout_secs(Some("nope"), 15), 15);
     assert_eq!(parse_db_timeout_secs(Some("30"), 15), 30);
 }
@@ -223,7 +230,9 @@ async fn in_flight_request_finishes_during_the_drain() {
     });
 
     let request = tokio::spawn(async move {
-        let response = reqwest::get(format!("http://{address}/slow")).await.unwrap();
+        let response = reqwest::get(format!("http://{address}/slow"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), 200);
         response.text().await.unwrap()
     });

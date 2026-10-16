@@ -162,9 +162,8 @@ pub async fn export_audit_logs(
         .await?;
     let truncated = rows.len() as i64 == AUDIT_EXPORT_LIMIT;
 
-    let mut csv = String::from(
-        "\u{feff}created_at,id,action,entity,entity_id,actor,summary,detail\r\n",
-    );
+    let mut csv =
+        String::from("\u{feff}created_at,id,action,entity,entity_id,actor,summary,detail\r\n");
     for row in rows {
         let fields = [
             row.created_at,

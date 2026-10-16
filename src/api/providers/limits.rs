@@ -72,8 +72,7 @@ pub async fn update_provider_model_limits(
         validate_limit("input", model.input_limit)?;
         validate_limit("output", model.output_limit)?;
         let max_concurrency = normalize_provider_concurrency(model.max_concurrency)?;
-        let queue_timeout_seconds =
-            normalize_provider_queue_timeout(model.queue_timeout_seconds)?;
+        let queue_timeout_seconds = normalize_provider_queue_timeout(model.queue_timeout_seconds)?;
         validate_cost_override("input cost", model.cost_input_override)?;
         validate_cost_override("output cost", model.cost_output_override)?;
         validate_cost_override("cache read cost", model.cost_cache_read_override)?;

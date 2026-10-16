@@ -30,7 +30,10 @@ fn normalize_pool(
             "window_seconds must be between 1 and {MAX_POOL_WINDOW_SECONDS}"
         )));
     }
-    for (label, limit) in [("request_limit", request_limit), ("token_limit", token_limit)] {
+    for (label, limit) in [
+        ("request_limit", request_limit),
+        ("token_limit", token_limit),
+    ] {
         if let Some(limit) = limit
             && limit <= 0
         {
@@ -210,7 +213,9 @@ async fn query_pool_views(
 }
 
 /// Lists provider pools with their allocations and effective shares.
-pub async fn list_provider_pools(State(state): State<AppState>) -> AppResult<Json<Vec<ProviderPoolView>>> {
+pub async fn list_provider_pools(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ProviderPoolView>>> {
     Ok(Json(query_pool_views(&state, None).await?))
 }
 
@@ -401,7 +406,9 @@ pub async fn delete_provider_pool(
 fn conflict_or(error: sqlx::Error, name: &str) -> AppError {
     let message = error.to_string();
     if message.contains("UNIQUE") || message.contains("unique") {
-        AppError::Conflict(format!("a pool named '{name}' already exists for this provider"))
+        AppError::Conflict(format!(
+            "a pool named '{name}' already exists for this provider"
+        ))
     } else {
         AppError::Database(error)
     }
@@ -412,5 +419,7 @@ pub async fn provider_pool_usage(
     State(state): State<AppState>,
     Path(provider_id): Path<i64>,
 ) -> AppResult<Json<Vec<crate::allocation::PoolUsageView>>> {
-    Ok(Json(crate::allocation::pool_usage(&state, provider_id).await?))
+    Ok(Json(
+        crate::allocation::pool_usage(&state, provider_id).await?,
+    ))
 }
