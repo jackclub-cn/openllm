@@ -37,6 +37,11 @@ struct Args {
     #[arg(long)]
     list_backups: bool,
 
+    /// Run the same read-only health checks as GET /api/diagnostics/self-check,
+    /// then exit. Exit code 0 = pass, 1 = fail, 2 = warnings.
+    #[arg(long)]
+    self_check: bool,
+
     /// Restore a backup and exit. Takes a file name from the backups
     /// directory, or a path. The gateway must not be running.
     #[arg(long, value_name = "FILE")]
@@ -66,6 +71,9 @@ async fn main() -> anyhow::Result<()> {
     }
     if args.list_backups {
         return finish(openllm::cli::list_backups(&config, args.json).await);
+    }
+    if args.self_check {
+        return finish(openllm::cli::self_check(&config, args.json).await);
     }
     if let Some(backup) = args.restore_backup.as_deref() {
         return finish(openllm::cli::restore_backup(&config, backup, args.json).await);

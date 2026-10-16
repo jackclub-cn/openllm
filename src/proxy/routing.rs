@@ -1559,13 +1559,6 @@ async fn close_provider_circuit(state: &AppState, provider_id: i64, reason: &'st
 /// active, and once the cooldown elapses exactly one request is admitted to
 /// probe recovery. That probe is what lets the provider leave the open state:
 /// a success clears the streak, a failure re-opens with the escalated cooldown.
-pub(super) async fn admit_provider_attempt(
-    state: &AppState,
-    provider_id: i64,
-) -> Result<(), Duration> {
-    admit_provider_attempt_with_lease(state, provider_id, PROVIDER_PROBE_LEASE).await
-}
-
 pub(super) async fn admit_provider_attempt_with_lease(
     state: &AppState,
     provider_id: i64,

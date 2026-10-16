@@ -23,7 +23,7 @@ use crate::state::{AppState, SETTING_GUARDRAILS, SETTING_INSPECTOR, SETTING_RESI
 
 mod admin;
 mod audit;
-mod diagnostics;
+pub(crate) mod diagnostics;
 mod helpers;
 mod keys;
 mod lifecycle;

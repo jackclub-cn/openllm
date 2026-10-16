@@ -10507,7 +10507,9 @@ async fn provider_circuit_stays_soft_below_the_open_threshold() {
         .await
         .insert(1, Instant::now() + Duration::from_secs(60));
     assert!(
-        admit_provider_attempt(&state, 1).await.is_ok(),
+        admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok(),
         "a provider below the threshold must still be attempted"
     );
 }
@@ -10529,7 +10531,7 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
         .await
         .insert(1, Instant::now() + Duration::from_secs(60));
 
-    let retry_after = admit_provider_attempt(&state, 1)
+    let retry_after = admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
         .await
         .expect_err("an open circuit must short-circuit the attempt");
     assert!(
@@ -10544,18 +10546,24 @@ async fn provider_circuit_hard_opens_then_admits_a_single_probe() {
         .await
         .insert(1, Instant::now() - Duration::from_secs(1));
     assert!(
-        admit_provider_attempt(&state, 1).await.is_ok(),
+        admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok(),
         "the first request after the cooldown probes recovery"
     );
     assert!(
-        admit_provider_attempt(&state, 1).await.is_err(),
+        admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_err(),
         "a second concurrent request must not stampede a recovering provider"
     );
 
     // A successful probe closes the circuit and frees the probe slot.
     mark_provider_success(&state, 1).await;
     assert!(
-        admit_provider_attempt(&state, 1).await.is_ok(),
+        admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok(),
         "after recovery the provider serves every request again"
     );
 }
@@ -10903,7 +10911,7 @@ async fn persisted_provider_circuit_survives_a_restart() {
             .copied(),
         Some(crate::state::DEFAULT_PROVIDER_OPEN_THRESHOLD)
     );
-    let retry_after = admit_provider_attempt(&restarted, 1)
+    let retry_after = admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
         .await
         .expect_err("a restored open circuit must still short-circuit the attempt");
     assert!(
@@ -10946,11 +10954,15 @@ async fn restored_expired_cooldown_stays_half_open() {
     let restarted = AppState::new(state.pool.clone(), None);
     assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 1);
     assert!(
-        admit_provider_attempt(&restarted, 1).await.is_ok(),
+        admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok(),
         "the first request after the restart probes recovery"
     );
     assert!(
-        admit_provider_attempt(&restarted, 1).await.is_err(),
+        admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_err(),
         "a second request must not stampede a half-open provider"
     );
 }
@@ -11071,7 +11083,11 @@ async fn cleared_cooldowns_do_not_come_back_after_a_restart() {
 
     let restarted = AppState::new(state.pool.clone(), None);
     assert_eq!(crate::resilience_state::restore(&restarted).await.unwrap(), 0);
-    assert!(admit_provider_attempt(&restarted, 1).await.is_ok());
+    assert!(
+        admit_provider_attempt_with_lease(&restarted, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok()
+    );
 }
 
 /// Persistence is opt-out, and the parser has to fail safe: a typo must keep

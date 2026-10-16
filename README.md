@@ -156,6 +156,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 场景 | 命令 / 接口 |
 | --- | --- |
 | 迁移预检 | `openllm --check-migrations [--json]` |
+| 离线自检 | `openllm --data-dir ./data --self-check [--json]` |
 | 在线备份 | `openllm --data-dir ./data --backup` |
 | 列出备份 | `openllm --data-dir ./data --list-backups` |
 | 恢复 | `openllm --data-dir ./data --restore-backup <文件名>`，必须在停服后执行 |

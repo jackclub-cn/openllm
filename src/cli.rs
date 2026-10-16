@@ -97,6 +97,42 @@ pub async fn list_backups(config: &Config, json: bool) -> anyhow::Result<i32> {
     Ok(0)
 }
 
+/// `--self-check`: run the read-only diagnostics without starting the server.
+pub async fn self_check(config: &Config, json: bool) -> anyhow::Result<i32> {
+    let database_path = crate::startup::database_path(config);
+    if !database_path.exists() {
+        anyhow::bail!(
+            "{} does not exist yet; start the gateway once before running --self-check",
+            database_path.display()
+        );
+    }
+    let pool = crate::startup::open_operator_pool(&database_path).await?;
+    let state = crate::state::AppState::new(pool.clone(), None);
+    let report = crate::api::diagnostics::run_self_check(&state).await;
+    pool.close().await;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!(
+            "总体: {}（pass {} / warn {} / fail {}）",
+            report.overall, report.counts.pass, report.counts.warn, report.counts.fail
+        );
+        for item in &report.checks {
+            println!("[{:4}] {}: {}", item.status, item.title, item.detail);
+            if let Some(hint) = item.hint {
+                println!("       建议: {hint}");
+            }
+        }
+    }
+
+    Ok(match report.overall {
+        "fail" => 1,
+        "warn" => 2,
+        _ => 0,
+    })
+}
+
 /// `--backup`: write an on-demand backup. Safe to run while the gateway serves.
 pub async fn create_backup(config: &Config, json: bool) -> anyhow::Result<i32> {
     let database_path = crate::startup::database_path(config);
@@ -199,4 +235,40 @@ pub fn described_database_path(config: &Config) -> String {
     crate::startup::database_path(config)
         .to_string_lossy()
         .replace('\\', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    #[tokio::test]
+    async fn self_check_runs_against_an_existing_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = Config {
+            bind: "127.0.0.1:8080".parse().unwrap(),
+            data_dir: directory.path().to_path_buf(),
+            database_url: None,
+            admin_token: None,
+        };
+        let database_path = crate::startup::database_path(&config);
+        std::fs::create_dir_all(database_path.parent().unwrap()).unwrap();
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                sqlx::sqlite::SqliteConnectOptions::new()
+                    .filename(&database_path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool.close().await;
+
+        let code = self_check(&config, true).await.unwrap();
+        assert_eq!(
+            code, 1,
+            "a fresh database has no routable model yet, so the self-check must fail"
+        );
+    }
 }
