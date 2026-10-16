@@ -261,8 +261,9 @@ pub(crate) const MAX_SLOW_TARGET_HOLD: Duration = Duration::from_secs(5 * 60);
 /// A target with no slow sample for this long starts a fresh penalty streak.
 pub(crate) const SLOW_TARGET_STREAK_WINDOW: Duration = Duration::from_secs(10 * 60);
 
-/// How long a single half-open recovery probe may hold a provider's probe slot
-/// before another probe is admitted.
+/// Minimum time a single half-open recovery probe may hold a provider's probe
+/// slot before another probe is admitted. Providers with a longer configured
+/// request timeout extend this lease so a slow probe is never pre-empted.
 ///
 /// The lease only bounds the case where a probe is claimed but never settles
 /// (for example the request fell over to a healthier target before it reached

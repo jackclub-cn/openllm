@@ -1,6 +1,7 @@
 use super::*;
 use crate::state::{
-    MemoryPressure, RequestByteBudget, parse_cgroup_memory_max, resolve_memory_limit,
+    MemoryPressure, PROVIDER_PROBE_LEASE, RequestByteBudget, parse_cgroup_memory_max,
+    resolve_memory_limit,
 };
 use tower::ServiceExt;
 
@@ -5047,6 +5048,47 @@ fn provider_cooldown_escalates_with_consecutive_failures_and_caps() {
             Some(60)
         ),
         Duration::from_secs(1800)
+    );
+}
+
+#[test]
+fn provider_probe_lease_covers_the_configured_timeout() {
+    assert_eq!(provider_probe_lease(None), PROVIDER_PROBE_LEASE);
+    assert_eq!(provider_probe_lease(Some(0)), PROVIDER_PROBE_LEASE);
+    assert_eq!(
+        provider_probe_lease(Some(3600)),
+        Duration::from_secs(3630),
+        "a provider allowed to wait an hour must reserve the probe for that long"
+    );
+}
+
+#[tokio::test]
+async fn a_long_provider_timeout_keeps_the_half_open_probe_reserved() {
+    let state = circuit_state().await;
+    state.provider_failure_streak.lock().await.insert(1, 3);
+    state
+        .provider_cooldown
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(1));
+    state
+        .provider_probe
+        .lock()
+        .await
+        .insert(1, Instant::now() - Duration::from_secs(200));
+
+    let lease = provider_probe_lease(Some(3600));
+    assert!(
+        admit_provider_attempt_with_lease(&state, 1, lease)
+            .await
+            .is_err(),
+        "an in-flight slow probe must keep the provider half-open"
+    );
+    assert!(
+        admit_provider_attempt_with_lease(&state, 1, PROVIDER_PROBE_LEASE)
+            .await
+            .is_ok(),
+        "the old lease still expires for direct callers using the minimum"
     );
 }
 

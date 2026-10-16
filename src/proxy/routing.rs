@@ -1166,6 +1166,20 @@ pub(super) fn provider_key_cooldown(status: StatusCode, retry_after: Option<Dura
         .min(MAX_PROVIDER_KEY_COOLDOWN)
 }
 
+/// Minimum probe reservation margin, added on top of a configured provider
+/// header timeout so the probe lease cannot expire while the upstream is still
+/// allowed to answer.
+const PROVIDER_PROBE_TIMEOUT_MARGIN: Duration = Duration::from_secs(30);
+
+pub(super) fn provider_probe_lease(timeout_seconds: Option<i64>) -> Duration {
+    let configured = timeout_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| Duration::from_secs(seconds.unsigned_abs()));
+    configured
+        .map(|timeout| PROVIDER_PROBE_LEASE.max(timeout.saturating_add(PROVIDER_PROBE_TIMEOUT_MARGIN)))
+        .unwrap_or(PROVIDER_PROBE_LEASE)
+}
+
 pub(super) fn target_cooldown(
     status: StatusCode,
     retry_after: Option<Duration>,
@@ -1549,6 +1563,14 @@ pub(super) async fn admit_provider_attempt(
     state: &AppState,
     provider_id: i64,
 ) -> Result<(), Duration> {
+    admit_provider_attempt_with_lease(state, provider_id, PROVIDER_PROBE_LEASE).await
+}
+
+pub(super) async fn admit_provider_attempt_with_lease(
+    state: &AppState,
+    provider_id: i64,
+    probe_lease: Duration,
+) -> Result<(), Duration> {
     let threshold = provider_open_threshold();
     if threshold == 0 {
         return Ok(());
@@ -1580,9 +1602,9 @@ pub(super) async fn admit_provider_attempt(
     // Cooldown elapsed: half-open. Admit exactly one probe; a probe that is
     // still within its lease means another request is already testing recovery.
     let mut probes = state.provider_probe.lock().await;
-    probes.retain(|_, started| now.saturating_duration_since(*started) < PROVIDER_PROBE_LEASE);
+    probes.retain(|_, started| now.saturating_duration_since(*started) < probe_lease);
     if probes.contains_key(&provider_id) {
-        return Err(PROVIDER_PROBE_LEASE);
+        return Err(probe_lease);
     }
     probes.insert(provider_id, now);
     Ok(())
@@ -1871,7 +1893,10 @@ where
     // upstream call, so a known-bad provider cannot pin an admission slot for a
     // full header timeout. The fallback loop moves to the next target, and if
     // none can serve, the client gets a fast 503 with a Retry-After.
-    if let Err(retry_after) = admit_provider_attempt(state, target.provider_id).await {
+    let probe_lease = provider_probe_lease(target.timeout_seconds);
+    if let Err(retry_after) =
+        admit_provider_attempt_with_lease(state, target.provider_id, probe_lease).await
+    {
         return Err(AppError::UpstreamStatus {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: format!(
