@@ -3,20 +3,18 @@ import {
   PlayCircleOutlined,
   ReloadOutlined,
 } from '@ant-design/icons'
-import { Button, DatePicker, Tag, Tooltip, Typography } from 'antd'
-import dayjs, { type Dayjs } from 'dayjs'
+import { Button, Tag, Tooltip, Typography } from 'antd'
+import dayjs from 'dayjs'
 import type { ReactNode } from 'react'
 import PageHeader from './PageHeader'
 
 type UsageRangeToolbarProps = {
   title: string
   description?: string
-  dates: [Dayjs, Dayjs]
   lastUpdated?: Date
   refreshing: boolean
   paused: boolean
   realtimeConnected: boolean
-  onDatesChange: (dates: [Dayjs, Dayjs]) => void
   onTogglePaused: () => void
   onRefresh: () => void
   extraActions?: ReactNode
@@ -25,41 +23,14 @@ type UsageRangeToolbarProps = {
 export default function UsageRangeToolbar({
   title,
   description,
-  dates,
   lastUpdated,
   refreshing,
   paused,
   realtimeConnected,
-  onDatesChange,
   onTogglePaused,
   onRefresh,
   extraActions,
 }: UsageRangeToolbarProps) {
-  const rangePresets = [
-    { label: '今天', value: [dayjs().startOf('day'), dayjs().endOf('day')] as [Dayjs, Dayjs] },
-    {
-      label: '近 7 天',
-      value: [dayjs().subtract(6, 'day').startOf('day'), dayjs().endOf('day')] as [
-        Dayjs,
-        Dayjs,
-      ],
-    },
-    {
-      label: '近 14 天',
-      value: [dayjs().subtract(13, 'day').startOf('day'), dayjs().endOf('day')] as [
-        Dayjs,
-        Dayjs,
-      ],
-    },
-    {
-      label: '近 30 天',
-      value: [dayjs().subtract(29, 'day').startOf('day'), dayjs().endOf('day')] as [
-        Dayjs,
-        Dayjs,
-      ],
-    },
-  ]
-
   return (
     <PageHeader
       title={title}
@@ -67,15 +38,6 @@ export default function UsageRangeToolbar({
       extra={
         <>
           {extraActions}
-          <DatePicker.RangePicker
-            allowClear={false}
-            value={dates}
-            presets={rangePresets}
-            disabledDate={(current) => Boolean(current && current > dayjs().endOf('day'))}
-            onChange={(value) => {
-              if (value?.[0] && value[1]) onDatesChange(value as [Dayjs, Dayjs])
-            }}
-          />
           {lastUpdated && (
             <Typography.Text type="secondary">
               更新于 {dayjs(lastUpdated).format('HH:mm:ss')}

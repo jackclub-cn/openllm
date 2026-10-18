@@ -82,15 +82,27 @@ export function withDevProviderMock(data: Overview) {
       cost_micros: Math.round(providerTokens * provider.cost_per_million_tokens),
       success_rate: provider.success_rate,
       avg_latency_ms: provider.avg_latency_ms,
+      cache_read: Math.round(promptTokens * 0.22),
+      cache_write: 0,
+      cache_hit_rate: 22,
     }
   })
 
   const daily_provider_requests = data.daily_usage.flatMap((day) => {
     const dailyRequests = allocate(day.requests, weights)
+    const dailyTokens = allocate(day.tokens, weights)
+    const dailyCost = allocate(day.cost_micros, weights)
     return MOCK_PROVIDERS.map((provider, index) => ({
       day: day.day,
       label: provider.provider_name,
       requests: dailyRequests[index],
+      tokens: dailyTokens[index],
+      prompt_tokens: Math.round(dailyTokens[index] * provider.input_ratio),
+      cost_micros: dailyCost[index],
+      success_rate: provider.success_rate,
+      cache_read: Math.round(dailyTokens[index] * 0.22),
+      cache_write: 0,
+      cache_hit_rate: 22,
     }))
   })
 

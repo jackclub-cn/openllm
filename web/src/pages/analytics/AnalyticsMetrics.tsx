@@ -2,7 +2,10 @@ import {
   ClockCircleOutlined,
   DatabaseOutlined,
   DollarOutlined,
+  FieldTimeOutlined,
+  HourglassOutlined,
   NodeIndexOutlined,
+  RocketOutlined,
   ThunderboltOutlined,
   ApiOutlined,
 } from '@ant-design/icons'
@@ -18,6 +21,8 @@ type AnalyticsMetricsProps = {
 
 export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
   const navigate = useNavigate()
+  const formatMs = (value?: number | null) =>
+    value == null || !Number.isFinite(value) ? '-' : `${Math.round(value)} ms`
   const sessionsHint =
     data.range_sessions > 0
       ? `会话 ${formatCompact(data.range_sessions)} · 每会话 ${data.range_avg_requests_per_session.toFixed(1)} 次`
@@ -32,6 +37,7 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           icon={<ThunderboltOutlined />}
           tone="blue"
           hint={sessionsHint}
+            comparison={{ previous: data.previous_range.requests }}
         />
       </Col>
       <Col xs={24} sm={12} xl={8}>
@@ -42,6 +48,7 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           icon={<ApiOutlined />}
           tone="cyan"
           hint={`输入 ${formatCompact(data.range_prompt_tokens)} · 输出 ${formatCompact(data.range_completion_tokens)}`}
+          comparison={{ previous: data.previous_range.tokens }}
         />
       </Col>
       <Col xs={24} sm={12} xl={8}>
@@ -52,6 +59,10 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           suffix="USD"
           icon={<DollarOutlined />}
           tone="purple"
+          comparison={{
+            previous: data.previous_range.cost_micros / 1_000_000,
+            previousLabel: `上一周期 ${formatCostMicros(data.previous_range.cost_micros)}`,
+          }}
           hint={
             data.range_unpriced > 0
               ? `${formatCostMicros(data.range_cost_micros)} · ${data.range_unpriced} 条未定价`
@@ -67,6 +78,10 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           suffix="%"
           icon={<NodeIndexOutlined />}
           tone="green"
+          comparison={{
+            previous: data.previous_range.success_rate,
+            delta: 'point',
+          }}
           hint={
             data.range_gateway_adjusted > 0 ? (
               <Tooltip title="网关自动修复工具历史或调整上游请求参数的次数">
@@ -90,6 +105,44 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           suffix="ms"
           icon={<ClockCircleOutlined />}
           tone="orange"
+          comparison={{
+            previous: data.previous_range.avg_latency_ms,
+            lowerIsBetter: true,
+          }}
+        />
+      </Col>
+      <Col xs={24} sm={12} xl={8}>
+        <MetricCard
+          label="P95 总用时"
+          value={data.range_latency_p95_ms}
+          precision={0}
+          suffix="ms"
+          icon={<FieldTimeOutlined />}
+          tone="orange"
+          hint={`P50 ${formatMs(data.range_latency_p50_ms)} · P99 ${formatMs(data.range_latency_p99_ms)}`}
+        />
+      </Col>
+      <Col xs={24} sm={12} xl={8}>
+        <MetricCard
+          label="P95 首字延迟"
+          value={data.range_first_token_p95_ms}
+          precision={0}
+          suffix="ms"
+          icon={<HourglassOutlined />}
+          tone="blue"
+          hint={`P50 ${formatMs(data.range_first_token_p50_ms)} · P99 ${formatMs(data.range_first_token_p99_ms)}`}
+        />
+      </Col>
+      <Col xs={24} sm={12} xl={8}>
+        <MetricCard
+          label="生成速度"
+          value={data.range_output_tps}
+          precision={1}
+          suffix="tok/s"
+          icon={<RocketOutlined />}
+          tone="cyan"
+          hint="输出 tokens / 生成耗时"
+          comparison={{ previous: data.previous_range.output_tps }}
         />
       </Col>
       <Col xs={24} sm={12} xl={8}>
@@ -100,6 +153,10 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
           suffix="%"
           icon={<DatabaseOutlined />}
           tone="green"
+          comparison={{
+            previous: data.previous_range.cache_hit_rate,
+            delta: 'point',
+          }}
           hint={`读取 ${formatCompact(data.range_cache_read)} · 写入 ${formatCompact(data.range_cache_write)}`}
         />
       </Col>

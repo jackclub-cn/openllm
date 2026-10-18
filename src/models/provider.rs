@@ -129,6 +129,37 @@ pub struct ProviderQuotaView {
     pub fetched_at: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct ProviderQuotaOverviewView {
+    pub provider_id: i64,
+    pub provider_name: String,
+    pub provider_enabled: bool,
+    pub kind: String,
+    pub title: String,
+    pub snapshots: Vec<ProviderQuotaOverviewSnapshotView>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProviderQuotaOverviewSnapshotView {
+    pub provider_id: i64,
+    pub key_id: Option<i64>,
+    pub key_name: Option<String>,
+    pub key_suffix: Option<String>,
+    pub model: String,
+    pub window_key: String,
+    pub used: Option<f64>,
+    pub limit: Option<f64>,
+    pub remaining: Option<f64>,
+    pub unit: String,
+    pub percent: Option<f64>,
+    pub reset_at: Option<String>,
+    pub source: String,
+    pub confidence: String,
+    pub observed_at: String,
+    pub valid_until: String,
+    pub state: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProviderQuotaQuery {
     #[serde(default)]

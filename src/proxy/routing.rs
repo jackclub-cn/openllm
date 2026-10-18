@@ -4575,6 +4575,12 @@ pub(crate) fn candidate_view(
     }
 }
 
+pub(super) struct OrderedTargets {
+    pub(super) targets: Vec<RouteTarget>,
+    pub(super) session_decision: &'static str,
+}
+
+#[cfg(test)]
 pub(super) async fn order_targets(
     state: &AppState,
     route_id: i64,
@@ -4583,8 +4589,23 @@ pub(super) async fn order_targets(
     session_id: Option<&str>,
     api_key_id: Option<i64>,
 ) -> AppResult<Vec<RouteTarget>> {
+    Ok(
+        order_targets_with_decision(state, route_id, strategy, targets, session_id, api_key_id)
+            .await?
+            .targets,
+    )
+}
+
+pub(super) async fn order_targets_with_decision(
+    state: &AppState,
+    route_id: i64,
+    strategy: &str,
+    targets: Vec<RouteTarget>,
+    session_id: Option<&str>,
+    api_key_id: Option<i64>,
+) -> AppResult<OrderedTargets> {
     let affinity = session_affinity_context(state, route_id, session_id, api_key_id, true).await;
-    order_targets_with_context(
+    order_targets_with_context_result(
         state,
         route_id,
         strategy,
@@ -4596,7 +4617,24 @@ pub(super) async fn order_targets(
     .await
 }
 
+/// Compatibility wrapper for diagnostic callers that only need the order.
 async fn order_targets_with_context(
+    state: &AppState,
+    route_id: i64,
+    strategy: &str,
+    targets: Vec<RouteTarget>,
+    session_id: Option<&str>,
+    api_key_id: Option<i64>,
+    affinity: Option<&SessionAffinityContext>,
+) -> AppResult<Vec<RouteTarget>> {
+    Ok(order_targets_with_context_result(
+        state, route_id, strategy, targets, session_id, api_key_id, affinity,
+    )
+    .await?
+    .targets)
+}
+
+async fn order_targets_with_context_result(
     state: &AppState,
     route_id: i64,
     strategy: &str,
@@ -4604,7 +4642,7 @@ async fn order_targets_with_context(
     session_id: Option<&str>,
     api_key_id: Option<i64>,
     affinity: Option<&SessionAffinityContext>,
-) -> AppResult<Vec<RouteTarget>> {
+) -> AppResult<OrderedTargets> {
     let strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
     let session_id = session_id.map(str::trim).filter(|value| !value.is_empty());
     let cache_aware = !matches!(
@@ -4775,5 +4813,20 @@ async fn order_targets_with_context(
     if strategy == RouteStrategy::QuotaPaced {
         apply_quota_pacing(state, &mut targets, affinity).await;
     }
-    Ok(targets)
+    let session_decision = match affinity.and_then(|context| context.pinned.as_ref()) {
+        Some(pinned)
+            if targets
+                .first()
+                .is_some_and(|target| same_affinity_target(target, pinned)) =>
+        {
+            "hit"
+        }
+        Some(_) => "miss",
+        None if affinity.is_some() => "miss",
+        None => "no_affinity",
+    };
+    Ok(OrderedTargets {
+        targets,
+        session_decision,
+    })
 }

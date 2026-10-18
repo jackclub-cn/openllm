@@ -108,6 +108,12 @@ impl RouteTraceRecorder {
         }
     }
 
+    pub(crate) fn set_session_decision(&mut self, decision: &str) {
+        if self.enabled {
+            self.session_decision = decision.to_string();
+        }
+    }
+
     pub(crate) fn finish(mut self, state: &AppState, final_outcome: TraceFinal) {
         if !self.enabled {
             return;

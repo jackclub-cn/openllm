@@ -20,27 +20,12 @@ import {
   type ProviderQuotaModel,
   type ProviderQuotaSnapshot,
 } from '../../api'
+import { quotaStateColors, quotaStateLabels } from './quotaPresentation'
 import { formatUnitPrice } from './types'
 
 type ProviderQuotaModalProps = {
   provider?: Provider
   onClose: () => void
-}
-
-const quotaStateLabels: Record<ProviderQuotaSnapshot['state'], string> = {
-  unknown: '未知',
-  healthy: '充足',
-  low: '偏低',
-  exhausted: '已耗尽',
-  reset_due: '待重置',
-}
-
-const quotaStateColors: Record<ProviderQuotaSnapshot['state'], string> = {
-  unknown: 'default',
-  healthy: 'success',
-  low: 'warning',
-  exhausted: 'error',
-  reset_due: 'processing',
 }
 
 function quotaValue(snapshot: ProviderQuotaSnapshot) {

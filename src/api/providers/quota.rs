@@ -1,8 +1,12 @@
 use super::*;
 
+use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::Duration as StdDuration;
 
 const COMMAND_CODE_PLAN_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+const DEFAULT_PROVIDER_QUOTA_REFRESH_MINUTES: u64 = 15;
+const MAX_PROVIDER_QUOTA_REFRESH_MINUTES: u64 = 7 * 24 * 60;
 
 #[derive(Clone)]
 struct CommandCodePlanCacheEntry {
@@ -24,9 +28,19 @@ pub async fn provider_quota(
         .fetch_optional(&state.pool)
         .await?
         .ok_or_else(|| AppError::NotFound("provider not found".to_string()))?;
+    Ok(Json(
+        refresh_provider_quota(&state, &provider, query.key_id).await?,
+    ))
+}
+
+async fn refresh_provider_quota(
+    state: &AppState,
+    provider: &Provider,
+    key_id: Option<i64>,
+) -> AppResult<ProviderQuotaView> {
     let kind = provider_quota_kind(&provider.base_url)
         .ok_or_else(|| AppError::BadRequest("this provider has no quota API".to_string()))?;
-    let credential = provider_quota_credential(&state, &provider, query.key_id).await?;
+    let credential = provider_quota_credential(state, provider, key_id).await?;
     let prices = provider_prices(&state, provider.id).await?;
     let mut view = match kind {
         "command_code" => fetch_command_code_quota(&state, &credential.secret).await?,
@@ -43,9 +57,220 @@ pub async fn provider_quota(
     view.key_suffix = Some(credential.key_suffix);
     view.prices = prices;
     view.snapshots =
-        crate::quota::store_provider_quota_view(&state, provider.id, credential.key_id, &view)
+        crate::quota::store_provider_quota_view(state, provider.id, credential.key_id, &view)
             .await?;
-    Ok(Json(view))
+    Ok(view)
+}
+
+pub async fn provider_quota_overview(
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<ProviderQuotaOverviewView>>> {
+    let providers = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY id")
+        .fetch_all(&state.pool)
+        .await?;
+    let mut overviews = Vec::new();
+    let mut overview_index = HashMap::new();
+    for provider in providers {
+        let Some(kind) = provider_quota_kind(&provider.base_url) else {
+            continue;
+        };
+        overview_index.insert(provider.id, overviews.len());
+        overviews.push(ProviderQuotaOverviewView {
+            provider_id: provider.id,
+            provider_name: provider.name,
+            provider_enabled: provider.enabled != 0,
+            kind: kind.to_string(),
+            title: quota_title(kind).to_string(),
+            snapshots: Vec::new(),
+        });
+    }
+    if overviews.is_empty() {
+        return Ok(Json(overviews));
+    }
+
+    let key_records =
+        sqlx::query_as::<_, ProviderApiKeyRecord>("SELECT * FROM provider_api_keys ORDER BY id")
+            .fetch_all(&state.pool)
+            .await?;
+    let keys = key_records
+        .into_iter()
+        .filter_map(|record| {
+            record.provider_id.map(|provider_id| {
+                (
+                    record.id,
+                    (provider_id, record.name, api_key_suffix(&record.secret)),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+
+    let records = sqlx::query_as::<_, ProviderQuotaSnapshotRecord>(
+        "SELECT provider_id, provider_key_id, model, window_key, \
+                limit_value, used, remaining, unit, reset_at, source, \
+                confidence, observed_at, valid_until \
+         FROM provider_quota_snapshots \
+         ORDER BY provider_id, provider_key_id, model, window_key, unit",
+    )
+    .fetch_all(&state.pool)
+    .await?;
+    for snapshot in crate::quota::effective_snapshot_views(records) {
+        let Some(index) = overview_index.get(&snapshot.provider_id).copied() else {
+            continue;
+        };
+        let key = snapshot
+            .provider_key_id
+            .and_then(|key_id| keys.get(&key_id).cloned().map(|value| (key_id, value)));
+        let (key_id, key_name, key_suffix) = match key {
+            Some((key_id, (_, name, suffix))) => (Some(key_id), Some(name), Some(suffix)),
+            None => (None, None, None),
+        };
+        overviews[index]
+            .snapshots
+            .push(ProviderQuotaOverviewSnapshotView {
+                provider_id: snapshot.provider_id,
+                key_id,
+                key_name,
+                key_suffix,
+                model: snapshot.model,
+                window_key: snapshot.window_key,
+                used: snapshot.used,
+                limit: snapshot.limit,
+                remaining: snapshot.remaining,
+                unit: snapshot.unit,
+                percent: snapshot.percent,
+                reset_at: snapshot.reset_at,
+                source: snapshot.source,
+                confidence: snapshot.confidence,
+                observed_at: snapshot.observed_at,
+                valid_until: snapshot.valid_until,
+                state: snapshot.state,
+            });
+    }
+    Ok(Json(overviews))
+}
+
+pub(crate) fn provider_quota_refresh_interval() -> Option<StdDuration> {
+    let configured = std::env::var("OPENLLM_PROVIDER_QUOTA_REFRESH_MINUTES").ok();
+    parse_provider_quota_refresh_interval(configured.as_deref())
+}
+
+pub(crate) fn parse_provider_quota_refresh_interval(
+    configured: Option<&str>,
+) -> Option<StdDuration> {
+    let minutes = match configured {
+        Some(value) => match value.trim().parse::<u64>() {
+            Ok(value) => value.min(MAX_PROVIDER_QUOTA_REFRESH_MINUTES),
+            Err(_) => {
+                tracing::warn!(
+                    value,
+                    default_minutes = DEFAULT_PROVIDER_QUOTA_REFRESH_MINUTES,
+                    "invalid provider quota refresh interval; using default"
+                );
+                DEFAULT_PROVIDER_QUOTA_REFRESH_MINUTES
+            }
+        },
+        None => DEFAULT_PROVIDER_QUOTA_REFRESH_MINUTES,
+    };
+    (minutes > 0).then(|| StdDuration::from_secs(minutes * 60))
+}
+
+pub(crate) async fn run_provider_quota_refresh(state: &AppState) {
+    let providers = match sqlx::query_as::<_, Provider>(
+        "SELECT * FROM providers WHERE enabled = 1 ORDER BY id",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        Ok(providers) => providers,
+        Err(error) => {
+            tracing::warn!(%error, "failed to query providers for scheduled quota refresh");
+            return;
+        }
+    };
+    let providers = providers
+        .into_iter()
+        .filter(|provider| provider_quota_kind(&provider.base_url).is_some())
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        provider_count = providers.len(),
+        "starting scheduled provider quota refresh"
+    );
+    futures_util::stream::iter(providers.into_iter().map(|provider| {
+        let state = state.clone();
+        async move {
+            refresh_provider_quota_keys(&state, provider).await;
+        }
+    }))
+    .buffer_unordered(2)
+    .for_each(|_| async {})
+    .await;
+}
+
+async fn refresh_provider_quota_keys(state: &AppState, provider: Provider) {
+    let records = match provider_api_key_records(&state.pool, provider.id).await {
+        Ok(records) => records,
+        Err(error) => {
+            tracing::warn!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                %error,
+                "failed to load provider keys for scheduled quota refresh"
+            );
+            return;
+        }
+    };
+    let has_records = !records.is_empty();
+    let keys = records
+        .into_iter()
+        .filter(|record| record.enabled != 0 && !record.secret.trim().is_empty())
+        .collect::<Vec<_>>();
+
+    if keys.is_empty() {
+        if has_records {
+            tracing::debug!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                "skipped scheduled quota refresh because no enabled provider keys exist"
+            );
+            return;
+        }
+        match refresh_provider_quota(state, &provider, None).await {
+            Ok(_) => tracing::info!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                "scheduled provider quota refresh completed"
+            ),
+            Err(error) => tracing::warn!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                %error,
+                "scheduled provider quota refresh failed"
+            ),
+        }
+        return;
+    }
+
+    for key in keys {
+        match refresh_provider_quota(state, &provider, Some(key.id)).await {
+            Ok(_) => tracing::info!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                key_id = key.id,
+                "scheduled provider quota refresh completed"
+            ),
+            Err(error) => tracing::warn!(
+                provider_id = provider.id,
+                provider = %provider.name,
+                key_id = key.id,
+                %error,
+                "scheduled provider quota refresh failed"
+            ),
+        }
+    }
 }
 
 pub async fn list_provider_quota_snapshots(

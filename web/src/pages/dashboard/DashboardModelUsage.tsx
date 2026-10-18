@@ -1,13 +1,21 @@
-import { Card, Progress, Table, Tooltip, Typography } from 'antd'
+import { Button, Card, Space, Table, Tag, Tooltip, Typography } from 'antd'
 import { useNavigate } from 'react-router-dom'
 import type { Overview } from '../../api'
 import { formatCompact, formatCostMicros, formatExact } from '../../format'
 
 type DashboardModelUsageProps = {
   data: Overview
+  fullBreakdown: boolean
+  onToggleFullBreakdown: () => void
+  loading?: boolean
 }
 
-export default function DashboardModelUsage({ data }: DashboardModelUsageProps) {
+export default function DashboardModelUsage({
+  data,
+  fullBreakdown,
+  onToggleFullBreakdown,
+  loading = false,
+}: DashboardModelUsageProps) {
   const navigate = useNavigate()
   const totalRequests = data.model_usage.reduce(
     (sum, record) => sum + record.requests,
@@ -15,7 +23,23 @@ export default function DashboardModelUsage({ data }: DashboardModelUsageProps) 
   )
 
   return (
-    <Card title="模型用量" bordered={false} className="section-row">
+    <Card
+      title={
+        <Space size={8}>
+          <span>模型用量</span>
+          <Button
+            size="small"
+            type="link"
+            loading={loading}
+            onClick={onToggleFullBreakdown}
+          >
+            {fullBreakdown ? '收起长尾' : '显示全部'}
+          </Button>
+        </Space>
+      }
+      bordered={false}
+      className="section-row"
+    >
       <Table
         rowKey="model"
         size="middle"
@@ -26,7 +50,7 @@ export default function DashboardModelUsage({ data }: DashboardModelUsageProps) 
           style: { cursor: 'pointer' },
         })}
         locale={{ emptyText: '暂无模型用量' }}
-        scroll={{ x: 900 }}
+        scroll={{ x: 1050 }}
         columns={[
           {
             title: '模型',
@@ -68,15 +92,26 @@ export default function DashboardModelUsage({ data }: DashboardModelUsageProps) 
             render: (value: number | null) => formatCostMicros(value),
           },
           {
+            title: '缓存',
+            dataIndex: 'cache_hit_rate',
+            width: 120,
+            sorter: (a, b) => a.cache_hit_rate - b.cache_hit_rate,
+            render: (value: number, record) => (
+              <Tooltip
+                title={`读取 ${formatExact(record.cache_read)} · 写入 ${formatExact(record.cache_write)}`}
+              >
+                <span>{value.toFixed(1)}%</span>
+              </Tooltip>
+            ),
+          },
+          {
             title: '成功率',
             dataIndex: 'success_rate',
             width: 160,
             render: (value: number) => (
-              <Progress
-                percent={Math.round(value)}
-                size="small"
-                status={value >= 99 ? 'success' : value >= 90 ? 'normal' : 'exception'}
-              />
+              <Tag color={value >= 99 ? 'success' : value >= 90 ? 'warning' : 'error'}>
+                {value.toFixed(1)}%
+              </Tag>
             ),
           },
           {

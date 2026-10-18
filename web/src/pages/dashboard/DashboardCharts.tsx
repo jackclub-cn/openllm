@@ -1,12 +1,22 @@
 import { Line, Pie } from '@ant-design/plots'
-import { Card, Col, Empty, Row, Segmented, Space, Tag } from 'antd'
+import {
+  Card,
+  Col,
+  Empty,
+  Row,
+  Segmented,
+  Select,
+  Space,
+  Tag,
+  Typography,
+} from 'antd'
 import { useMemo, useState } from 'react'
 import type { DailyBreakdownUsage, Overview } from '../../api'
 import { formatCompact, formatExact } from '../../format'
 
 type BreakdownDimension = 'model' | 'provider'
-
-type TrendMetric = 'requests' | 'tokens' | BreakdownDimension
+type TrendView = 'total' | BreakdownDimension
+type TrendMetric = 'requests' | 'tokens' | 'cost' | 'success' | 'cache'
 
 const BREAKDOWN_COLORS = [
   '#1677ff',
@@ -18,22 +28,60 @@ const BREAKDOWN_COLORS = [
   '#8c8c8c',
 ]
 
-const METRIC_OPTIONS = [
-  { label: '请求数', value: 'requests' },
-  { label: '总 tokens', value: 'tokens' },
+const VIEW_OPTIONS = [
+  { label: '不拆分', value: 'total' },
   { label: '按模型', value: 'model' },
   { label: '按提供商', value: 'provider' },
 ]
 
-type BreakdownPoint = {
+const METRIC_OPTIONS = [
+  { label: '请求', value: 'requests' },
+  { label: 'Token', value: 'tokens' },
+  { label: '费用', value: 'cost' },
+  { label: '成功', value: 'success' },
+  { label: '缓存', value: 'cache' },
+]
+
+type SeriesPoint = {
   day: string
   label: string
-  requests: number
+  value: number
 }
 
 type DistributionDatum = {
   name: string
   value: number
+}
+
+const METRIC_STYLE: Record<
+  TrendMetric,
+  { name: string; color: string; format: (value: number) => string }
+> = {
+  requests: {
+    name: '请求数',
+    color: '#1677ff',
+    format: (value) => formatExact(value),
+  },
+  tokens: {
+    name: '总 tokens',
+    color: '#13c2c2',
+    format: (value) => formatExact(value),
+  },
+  cost: {
+    name: '费用',
+    color: '#fa8c16',
+    format: (value) => `$${value.toFixed(value < 0.01 ? 4 : 2)}`,
+  },
+  success: {
+    name: '成功率',
+    color: '#52c41a',
+    format: (value) => `${value.toFixed(1)}%`,
+  },
+  cache: {
+    name: '缓存命中率',
+    color: '#2f54eb',
+    format: (value) => `${value.toFixed(1)}%`,
+  },
 }
 
 function withAlpha(hex: string, alpha: number) {
@@ -44,12 +92,50 @@ function withAlpha(hex: string, alpha: number) {
   return `rgba(${red}, ${green}, ${blue}, ${alpha})`
 }
 
+function totalValue(
+  row: Overview['daily_usage'][number],
+  metric: TrendMetric,
+): number | null {
+  switch (metric) {
+    case 'requests':
+      return row.requests
+    case 'tokens':
+      return row.tokens
+    case 'cost':
+      return row.cost_micros / 1_000_000
+    case 'success':
+      return row.requests > 0 ? row.success_rate : null
+    case 'cache':
+      return row.prompt_tokens > 0 ? row.cache_hit_rate : null
+  }
+}
+
+function breakdownValue(
+  row: DailyBreakdownUsage,
+  metric: TrendMetric,
+): number | null {
+  switch (metric) {
+    case 'requests':
+      return row.requests
+    case 'tokens':
+      return row.tokens
+    case 'cost':
+      return row.cost_micros / 1_000_000
+    case 'success':
+      return row.requests > 0 ? row.success_rate : null
+    case 'cache':
+      return row.prompt_tokens > 0 ? row.cache_hit_rate : null
+  }
+}
+
 // Expand the per-day breakdown into a dense day x series matrix so every line
-// keeps a point for days it saw no traffic.
+// keeps a point for days it saw no traffic. Success rate skips empty days
+// instead of drawing a misleading 0%.
 function buildBreakdownSeries(
   breakdown: DailyBreakdownUsage[],
   days: Overview['daily_usage'],
-): BreakdownPoint[] {
+  metric: TrendMetric,
+): SeriesPoint[] {
   if (!breakdown.length || !days.length) return []
   const totals = new Map<string, number>()
   for (const row of breakdown) {
@@ -61,14 +147,20 @@ function buildBreakdownSeries(
     return (totals.get(right) ?? 0) - (totals.get(left) ?? 0)
   })
   const byDayLabel = new Map(
-    breakdown.map((row) => [`${row.day}\u0000${row.label}`, row.requests]),
+    breakdown.map((row) => [
+      `${row.day}\u0000${row.label}`,
+      breakdownValue(row, metric),
+    ]),
   )
-  return days.flatMap((day) =>
-    labels.map((label) => {
-      const requests = byDayLabel.get(`${day.day}\u0000${label}`) ?? 0
-      return { day: day.day, label, requests }
-    }),
-  )
+  const points: SeriesPoint[] = []
+  for (const day of days) {
+    for (const label of labels) {
+      const value = byDayLabel.get(`${day.day}\u0000${label}`)
+      if ((metric === 'success' || metric === 'cache') && value == null) continue
+      points.push({ day: day.day, label, value: value ?? 0 })
+    }
+  }
+  return points
 }
 
 function buildDistribution<T>(
@@ -139,35 +231,36 @@ export default function DashboardCharts({
   data,
   providerDataMocked = false,
 }: DashboardChartsProps) {
+  const [view, setView] = useState<TrendView>('total')
   const [metric, setMetric] = useState<TrendMetric>('requests')
-  const isBreakdown = metric === 'model' || metric === 'provider'
-  const points = useMemo(
-    () =>
-      isBreakdown
-        ? buildBreakdownSeries(
-            metric === 'model' ? data.daily_model_requests : data.daily_provider_requests,
-            data.daily_usage,
-          )
-        : data.daily_usage,
-    [
-      data.daily_model_requests,
-      data.daily_provider_requests,
+  const isBreakdown = view !== 'total'
+  const points = useMemo(() => {
+    if (!isBreakdown) {
+      const series: SeriesPoint[] = []
+      for (const row of data.daily_usage) {
+        const value = totalValue(row, metric)
+        if (value != null) {
+          series.push({ day: row.day, label: '总体', value })
+        }
+      }
+      return series
+    }
+    return buildBreakdownSeries(
+      view === 'model' ? data.daily_model_requests : data.daily_provider_requests,
       data.daily_usage,
-      isBreakdown,
       metric,
-    ],
-  )
-  const valueName = metric === 'tokens' ? '总 tokens' : '请求数'
-  const valueColor = metric === 'tokens' ? '#13c2c2' : '#1677ff'
-  const valueGradient =
-    metric === 'tokens'
-      ? 'linear-gradient(-90deg, rgba(19,194,194,0.34) 0%, rgba(19,194,194,0.02) 100%)'
-      : 'linear-gradient(-90deg, rgba(22,119,255,0.34) 0%, rgba(22,119,255,0.02) 100%)'
+    )
+  }, [
+    data.daily_model_requests,
+    data.daily_provider_requests,
+    data.daily_usage,
+    isBreakdown,
+    metric,
+    view,
+  ])
+  const metricStyle = METRIC_STYLE[metric]
   const breakdownLabels = useMemo(
-    () =>
-      isBreakdown
-        ? [...new Set((points as BreakdownPoint[]).map((point) => point.label))]
-        : [],
+    () => (isBreakdown ? [...new Set(points.map((point) => point.label))] : []),
     [isBreakdown, points],
   )
   const breakdownColorScale = useMemo(
@@ -184,9 +277,9 @@ export default function DashboardCharts({
       ),
     [breakdownLabels],
   )
-  const breakdownStroke = (group: BreakdownPoint[]) =>
+  const breakdownStroke = (group: SeriesPoint[]) =>
     breakdownColorMap[group[0]?.label] ?? BREAKDOWN_COLORS[0]
-  const breakdownFill = (group: BreakdownPoint[]) => {
+  const breakdownFill = (group: SeriesPoint[]) => {
     const color = breakdownStroke(group)
     return `linear-gradient(-90deg, ${withAlpha(color, 0.3)} 0%, ${withAlpha(color, 0.02)} 100%)`
   }
@@ -213,63 +306,104 @@ export default function DashboardCharts({
     <Row gutter={[16, 16]} className="section-row">
       <Col xs={24}>
         <Card title="用量趋势" bordered={false}>
-          <Segmented
-            block
-            size="small"
-            value={metric}
-            onChange={(value) => setMetric(value as TrendMetric)}
-            options={METRIC_OPTIONS}
-            style={{ marginBottom: 16 }}
-          />
-          {points.length ? (
-            <Line
-              data={points}
-              xField="day"
-              yField={metric === 'tokens' ? 'tokens' : 'requests'}
-              colorField={isBreakdown ? 'label' : undefined}
-              seriesField={isBreakdown ? 'label' : undefined}
-              height={260}
-              axis={{
-                x: {
-                  title: false,
-                  labelFormatter: (value: string) =>
-                    data.granularity === 'hour' ? value.slice(11, 16) : value,
-                },
-                y: {
-                  title: false,
-                  labelFormatter: (value: number) => formatCompact(value),
-                },
-              }}
-              scale={isBreakdown ? breakdownColorScale : undefined}
-              legend={isBreakdown ? { color: { position: 'bottom' } } : undefined}
-              style={
-                isBreakdown
-                  ? { lineWidth: 2, stroke: breakdownStroke }
-                  : { lineWidth: 2, stroke: valueColor }
-              }
-              area={
-                isBreakdown
-                  ? {
-                      style: {
-                        fill: breakdownFill,
-                        fillOpacity: 1,
-                      },
-                    }
-                  : { style: { fill: valueGradient } }
-              }
-              tooltip={{
-                items: [
-                  {
-                    channel: 'y',
-                    name: valueName,
-                    valueFormatter: (value: number) => formatExact(value),
+          <div className="trend-toolbar">
+            <div className="trend-metric-control">
+              <Typography.Text type="secondary">指标</Typography.Text>
+              <Segmented
+                size="small"
+                value={metric}
+                onChange={(value) => setMetric(value as TrendMetric)}
+                options={METRIC_OPTIONS}
+              />
+            </div>
+            <div className="trend-split-control">
+              <Typography.Text type="secondary">拆分</Typography.Text>
+              <Select
+                size="small"
+                value={view}
+                onChange={(value) => setView(value as TrendView)}
+                options={VIEW_OPTIONS}
+                style={{ minWidth: 108 }}
+                popupMatchSelectWidth={false}
+              />
+            </div>
+          </div>
+          <div className="trend-chart">
+            {points.length ? (
+              <Line
+                data={points}
+                xField="day"
+                yField="value"
+                colorField={isBreakdown ? 'label' : undefined}
+                seriesField={isBreakdown ? 'label' : undefined}
+                height={260}
+                axis={{
+                  x: {
+                    title: false,
+                    tickCount: data.granularity === 'hour' ? 8 : 6,
+                    labelAutoRotate: false,
+                    labelAutoHide: true,
+                    labelFormatter: (value: string) => {
+                      switch (data.granularity) {
+                        case 'hour':
+                          return value.slice(11, 16)
+                        case 'week':
+                          return `${value.slice(5)} 周`
+                        case 'month':
+                          return value.slice(0, 7)
+                        default:
+                          return value.slice(5)
+                      }
+                    },
                   },
-                ],
-              }}
-            />
-          ) : (
-            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无请求数据" />
-          )}
+                  y: {
+                    title: false,
+                    labelFormatter: (value: number) =>
+                      metric === 'success' || metric === 'cache'
+                        ? `${value}%`
+                        : metric === 'cost'
+                          ? `$${value < 0.01 ? value.toFixed(4) : value.toFixed(2)}`
+                          : formatCompact(value),
+                  },
+                }}
+                scale={isBreakdown ? breakdownColorScale : undefined}
+                legend={isBreakdown ? { color: { position: 'bottom' } } : undefined}
+                style={
+                  isBreakdown
+                    ? { lineWidth: 2, stroke: breakdownStroke }
+                    : { lineWidth: 2, stroke: metricStyle.color }
+                }
+                area={
+                  isBreakdown
+                    ? {
+                        style: {
+                          fill: breakdownFill,
+                          fillOpacity: 1,
+                        },
+                      }
+                    : {
+                        style: {
+                          fill: `linear-gradient(-90deg, ${withAlpha(metricStyle.color, 0.34)} 0%, ${withAlpha(metricStyle.color, 0.02)} 100%)`,
+                        },
+                      }
+                }
+                tooltip={{
+                  items: [
+                    {
+                      channel: 'y',
+                      name: metricStyle.name,
+                      valueFormatter: metricStyle.format,
+                    },
+                  ],
+                }}
+              />
+            ) : (
+              <Empty
+                image={Empty.PRESENTED_IMAGE_SIMPLE}
+                description="暂无请求数据"
+              />
+            )}
+          </div>
         </Card>
       </Col>
       <Col xs={24} xl={12}>
@@ -294,7 +428,7 @@ export default function DashboardCharts({
         >
           <DistributionPie
             data={providerPieData}
-            emptyText="请先添加上游提供商"
+            emptyText="暂无提供商用量"
           />
         </Card>
       </Col>

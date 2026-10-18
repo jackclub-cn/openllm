@@ -1090,6 +1090,82 @@ async fn quota_snapshots_persist_manual_overrides_and_restore_to_cache() {
     }));
 }
 
+#[test]
+fn provider_quota_refresh_interval_parses_and_clamps() {
+    assert_eq!(parse_provider_quota_refresh_interval(Some("0")), None);
+    assert_eq!(
+        parse_provider_quota_refresh_interval(Some("15")),
+        Some(std::time::Duration::from_secs(15 * 60))
+    );
+    assert_eq!(
+        parse_provider_quota_refresh_interval(Some("invalid")),
+        Some(std::time::Duration::from_secs(15 * 60))
+    );
+    assert_eq!(
+        parse_provider_quota_refresh_interval(Some("999999999")),
+        Some(std::time::Duration::from_secs(7 * 24 * 60 * 60))
+    );
+}
+
+#[tokio::test]
+async fn provider_quota_overview_groups_database_snapshots_without_upstream_calls() {
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, enabled) VALUES \
+         (1, 'OpenCode Primary', 'openai', 'https://opencode.ai/zen/go/v1', 1), \
+         (2, 'Unsupported', 'openai', 'https://api.openai.com/v1', 1), \
+         (3, 'OpenCode Backup', 'openai', 'https://opencode.ai/zen/go/v1', 0)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled) \
+         VALUES (11, 1, 'Primary', 'sk-quota', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    crate::quota::upsert_manual_snapshots(
+        &state,
+        1,
+        &[ProviderQuotaSnapshotInput {
+            key_id: Some(11),
+            model: None,
+            window_key: "5h".to_string(),
+            used: Some(20.0),
+            limit: Some(100.0),
+            remaining: Some(80.0),
+            unit: "percent".to_string(),
+            reset_at: None,
+            valid_seconds: Some(3_600),
+        }],
+    )
+    .await
+    .unwrap();
+
+    let Json(overview) = provider_quota_overview(State(state.clone())).await.unwrap();
+    assert_eq!(
+        overview
+            .iter()
+            .map(|item| item.provider_id)
+            .collect::<Vec<_>>(),
+        vec![1, 3]
+    );
+    assert_eq!(overview[0].provider_name, "OpenCode Primary");
+    assert!(overview[0].provider_enabled);
+    assert_eq!(overview[0].snapshots.len(), 1);
+    let snapshot = &overview[0].snapshots[0];
+    assert_eq!(snapshot.key_id, Some(11));
+    assert_eq!(snapshot.key_name.as_deref(), Some("Primary"));
+    assert_eq!(snapshot.key_suffix.as_deref(), Some("uota"));
+    assert_eq!(snapshot.state, "healthy");
+    assert_eq!(snapshot.remaining, Some(80.0));
+    assert!(!overview[1].provider_enabled);
+    assert!(overview[1].snapshots.is_empty());
+}
+
 #[tokio::test]
 async fn provider_api_key_rotation_resets_stale_health_state() {
     let state = provider_key_test_state().await;
@@ -3312,6 +3388,27 @@ fn validates_overview_ranges() {
 }
 
 #[test]
+fn overview_query_deserializes_typed_filters() {
+    let uri: axum::http::Uri = "http://localhost/api/overview\
+        ?tz_offset_minutes=480&provider_id=1&api_key_id=2&route_id=3\
+        &provider_api_key_id=4&success=false&gateway_adjusted=true&full_breakdown=true\
+        &granularity=week"
+        .parse()
+        .unwrap();
+    let Query(query) = Query::<OverviewQuery>::try_from_uri(&uri).unwrap();
+    assert_eq!(query.tz_offset_minutes, 480);
+    assert_eq!(query.provider_id, Some(1));
+    assert_eq!(query.api_key_id, Some(2));
+    assert_eq!(query.route_id, Some(3));
+    assert_eq!(query.provider_api_key_id, Some(4));
+    assert_eq!(query.success, Some(false));
+    assert_eq!(query.gateway_adjusted, Some(true));
+    assert!(query.full_breakdown);
+    assert_eq!(query.granularity, Some(AnalyticsGranularity::Week));
+    assert_eq!(query.filters().provider_id, Some(1));
+}
+
+#[test]
 fn generates_api_key_material() {
     let (raw, hash, prefix, suffix) = generate_api_key_material();
     assert!(raw.starts_with("sk-openllm-"));
@@ -4020,10 +4117,12 @@ async fn usage_completed_indexes_are_migrated() {
         indexes,
         vec![
             "idx_usage_completed_created",
+            "idx_usage_completed_endpoint_created",
             "idx_usage_completed_model_created",
             "idx_usage_completed_provider_created",
             "idx_usage_completed_provider_key_created",
             "idx_usage_completed_route_created",
+            "idx_usage_completed_success_created",
         ]
     );
 }
@@ -4154,6 +4253,7 @@ async fn overview_range_filters_dashboard_usage() {
             from: Some(range_start.to_rfc3339()),
             to: Some(range_end.to_rfc3339()),
             include_session_metrics: true,
+            ..Default::default()
         }),
     )
     .await
@@ -4177,6 +4277,20 @@ async fn overview_range_filters_dashboard_usage() {
     assert!((view.range_success_rate - 66.666_666).abs() < 0.001);
     assert_eq!(view.range_avg_latency_ms, 200.0);
     assert_eq!(view.range_gateway_adjusted, 1);
+    assert_eq!(view.range_latency_p50_ms, Some(200));
+    assert_eq!(view.range_latency_p95_ms, Some(300));
+    assert_eq!(view.range_latency_p99_ms, Some(300));
+    assert!(view.range_first_token_p50_ms.is_none());
+    assert!((view.range_output_tps.unwrap() - 166.666_666).abs() < 0.001);
+    assert_eq!(view.status_breakdown.len(), 1);
+    assert_eq!(view.status_breakdown[0].status_code, 200);
+    assert_eq!(view.status_breakdown[0].count, 3);
+    assert_eq!(view.error_reasons.len(), 1);
+    assert_eq!(view.error_reasons[0].label, "无错误信息");
+    assert_eq!(view.error_reasons[0].count, 1);
+    assert_eq!(view.gateway_adjustments.len(), 1);
+    assert_eq!(view.gateway_adjustments[0].category, "other");
+    assert_eq!(view.gateway_adjustments[0].count, 1);
     assert_eq!(view.active_providers, 3);
     assert_eq!(view.healthy_providers, 1);
     assert_eq!(view.failed_providers, 1);
@@ -4204,6 +4318,13 @@ async fn overview_range_filters_dashboard_usage() {
             .sum::<i64>(),
         view.range_completion_tokens
     );
+    assert_eq!(
+        view.daily_usage
+            .iter()
+            .map(|row| row.cost_micros)
+            .sum::<i64>(),
+        view.range_cost_micros
+    );
     assert_eq!(view.recent_requests.len(), 4);
     assert!(view.recent_requests.iter().any(|row| row.in_flight));
     assert!(
@@ -4215,6 +4336,15 @@ async fn overview_range_filters_dashboard_usage() {
     assert_eq!(view.model_usage[0].tokens, 190);
     assert_eq!(view.model_usage[0].prompt_tokens, 140);
     assert_eq!(view.model_usage[0].completion_tokens, 50);
+    assert_eq!(view.model_usage[0].cache_read, 25);
+    assert!((view.model_usage[0].cache_hit_rate - 17.857_142).abs() < 0.001);
+    assert_eq!(
+        view.daily_usage
+            .iter()
+            .map(|row| row.cache_read)
+            .sum::<i64>(),
+        view.range_cache_read
+    );
     assert_eq!(
         view.daily_model_requests
             .iter()
@@ -4241,6 +4371,13 @@ async fn overview_range_filters_dashboard_usage() {
             .iter()
             .all(|row| row.label == "其他")
     );
+    assert_eq!(
+        view.daily_model_requests
+            .iter()
+            .map(|row| row.tokens)
+            .sum::<i64>(),
+        view.range_tokens
+    );
 
     let Json(view_without_sessions) = overview(
         State(state),
@@ -4249,6 +4386,7 @@ async fn overview_range_filters_dashboard_usage() {
             from: Some(range_start.to_rfc3339()),
             to: Some(range_end.to_rfc3339()),
             include_session_metrics: false,
+            ..Default::default()
         }),
     )
     .await
@@ -4295,6 +4433,7 @@ async fn overview_buckets_a_single_day_by_hour() {
             from: Some(day_start.to_rfc3339()),
             to: Some((day_start + Duration::days(1)).to_rfc3339()),
             include_session_metrics: false,
+            ..Default::default()
         }),
     )
     .await
@@ -4328,6 +4467,818 @@ async fn overview_buckets_a_single_day_by_hour() {
             .sum::<i64>(),
         2
     );
+}
+
+#[tokio::test]
+async fn overview_applies_dimension_filters() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url, enabled) VALUES
+            (1, 'alpha-provider', 'openai', 'https://alpha.example/v1', 1),
+            (2, 'beta-provider', 'openai', 'https://beta.example/v1', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let now = Utc::now().to_rfc3339();
+    for (request_id, model, provider_id, endpoint, tokens, latency, status, success, error) in [
+        (
+            "alpha-ok",
+            "alpha",
+            1_i64,
+            "/v1/chat/completions",
+            10_i64,
+            100_i64,
+            200_i64,
+            1_i64,
+            None,
+        ),
+        (
+            "alpha-failed",
+            "alpha",
+            1,
+            "/v1/responses",
+            20,
+            300,
+            500,
+            0,
+            Some("upstream failed"),
+        ),
+        (
+            "beta-ok",
+            "beta",
+            2,
+            "/v1/chat/completions",
+            40,
+            500,
+            200,
+            1,
+            None,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                    request_id, requested_model, provider_id, endpoint,
+                    prompt_tokens, completion_tokens, total_tokens, latency_ms,
+                    status_code, success, error_message, created_at
+                 ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(request_id)
+        .bind(model)
+        .bind(provider_id)
+        .bind(endpoint)
+        .bind(tokens)
+        .bind(tokens)
+        .bind(latency)
+        .bind(status)
+        .bind(success)
+        .bind(error)
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let state = AppState::new(pool, None);
+    let from = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let to = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let call = |filters: UsageFilters| {
+        let state = state.clone();
+        let from = from.clone();
+        let to = to.clone();
+        async move {
+            overview(
+                State(state),
+                Query(OverviewQuery {
+                    tz_offset_minutes: 0,
+                    from: Some(from),
+                    to: Some(to),
+                    include_session_metrics: false,
+                    provider_id: filters.provider_id,
+                    provider_api_key_id: filters.provider_api_key_id,
+                    api_key_id: filters.api_key_id,
+                    route_id: filters.route_id,
+                    model: filters.model,
+                    request_id: filters.request_id,
+                    session_id: filters.session_id,
+                    endpoint: filters.endpoint,
+                    success: filters.success,
+                    in_flight: filters.in_flight,
+                    gateway_adjusted: filters.gateway_adjusted,
+                    full_breakdown: false,
+                    granularity: None,
+                }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    let Json(alpha) = call(UsageFilters {
+        model: Some("alpha".to_string()),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(alpha.range_requests, 2);
+    assert_eq!(alpha.range_tokens, 30);
+    assert!((alpha.range_success_rate - 50.0).abs() < 0.001);
+    assert_eq!(alpha.model_usage.len(), 1);
+    assert_eq!(alpha.model_usage[0].model, "alpha");
+    assert_eq!(alpha.provider_usage.len(), 1);
+    assert_eq!(alpha.provider_usage[0].provider_name, "alpha-provider");
+    assert_eq!(alpha.status_breakdown.len(), 2);
+    assert_eq!(
+        alpha
+            .status_breakdown
+            .iter()
+            .find(|row| row.status_code == 500)
+            .map(|row| row.count),
+        Some(1)
+    );
+
+    let Json(beta_provider) = call(UsageFilters {
+        provider_id: Some(2),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(beta_provider.range_requests, 1);
+    assert_eq!(beta_provider.range_tokens, 40);
+    assert_eq!(beta_provider.model_usage[0].model, "beta");
+
+    let Json(failed) = call(UsageFilters {
+        success: Some(false),
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(failed.range_requests, 1);
+    assert_eq!(failed.error_reasons.len(), 1);
+    assert_eq!(failed.error_reasons[0].label, "upstream failed");
+    assert_eq!(failed.error_reasons[0].count, 1);
+}
+
+#[tokio::test]
+async fn analytics_dimensions_groups_keys_routes_endpoints_and_sessions() {
+    async fn insert_usage(
+        pool: &sqlx::SqlitePool,
+        request_id: &str,
+        api_key_id: Option<i64>,
+        route_id: Option<i64>,
+        provider_id: Option<i64>,
+        provider_api_key_id: Option<i64>,
+        model: &str,
+        endpoint: &str,
+        session_id: Option<&str>,
+        prompt_tokens: i64,
+        completion_tokens: i64,
+        cache_read: i64,
+        cache_write: i64,
+        latency_ms: i64,
+        status_code: i64,
+        success: i64,
+        cost_micros: Option<i64>,
+        created_at: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                    request_id, api_key_id, route_id, provider_id, provider_api_key_id,
+                    requested_model, provider_api_key_name, endpoint, session_id,
+                    prompt_tokens, completion_tokens, total_tokens,
+                    cache_read_tokens, cache_write_tokens, latency_ms,
+                    status_code, success, estimated_cost_micros, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(request_id)
+        .bind(api_key_id)
+        .bind(route_id)
+        .bind(provider_id)
+        .bind(provider_api_key_id)
+        .bind(model)
+        .bind(provider_api_key_id.map(|_| "Primary"))
+        .bind(endpoint)
+        .bind(session_id)
+        .bind(prompt_tokens)
+        .bind(completion_tokens)
+        .bind(prompt_tokens + completion_tokens)
+        .bind(cache_read)
+        .bind(cache_write)
+        .bind(latency_ms)
+        .bind(status_code)
+        .bind(success)
+        .bind(cost_micros)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url) VALUES
+            (1, 'Alpha', 'openai', 'https://alpha.example/v1'),
+            (2, 'Beta', 'openai', 'https://beta.example/v1')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (id, name, key_hash, key_prefix, key_suffix) VALUES
+            (1, 'Console', 'dimension-hash-1', 'sk-console', 'a1b2'),
+            (2, 'CI', 'dimension-hash-2', 'sk-ci', 'c3d4')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy) VALUES
+            (1, 'Chat', 'gpt-*', 'priority'),
+            (2, 'Responses', 'claude-*', 'priority')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret) VALUES
+            (3, 1, 'Primary', 'dimension-alpha-key'),
+            (4, 2, 'Primary', 'dimension-beta-key')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let base = Utc::now() - Duration::hours(1);
+    let t1 = (base - Duration::minutes(30)).to_rfc3339();
+    let t2 = base.to_rfc3339();
+    let t3 = (base + Duration::minutes(10)).to_rfc3339();
+    let t4 = (base + Duration::minutes(20)).to_rfc3339();
+    insert_usage(
+        &pool,
+        "r1",
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(3),
+        "gpt-5.1",
+        "/v1/chat/completions",
+        Some("s1"),
+        100,
+        50,
+        40,
+        10,
+        1000,
+        200,
+        1,
+        Some(1000),
+        &t1,
+    )
+    .await;
+    insert_usage(
+        &pool,
+        "r2",
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(3),
+        "gpt-5.1",
+        "/v1/chat/completions",
+        Some("s1"),
+        200,
+        0,
+        0,
+        0,
+        2000,
+        500,
+        0,
+        None,
+        &t2,
+    )
+    .await;
+    insert_usage(
+        &pool,
+        "r3",
+        Some(2),
+        Some(2),
+        Some(2),
+        Some(4),
+        "claude-sonnet-4",
+        "/v1/responses",
+        Some("s2"),
+        100,
+        100,
+        50,
+        0,
+        3000,
+        200,
+        1,
+        Some(2000),
+        &t3,
+    )
+    .await;
+    insert_usage(
+        &pool,
+        "r4",
+        None,
+        None,
+        None,
+        None,
+        "local-model",
+        "/v1/responses",
+        None,
+        50,
+        0,
+        0,
+        0,
+        500,
+        200,
+        1,
+        None,
+        &t4,
+    )
+    .await;
+
+    let state = AppState::new(pool, None);
+    let from = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let to = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let Json(dimensions) = analytics_dimensions(
+        State(state.clone()),
+        Query(OverviewQuery {
+            from: Some(from.clone()),
+            to: Some(to.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(dimensions.api_key_usage.len(), 3);
+    let console = dimensions
+        .api_key_usage
+        .iter()
+        .find(|row| row.id == Some(1))
+        .unwrap();
+    assert_eq!(console.label, "Console");
+    assert_eq!(console.requests, 2);
+    assert_eq!(console.tokens, 350);
+    assert_eq!(console.cache_read, 40);
+    assert!((console.cache_hit_rate - 13.333_333).abs() < 0.001);
+    assert!((console.success_rate - 50.0).abs() < 0.001);
+    assert_eq!(console.cost_micros, Some(1000));
+
+    assert_eq!(dimensions.provider_api_key_usage.len(), 3);
+    let alpha_key = dimensions
+        .provider_api_key_usage
+        .iter()
+        .find(|row| row.id == Some(3))
+        .unwrap();
+    assert_eq!(alpha_key.label, "Alpha · Primary");
+    assert_eq!(alpha_key.requests, 2);
+    assert!((alpha_key.cache_hit_rate - 13.333_333).abs() < 0.001);
+
+    assert_eq!(dimensions.route_usage.len(), 3);
+    let chat = dimensions
+        .route_usage
+        .iter()
+        .find(|row| row.id == Some(1))
+        .unwrap();
+    assert_eq!(chat.label, "Chat");
+    assert_eq!(chat.requests, 2);
+
+    assert_eq!(dimensions.endpoint_usage.len(), 2);
+    let responses = dimensions
+        .endpoint_usage
+        .iter()
+        .find(|row| row.label == "/v1/responses")
+        .unwrap();
+    assert_eq!(responses.id, None);
+    assert_eq!(responses.requests, 2);
+
+    assert_eq!(dimensions.session_usage.len(), 2);
+    let session_one = dimensions
+        .session_usage
+        .iter()
+        .find(|row| row.session_id == "s1")
+        .unwrap();
+    assert_eq!(session_one.requests, 2);
+    assert_eq!(session_one.last_seen, t2);
+    assert!((session_one.cache_hit_rate - 13.333_333).abs() < 0.001);
+    let session_two = dimensions
+        .session_usage
+        .iter()
+        .find(|row| row.session_id == "s2")
+        .unwrap();
+    assert_eq!(session_two.requests, 1);
+    assert_eq!(session_two.last_seen, t3);
+
+    let Json(filtered) = analytics_dimensions(
+        State(state),
+        Query(OverviewQuery {
+            from: Some(from),
+            to: Some(to),
+            provider_id: Some(2),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered.api_key_usage.len(), 1);
+    assert_eq!(filtered.api_key_usage[0].id, Some(2));
+    assert_eq!(filtered.route_usage.len(), 1);
+    assert_eq!(filtered.route_usage[0].label, "Responses");
+    assert_eq!(filtered.session_usage.len(), 1);
+    assert_eq!(filtered.session_usage[0].session_id, "s2");
+}
+
+#[tokio::test]
+async fn overview_full_breakdown_lifts_model_limit() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let now = Utc::now().to_rfc3339();
+    for index in 0..10 {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                    request_id, requested_model, endpoint, prompt_tokens,
+                    completion_tokens, total_tokens, latency_ms, status_code,
+                    success, created_at
+                 ) VALUES (?, ?, '/v1/chat/completions', 10, 5, 15, 100, 200, 1, ?)",
+        )
+        .bind(format!("model-{index}"))
+        .bind(format!("model-{index:02}"))
+        .bind(&now)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let state = AppState::new(pool, None);
+    let from = (Utc::now() - Duration::days(1)).to_rfc3339();
+    let to = (Utc::now() + Duration::days(1)).to_rfc3339();
+    let Json(limited) = overview(
+        State(state.clone()),
+        Query(OverviewQuery {
+            from: Some(from.clone()),
+            to: Some(to.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(limited.model_usage.len(), 8);
+
+    let Json(full) = overview(
+        State(state),
+        Query(OverviewQuery {
+            from: Some(from),
+            to: Some(to),
+            full_breakdown: true,
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(full.model_usage.len(), 10);
+}
+
+#[tokio::test]
+async fn overview_compares_previous_equal_length_range() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let range_end = Utc::now() - Duration::hours(1);
+    let range_start = range_end - Duration::hours(2);
+    let previous_start = range_start - Duration::hours(2);
+    for (request_id, created_at, tokens) in [
+        ("previous-1", previous_start + Duration::minutes(30), 10),
+        ("previous-2", previous_start + Duration::minutes(90), 20),
+        ("current-1", range_start + Duration::minutes(30), 30),
+        ("current-2", range_start + Duration::minutes(90), 40),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                 request_id, requested_model, endpoint, prompt_tokens,
+                 completion_tokens, total_tokens, latency_ms, status_code,
+                 success, created_at
+             ) VALUES (?, 'test-model', '/v1/chat/completions', ?, 0, ?, 100, 200, 1, ?)",
+        )
+        .bind(request_id)
+        .bind(tokens)
+        .bind(tokens)
+        .bind(created_at.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let Json(view) = overview(
+        State(AppState::new(pool, None)),
+        Query(OverviewQuery {
+            from: Some(range_start.to_rfc3339()),
+            to: Some(range_end.to_rfc3339()),
+            granularity: Some(AnalyticsGranularity::Day),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(view.granularity, "day");
+    assert_eq!(view.range_requests, 2);
+    assert_eq!(view.range_tokens, 70);
+    assert_eq!(view.previous_range.from, previous_start.to_rfc3339());
+    assert_eq!(view.previous_range.to, range_start.to_rfc3339());
+    assert_eq!(view.previous_range.requests, 2);
+    assert_eq!(view.previous_range.tokens, 30);
+    assert!((view.previous_range.success_rate - 100.0).abs() < 0.001);
+}
+
+#[tokio::test]
+async fn overview_supports_week_and_month_buckets() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let range_start = DateTime::parse_from_rfc3339("2026-01-05T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let range_end = DateTime::parse_from_rfc3339("2026-02-02T00:00:00Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    for (request_id, created_at) in [
+        ("week-1", "2026-01-06T12:00:00Z"),
+        ("week-2", "2026-01-12T12:00:00Z"),
+        ("week-3", "2026-02-01T12:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                 request_id, requested_model, endpoint, prompt_tokens,
+                 completion_tokens, total_tokens, latency_ms, status_code,
+                 success, created_at
+             ) VALUES (?, 'test-model', '/v1/chat/completions', 10, 5, 15, 100, 200, 1, ?)",
+        )
+        .bind(request_id)
+        .bind(created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    let state = AppState::new(pool, None);
+    let Json(weekly) = overview(
+        State(state.clone()),
+        Query(OverviewQuery {
+            from: Some(range_start.to_rfc3339()),
+            to: Some(range_end.to_rfc3339()),
+            granularity: Some(AnalyticsGranularity::Week),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(weekly.granularity, "week");
+    assert_eq!(
+        weekly
+            .daily_usage
+            .iter()
+            .map(|row| row.day.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2026-01-05", "2026-01-12", "2026-01-19", "2026-01-26"]
+    );
+    assert_eq!(
+        weekly
+            .daily_usage
+            .iter()
+            .map(|row| row.requests)
+            .sum::<i64>(),
+        3
+    );
+
+    let Json(monthly) = overview(
+        State(state),
+        Query(OverviewQuery {
+            from: Some(range_start.to_rfc3339()),
+            to: Some(range_end.to_rfc3339()),
+            granularity: Some(AnalyticsGranularity::Month),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(monthly.granularity, "month");
+    assert_eq!(
+        monthly
+            .daily_usage
+            .iter()
+            .map(|row| row.day.as_str())
+            .collect::<Vec<_>>(),
+        vec!["2026-01-01", "2026-02-01"]
+    );
+}
+
+#[tokio::test]
+async fn overview_rejects_oversized_hourly_range() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let start = Utc::now() - Duration::days(40);
+    let result = overview(
+        State(AppState::new(pool, None)),
+        Query(OverviewQuery {
+            from: Some(start.to_rfc3339()),
+            to: Some(Utc::now().to_rfc3339()),
+            granularity: Some(AnalyticsGranularity::Hour),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn analytics_route_quality_groups_strategies_routes_sessions_and_failures() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO routes (id, name, model_pattern, strategy, strategy_ext) VALUES
+            (1, 'Priority route', 'gpt-*', 'priority', ''),
+            (2, 'Cost route', 'claude-*', 'priority', 'cost_optimized')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let created_at = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+    for (request_id, route_id, model, success, latency) in [
+        ("quality-1", 1_i64, "gpt-5.1", 1_i64, 100_i64),
+        ("quality-2", 2, "claude-sonnet-4", 1, 250),
+        ("quality-3", 1, "gpt-5.1", 0, 800),
+    ] {
+        sqlx::query(
+            "INSERT INTO usage_logs (
+                 request_id, route_id, requested_model, endpoint, prompt_tokens,
+                 completion_tokens, total_tokens, latency_ms, status_code,
+                 success, created_at
+             ) VALUES (?, ?, ?, '/v1/chat/completions', 10, 5, 15, ?, ?, ?, ?)",
+        )
+        .bind(request_id)
+        .bind(route_id)
+        .bind(model)
+        .bind(latency)
+        .bind(if success == 1 { 200 } else { 500 })
+        .bind(success)
+        .bind(&created_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    for (
+        request_id,
+        route_id,
+        strategy,
+        session_decision,
+        attempt_count,
+        fallback_count,
+        success,
+    ) in [
+        ("quality-1", 1_i64, "priority", "hit", 1_i64, 0_i64, 1_i64),
+        ("quality-2", 2, "cost_optimized", "miss", 2, 1, 1),
+        ("quality-3", 1, "priority", "no_affinity", 1, 0, 0),
+    ] {
+        sqlx::query(
+            "INSERT INTO routing_traces (
+                 request_id, route_id, strategy, session_id, session_decision,
+                 attempt_count, fallback_count, success
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(request_id)
+        .bind(route_id)
+        .bind(strategy)
+        .bind((request_id != "quality-3").then_some("session-a"))
+        .bind(session_decision)
+        .bind(attempt_count)
+        .bind(fallback_count)
+        .bind(success)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO routing_attempts (
+             request_id, attempt_index, round, candidate_order, started_at,
+             latency_ms, status_code, success, retryable, reason_code,
+             failure_scope, failure_retry, failure_confidence
+         ) VALUES
+            ('quality-1', 1, 0, 1, ?, 100, 200, 1, 0, 'upstream_success', NULL, NULL, 'exact'),
+            ('quality-2', 1, 0, 1, ?, 120, 429, 0, 1, 'upstream_rate_limited', 'provider', 'next_target', 'inferred'),
+            ('quality-2', 2, 0, 2, ?, 130, 200, 1, 0, 'upstream_success', NULL, NULL, 'exact'),
+            ('quality-3', 1, 0, 1, ?, 800, 500, 0, 0, 'internal_error', 'endpoint', 'do_not_retry', 'exact')",
+    )
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(&created_at)
+    .bind(&created_at)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = AppState::new(pool, None);
+    let from = (Utc::now() - Duration::hours(1)).to_rfc3339();
+    let to = Utc::now().to_rfc3339();
+    let Json(quality) = analytics_route_quality(
+        State(state.clone()),
+        Query(OverviewQuery {
+            from: Some(from.clone()),
+            to: Some(to.clone()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(quality.traces, 3);
+    assert!((quality.fallback_rate - 33.333_333).abs() < 0.001);
+    assert!((quality.avg_attempts - 1.333_333).abs() < 0.001);
+    assert_eq!(quality.session_requests, 2);
+    assert_eq!(quality.session_hits, 1);
+    assert!((quality.session_hit_rate - 50.0).abs() < 0.001);
+    assert!((quality.success_rate - 66.666_666).abs() < 0.001);
+    assert_eq!(quality.strategies.len(), 2);
+    let priority = quality
+        .strategies
+        .iter()
+        .find(|row| row.strategy == "priority")
+        .unwrap();
+    assert_eq!(priority.traces, 2);
+    assert!((priority.success_rate - 50.0).abs() < 0.001);
+    let cost = quality
+        .strategies
+        .iter()
+        .find(|row| row.strategy == "cost_optimized")
+        .unwrap();
+    assert_eq!(cost.fallback_rate, 100.0);
+    assert_eq!(quality.routes.len(), 2);
+    assert_eq!(
+        quality
+            .routes
+            .iter()
+            .find(|row| row.route_id == Some(1))
+            .map(|row| row.route_name.as_str()),
+        Some("Priority route")
+    );
+    assert_eq!(
+        quality
+            .session_decisions
+            .iter()
+            .find(|row| row.decision == "hit")
+            .map(|row| row.count),
+        Some(1)
+    );
+    assert_eq!(
+        quality
+            .failure_reasons
+            .iter()
+            .find(|row| row.reason_code == "upstream_rate_limited")
+            .map(|row| row.failure_scope.as_str()),
+        Some("provider")
+    );
+
+    let Json(filtered) = analytics_route_quality(
+        State(state),
+        Query(OverviewQuery {
+            from: Some(from),
+            to: Some(to),
+            route_id: Some(1),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(filtered.traces, 2);
+    assert_eq!(filtered.routes.len(), 1);
+    assert_eq!(filtered.routes[0].route_id, Some(1));
 }
 
 #[tokio::test]

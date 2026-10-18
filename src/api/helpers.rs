@@ -1351,72 +1351,79 @@ pub(super) fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 pub(super) fn apply_usage_filters<'a>(
     builder: &mut QueryBuilder<'a, Sqlite>,
-    query: &'a UsageQuery,
+    filters: &'a UsageFilters,
 ) {
-    if let Some(provider_id) = query.provider_id {
+    if let Some(provider_id) = filters.provider_id {
         builder.push(" AND u.provider_id = ").push_bind(provider_id);
     }
-    if let Some(provider_api_key_id) = query.provider_api_key_id {
+    if let Some(provider_api_key_id) = filters.provider_api_key_id {
         builder
             .push(" AND u.provider_api_key_id = ")
             .push_bind(provider_api_key_id);
     }
-    if let Some(api_key_id) = query.api_key_id {
+    if let Some(api_key_id) = filters.api_key_id {
         builder.push(" AND u.api_key_id = ").push_bind(api_key_id);
     }
-    if let Some(route_id) = query.route_id {
+    if let Some(route_id) = filters.route_id {
         builder.push(" AND u.route_id = ").push_bind(route_id);
     }
-    if let Some(model) = &query.model
+    if let Some(model) = &filters.model
         && !model.trim().is_empty()
     {
         builder
             .push(" AND u.requested_model LIKE ")
             .push_bind(format!("%{}%", model.trim()));
     }
-    if let Some(request_id) = &query.request_id
+    if let Some(request_id) = &filters.request_id
         && !request_id.trim().is_empty()
     {
         builder
             .push(" AND u.request_id LIKE ")
             .push_bind(format!("%{}%", request_id.trim()));
     }
-    if let Some(session_id) = &query.session_id
+    if let Some(session_id) = &filters.session_id
         && !session_id.trim().is_empty()
     {
         builder
             .push(" AND u.session_id LIKE ")
             .push_bind(format!("%{}%", session_id.trim()));
     }
-    if let Some(endpoint) = &query.endpoint
+    if let Some(endpoint) = &filters.endpoint
         && !endpoint.trim().is_empty()
     {
         builder
             .push(" AND u.endpoint LIKE ")
             .push_bind(format!("%{}%", endpoint.trim()));
     }
-    if let Some(success) = query.success {
+    if let Some(success) = filters.success {
         builder.push(" AND u.success = ").push_bind(success as i64);
         if !success {
             builder.push(" AND u.in_flight = 0");
         }
     }
-    if let Some(in_flight) = query.in_flight {
+    if let Some(in_flight) = filters.in_flight {
         builder
             .push(" AND u.in_flight = ")
             .push_bind(in_flight as i64);
     }
-    if let Some(gateway_adjusted) = query.gateway_adjusted {
+    if let Some(gateway_adjusted) = filters.gateway_adjusted {
         if gateway_adjusted {
             builder.push(" AND u.warning_message IS NOT NULL AND TRIM(u.warning_message) <> ''");
         } else {
             builder.push(" AND (u.warning_message IS NULL OR TRIM(u.warning_message) = '')");
         }
     }
-    if let Some(from) = &query.from {
+}
+
+pub(super) fn apply_usage_time_range<'a>(
+    builder: &mut QueryBuilder<'a, Sqlite>,
+    from: Option<&'a str>,
+    to: Option<&'a str>,
+) {
+    if let Some(from) = from {
         builder.push(" AND u.created_at >= ").push_bind(from);
     }
-    if let Some(to) = &query.to {
+    if let Some(to) = to {
         builder.push(" AND u.created_at <= ").push_bind(to);
     }
 }

@@ -269,10 +269,17 @@ pub(crate) async fn views_for_scope(
         .fetch_all(&state.pool)
         .await?
     };
-    Ok(effective_records(rows)
+    Ok(effective_snapshot_views(rows))
+}
+
+pub(crate) fn effective_snapshot_views(
+    records: Vec<ProviderQuotaSnapshotRecord>,
+) -> Vec<ProviderQuotaSnapshotView> {
+    let now = Utc::now();
+    effective_records(records)
         .into_iter()
-        .map(|record| quota_snapshot_view(record, Utc::now()))
-        .collect())
+        .map(|record| quota_snapshot_view(record, now))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq)]

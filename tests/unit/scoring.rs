@@ -102,6 +102,46 @@ async fn bind_affinity_pin(state: &AppState, provider_id: i64) {
         .await;
 }
 
+#[tokio::test]
+async fn routing_decision_reports_session_affinity_hits_and_misses() {
+    let (state, _) = affinity_test_state().await;
+    bind_affinity_pin(&state, 1).await;
+    let targets = vec![
+        scoring_target(1, "provider-1"),
+        scoring_target(2, "provider-2"),
+    ];
+
+    let hit = order_targets_with_decision(
+        &state,
+        7,
+        "priority",
+        targets.clone(),
+        Some("session-a"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(hit.session_decision, "hit");
+    assert_eq!(hit.targets[0].provider_id, 1);
+
+    let miss = order_targets_with_decision(
+        &state,
+        7,
+        "priority",
+        targets.clone(),
+        Some("session-b"),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(miss.session_decision, "miss");
+
+    let no_affinity = order_targets_with_decision(&state, 7, "priority", targets, None, None)
+        .await
+        .unwrap();
+    assert_eq!(no_affinity.session_decision, "no_affinity");
+}
+
 async fn record_cache_usage(
     pool: &sqlx::SqlitePool,
     request_id: &str,

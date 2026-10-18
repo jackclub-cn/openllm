@@ -7,6 +7,7 @@ import {
   type ClearCooldownsResult,
   type Provider,
   type ProviderApiKeyInput,
+  type ProviderQuotaOverview,
   type ProviderInput,
   type ProviderKeyTestAllResult,
 } from '../api'
@@ -16,6 +17,7 @@ import ProviderEditorModal from './providers/ProviderEditorModal'
 import ProviderKeyTestModal from './providers/ProviderKeyTestModal'
 import ProviderLimitsModal from './providers/ProviderLimitsModal'
 import ProviderQuotaModal from './providers/ProviderQuotaModal'
+import ProviderQuotaCards from './providers/ProviderQuotaCards'
 import ProviderSyncModal from './providers/ProviderSyncModal'
 import ProviderTable from './providers/ProviderTable'
 import ProviderTemplateModal from './providers/ProviderTemplateModal'
@@ -31,7 +33,9 @@ export default function Providers() {
   const { message } = App.useApp()
   const [searchParams, setSearchParams] = useSearchParams()
   const [items, setItems] = useState<Provider[]>([])
+  const [quotaOverviews, setQuotaOverviews] = useState<ProviderQuotaOverview[]>([])
   const [loading, setLoading] = useState(true)
+  const [quotaLoading, setQuotaLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [togglingProviderId, setTogglingProviderId] = useState<number>()
   const [resettingProviderId, setResettingProviderId] = useState<number>()
@@ -82,12 +86,33 @@ export default function Providers() {
 
   const load = async () => {
     setLoading(true)
+    setQuotaLoading(true)
+    const [providersResult, quotaResult] = await Promise.allSettled([
+      api.get<Provider[]>('/api/providers'),
+      api.get<ProviderQuotaOverview[]>('/api/providers/quota-overview'),
+    ])
+    if (providersResult.status === 'fulfilled') {
+      setItems(providersResult.value)
+    } else {
+      message.error(formatError(providersResult.reason))
+    }
+    if (quotaResult.status === 'fulfilled') {
+      setQuotaOverviews(quotaResult.value)
+    } else {
+      message.error(formatError(quotaResult.reason))
+    }
+    setLoading(false)
+    setQuotaLoading(false)
+  }
+
+  const loadQuotaOverview = async () => {
+    setQuotaLoading(true)
     try {
-      setItems(await api.get<Provider[]>('/api/providers'))
+      setQuotaOverviews(await api.get<ProviderQuotaOverview[]>('/api/providers/quota-overview'))
     } catch (error) {
       message.error(formatError(error))
     } finally {
-      setLoading(false)
+      setQuotaLoading(false)
     }
   }
 
@@ -437,6 +462,12 @@ export default function Providers() {
         onRemove={(id) => void remove(id)}
         onPreviewSync={setSyncTarget}
       />
+      <ProviderQuotaCards
+        providers={filteredProviders}
+        overviews={quotaOverviews}
+        loading={loading || quotaLoading}
+        onOpenQuota={setQuotaProvider}
+      />
 
       <ProviderTemplateModal
         open={templateOpen}
@@ -468,7 +499,10 @@ export default function Providers() {
       />
       <ProviderQuotaModal
         provider={quotaProvider}
-        onClose={() => setQuotaProvider(undefined)}
+        onClose={() => {
+          setQuotaProvider(undefined)
+          void loadQuotaOverview()
+        }}
       />
       <ProviderLimitsModal
         provider={limitProvider}

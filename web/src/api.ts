@@ -194,6 +194,21 @@ export type ProviderQuotaSnapshot = {
   state: 'unknown' | 'healthy' | 'low' | 'exhausted' | 'reset_due'
 }
 
+export type ProviderQuotaOverviewSnapshot = ProviderQuotaSnapshot & {
+  key_id?: number | null
+  key_name?: string | null
+  key_suffix?: string | null
+}
+
+export type ProviderQuotaOverview = {
+  provider_id: number
+  provider_name: string
+  provider_enabled: boolean
+  kind: string
+  title: string
+  snapshots: ProviderQuotaOverviewSnapshot[]
+}
+
 export type ProviderPrice = {
   model_name: string
   input?: number | null
@@ -615,6 +630,26 @@ export type RouteTrace = {
   attempts: RouteTraceAttempt[]
 }
 
+export type AnalyticsGranularity = 'auto' | 'hour' | 'day' | 'week' | 'month'
+
+export type OverviewComparison = {
+  from: string
+  to: string
+  requests: number
+  tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  cache_read: number
+  cache_write: number
+  cache_hit_rate: number
+  cost_micros: number
+  unpriced: number
+  success_rate: number
+  avg_latency_ms: number
+  output_tps: number | null
+  gateway_adjusted: number
+}
+
 export type Overview = {
   requests_today: number
   tokens_today: number
@@ -648,7 +683,15 @@ export type Overview = {
   range_unpriced: number
   range_success_rate: number
   range_avg_latency_ms: number
+  range_latency_p50_ms: number | null
+  range_latency_p95_ms: number | null
+  range_latency_p99_ms: number | null
+  range_first_token_p50_ms: number | null
+  range_first_token_p95_ms: number | null
+  range_first_token_p99_ms: number | null
+  range_output_tps: number | null
   range_gateway_adjusted: number
+  previous_range: OverviewComparison
   success_rate: number
   avg_latency_ms: number
   active_providers: number
@@ -665,7 +708,7 @@ export type Overview = {
   cooling_provider_keys: number
   in_flight_requests: number
   recent_requests: UsageLog[]
-  granularity: 'hour' | 'day'
+  granularity: Exclude<AnalyticsGranularity, 'auto'>
   provider_usage: Array<{
     provider_id: number
     provider_name: string
@@ -676,6 +719,9 @@ export type Overview = {
     cost_micros?: number | null
     success_rate: number
     avg_latency_ms: number
+    cache_read: number
+    cache_write: number
+    cache_hit_rate: number
   }>
   model_usage: Array<{
     model: string
@@ -686,6 +732,9 @@ export type Overview = {
     cost_micros?: number | null
     success_rate: number
     avg_latency_ms: number
+    cache_read: number
+    cache_write: number
+    cache_hit_rate: number
   }>
   daily_usage: Array<{
     day: string
@@ -693,15 +742,110 @@ export type Overview = {
     tokens: number
     prompt_tokens: number
     completion_tokens: number
+    cost_micros: number
+    success_rate: number
+    cache_read: number
+    cache_write: number
+    cache_hit_rate: number
   }>
   daily_model_requests: DailyBreakdownUsage[]
   daily_provider_requests: DailyBreakdownUsage[]
+  status_breakdown: Array<{ status_code: number; count: number }>
+  error_reasons: Array<{ label: string; count: number }>
+  gateway_adjustments: Array<{ category: string; count: number }>
 }
 
 export type DailyBreakdownUsage = {
   day: string
   label: string
   requests: number
+  tokens: number
+  prompt_tokens: number
+  cost_micros: number
+  success_rate: number
+  cache_read: number
+  cache_write: number
+  cache_hit_rate: number
+}
+
+export type DimensionUsage = {
+  id?: number | null
+  label: string
+  requests: number
+  tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_micros?: number | null
+  success_rate: number
+  avg_latency_ms: number
+  cache_read: number
+  cache_write: number
+  cache_hit_rate: number
+}
+
+export type SessionUsage = {
+  session_id: string
+  requests: number
+  tokens: number
+  prompt_tokens: number
+  completion_tokens: number
+  cost_micros?: number | null
+  success_rate: number
+  avg_latency_ms: number
+  cache_read: number
+  cache_write: number
+  cache_hit_rate: number
+  last_seen: string
+}
+
+export type AnalyticsDimensions = {
+  api_key_usage: DimensionUsage[]
+  provider_api_key_usage: DimensionUsage[]
+  route_usage: DimensionUsage[]
+  endpoint_usage: DimensionUsage[]
+  session_usage: SessionUsage[]
+}
+
+export type RouteQualityStrategy = {
+  strategy: string
+  traces: number
+  fallback_rate: number
+  avg_attempts: number
+  success_rate: number
+}
+
+export type RouteQualityRoute = {
+  route_id?: number | null
+  route_name: string
+  traces: number
+  fallback_rate: number
+  avg_attempts: number
+  success_rate: number
+}
+
+export type RouteQualityDecision = {
+  decision: string
+  count: number
+}
+
+export type RouteQualityFailure = {
+  reason_code: string
+  failure_scope: string
+  count: number
+}
+
+export type RouteQuality = {
+  traces: number
+  fallback_rate: number
+  avg_attempts: number
+  session_requests: number
+  session_hits: number
+  session_hit_rate: number
+  success_rate: number
+  strategies: RouteQualityStrategy[]
+  routes: RouteQualityRoute[]
+  session_decisions: RouteQualityDecision[]
+  failure_reasons: RouteQualityFailure[]
 }
 
 export type DatabaseStats = {

@@ -57,7 +57,7 @@ export default function ProviderToolbar({
             value={providerSearch}
             onChange={(event) => onSearchChange(event.target.value)}
             placeholder="搜索名称、地址、模型或密钥"
-            style={{ width: 250 }}
+            style={{ width: 250, maxWidth: '100%' }}
           />
           <Select
             value={providerStatus}

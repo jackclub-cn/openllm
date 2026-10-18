@@ -439,7 +439,7 @@ async fn run_openai_attempts(
     let request_deadline = context.request_deadline;
     let busy_wait_deadline = context.busy_wait_deadline;
     let mut wait_round = 0u32;
-    let mut ordered_targets = order_targets(
+    let ordered = order_targets_with_decision(
         state,
         context.ordering_key,
         &context.resolved.strategy,
@@ -448,12 +448,14 @@ async fn run_openai_attempts(
         context.api_key.as_ref().map(|key| key.id),
     )
     .await?;
+    let mut ordered_targets = ordered.targets;
     let mut trace = super::route_trace::RouteTraceRecorder::new(
         context.request_id.clone(),
         context.route_id,
         context.resolved.strategy.clone(),
         context.session_id.clone(),
     );
+    trace.set_session_decision(ordered.session_decision);
     trace
         .update_candidates(
             state,
@@ -757,7 +759,7 @@ async fn run_openai_attempts(
             "all route targets are temporarily busy; waiting before reordering candidates"
         );
         tokio::time::sleep(delay).await;
-        ordered_targets = order_targets(
+        let ordered = order_targets_with_decision(
             state,
             context.ordering_key,
             &context.resolved.strategy,
@@ -766,6 +768,8 @@ async fn run_openai_attempts(
             context.api_key.as_ref().map(|key| key.id),
         )
         .await?;
+        ordered_targets = ordered.targets;
+        trace.set_session_decision(ordered.session_decision);
         trace
             .update_candidates(
                 state,

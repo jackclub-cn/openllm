@@ -42,7 +42,7 @@ export default function AnalyticsProviderUsage({
             : {}
         }
         locale={{ emptyText: '暂无提供商用量' }}
-        scroll={{ x: 940 }}
+        scroll={{ x: 1040 }}
         columns={[
           {
             title: '提供商',
@@ -93,6 +93,19 @@ export default function AnalyticsProviderUsage({
             width: 110,
             sorter: (left, right) => (left.cost_micros ?? 0) - (right.cost_micros ?? 0),
             render: (value: number | null) => formatCostMicros(value),
+          },
+          {
+            title: '缓存',
+            dataIndex: 'cache_hit_rate',
+            width: 120,
+            sorter: (left, right) => left.cache_hit_rate - right.cache_hit_rate,
+            render: (value: number, record) => (
+              <Tooltip
+                title={`读取 ${formatExact(record.cache_read)} · 写入 ${formatExact(record.cache_write)}`}
+              >
+                <span>{value.toFixed(1)}%</span>
+              </Tooltip>
+            ),
           },
           {
             title: '成功率',
