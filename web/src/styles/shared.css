@@ -1,0 +1,20 @@
+.full-height-card {
+  height: 100%;
+}
+
+.stat-line {
+  margin-top: 4px;
+  font-size: 22px;
+}
+
+.page-alert {
+  margin-bottom: 16px;
+}
+
+.filter-card {
+  margin-bottom: 16px;
+}
+
+.new-records-alert {
+  margin-bottom: 16px;
+}

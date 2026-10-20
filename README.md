@@ -214,13 +214,27 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 </details>
 
+## 开发规范
+
+代码组织、模块职责和验证要求见 [docs/CODE_STANDARDS.md](docs/CODE_STANDARDS.md)，
+开发代理同时遵循根目录 [AGENTS.md](AGENTS.md)。文件规模和 Rust 格式由 CI 自动检查；
+新功能接近文件上限时，应在同一轮按职责拆分。
+
+```bash
+node scripts/check-code-structure.mjs
+cargo fmt --check
+cargo test --locked
+```
+
+前端改动另外在 `web/` 执行 `npm run build`。
+
 ## 发布流程
 
 GitHub Actions 在 Pull Request 和手动触发时执行测试与构建；推送 `v*` 标签时创建 Release，并上传三平台二进制和校验文件。
 
 ```bash
-git tag v0.3.29
-git push origin v0.3.29
+git tag v0.3.30
+git push origin v0.3.30
 ```
 
 Release 页面：<https://github.com/jackclub-cn/openllm/releases>

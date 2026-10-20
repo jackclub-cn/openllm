@@ -26,11 +26,19 @@ function stateStrokeColor(state: string) {
 }
 
 function windowValue(group: ProviderQuotaWindowGroup) {
-  if (group.remaining == null) return '—'
-  const remaining = formatQuotaAmount(group.remaining, group.unit)
+  const used =
+    group.used ??
+    (group.remaining != null && group.limit != null
+      ? Math.max(0, group.limit - group.remaining)
+      : undefined)
+  if (used == null) {
+    return group.remaining == null
+      ? '—'
+      : formatQuotaAmount(group.remaining, group.unit)
+  }
   return group.limit == null
-    ? remaining
-    : `${remaining} / ${formatQuotaAmount(group.limit, group.unit)}`
+    ? formatQuotaAmount(used, group.unit)
+    : `${formatQuotaAmount(used, group.unit)} / ${formatQuotaAmount(group.limit, group.unit)}`
 }
 
 export default function ProviderQuotaCards({

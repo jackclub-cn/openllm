@@ -764,10 +764,12 @@ pub(crate) async fn mark_provider_tool_search_unsupported(state: &AppState, prov
     }
     crate::capabilities::record_capability(
         state,
-        provider_id,
-        "",
-        "",
-        crate::capabilities::CAPABILITY_TOOL_SEARCH,
+        crate::capabilities::CapabilityKey {
+            provider_id,
+            model: String::new(),
+            endpoint: String::new(),
+            capability: crate::capabilities::CAPABILITY_TOOL_SEARCH.to_string(),
+        },
         false,
         crate::capabilities::SOURCE_RUNTIME,
         "exact",

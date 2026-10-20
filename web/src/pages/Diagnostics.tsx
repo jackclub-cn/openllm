@@ -1,3 +1,7 @@
+import { formatSeconds, formatTimestamp } from './diagnostics/format'
+import DiagnosticCapacity from './diagnostics/DiagnosticCapacity'
+import DiagnosticPools from './diagnostics/DiagnosticPools'
+import DiagnosticFailures from './diagnostics/DiagnosticFailures'
 import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
@@ -9,10 +13,8 @@ import {
   Col,
   Descriptions,
   Empty,
-  Progress,
   Row,
   Space,
-  Statistic,
   Table,
   Tag,
   Typography,
@@ -27,9 +29,7 @@ import {
   formatError,
   type ApiKey,
   type ClearCooldownsResult,
-  type DiagnosticFailure,
   type DiagnosticSnapshot,
-  type PoolUsage,
   type SelfCheckItem,
   type SelfCheckStatus,
 } from '../api'
@@ -47,20 +47,6 @@ const categoryLabels: Record<string, string> = {
   routing: '路由与密钥',
   capacity: '容量与内存',
   observability: '可观测与维护',
-}
-
-function formatSeconds(seconds?: number | null) {
-  if (seconds === undefined || seconds === null) return '—'
-  if (seconds < 60) return `${seconds} 秒`
-  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分 ${seconds % 60} 秒`
-  return `${Math.floor(seconds / 3600)} 小时 ${Math.floor((seconds % 3600) / 60)} 分`
-}
-
-function formatTimestamp(value?: string | null) {
-  if (!value) return '—'
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return value
-  return date.toLocaleString()
 }
 
 type CooldownRow = {
@@ -96,7 +82,7 @@ export default function DiagnosticsPage() {
         setLoading(false)
       }
     },
-    [message],
+    [message]
   )
 
   useEffect(() => {
@@ -116,9 +102,7 @@ export default function DiagnosticsPage() {
         .replace(/[:.]/g, '-')}.json`
       anchor.click()
       URL.revokeObjectURL(url)
-      message.success(
-        includeSecrets ? '已导出（包含明文上游凭据）' : '已导出诊断快照',
-      )
+      message.success(includeSecrets ? '已导出（包含明文上游凭据）' : '已导出诊断快照')
       // The export is an audited action when secrets are included; refresh so
       // the audit trail and the page agree.
       if (includeSecrets) void load(true)
@@ -134,7 +118,7 @@ export default function DiagnosticsPage() {
     try {
       const result = await api.post<ClearCooldownsResult>(
         '/api/resilience/cooldowns/clear',
-        { all: true },
+        { all: true }
       )
       const total =
         result.cleared_provider_cooldowns +
@@ -171,25 +155,26 @@ export default function DiagnosticsPage() {
       kind: '模型冷却',
       target: `${item.provider_name || `#${item.provider_id}`} · ${item.model}`,
       remaining: item.remaining_seconds,
-      detail:
-        formatFailureClassification(item) || '该模型暂不参与路由',
+      detail: formatFailureClassification(item) || '该模型暂不参与路由',
     })),
     ...(snapshot?.resilience.provider_key_cooldowns || []).map((item) => ({
       key: `key-${item.provider_key_id}`,
       kind: '上游密钥冷却',
-      target: `${item.provider_name || '未知提供商'} · ${item.key_name || `#${item.provider_key_id}`}`,
+      target: `${item.provider_name || '未知提供商'} · ${
+        item.key_name || `#${item.provider_key_id}`
+      }`,
       remaining: item.remaining_seconds,
-      detail:
-        formatFailureClassification(item) || '该上游密钥暂不参与路由',
+      detail: formatFailureClassification(item) || '该上游密钥暂不参与路由',
     })),
   ].sort((a, b) => b.remaining - a.remaining)
 
-  const admission = snapshot?.status.admission
-  const memory = snapshot?.status.memory
-  const database = snapshot?.status.database
-
   return (
-    <Space direction="vertical" size={16} style={{ width: '100%' }}>
+    <Space
+      className="diagnostics-page"
+      direction="vertical"
+      size={16}
+      style={{ width: '100%' }}
+    >
       <Card
         title={
           <Space size={12}>
@@ -201,15 +186,15 @@ export default function DiagnosticsPage() {
                   check.overall === 'pass'
                     ? 'success'
                     : check.overall === 'warn'
-                      ? 'warning'
-                      : 'error'
+                    ? 'warning'
+                    : 'error'
                 }
                 text={
                   check.overall === 'pass'
                     ? '全部通过'
                     : check.overall === 'warn'
-                      ? `${check.counts.warn} 项需要注意`
-                      : `${check.counts.fail} 项失败`
+                    ? `${check.counts.warn} 项需要注意`
+                    : `${check.counts.fail} 项失败`
                 }
               />
             ) : null}
@@ -244,6 +229,7 @@ export default function DiagnosticsPage() {
         ) : null}
         <Table<SelfCheckItem>
           size="small"
+          scroll={{ x: 720 }}
           rowKey="id"
           loading={loading}
           pagination={false}
@@ -271,9 +257,7 @@ export default function DiagnosticsPage() {
                 <>
                   <div>{value}</div>
                   {item.hint ? (
-                    <Typography.Text type="secondary">
-                      建议：{item.hint}
-                    </Typography.Text>
+                    <Typography.Text type="secondary">建议：{item.hint}</Typography.Text>
                   ) : null}
                 </>
               ),
@@ -282,73 +266,7 @@ export default function DiagnosticsPage() {
         />
       </Card>
 
-      <Card title="容量与并发">
-        <Row gutter={[16, 16]}>
-          <Col xs={12} md={6}>
-            <Statistic
-              title="在途请求 / 并发上限"
-              value={admission?.in_flight ?? 0}
-              suffix={`/ ${admission?.max_concurrent_requests || '不限'}`}
-            />
-          </Col>
-          <Col xs={12} md={6}>
-            <Statistic
-              title="准入卸载请求"
-              value={admission?.requests_shed_total ?? 0}
-            />
-          </Col>
-          <Col xs={12} md={6}>
-            <Statistic
-              title="请求体占用 / 上限 (MiB)"
-              value={(admission?.in_flight_request_mib ?? 0).toFixed(2)}
-              suffix={`/ ${admission?.max_inflight_request_mib || '不限'}`}
-            />
-          </Col>
-          <Col xs={12} md={6}>
-            <Statistic
-              title="运行时阻塞"
-              value={snapshot?.status.runtime_lag_millis ?? 0}
-              suffix="ms"
-              valueStyle={
-                (snapshot?.status.runtime_lag_millis ?? 0) > 5000
-                  ? { color: '#d4380d' }
-                  : undefined
-              }
-            />
-          </Col>
-          <Col xs={24} md={12}>
-            <Typography.Text type="secondary">
-              内存 {memory ? `${memory.used_mib ?? 0} / ${memory.limit_mib || '不限'} MiB` : '—'}
-              {memory && !memory.limit_mib
-                ? `（采样来源：${memory.source}${memory.source === 'off' ? '，未启用内存保护' : ''}）`
-                : ''}
-            </Typography.Text>
-            <Progress
-              percent={
-                memory?.used_ratio
-                  ? Math.min(100, Math.round(memory.used_ratio * 100))
-                  : 0
-              }
-              status={memory?.pressure ? 'exception' : 'normal'}
-              showInfo={Boolean(memory?.used_ratio)}
-            />
-          </Col>
-          <Col xs={24} md={12}>
-            <Typography.Text type="secondary">
-              数据库连接{' '}
-              {database
-                ? `${database.connections} 已用 / ${database.idle} 空闲 / ${database.max_connections} 上限`
-                : '—'}
-            </Typography.Text>
-            <div>
-              <Typography.Text type="secondary">
-                内存卸载 {memory?.shed_total ?? 0} 次 · 请求体卸载{' '}
-                {admission?.request_bytes_shed_total ?? 0} 次
-              </Typography.Text>
-            </div>
-          </Col>
-        </Row>
-      </Card>
+      <DiagnosticCapacity snapshot={snapshot} />
 
       <Card
         title="冷却与熔断"
@@ -371,6 +289,7 @@ export default function DiagnosticsPage() {
       >
         <Table<CooldownRow>
           size="small"
+          scroll={{ x: 560 }}
           rowKey="key"
           pagination={false}
           loading={loading}
@@ -390,169 +309,11 @@ export default function DiagnosticsPage() {
         />
       </Card>
 
-      <Card title="提供商配额池">
-        <Table<PoolUsage>
-          size="small"
-          rowKey="pool_id"
-          pagination={false}
-          loading={loading}
-          dataSource={snapshot?.pools || []}
-          locale={{ emptyText: '尚未配置配额池' }}
-          expandable={{
-            rowExpandable: (pool) => pool.allocations.length > 0,
-            expandedRowRender: (pool) => (
-              <Table
-                size="small"
-                rowKey={(row) => `alloc-${row.api_key_id}`}
-                pagination={false}
-                dataSource={pool.allocations}
-                columns={[
-                  {
-                    title: '网关密钥',
-                    dataIndex: 'api_key_id',
-                    render: (value: number) =>
-                      keyNames.get(value) || `#${value}`,
-                  },
-                  {
-                    title: '权重',
-                    dataIndex: 'weight_pct',
-                    render: (value: number) => `${value}%`,
-                  },
-                  { title: '策略', dataIndex: 'policy' },
-                  {
-                    title: '本窗口请求 / 份额',
-                    render: (_: unknown, row) =>
-                      `${row.key_requests} / ${row.request_share ?? '不限'}`,
-                  },
-                  {
-                    title: '本窗口 Token / 份额',
-                    render: (_: unknown, row) =>
-                      `${row.key_tokens} / ${row.token_share ?? '不限'}`,
-                  },
-                ]}
-              />
-            ),
-          }}
-          columns={[
-            { title: '配额池', dataIndex: 'name' },
-            {
-              title: '提供商',
-              dataIndex: 'provider_id',
-              render: (value: number) =>
-                snapshot?.providers.find((item) => item.id === value)?.name ||
-                `#${value}`,
-            },
-            {
-              title: '窗口',
-              dataIndex: 'window_seconds',
-              render: (value: number) => formatSeconds(value),
-            },
-            {
-              title: '请求用量 / 上限',
-              render: (_: unknown, row) =>
-                `${row.requests} / ${row.request_limit ?? '不限'}`,
-            },
-            {
-              title: 'Token 用量 / 上限',
-              render: (_: unknown, row) =>
-                `${row.tokens} / ${row.token_limit ?? '不限'}`,
-            },
-            {
-              title: '饱和度',
-              dataIndex: 'saturated',
-              width: 90,
-              render: (value: boolean) =>
-                value ? (
-                  <Tag color="warning">已饱和</Tag>
-                ) : (
-                  <Tag color="success">正常</Tag>
-                ),
-            },
-            {
-              title: '拒绝',
-              dataIndex: 'denials',
-              width: 80,
-              render: (value: number) =>
-                value > 0 ? <Typography.Text type="danger">{value}</Typography.Text> : 0,
-            },
-            {
-              title: '分配',
-              width: 70,
-              render: (_: unknown, row) => row.allocations.length,
-            },
-          ]}
-        />
-      </Card>
+      <DiagnosticPools snapshot={snapshot} loading={loading} keyNames={keyNames} />
 
       <Row gutter={[16, 16]}>
         <Col xs={24} lg={14}>
-          <Card title="最近失败请求">
-            <Space size={16} style={{ marginBottom: 12 }} wrap>
-              <Statistic
-                title="24 小时请求"
-                value={snapshot?.requests_24h.total ?? 0}
-              />
-              <Statistic
-                title="成功"
-                value={snapshot?.requests_24h.successful ?? 0}
-              />
-              <Statistic
-                title="失败"
-                value={snapshot?.requests_24h.failed ?? 0}
-                valueStyle={
-                  (snapshot?.requests_24h.failed ?? 0) > 0
-                    ? { color: '#d4380d' }
-                    : undefined
-                }
-              />
-              <div>
-                <Typography.Text type="secondary">失败状态码</Typography.Text>
-                <div>
-                  {(snapshot?.requests_24h.failures_by_status || []).map((item) => (
-                    <Tag key={item.status_code} color="error">
-                      {item.status_code}：{item.count}
-                    </Tag>
-                  ))}
-                </div>
-              </div>
-            </Space>
-            <Table<DiagnosticFailure>
-              size="small"
-              rowKey="request_id"
-              loading={loading}
-              pagination={false}
-              dataSource={snapshot?.recent_failures || []}
-              locale={{ emptyText: '没有失败记录' }}
-              columns={[
-                {
-                  title: '时间',
-                  dataIndex: 'created_at',
-                  width: 170,
-                  render: (value: string) => formatTimestamp(value),
-                },
-                { title: '模型', dataIndex: 'upstream_model', width: 140 },
-                { title: '状态码', dataIndex: 'status_code', width: 80 },
-                {
-                  title: '延迟',
-                  dataIndex: 'latency_ms',
-                  width: 90,
-                  render: (value: number) => `${value} ms`,
-                },
-                {
-                  title: '错误',
-                  dataIndex: 'error_message',
-                  render: (value: string | null, row) => (
-                    <Typography.Text type="secondary" ellipsis={{ tooltip: true }}>
-                      {value || row.warning_message || '—'}
-                    </Typography.Text>
-                  ),
-                },
-              ]}
-            />
-            <Typography.Paragraph type="secondary" style={{ marginTop: 8, marginBottom: 0 }}>
-              快照与页面只包含错误摘要，不包含提示词或模型回复内容。
-            </Typography.Paragraph>
-          </Card>
+          <DiagnosticFailures snapshot={snapshot} loading={loading} />
         </Col>
         <Col xs={24} lg={10}>
           <Space direction="vertical" size={16} style={{ width: '100%' }}>

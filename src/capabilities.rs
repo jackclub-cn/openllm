@@ -80,10 +80,7 @@ pub(crate) async fn capability_support(
 
 pub(crate) async fn record_capability(
     state: &AppState,
-    provider_id: i64,
-    model: &str,
-    endpoint: &str,
-    capability: &str,
+    key: CapabilityKey,
     supported: bool,
     source: &str,
     confidence: &str,
@@ -99,12 +96,6 @@ pub(crate) async fn record_capability(
         SOURCE_RUNTIME => "runtime-v1",
         SOURCE_TEMPLATE => "template-v1",
         _ => "manual-v1",
-    };
-    let key = CapabilityKey {
-        provider_id,
-        model: model.to_string(),
-        endpoint: endpoint.to_string(),
-        capability: capability.to_string(),
     };
     let record = CapabilityRecord {
         key: key.clone(),
@@ -140,7 +131,7 @@ pub(crate) async fn record_capability(
                  ELSE 1
              END",
     )
-    .bind(provider_id)
+    .bind(key.provider_id)
     .bind(&key.model)
     .bind(&key.endpoint)
     .bind(&key.capability)
@@ -161,7 +152,7 @@ pub(crate) async fn record_capability(
         Err(error) => {
             tracing::warn!(
                 %error,
-                provider_id,
+                provider_id = key.provider_id,
                 model = %key.model,
                 endpoint = %key.endpoint,
                 capability = %key.capability,

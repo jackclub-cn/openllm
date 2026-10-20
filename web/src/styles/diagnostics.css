@@ -1,0 +1,23 @@
+.diagnostics-page > .ant-space-item,
+.diagnostics-page .ant-col {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.diagnostics-page .ant-card-head-wrapper {
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.diagnostics-page .ant-card-head-title {
+  white-space: normal;
+}
+
+.diagnostics-page .ant-card-extra,
+.diagnostics-page .ant-card-extra > .ant-space {
+  max-width: 100%;
+}
+
+.diagnostics-page .ant-card-extra > .ant-space {
+  flex-wrap: wrap;
+}

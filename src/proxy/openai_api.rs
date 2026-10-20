@@ -403,7 +403,14 @@ pub(crate) async fn proxy_openai_inner(
         request_deadline,
         busy_wait_deadline,
     };
-    match run_openai_attempts(state, &context, true).await? {
+    match track_usage_request(
+        state,
+        request_id,
+        started,
+        run_openai_attempts(state, &context, true),
+    )
+    .await?
+    {
         OpenAiAttemptOutcome::Response(response) => Ok(response),
         OpenAiAttemptOutcome::BusyWait => {
             let state = state.clone();
@@ -415,7 +422,14 @@ pub(crate) async fn proxy_openai_inner(
                 interval,
                 SseErrorProtocol::OpenAi,
                 async move {
-                    match run_openai_attempts(&state, &context, false).await? {
+                    match track_usage_request(
+                        &state,
+                        &context.request_id,
+                        context.started,
+                        run_openai_attempts(&state, &context, false),
+                    )
+                    .await?
+                    {
                         OpenAiAttemptOutcome::Response(response) => Ok(response),
                         OpenAiAttemptOutcome::BusyWait => Err(AppError::Internal(anyhow::anyhow!(
                             "busy-wait stream did not resume routing"

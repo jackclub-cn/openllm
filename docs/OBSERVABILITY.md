@@ -41,7 +41,7 @@ docker run --rm --entrypoint promtool -v "$(pwd):/rules" -w /rules \
 
 > 测试文件里的 `exp_annotations` 是完整断言，因此改告警文案后需要同步更新：promtool 失败信息会直接打印新旧文本，复制过去即可。
 
-仓库内另有 `scripts/check-monitoring.sh`，一次性完成「规则语法校验」「规则单元测试」「面板 JSON 校验」与「规则/测试/面板引用的指标名确实由 `/metrics` 导出」四项检查，适合放进 CI。不加参数时指标名对照 `src/api/metrics.rs` 里的声明（无需起网关）；设 `OPENLLM_METRICS_URL` 则改为对照真实抓取结果。
+仓库内另有 `scripts/check-monitoring.sh`，一次性完成「规则语法校验」「规则单元测试」「面板 JSON 校验」与「规则/测试/面板引用的指标名确实由 `/metrics` 导出」四项检查，适合放进 CI。不加参数时指标名对照 `src/api/metrics/` 各领域模块里的声明（无需起网关）；设 `OPENLLM_METRICS_URL` 则改为对照真实抓取结果。
 
 ## 2. 抓取配置
 

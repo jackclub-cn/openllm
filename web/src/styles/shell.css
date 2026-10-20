@@ -1,0 +1,118 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #f4f7fb;
+  color: #172033;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-sider {
+  position: sticky !important;
+  top: 0;
+  height: 100vh;
+  overflow: auto;
+  background: #101828 !important;
+}
+
+.brand {
+  height: 80px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 0 20px;
+  color: #fff;
+}
+
+.brand-collapsed {
+  justify-content: center;
+  padding: 0;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  flex: 0 0 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #1677ff;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.brand-name {
+  font-size: 16px;
+  font-weight: 650;
+  line-height: 1.2;
+}
+
+.brand-caption {
+  color: #98a2b3;
+  font-size: 11px;
+}
+
+.app-header {
+  height: 64px;
+  padding: 0 24px;
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom: 1px solid #e6eaf0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  backdrop-filter: blur(10px);
+}
+
+.app-content {
+  padding: 24px;
+  max-width: 1600px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+.page-header {
+  min-height: 58px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 20px;
+}
+
+.page-header-title {
+  flex: 1 1 240px;
+  min-width: 240px;
+}
+
+.page-header-extra {
+  min-width: 0;
+  max-width: 100%;
+  margin-left: auto;
+}
+
+.page-header-extra .ant-space {
+  max-width: 100%;
+}
+
+.page-header h3 {
+  margin: 0 0 4px !important;
+}
+
+.section-row {
+  margin-top: 16px;
+}

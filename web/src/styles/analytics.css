@@ -1,0 +1,62 @@
+.trend-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.trend-metric-control,
+.trend-split-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.trend-metric-control {
+  flex: 1 1 auto;
+}
+
+.trend-metric-control .ant-segmented {
+  min-width: 0;
+}
+
+.trend-split-control {
+  flex: 0 0 auto;
+}
+
+.trend-chart {
+  margin-top: 16px;
+}
+
+/* G2 keeps hidden tooltips in layout, which can create a phantom horizontal
+   scrollbar after the pointer leaves a chart near the right edge. */
+.g2-tooltip[style*='visibility: hidden'] {
+  display: none;
+}
+
+@media (max-width: 600px) {
+  .trend-toolbar,
+  .trend-metric-control,
+  .trend-split-control {
+    align-items: stretch;
+  }
+
+  .trend-toolbar {
+    flex-direction: column;
+  }
+
+  .trend-metric-control {
+    flex-direction: column;
+    flex: 1 1 auto;
+  }
+
+  .trend-metric-control .ant-segmented {
+    width: 100%;
+  }
+
+  .trend-split-control .ant-select {
+    flex: 1 1 auto;
+  }
+}

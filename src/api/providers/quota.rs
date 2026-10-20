@@ -41,11 +41,11 @@ async fn refresh_provider_quota(
     let kind = provider_quota_kind(&provider.base_url)
         .ok_or_else(|| AppError::BadRequest("this provider has no quota API".to_string()))?;
     let credential = provider_quota_credential(state, provider, key_id).await?;
-    let prices = provider_prices(&state, provider.id).await?;
+    let prices = provider_prices(state, provider.id).await?;
     let mut view = match kind {
-        "command_code" => fetch_command_code_quota(&state, &credential.secret).await?,
-        "opencode_go" => fetch_opencode_go_quota(&state, &credential.secret).await?,
-        "deepseek" => fetch_deepseek_quota(&state, &credential.secret).await?,
+        "command_code" => fetch_command_code_quota(state, &credential.secret).await?,
+        "opencode_go" => fetch_opencode_go_quota(state, &credential.secret).await?,
+        "deepseek" => fetch_deepseek_quota(state, &credential.secret).await?,
         _ => {
             return Err(AppError::BadRequest(
                 "this provider has no quota API".to_string(),

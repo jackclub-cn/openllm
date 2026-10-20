@@ -348,6 +348,36 @@ async fn snapshot_never_carries_request_previews() {
     }
 }
 
+/// A running request has not failed and must not enter the failure export.
+#[tokio::test]
+async fn snapshot_counts_only_completed_requests_and_carries_failure_protocol() {
+    let state = healthy_state().await;
+    sqlx::query(
+        "INSERT INTO usage_logs (request_id, requested_model, endpoint, status_code, \
+                                 in_flight, success, streamed) VALUES \
+             ('completed-ok', 'm', '/v1/responses', 200, 0, 1, 1), \
+             ('completed-error', 'm', '/v1/responses', 400, 0, 0, 1), \
+             ('running', 'm', '/v1/chat/completions', 0, 1, 0, 0)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let Json(snapshot) = diagnostic_snapshot(State(state), Query(SnapshotQuery::default()))
+        .await
+        .unwrap();
+    assert_eq!(snapshot.requests_24h.total, 2);
+    assert_eq!(snapshot.requests_24h.successful, 1);
+    assert_eq!(snapshot.requests_24h.failed, 1);
+    assert_eq!(snapshot.requests_24h.failures_by_status.len(), 1);
+    assert_eq!(snapshot.requests_24h.failures_by_status[0].status_code, 400);
+    assert_eq!(snapshot.recent_failures.len(), 1);
+    let failure = serde_json::to_value(&snapshot.recent_failures[0]).unwrap();
+    assert_eq!(failure["request_id"], "completed-error");
+    assert_eq!(failure["endpoint"], "/v1/responses");
+    assert_eq!(failure["streamed"], true);
+}
+
 /// Long upstream error bodies are truncated so one snapshot cannot balloon.
 #[tokio::test]
 async fn snapshot_truncates_long_error_messages() {

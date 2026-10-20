@@ -1,0 +1,94 @@
+.metric-card {
+  height: 118px;
+  min-height: 118px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.metric-card .ant-card-body {
+  width: 100%;
+  height: 100%;
+  padding: 16px 20px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.metric-icon {
+  width: 48px;
+  height: 48px;
+  flex: 0 0 48px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  font-size: 22px;
+}
+
+.metric-icon-blue {
+  color: #1677ff;
+  background: #eaf2ff;
+}
+
+.metric-icon-cyan {
+  color: #08979c;
+  background: #e6fffb;
+}
+
+.metric-icon-green {
+  color: #389e0d;
+  background: #f6ffed;
+}
+
+.metric-icon-orange {
+  color: #d46b08;
+  background: #fff7e6;
+}
+
+.metric-icon-purple {
+  color: #722ed1;
+  background: #f9f0ff;
+}
+
+.metric-copy {
+  min-width: 0;
+}
+
+.metric-label-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+}
+
+.metric-comparison {
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.metric-copy .ant-statistic-content {
+  font-size: 26px;
+  font-weight: 650;
+}
+
+/* Compact figures put the unit outside Statistic so the number can shrink
+   without the suffix wrapping onto its own line. */
+.metric-compact {
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+
+.metric-suffix {
+  font-size: 22px;
+  font-weight: 650;
+}
+
+.metric-hint {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 18px;
+}

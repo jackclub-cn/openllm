@@ -1,9 +1,10 @@
 {
   "name": "openllm-console",
   "private": true,
-  "version": "0.3.29",
+  "version": "0.3.30",
   "type": "module",
   "scripts": {
+    "check:structure": "node ../scripts/check-code-structure.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview"

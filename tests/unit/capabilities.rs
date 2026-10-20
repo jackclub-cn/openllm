@@ -23,10 +23,12 @@ async fn capability_profiles_are_scoped_prioritized_and_expire() {
     let state = capability_state().await;
     record_capability(
         &state,
-        1,
-        "model-a",
-        "/v1/responses",
-        CAPABILITY_REASONING_HISTORY,
+        CapabilityKey {
+            provider_id: 1,
+            model: "model-a".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            capability: CAPABILITY_REASONING_HISTORY.to_string(),
+        },
         true,
         SOURCE_RUNTIME,
         "exact",
@@ -82,10 +84,12 @@ async fn capability_profiles_are_scoped_prioritized_and_expire() {
 
     record_capability(
         &state,
-        1,
-        "model-a",
-        "/v1/responses",
-        CAPABILITY_STRICT_TOOLS,
+        CapabilityKey {
+            provider_id: 1,
+            model: "model-a".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            capability: CAPABILITY_STRICT_TOOLS.to_string(),
+        },
         false,
         SOURCE_RUNTIME,
         "exact",
@@ -93,10 +97,12 @@ async fn capability_profiles_are_scoped_prioritized_and_expire() {
     .await;
     record_capability(
         &state,
-        1,
-        "model-a",
-        "/v1/responses",
-        CAPABILITY_STRICT_TOOLS,
+        CapabilityKey {
+            provider_id: 1,
+            model: "model-a".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            capability: CAPABILITY_STRICT_TOOLS.to_string(),
+        },
         true,
         SOURCE_TEMPLATE,
         "exact",
@@ -117,10 +123,12 @@ async fn capability_profiles_are_scoped_prioritized_and_expire() {
 
     record_capability(
         &state,
-        1,
-        "",
-        "",
-        CAPABILITY_TOOL_SEARCH,
+        CapabilityKey {
+            provider_id: 1,
+            model: String::new(),
+            endpoint: String::new(),
+            capability: CAPABILITY_TOOL_SEARCH.to_string(),
+        },
         false,
         SOURCE_RUNTIME,
         "exact",

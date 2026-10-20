@@ -446,7 +446,7 @@ fn normalize_guardrail_settings(mut input: GuardrailSettings) -> AppResult<Guard
             continue;
         }
         let chars = term.chars().count();
-        if chars < 2 || chars > MAX_BLOCKED_TERM_CHARS {
+        if !(2..=MAX_BLOCKED_TERM_CHARS).contains(&chars) {
             return Err(AppError::BadRequest(format!(
                 "blocked terms must contain between 2 and {MAX_BLOCKED_TERM_CHARS} characters"
             )));

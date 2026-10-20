@@ -10,7 +10,7 @@
 #   4. every openllm_* metric referenced by the alert rules, the rule tests and
 #      the Grafana dashboard is actually exported by GET /metrics
 #
-# Check (4) compares against the metric names declared in src/api/metrics.rs so
+# Check (4) compares against the metric names declared in src/api/metrics/ so
 # it works without a running gateway. Set OPENLLM_METRICS_URL to compare against
 # a live scrape instead (stronger, and what CI should do):
 #
@@ -25,7 +25,7 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 rules="$root/deploy/prometheus/openllm-alerts.yml"
 rules_test="$root/deploy/prometheus/openllm-alerts.test.yml"
 dashboard="$root/deploy/grafana/openllm-dashboard.json"
-metrics_src="$root/src/api/metrics.rs"
+metrics_src="$root/src/api/metrics"
 
 fail=0
 work="$(mktemp -d)"
@@ -107,8 +107,8 @@ if [ -n "${OPENLLM_METRICS_URL:-}" ]; then
   grep -v '^#' "$work/scrape.txt" 2>/dev/null \
     | sed -E 's/[ {].*$//' | grep -E '^openllm_' | sort -u > "$work/series.txt" || true
 else
-  note "using declared metric names in src/api/metrics.rs (set OPENLLM_METRICS_URL for a live check)"
-  grep -oE '"openllm_[a-z0-9_]+"' "$metrics_src" | tr -d '"' | sort -u > "$work/exported.txt"
+  note "using declared metric names in src/api/metrics/ (set OPENLLM_METRICS_URL for a live check)"
+  grep -rhoE '"openllm_[a-z0-9_]+"' "$metrics_src" | tr -d '"' | sort -u > "$work/exported.txt"
 fi
 
 if [ ! -s "$work/exported.txt" ]; then

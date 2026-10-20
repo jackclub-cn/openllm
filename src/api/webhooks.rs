@@ -197,7 +197,7 @@ async fn webhook_view(state: &AppState, id: i64) -> AppResult<WebhookView> {
         .bind(id)
         .fetch_one(&state.pool)
         .await?;
-    Ok(into_view(state, webhook).await?)
+    into_view(state, webhook).await
 }
 
 async fn into_view(state: &AppState, webhook: Webhook) -> AppResult<WebhookView> {

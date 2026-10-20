@@ -1,0 +1,159 @@
+.playground-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 16px;
+  align-items: start;
+}
+
+.playground-card {
+  min-height: calc(100vh - 150px);
+}
+
+.playground-card .ant-card-body {
+  height: calc(100vh - 150px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+}
+
+.chat-scroll {
+  flex: 1;
+  overflow: auto;
+  padding: 24px;
+  background: #fbfcfe;
+}
+
+.chat-empty {
+  min-height: 320px;
+  display: grid;
+  place-items: center;
+}
+
+.chat-message {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-bottom: 20px;
+  max-width: 88%;
+}
+
+.chat-message-user {
+  margin-left: auto;
+  flex-direction: row-reverse;
+}
+
+.chat-avatar {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 6px;
+  color: #fff;
+  background: #1677ff;
+}
+
+.chat-message-user .chat-avatar {
+  background: #475467;
+}
+
+.chat-bubble {
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: #fff;
+  border: 1px solid #e6eaf0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.65;
+}
+
+.chat-message-user .chat-bubble {
+  background: #eaf2ff;
+  border-color: #c7dbff;
+}
+
+.chat-bubble-error {
+  color: #b42318;
+  background: #fff1f0;
+  border-color: #ffccc7;
+}
+
+.chat-copy {
+  align-self: center;
+  color: #98a2b3;
+}
+
+.stream-cursor {
+  display: inline-block;
+  width: 7px;
+  height: 15px;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: #1677ff;
+  animation: stream-blink 0.9s steps(2, start) infinite;
+}
+
+.tool-call {
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid #c7d2fe;
+  border-radius: 6px;
+  background: #f5f7ff;
+}
+
+.tool-call-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tool-call-args {
+  margin: 8px 0 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+@keyframes stream-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+.chat-composer {
+  padding: 16px;
+  border-top: 1px solid #e6eaf0;
+  background: #fff;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.playground-settings {
+  position: sticky;
+  top: 88px;
+}
+
+.settings-control {
+  width: 100%;
+  margin-top: 8px;
+}
+
+.capability-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.capability-tags .ant-tag {
+  margin-inline-end: 0;
+}

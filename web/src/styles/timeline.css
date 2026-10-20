@@ -1,0 +1,130 @@
+.usage-timeline-card .ant-card-body {
+  padding-top: 12px;
+}
+
+.usage-timeline-canvas {
+  position: relative;
+  width: 100%;
+}
+
+.usage-timeline-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  max-width: 100%;
+}
+
+.usage-timeline-axis {
+  position: relative;
+  height: 28px;
+  overflow: hidden;
+  border-bottom: 1px solid #e6eaf0;
+}
+
+/* Slid by a per-frame transform so the window scrolls continuously instead of
+   stepping once per second. */
+.usage-timeline-layer {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+
+.usage-timeline-axis span {
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
+  color: #667085;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.usage-timeline-plot {
+  position: relative;
+  overflow: hidden;
+}
+
+.usage-timeline-gridline {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #eef2f6;
+  pointer-events: none;
+}
+
+.usage-timeline-bar {
+  position: absolute;
+  min-width: 3px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  transition: filter 0.15s, transform 0.15s;
+}
+
+.usage-timeline-bar:hover,
+.usage-timeline-bar:focus-visible {
+  z-index: 2;
+  filter: brightness(0.92);
+  outline: none;
+  transform: scaleY(1.14);
+}
+
+.usage-timeline-bar-success {
+  background: #52c41a;
+}
+
+.usage-timeline-bar-warning {
+  background: #faad14;
+}
+
+.usage-timeline-bar-error {
+  background: #ff4d4f;
+}
+
+.usage-timeline-bar-pending {
+  background: repeating-linear-gradient(
+    -45deg,
+    #1677ff,
+    #1677ff 5px,
+    #69b1ff 5px,
+    #69b1ff 10px
+  );
+}
+
+.usage-timeline-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.usage-timeline-legend i {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+}
+
+.usage-timeline-dot-success {
+  background: #52c41a;
+}
+
+.usage-timeline-dot-warning {
+  background: #faad14;
+}
+
+.usage-timeline-dot-error {
+  background: #ff4d4f;
+}
+
+.usage-timeline-dot-pending {
+  background: #69b1ff;
+}
+
+.usage-timeline-tooltip {
+  display: grid;
+  gap: 3px;
+}

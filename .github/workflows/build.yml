@@ -2,6 +2,8 @@ name: Build and Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
   pull_request:
@@ -11,6 +13,33 @@ permissions:
   contents: read
 
 jobs:
+  quality:
+    name: Code structure and formatting
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Check code structure
+        run: node scripts/check-code-structure.mjs
+
+      - name: Test structure checks
+        run: node --test scripts/check-code-structure.test.mjs
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check Rust formatting
+        run: cargo fmt --check
+
   build:
     name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -55,6 +84,11 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Check Rust lints
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Run Rust tests
         run: cargo test --locked
@@ -117,7 +151,7 @@ jobs:
   release:
     name: Publish GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [quality, build, monitoring]
     runs-on: ubuntu-latest
     permissions:
       contents: write
