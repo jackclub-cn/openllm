@@ -10,6 +10,7 @@ mod models_dev;
 mod proxy;
 mod quota;
 mod registry;
+mod release_feed;
 mod resilience_state;
 mod session_affinity;
 mod startup;

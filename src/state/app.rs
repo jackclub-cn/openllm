@@ -73,6 +73,7 @@ impl AppState {
         Self {
             pool,
             client,
+            release_feed: Arc::new(crate::release_feed::ReleaseFeed::default()),
             admin_token: admin_token.filter(|token| !token.is_empty()),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             session_affinity,

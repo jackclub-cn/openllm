@@ -4,9 +4,8 @@ use super::*;
 ///
 /// `?latest=` makes the check testable and usable on an air-gapped host; when
 /// it is absent `OPENLLM_UPGRADE_FEED_URL` is fetched (a GitHub-release shaped
-/// document with `tag_name` or `version`). With neither, the answer is
-/// `unknown` — a gateway without a repository field in `Cargo.toml` has no
-/// sensible default feed and must not guess.
+/// document with `tag_name` or `version`). `?official=true` opts into the
+/// project's stable GitHub releases when no custom feed is configured.
 pub async fn upgrade_check(
     State(state): State<AppState>,
     Query(query): Query<UpgradeCheckQuery>,
@@ -15,6 +14,11 @@ pub async fn upgrade_check(
     let pending = crate::startup::pending_migrations(&state.pool, &sqlx::migrate!("./migrations"))
         .await
         .map_err(AppError::Internal)?;
+    let feed_url = upgrade_feed_url().or_else(|| {
+        query
+            .official
+            .then(|| crate::release_feed::OFFICIAL_RELEASE_FEED.to_string())
+    });
 
     let (latest, source, mut problems) = match query
         .latest
@@ -23,9 +27,9 @@ pub async fn upgrade_check(
         .filter(|value| !value.is_empty())
     {
         Some(version) => (Some(normalize_version(version)), "query", Vec::new()),
-        None => match upgrade_feed_url() {
-            Some(url) => match fetch_latest_version(&state.client, &url).await {
-                Ok(version) => (Some(version), "feed", Vec::new()),
+        None => match feed_url {
+            Some(url) => match state.release_feed.latest(&state.client, &url).await {
+                Ok(version) => (Some(normalize_version(&version)), "feed", Vec::new()),
                 Err(error) => (
                     None,
                     "feed",
@@ -36,7 +40,7 @@ pub async fn upgrade_check(
                 None,
                 "none",
                 vec![
-                    "未提供 latest 参数，也未设置 OPENLLM_UPGRADE_FEED_URL，无法判断是否有新版本"
+                    "未提供 latest 参数、未设置 OPENLLM_UPGRADE_FEED_URL，也未启用官方发布源，无法判断是否有新版本"
                         .to_string(),
                 ],
             ),
@@ -125,9 +129,11 @@ pub(super) fn normalize_version(value: &str) -> String {
 pub(super) fn is_numeric_version(value: &str) -> bool {
     let value = normalize_version(value);
     !value.is_empty()
-        && value
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && value.split('.').all(|part| {
+            !part.is_empty()
+                && part.bytes().all(|byte| byte.is_ascii_digit())
+                && part.parse::<u64>().is_ok()
+        })
 }
 
 /// Compare dotted numeric versions. Missing segments count as zero, so `0.4`
@@ -159,28 +165,4 @@ pub(crate) fn compare_versions(current: &str, latest: &str) -> std::cmp::Orderin
         latest.push(0);
     }
     current.cmp(&latest)
-}
-
-pub(super) async fn fetch_latest_version(
-    client: &reqwest::Client,
-    url: &str,
-) -> anyhow::Result<String> {
-    let response = client
-        .get(url)
-        .timeout(std::time::Duration::from_secs(5))
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await?;
-    if !response.status().is_success() {
-        anyhow::bail!("HTTP {}", response.status());
-    }
-    let body: Value = response.json().await?;
-    let version = body
-        .get("tag_name")
-        .or_else(|| body.get("version"))
-        .or_else(|| body.get("latest"))
-        .and_then(Value::as_str)
-        .map(normalize_version)
-        .filter(|version| !version.is_empty());
-    version.ok_or_else(|| anyhow::anyhow!("响应里没有 tag_name/version 字段"))
 }

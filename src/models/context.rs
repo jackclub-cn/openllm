@@ -22,6 +22,11 @@ pub struct ContextBreakdown {
     pub categories: Vec<ContextCategory>,
     #[serde(default)]
     pub unmetered_items: usize,
+    /// Replayed Responses reasoning can be encrypted and contain no readable text.
+    /// Track it separately so calibration can attribute the otherwise opaque
+    /// token delta to reasoning instead of the catch-all bucket.
+    #[serde(default)]
+    pub opaque_reasoning_items: usize,
 }
 
 impl ContextBreakdown {
@@ -53,6 +58,27 @@ impl ContextBreakdown {
             .iter()
             .map(|category| category.tokens.max(0))
             .sum::<i64>();
+        if self.unmetered_items == 0 && self.opaque_reasoning_items > 0 {
+            let residual = actual_input_tokens.saturating_sub(estimated_total);
+            if residual > 0 {
+                if let Some(reasoning) = self
+                    .categories
+                    .iter_mut()
+                    .find(|category| category.key == "reasoning")
+                {
+                    reasoning.tokens = reasoning.tokens.saturating_add(residual);
+                } else {
+                    self.categories.push(ContextCategory {
+                        key: "reasoning".to_string(),
+                        tokens: residual,
+                        items: self.opaque_reasoning_items,
+                    });
+                }
+                self.input_tokens = actual_input_tokens;
+                self.input_estimated = false;
+                return;
+            }
+        }
         if estimated_total <= 0 {
             self.categories = vec![ContextCategory {
                 key: "unattributed".to_string(),

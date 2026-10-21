@@ -6,7 +6,9 @@ import { formatCompact, formatExact } from '../format'
 const categoryLabels: Record<string, string> = {
   system: '系统提示',
   tools: '工具定义',
+  tool_calls: '工具调用',
   tool_results: '工具结果',
+  reasoning: '推理历史',
   conversation: '会话内容',
   unattributed: '未归因',
 }
@@ -14,7 +16,9 @@ const categoryLabels: Record<string, string> = {
 const categoryColors: Record<string, string> = {
   system: '#722ed1',
   tools: '#13c2c2',
+  tool_calls: '#fa8c16',
   tool_results: '#eb2f96',
+  reasoning: '#d4b106',
   conversation: '#597ef7',
   unattributed: '#8c8c8c',
 }

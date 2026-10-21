@@ -27,15 +27,37 @@
 }
 
 .activity-live-card .activity-detail-panel {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
 
-.activity-live-card .detail-status,
-.activity-live-card .activity-detail-chain,
-.activity-live-card .activity-detail-metadata {
-  grid-column: 1 / -1;
+.activity-overview-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 0.9fr) minmax(480px, 1.1fr);
+  align-items: start;
+  gap: 24px;
+}
+
+.activity-overview-grid > * {
+  min-width: 0;
+}
+
+.activity-overview-grid h5,
+.activity-context-section h5 {
+  margin-top: 0 !important;
+}
+
+.activity-request-summary .activity-detail-metadata .ant-descriptions-item-label {
+  width: 84px;
+}
+
+.activity-context-section {
+  width: 100%;
+}
+
+.ant-drawer .activity-overview-grid {
+  grid-template-columns: minmax(0, 1fr);
 }
 
 .activity-chain {
@@ -105,6 +127,14 @@
   display: flex;
   flex-direction: column;
   gap: 9px;
+}
+
+.request-timing-summary {
+  margin-bottom: 12px;
+}
+
+.request-timing-panel > .activity-timings {
+  margin-bottom: 12px;
 }
 
 .activity-timing-row {
@@ -207,7 +237,7 @@
 }
 
 @media (max-width: 720px) {
-  .activity-live-card .activity-detail-panel {
+  .activity-overview-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 

@@ -40,17 +40,7 @@ pub struct ActivityAttempt {
     pub failure_scope: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct ActivityTimings {
-    pub prepare_ms: Option<i64>,
-    pub route_wait_ms: Option<i64>,
-    pub upstream_headers_ms: Option<i64>,
-    pub response_wait_ms: Option<i64>,
-    pub response_read_ms: Option<i64>,
-    pub time_to_first_token_ms: Option<i64>,
-    pub generation_ms: Option<i64>,
-    pub total_ms: i64,
-}
+pub type ActivityTimings = crate::models::RequestTimings;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ActivityCache {

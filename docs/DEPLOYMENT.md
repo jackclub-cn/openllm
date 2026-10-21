@@ -189,7 +189,14 @@ curl -fsS -H "x-admin-token: $T" -H 'content-type: application/json' \
 curl -fsS -H "x-admin-token: $T" "http://127.0.0.1:8080/api/maintenance/upgrade-check?latest=0.4.0"
 ```
 
-未传 `latest` 时改用 `OPENLLM_UPGRADE_FEED_URL` 指定的升级源；两者都没有时结论为 `unknown`，网关不会主动外联。
+未传 `latest` 时改用 `OPENLLM_UPGRADE_FEED_URL` 指定的升级源；增加 `official=true`
+可在未配置自定义源时检查 `jackclub-cn/openllm` 的 GitHub 正式发布版本。不带这些
+参数且未配置升级源时仍返回 `unknown`。右上角版本提示和运维页的留空检查会传
+`official=true`；控制台打开后每小时检查一次，服务端成功缓存一小时、失败缓存一分钟，
+并合并并发检查。连接超时、限流或版本无法解析时保留未知状态，不误报为已是最新。
+有更新时提示链接指向项目发布页；只提供更新信息，不执行自动升级。
+
+左侧菜单底部提供项目 GitHub 链接，导航收起时保留图标入口。
 
 ## 6. 日常巡检
 

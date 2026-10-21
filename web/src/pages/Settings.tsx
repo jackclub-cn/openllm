@@ -7,7 +7,6 @@ import {
   SafetyCertificateOutlined,
 } from '@ant-design/icons'
 import {
-  Alert,
   Button,
   Card,
   Descriptions,
@@ -20,21 +19,19 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Alert,
 } from 'antd'
+import { Link } from 'react-router-dom'
 import PageHeader from '../components/PageHeader'
 import { formatBytes, formatCompact, formatExact } from '../format'
 import useSettings from './settings/useSettings'
 import RuntimeSettingsCard from './settings/RuntimeSettingsCard'
 import SettingsCooldownsCard from './settings/SettingsCooldownsCard'
 
-export default function SettingsPage({ onSave }: { onSave: (value: string) => void }) {
+export default function SettingsPage() {
   const state = useSettings()
   const {
     settings,
-    saved,
-    setSaved,
-    token,
-    setToken,
     vacuuming,
     retentionDays,
     setRetentionDays,
@@ -77,41 +74,16 @@ export default function SettingsPage({ onSave }: { onSave: (value: string) => vo
           message="当前服务未配置 OPENLLM_ADMIN_TOKEN，管理 API 在本机或网络边界之外暴露时存在风险。"
         />
       )}
-      <div className="settings-grid">
-        <Card title="管理访问" bordered={false}>
-          <Form layout="vertical">
-            <Form.Item
-              label="管理令牌"
-              extra="当服务启动时设置了 OPENLLM_ADMIN_TOKEN，在此填写相同值。令牌仅保存在当前浏览器。"
-            >
-              <Input.Password
-                value={token}
-                onChange={(event) => {
-                  setToken(event.target.value)
-                  setSaved(false)
-                }}
-                placeholder="输入管理令牌"
-              />
-            </Form.Item>
-            <Button
-              type="primary"
-              icon={<CheckCircleOutlined />}
-              onClick={() => {
-                onSave(token)
-                setSaved(true)
-              }}
-            >
-              保存到浏览器
-            </Button>
-            {saved && (
-              <Typography.Text type="success" className="save-note">
-                已保存
-              </Typography.Text>
-            )}
-          </Form>
-        </Card>
-        <RuntimeSettingsCard state={state} />
-      </div>
+      {settings?.admin_auth_enabled && (
+        <Alert
+          className="page-alert"
+          type="info"
+          showIcon
+          message="管理令牌在独立登录页中填写和更新。"
+          action={<Link to="/login">打开管理登录</Link>}
+        />
+      )}
+      <RuntimeSettingsCard state={state} />
       <Card
         className="settings-retention"
         title={

@@ -106,6 +106,16 @@ async fn activity_anthropic_stream_exposes_cache_before_first_output_and_persist
     assert_eq!(snapshot.cache.hit_rate, Some(0.6));
     assert!(snapshot.timings.time_to_first_token_ms.is_some());
     assert_eq!(snapshot.attempt_count, 1);
+    let performance = crate::api::get_usage_detail(
+        State(state.clone()),
+        axum::extract::Path("native-live".to_string()),
+    )
+    .await
+    .unwrap()
+    .0
+    .performance
+    .unwrap();
+    assert_eq!(performance.timings, snapshot.timings);
     server.abort();
 }
 
@@ -151,6 +161,19 @@ async fn activity_response_drop_cancels_the_stream_and_usage_row() {
         }
     }).await.unwrap();
     assert_eq!(state.activity.recent(50).active_count, 0);
+    let performance = crate::api::get_usage_detail(
+        State(state.clone()),
+        axum::extract::Path("cancel-live".to_string()),
+    )
+    .await
+    .unwrap()
+    .0
+    .performance
+    .unwrap();
+    assert_eq!(
+        performance.timings,
+        state.activity.snapshot("cancel-live").unwrap().timings
+    );
     server.abort();
 }
 
@@ -258,6 +281,25 @@ async fn activity_upstream_stream_error_is_failed_not_client_cancelled() {
             .status_code,
         Some(502)
     );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let detail = crate::api::get_usage_detail(
+                State(state.clone()),
+                axum::extract::Path("failed-stream".to_string()),
+            )
+            .await
+            .unwrap()
+            .0;
+            if !detail.in_flight {
+                assert_eq!(detail.status_code, 502);
+                assert!(detail.performance.is_some());
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     server.abort();
 }
 

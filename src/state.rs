@@ -222,6 +222,8 @@ pub struct AppState {
     /// Held behind a read-mostly lock because provider sync refreshes it only
     /// once per TTL.
     pub(crate) models_dev: Arc<RwLock<Option<crate::models_dev::CatalogCache>>>,
+    /// Cached public release metadata; never queried by the proxy hot path.
+    pub(crate) release_feed: Arc<crate::release_feed::ReleaseFeed>,
     /// Bounded in-memory request activity used by the realtime console.
     pub(crate) activity: Arc<RequestActivityStore>,
     /// Activity transitions for the console SSE stream.

@@ -14,3 +14,5 @@ mod logging;
 pub(crate) use logging::*;
 mod lifecycle;
 pub(crate) use lifecycle::track_usage_request;
+mod performance;
+use performance::activity_performance_json;

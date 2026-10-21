@@ -14,6 +14,57 @@ body {
   color: #172033;
 }
 
+.auth-screen {
+  min-height: 100vh;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: #f4f7fb;
+}
+
+.auth-card {
+  width: min(100%, 460px);
+  box-shadow: 0 18px 48px rgba(16, 24, 40, 0.12);
+}
+
+.auth-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 30px;
+}
+
+.auth-brand .brand-name {
+  color: #172033;
+}
+
+.auth-heading {
+  width: 100%;
+  margin-bottom: 22px;
+}
+
+.auth-heading h3 {
+  margin: 0 !important;
+}
+
+.auth-alert {
+  margin-bottom: 18px;
+}
+
+.auth-hint {
+  margin: 18px 0 0 !important;
+  font-size: 12px;
+}
+
+.auth-footer {
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 18px;
+}
+
 .app-shell {
   min-height: 100vh;
 }
@@ -33,6 +84,41 @@ body {
   gap: 12px;
   padding: 0 20px;
   color: #fff;
+}
+
+.app-sider .ant-layout-sider-children {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.sider-footer {
+  margin-top: auto;
+  padding: 16px 12px;
+  border-top: 1px solid #273447;
+}
+
+.sider-github {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 32px;
+  padding: 4px 8px;
+  color: #98a2b3;
+  font-size: 12px;
+}
+
+.sider-github:hover {
+  color: #fff;
+}
+
+.sider-github .anticon {
+  font-size: 18px;
+}
+
+.sider-github-collapsed {
+  justify-content: center;
+  padding-inline: 0;
 }
 
 .brand-collapsed {

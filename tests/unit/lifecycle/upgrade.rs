@@ -12,6 +12,7 @@ async fn the_upgrade_check_compares_against_a_given_version() {
         State(state.clone()),
         Query(UpgradeCheckQuery {
             latest: Some("v0.4.0".to_string()),
+            official: false,
         }),
     )
     .await
@@ -29,6 +30,7 @@ async fn the_upgrade_check_compares_against_a_given_version() {
         State(state.clone()),
         Query(UpgradeCheckQuery {
             latest: Some("latest-release".to_string()),
+            official: false,
         }),
     )
     .await
@@ -46,6 +48,7 @@ async fn the_upgrade_check_compares_against_a_given_version() {
         State(state.clone()),
         Query(UpgradeCheckQuery {
             latest: Some(env!("CARGO_PKG_VERSION").to_string()),
+            official: false,
         }),
     )
     .await
@@ -58,6 +61,7 @@ async fn the_upgrade_check_compares_against_a_given_version() {
         State(state.clone()),
         Query(UpgradeCheckQuery {
             latest: Some("0.1.0".to_string()),
+            official: false,
         }),
     )
     .await
@@ -69,7 +73,10 @@ async fn the_upgrade_check_compares_against_a_given_version() {
     if std::env::var("OPENLLM_UPGRADE_FEED_URL").is_err() {
         let unknown = upgrade_check(
             State(state.clone()),
-            Query(UpgradeCheckQuery { latest: None }),
+            Query(UpgradeCheckQuery {
+                latest: None,
+                official: false,
+            }),
         )
         .await
         .unwrap()
@@ -97,6 +104,7 @@ fn version_comparison_is_numeric_and_tolerates_a_v_prefix() {
     assert!(!is_numeric_version("not-a-version"));
     assert!(!is_numeric_version("1.0.0-rc1"));
     assert!(!is_numeric_version(""));
+    assert!(!is_numeric_version("999999999999999999999999999999"));
     assert!(is_numeric_version("v1.2.3"));
     assert!(is_numeric_version(" 2 "));
 }

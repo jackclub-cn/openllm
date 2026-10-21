@@ -350,6 +350,9 @@ pub struct UpgradeCheckQuery {
     /// air-gapped operator run the check with no outbound network access.
     #[serde(default)]
     pub latest: Option<String>,
+    /// Opt into the project's stable GitHub feed when no custom feed is set.
+    #[serde(default)]
+    pub official: bool,
 }
 
 #[derive(Debug, Serialize)]

@@ -41,7 +41,7 @@ OpenLLM 当前已经有：
 | P2 | 上下文窗口、分类占用、最终缓存命中率、历史回看 | 高 | 2-4 人日 |
 | P3 | DNS、TCP、TLS 等底层网络阶段拆解 | 有限 | 4-7 人日，暂不建议 |
 
-第二张截图标出的四类上下文图例属于 P2，建议纳入完整交付范围。P1/P2 合计粗估
+第二张截图标出的上下文分类图例属于 P2，建议纳入完整交付范围。P1/P2 合计粗估
 5-9 人日，包含测试与文档；已有草稿的复用收益和缺陷修复成本须在实施前复核。
 
 Magpie 截图里的 DNS、建连、TLS 分别计时，依赖更底层的 HTTP 传输观测。
@@ -128,7 +128,7 @@ P1 不新增顶级导航，直接增强现有 Dashboard：
    - 数据来源标记：估算、上游确认、未知。
 
 上下文区块采用与截图一致的信息顺序：先显示总量、窗口状态和数据来源，再显示
-四类占用的比例色块、图例和 Token 数，最后显示可切换分类的统计明细。明细只含
+各分类占用的比例色块、图例和 Token 数，最后显示可切换分类的统计明细。明细只含
 分类、条目数量和 Token 数，不返回正文。窗口
 未知时只显示已用 Token 和分类比例，不绘制伪造的总容量分母。
 
@@ -239,9 +239,10 @@ P1 不新增顶级导航，直接增强现有 Dashboard：
 | --- | --- | --- | --- |
 | `system` | `system` / `developer` 消息 | `instructions` | 顶层 `system` |
 | `tools` | `tools`、`functions` 定义 | `tools` 定义 | `tools` 定义 |
+| `tool_calls` | assistant `tool_calls` 参数 | `function_call`、工具 `*_call` | `tool_use` 内容块 |
 | `tool_results` | `role=tool` 消息 | `function_call_output` | `tool_result` 内容块 |
+| `reasoning` | `reasoning_content` / `reasoning_text` | `reasoning` 历史与 summary | `thinking` / `redacted_thinking` |
 | `conversation` | 其他 user/assistant 消息 | 其他 input 项 | 其他 message 内容 |
-| `media` | 图片、音频等非文本输入 | 其他非文本 input | 图片、文档等非文本块 |
 
 P2 复用现有 `count_text_chars` 和字符数除以 4 的估算器，不新增 Tokenizer
 依赖。分类估算在请求开始时计算，上游返回真实 `prompt_tokens` 后等比校准：
@@ -251,7 +252,9 @@ P2 复用现有 `count_text_chars` 和字符数除以 4 的估算器，不新增
 - 上游没有返回真实 Prompt Token 时持续标记为估算。
 - `input_estimated` 与分类 `estimated` 分开保存；校准不能把分类标成精确分词结果。
 - 图片、音频和未知字段记录存在性与数量，不把 URL、Base64 长度当作媒体 Token。
-  无可靠媒体用量时显示“多模态用量未单独计量”，不能将真实总量全部强摊入四类文本。
+  无可靠媒体用量时显示“多模态用量未单独计量”，不能将真实总量全部强摊入文本分类。
+- Responses 的加密推理历史没有可读正文时单独标记为不透明推理项；真实输入用量
+  高于文本估算且没有媒体/未知项时，差额归入 `reasoning`，而不是 `unattributed`。
 - 需要闭合分类总数时增加 `unattributed`（未归因），旧历史记录无分类时显示暂无数据。
 
 模型窗口分母使用最终目标的完整上下文容量。能力经过保守输入上限归一化时，优先
@@ -453,6 +456,7 @@ data: {"kind":"updated","instance_id":"process-uuid","sequence":42,"active_count
 | `web/src/pages/dashboard/DashboardRequestActivity.tsx` | 单请求内联详情、活动总数和历史入口 |
 | `web/src/pages/dashboard/requestActivity.ts` | 优先最新进行中请求，无进行中时选择最近一条 |
 | `web/src/pages/dashboard/ActivityDetailPanel.tsx` | 客户端、路由、目标链路和阶段耗时；增长时按职责拆分 |
+| `web/src/components/RequestTimingPanel.tsx`、`requestTimings.ts` | 实时与持久化耗时展示、最长阶段归因及失败尝试摘要 |
 | `web/src/components/ContextBreakdownPanel.tsx` | 实时与历史共用的分类、窗口和来源展示 |
 | `web/src/styles/activity.css` | 实时请求领域样式 |
 
@@ -509,7 +513,7 @@ P1 完成后应能实时回答：
 P2 完成后应能回答：
 
 - 本次请求占用了多少上下文窗口？
-- 系统提示、工具定义、工具结果和会话内容各占多少？
+- 系统提示、工具定义、工具调用、工具结果、推理历史和会话内容各占多少？
 - 这是精确值还是估算值？
 - 提示词缓存是否命中，节省了多少输入 Token？
 
@@ -576,7 +580,7 @@ P3 必须证明不会破坏连接池复用、TLS 校验、代理支持、超时�
 - 1 个活动请求和多个并发请求下直接展示详情，选择规则稳定。
 - 较新的已完成请求不抢占较早的进行中请求；全部完成后显示最近一条。
 - 详情内容不因事件乱序回退，切换请求时清除分类筛选，暂停后耗时停止增长。
-- 移动端和窄屏下路由链路、耗时条和 token 卡片不重叠。
+- 桌面布局下路由链路、耗时条和 token 卡片不重叠。
 
 ### 9.5 验收场景
 
@@ -590,7 +594,7 @@ P3 必须证明不会破坏连接池复用、TLS 校验、代理支持、超时�
 8. 强制一个候选返回 5xx，另一个成功，详情完整展示回退原因。
 9. 客户端中途断开，记录显示取消，不残留永久活动状态。
 10. 新活动接口、事件和新增数据库字段不记录正文；现有日志设置与行为保持不变。
-11. P2 的四类占用色块和图例可见，进行中显示估算，上游用量返回后总数校准，
+11. P2 的各分类占用色块和图例可见，进行中显示估算，上游用量返回后总数校准，
     分类仍保留估算标记，未知窗口不显示虚假比例。
 
 ## 10. 风险和约束
@@ -635,7 +639,7 @@ P1 交付标准：
   `cargo test --locked`、`cargo clippy --locked --all-targets -- -D warnings`
   和 `web/` 下的 `npm run build` 全部通过。
 
-P2 交付标准是四类图例与数量、可信的窗口分母、估算来源、可提前显示的缓存数据，
+P2 交付标准是分类图例与数量、可信的窗口分母、估算来源、可提前显示的缓存数据，
 以及完成后的历史回看；同样完成相关后端与前端检查。P3 独立评估，不影响 P1/P2 验收。
 
 ## 13. 实施与验证记录
@@ -653,7 +657,7 @@ P2 交付标准是四类图例与数量、可信的窗口分母、估算来源�
 | 保留、禁用、幂等、顺序和摘要上限 | `tests/unit/state/activity.rs`，含并发广播与 UTF-8 名称 |
 | 三协议分类、校准与多模态未归因 | `tests/unit/proxy/usage_context.rs` |
 | 乱序、缺口、快照竞态、进程重启与单调计时 | `node --test web/tests/activityState.test.mjs` |
-| 桌面/390px 窄屏、分类筛选、历史回看、SSE 错误后轮询与重连 | 本地 Playwright 验证及截图 |
+| 桌面布局、分类筛选、历史回看、SSE 错误后轮询与重连 | 本地 Playwright 验证及截图 |
 | 100 个并发请求后的列表与浏览器运行错误 | Playwright + 本地模拟上游；无页面异常，列表保留最近 50 条 |
 
 验证输出与截图位于本地忽略目录 `.pi/activity-rehearsal/`，包括
@@ -670,5 +674,11 @@ P3 的底层网络拆解保持未实施，分类 Token 仍明确标记为估算�
 构建通过。桌面 Playwright 的 9 组场景覆盖内联详情、暂停计时、进行中优先、并发
 选择与分类重置、取消后切换、空闲回看、历史日志跳转、断线轮询与重连，以及
 关闭/空记录/刷新错误。验证结果在 `.pi/activity-rehearsal/inline-browser-result.json`，
-桌面截图在 `inline-desktop-live.png`；没有页面运行异常。按用户要求，本次后续验收
-以桌面布局为准。构建仍保留原有依赖分块体积提示；未改动 Rust 代码。
+桌面截图在 `inline-desktop-live.png`；没有页面运行异常。控制台后续验收以桌面
+布局为准，窄屏不作为发布门禁。构建仍保留原有依赖分块体积提示；未改动 Rust 代码。
+
+2026-10-21 历史性能扩展：迁移 `0058_usage_performance.sql` 保存完成、失败和取消的
+性能摘要。历史详情在实时活动淘汰或进程重启后仍可显示阶段耗时、最长阶段和失败
+尝试耗时；旧日志不回填推测数据。模型按日志、轨迹、分析、计费和性能摘要拆分，
+阶段展示由实时与历史共用。桌面浏览器已验证真实流式请求及重启后的历史回看，
+证据位于本地忽略目录 `.pi/performance-rehearsal/`。

@@ -1,4 +1,12 @@
-import type { ContextBreakdown } from './activity'
+import type { ActivityTimings, ContextBreakdown } from './activity'
+
+export type RequestPerformance = {
+  timings: ActivityTimings
+  attempt_count: number
+  fallback_count: number
+  failed_attempts_ms: number
+  attempts_truncated: boolean
+}
 
 export type UsageLog = {
   id: number
@@ -35,6 +43,7 @@ export type UsageLog = {
   response_preview?: string
   context?: ContextBreakdown | null
   cache_usage_reported?: boolean | null
+  performance?: RequestPerformance | null
   warning_message?: string
   created_at: string
 }

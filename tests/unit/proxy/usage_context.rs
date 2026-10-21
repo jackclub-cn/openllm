@@ -16,7 +16,18 @@ fn openai_chat_context_is_split_by_message_role_and_tools() {
             {"role": "system", "content": "system instructions with useful detail"},
             {"role": "user", "content": "please inspect the repository"},
             {"role": "tool", "content": "tool output that is fairly long"},
-            {"role": "assistant", "content": "I will inspect it"}
+            {
+                "role": "assistant",
+                "content": "I will inspect it",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": "{\"path\":\"src/lib.rs\"}"
+                    }
+                }]
+            }
         ],
         "tools": [{
             "type": "function",
@@ -38,6 +49,7 @@ fn openai_chat_context_is_split_by_message_role_and_tools() {
     );
     assert!(category_tokens(&context, "system") > 0);
     assert!(category_tokens(&context, "tools") > 0);
+    assert!(category_tokens(&context, "tool_calls") > 0);
     assert!(category_tokens(&context, "tool_results") > 0);
     assert!(category_tokens(&context, "conversation") > 0);
     assert!(context.estimated);
@@ -50,13 +62,17 @@ fn responses_and_anthropic_context_shapes_are_supported() {
         "tools": [{"type": "function", "name": "shell", "description": "run a shell command"}],
         "input": [
             {"type": "message", "role": "user", "content": "fix the tests"},
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "inspect failures"}]},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"command\":\"cargo test\"}"},
             {"type": "function_call_output", "call_id": "c1", "output": "failure output"}
         ]
     });
     let context = request_context_breakdown(&responses, OPENAI_RESPONSES, 80);
     assert!(category_tokens(&context, "system") > 0);
     assert!(category_tokens(&context, "tools") > 0);
+    assert!(category_tokens(&context, "tool_calls") > 0);
     assert!(category_tokens(&context, "tool_results") > 0);
+    assert!(category_tokens(&context, "reasoning") > 0);
 
     let anthropic = json!({
         "system": "answer carefully",
@@ -64,6 +80,8 @@ fn responses_and_anthropic_context_shapes_are_supported() {
         "messages": [
             {"role": "user", "content": [
                 {"type": "text", "text": "find the issue"},
+                {"type": "thinking", "thinking": "trace the failing branch"},
+                {"type": "tool_use", "id": "t1", "name": "lookup", "input": {"query": "failure"}},
                 {"type": "tool_result", "tool_use_id": "t1", "content": "large tool result"}
             ]}
         ]
@@ -71,7 +89,9 @@ fn responses_and_anthropic_context_shapes_are_supported() {
     let context = request_context_breakdown(&anthropic, ANTHROPIC_MESSAGES, 60);
     assert!(category_tokens(&context, "system") > 0);
     assert!(category_tokens(&context, "tools") > 0);
+    assert!(category_tokens(&context, "tool_calls") > 0);
     assert!(category_tokens(&context, "tool_results") > 0);
+    assert!(category_tokens(&context, "reasoning") > 0);
     assert_eq!(
         context
             .categories
@@ -79,6 +99,43 @@ fn responses_and_anthropic_context_shapes_are_supported() {
             .map(|category| category.tokens)
             .sum::<i64>(),
         60
+    );
+}
+
+#[test]
+fn encrypted_responses_reasoning_absorbs_the_unmeasured_context_delta() {
+    let body = json!({
+        "instructions": "You are a coding agent. ".repeat(100),
+        "tools": [{"type": "function", "name": "shell", "description": "run commands"}],
+        "input": [
+            {"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "fix the failing tests"}
+            ]},
+            {"type": "reasoning", "summary": [], "encrypted_content": "opaque-reasoning-1"},
+            {"type": "reasoning", "summary": [], "encrypted_content": "opaque-reasoning-2"},
+            {"type": "function_call", "call_id": "c1", "name": "shell", "arguments": "{\"command\":\"cargo test --locked\"}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "test failure details"},
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "output_text", "text": "I found the failing test."}
+            ]}
+        ]
+    });
+    let mut context = request_context_breakdown(&body, OPENAI_RESPONSES, 1_000);
+    assert_eq!(context.unmetered_items, 0);
+    assert_eq!(context.opaque_reasoning_items, 2);
+    context.calibrate(100_000);
+    assert_eq!(context.input_tokens, 100_000);
+    assert_eq!(category_tokens(&context, "unattributed"), 0);
+    assert!(category_tokens(&context, "reasoning") > 90_000);
+    assert!(category_tokens(&context, "tool_calls") > 0);
+    assert!(category_tokens(&context, "tool_results") > 0);
+    assert_eq!(
+        context
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<i64>(),
+        100_000
     );
 }
 

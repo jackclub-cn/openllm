@@ -226,6 +226,8 @@ mod routing_overrides;
 
 #[path = "proxy/usage_logging.rs"]
 mod usage_logging;
+#[path = "proxy/usage_performance.rs"]
+mod usage_performance;
 
 #[path = "proxy/diagnostics.rs"]
 mod diagnostics;

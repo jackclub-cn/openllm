@@ -33,7 +33,7 @@ pub async fn list_usage(
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms, u.status_code,
                u.in_flight, u.success, u.streamed, u.error_message, u.created_at,
                u.first_token_ms, u.session_id, u.warning_message,
-               u.context_breakdown_json, u.cache_usage_reported,
+               u.context_breakdown_json, u.cache_usage_reported, u.performance_json,
                NULL AS request_preview, NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name
@@ -81,7 +81,7 @@ pub async fn export_usage(
                u.cache_write_tokens, u.estimated_cost_micros, u.latency_ms,
                u.status_code, u.in_flight, u.success, u.streamed, u.error_message,
                u.created_at, u.first_token_ms, u.session_id, u.warning_message,
-               u.context_breakdown_json, u.cache_usage_reported,
+               u.context_breakdown_json, u.cache_usage_reported, u.performance_json,
                NULL AS request_preview, NULL AS response_preview,
                k.name AS api_key_name, r.name AS route_name, p.name AS provider_name,
                COALESCE(u.provider_api_key_name, pk.name) AS provider_api_key_name

@@ -68,6 +68,7 @@ export type ContextBreakdown = {
   input_estimated: boolean
   categories: ContextCategory[]
   unmetered_items: number
+  opaque_reasoning_items?: number
 }
 
 export type RequestActivity = {

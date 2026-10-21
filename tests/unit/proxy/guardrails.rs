@@ -32,6 +32,31 @@ fn text_estimate_counts_nested_content_blocks() {
 }
 
 #[test]
+fn text_estimate_counts_responses_instructions_reasoning_and_tool_outputs() {
+    let body = json!({
+        "instructions": "a".repeat(400),
+        "input": [
+            {
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": "b".repeat(100)}]
+            },
+            {
+                "type": "function_call",
+                "name": "shell",
+                "arguments": "{\"command\":\"cargo test\"}"
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "c1",
+                "output": "c".repeat(200)
+            }
+        ]
+    });
+    // 729 text-bearing characters -> 182 tokens, plus 12 framing tokens.
+    assert_eq!(estimate_request_tokens(&body), 194);
+}
+
+#[test]
 fn text_estimate_skips_image_payloads() {
     // A base64 image must not be metered as prompt text.
     let body = json!({

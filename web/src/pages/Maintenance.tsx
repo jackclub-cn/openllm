@@ -196,7 +196,7 @@ export default function MaintenancePage() {
   const checkUpgrade = async () => {
     setBusy('upgrade')
     try {
-      const query = latest.trim() ? `?latest=${encodeURIComponent(latest.trim())}` : ''
+      const query = latest.trim() ? `?latest=${encodeURIComponent(latest.trim())}` : '?official=true'
       setUpgrade(await api.get<UpgradeStatus>(`/api/maintenance/upgrade-check${query}`))
     } catch (error) {
       message.error(formatError(error))
@@ -546,7 +546,7 @@ export default function MaintenancePage() {
             检查更新
           </Button>
           <Typography.Text type="secondary">
-            离线环境可手动填写候选版本；也可以设置 OPENLLM_UPGRADE_FEED_URL 后留空检查。
+            留空检查 GitHub 正式发布版本；离线环境可填写候选版本。
           </Typography.Text>
         </Space>
         {upgrade && (

@@ -29,6 +29,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 ```
 
 > 未设置 `OPENLLM_ADMIN_TOKEN` 时管理接口默认开放，仅适合本机。对公网或局域网提供服务时，应设置管理令牌并放在反向代理或私网之后。
+> 设置令牌后，控制台会先进入独立的管理登录页；令牌只保存在当前浏览器，设置页不保存管理令牌。
 
 ### 常用配置
 
@@ -207,7 +208,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `OPENLLM_SESSION_AFFINITY_PERSIST` | `0` | 是否把粘性映射镜像到 SQLite |
 | `OPENLLM_MULTI_INSTANCE` | `refuse` | 同库已有活实例时默认拒绝启动 |
 | `OPENLLM_INSTANCE_LEASE_TTL_SECS` | `300` | 实例租约有效期，范围 30–86400 |
-| `OPENLLM_UPGRADE_FEED_URL` | 空 | 版本升级检查数据源；未设置时不主动外联 |
+| `OPENLLM_UPGRADE_FEED_URL` | 空 | 自定义版本升级源；控制台默认检查项目 GitHub 正式发布，服务端缓存一小时 |
 | `OPENLLM_MEMORY_SHED_RATIO` | `0.9` | 达到内存上限该比例后拒绝新请求 |
 | `OPENLLM_DB_MAX_CONNECTIONS` | `4` | SQLite 连接池大小；每条连接会持有独立页缓存，上限 256 |
 | `OPENLLM_DB_BUSY_TIMEOUT_SECS` | `10` | SQLite 写入竞争等待时间 |

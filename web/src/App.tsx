@@ -2,9 +2,7 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import {
   ApiOutlined,
   AppstoreOutlined,
-  BellOutlined,
   AuditOutlined,
-  ClusterOutlined,
   DashboardOutlined,
   FileSearchOutlined,
   KeyOutlined,
@@ -17,10 +15,20 @@ import {
   SettingOutlined,
   ToolOutlined,
 } from '@ant-design/icons'
-import { Button, Layout, Menu, Skeleton, Space, Tag, Tooltip, Typography } from 'antd'
+import { Button, Layout, Menu, Skeleton, Space, Spin, Tag, Tooltip, Typography } from 'antd'
 import { Navigate, Route, Routes, useLocation, useNavigate } from 'react-router-dom'
-import { api, setAdminToken, type Settings } from './api'
+import {
+  api,
+  ApiError,
+  getAdminToken,
+  setAdminToken,
+  type RuntimeStatus,
+  type Settings,
+} from './api'
 import { RealtimeProvider, useRealtime } from './realtime'
+import AdminLogin from './pages/AdminLogin'
+import GithubLink from './components/GithubLink'
+import VersionStatus from './components/VersionStatus'
 
 const { Header, Sider, Content } = Layout
 
@@ -42,14 +50,12 @@ const MaintenancePage = lazy(() => import('./pages/Maintenance'))
 const navigation = [
   { key: '/', icon: <DashboardOutlined />, label: '仪表盘' },
   { key: '/analytics', icon: <LineChartOutlined />, label: '用量分析' },
+  { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
   { key: '/providers', icon: <ApiOutlined />, label: '提供商' },
   { key: '/models', icon: <AppstoreOutlined />, label: '模型目录' },
-  { key: '/routes', icon: <NodeIndexOutlined />, label: '路由' },
   { key: '/playground', icon: <MessageOutlined />, label: '模型调试' },
-  { key: '/keys', icon: <KeyOutlined />, label: '访问密钥' },
-  { key: '/pools', icon: <ClusterOutlined />, label: '配额池' },
+  { key: '/routes', icon: <NodeIndexOutlined />, label: '路由' },
   { key: '/usage', icon: <FileSearchOutlined />, label: '请求日志' },
-  { key: '/webhooks', icon: <BellOutlined />, label: 'Webhook' },
   { key: '/audit', icon: <AuditOutlined />, label: '审计日志' },
   { key: '/diagnostics', icon: <SafetyCertificateOutlined />, label: '诊断' },
   { key: '/maintenance', icon: <ToolOutlined />, label: '运维' },
@@ -62,14 +68,102 @@ export default function App() {
   const [collapsed, setCollapsed] = useState(false)
   const [settings, setSettings] = useState<Settings>()
   const [tokenRevision, setTokenRevision] = useState(0)
+  const [access, setAccess] = useState<'checking' | 'authenticated' | 'required'>(
+    'checking'
+  )
+  const [accessError, setAccessError] = useState('')
 
   useEffect(() => {
-    api.get<Settings>('/api/settings').then(setSettings).catch(() => setSettings(undefined))
+    let cancelled = false
+    api
+      .get<Settings>('/api/settings')
+      .then((next) => {
+        if (cancelled) return
+        setSettings(next)
+        if (!next.admin_auth_enabled) setAccess('authenticated')
+      })
+      .catch(() => {
+        if (!cancelled) setAccess('authenticated')
+      })
+    return () => {
+      cancelled = true
+    }
   }, [location.pathname])
 
-  const saveAdminToken = (value: string) => {
+  useEffect(() => {
+    if (!settings?.admin_auth_enabled) return
+    const token = getAdminToken()
+    if (!token) {
+      setAccess('required')
+      return
+    }
+    let cancelled = false
+    setAccess('checking')
+    api
+      .get<RuntimeStatus>('/api/status')
+      .then(() => {
+        if (!cancelled) setAccess('authenticated')
+      })
+      .catch((error) => {
+        if (cancelled) return
+        if (error instanceof ApiError && error.status === 401) {
+          setAdminToken('')
+          setAccessError('浏览器中保存的管理令牌无效，请重新输入。')
+          setAccess('required')
+          return
+        }
+        // Keep the console usable when the gateway itself is transiently unavailable.
+        setAccess('authenticated')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [settings?.admin_auth_enabled])
+
+  useEffect(() => {
+    if (access !== 'required' || location.pathname === '/login') return
+    navigate('/login', {
+      replace: true,
+      state: {
+        from: `${location.pathname}${location.search}${location.hash}`,
+      },
+    })
+  }, [access, location.hash, location.pathname, location.search, navigate])
+
+  const saveAdminToken = async (value: string) => {
+    const previous = getAdminToken()
     setAdminToken(value)
+    try {
+      await api.get<RuntimeStatus>('/api/status')
+    } catch (error) {
+      setAdminToken(previous)
+      throw error
+    }
+    setAccessError('')
+    setAccess('authenticated')
     setTokenRevision((revision) => revision + 1)
+    const from = (location.state as { from?: string } | null)?.from
+    navigate(from && from !== '/login' ? from : '/', { replace: true })
+  }
+
+  if (access === 'checking') {
+    return (
+      <div className="auth-screen">
+        <Spin size="large" />
+      </div>
+    )
+  }
+
+  if (access === 'required' || (location.pathname === '/login' && settings?.admin_auth_enabled)) {
+    return (
+      <AdminLogin
+        version={settings?.version}
+        updating={access === 'authenticated'}
+        initialError={accessError}
+        onSubmit={saveAdminToken}
+        onBack={access === 'authenticated' ? () => navigate('/') : undefined}
+      />
+    )
   }
 
   return (
@@ -80,7 +174,6 @@ export default function App() {
         settings={settings}
         location={location}
         navigate={navigate}
-        onSaveAdminToken={saveAdminToken}
       />
     </RealtimeProvider>
   )
@@ -92,14 +185,12 @@ function AppLayout({
   settings,
   location,
   navigate,
-  onSaveAdminToken,
 }: {
   collapsed: boolean
   setCollapsed: (value: boolean | ((value: boolean) => boolean)) => void
   settings?: Settings
   location: ReturnType<typeof useLocation>
   navigate: ReturnType<typeof useNavigate>
-  onSaveAdminToken: (value: string) => void
 }) {
   const realtime = useRealtime()
 
@@ -133,6 +224,7 @@ function AppLayout({
             if (window.matchMedia('(max-width: 992px)').matches) setCollapsed(true)
           }}
         />
+        <GithubLink collapsed={collapsed} />
       </Sider>
       <Layout>
         <Header className="app-header">
@@ -156,7 +248,7 @@ function AppLayout({
             <Tag color={settings?.admin_auth_enabled ? 'blue' : 'default'}>
               {settings?.admin_auth_enabled ? '管理鉴权已开启' : '本地模式'}
             </Tag>
-            {settings && <Typography.Text type="secondary">v{settings.version}</Typography.Text>}
+            {settings && <VersionStatus version={settings.version} />}
           </Space>
         </Header>
         <Content className="app-content">
@@ -175,7 +267,7 @@ function AppLayout({
               <Route path="/audit" element={<AuditLogs />} />
               <Route path="/diagnostics" element={<DiagnosticsPage />} />
               <Route path="/maintenance" element={<MaintenancePage />} />
-              <Route path="/settings" element={<SettingsPage onSave={onSaveAdminToken} />} />
+              <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>

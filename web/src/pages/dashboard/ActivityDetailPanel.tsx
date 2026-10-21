@@ -6,12 +6,15 @@ import {
   LoadingOutlined,
   NodeIndexOutlined,
 } from '@ant-design/icons'
-import { Descriptions, Empty, Table, Tag, Tooltip, Typography } from 'antd'
+import { Empty, Table, Tag, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import type { ActivityAttempt, RequestActivity } from '../../api'
 import ContextBreakdownPanel from '../../components/ContextBreakdownPanel'
+import RequestTimingPanel from '../../components/RequestTimingPanel'
+import { formatTimingMs as formatMs } from '../../components/requestTimings'
 import { traceReasonLabel } from '../analytics/routingLabels'
 import useActivityClock, { activityElapsedMs, activityLiveTimings } from '../../hooks/useActivityClock'
+import ActivityRequestSummary from './ActivityRequestSummary'
 
 const phaseLabels: Record<string, string> = {
   admitted: '已接收',
@@ -28,34 +31,6 @@ const phaseLabels: Record<string, string> = {
 
 function phaseLabel(value: string) {
   return phaseLabels[value] || value
-}
-
-function formatMs(value?: number | null) {
-  if (value == null) return '-'
-  return value >= 1000 ? `${(value / 1000).toFixed(2)} s` : `${Math.max(0, Math.round(value))} ms`
-}
-
-function TimingRow({
-  label,
-  value,
-  total,
-  color,
-}: {
-  label: string
-  value?: number | null
-  total: number
-  color: string
-}) {
-  const width = value && total > 0 ? Math.min(100, Math.max(1, (value / total) * 100)) : 0
-  return (
-    <div className="activity-timing-row">
-      <span>{label}</span>
-      <div className="activity-timing-track">
-        <i style={{ width: `${width}%`, background: color }} />
-      </div>
-      <strong>{formatMs(value)}</strong>
-    </div>
-  )
 }
 
 export default function ActivityDetailPanel({
@@ -157,100 +132,28 @@ export default function ActivityDetailPanel({
             </div>
           </section>
 
-          <section>
-            <Typography.Title level={5}>阶段耗时</Typography.Title>
-            <div className="activity-timings">
-              <TimingRow
-                label="网关准备"
-                value={timings.prepare_ms}
-                total={total}
-                color="#1677ff"
-              />
-              <TimingRow
-                label="路由与等待"
-                value={timings.route_wait_ms}
-                total={total}
-                color="#13a8a8"
-              />
-              <TimingRow
-                label="上游响应头"
-                value={timings.upstream_headers_ms}
-                total={total}
-                color="#fa8c16"
-              />
-              <TimingRow
-                label={activity.streamed ? '等待首输出' : '读取响应'}
-                value={activity.streamed ? timings.response_wait_ms : timings.response_read_ms}
-                total={total}
-                color="#722ed1"
-              />
-              {activity.streamed && <TimingRow
-                label="生成阶段"
-                value={timings.generation_ms}
-                total={total}
-                color="#52c41a"
-              />}
-            </div>
-          </section>
+          <div className="activity-overview-grid">
+            <RequestTimingPanel
+              timings={{ ...timings, total_ms: total }}
+              streamed={activity.streamed}
+              running={activity.outcome === 'running'}
+              performance={{
+                timings,
+                attempt_count: activity.attempt_count,
+                fallback_count: activity.fallback_count,
+                failed_attempts_ms: activity.attempts
+                  .filter((attempt) => !attempt.success && attempt.reason_code)
+                  .reduce((sum, attempt) => sum + Math.max(0, attempt.latency_ms), 0),
+                attempts_truncated: activity.attempts_truncated,
+              }}
+            />
+            <ActivityRequestSummary activity={activity} totalMs={total} />
+          </div>
 
-          <section>
+          <section className="activity-context-section">
             <Typography.Title level={5}>上下文窗口</Typography.Title>
             <ContextBreakdownPanel context={activity.context} />
           </section>
-
-          <Descriptions className="activity-detail-metadata" column={{ xs: 1, sm: 2 }} size="small" bordered>
-            <Descriptions.Item label="请求 ID" span="filled">
-              <Typography.Text copyable={{ text: activity.request_id }}>
-                {activity.request_id}
-              </Typography.Text>
-            </Descriptions.Item>
-            <Descriptions.Item label="请求模型">
-              {activity.requested_model || '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label="流式">
-              <Tag>{activity.streamed ? '是' : '否'}</Tag>
-            </Descriptions.Item>
-            <Descriptions.Item label="上游密钥">
-              {activity.target?.provider_api_key_id ? `#${activity.target.provider_api_key_id}` : '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label="尝试 / 回退">
-              {activity.attempt_count} / {activity.fallback_count}
-            </Descriptions.Item>
-            <Descriptions.Item label="首 Token">
-              <Tooltip title={activity.streamed ? '首个有效输出片段' : '非流式请求不适用'}>
-                <span>
-                  {activity.streamed
-                    ? formatMs(activity.timings.time_to_first_token_ms)
-                    : '不适用'}
-                </span>
-              </Tooltip>
-            </Descriptions.Item>
-            <Descriptions.Item label="输入 tokens">
-              {activity.prompt_tokens ?? `~${activity.request_tokens_estimated}`}
-            </Descriptions.Item>
-            <Descriptions.Item label="输出 tokens">
-              {activity.completion_tokens ?? '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label="缓存读取">
-              {activity.cache.state === 'reported' ? activity.cache.read_tokens : '未知'}
-            </Descriptions.Item>
-            <Descriptions.Item label="缓存写入">
-              {activity.cache.state === 'reported' ? activity.cache.write_tokens : '未知'}
-            </Descriptions.Item>
-            <Descriptions.Item label="缓存命中率">
-              {activity.cache.hit_rate != null
-                ? `${(activity.cache.hit_rate * 100).toFixed(1)}%`
-                : activity.outcome === 'running'
-                  ? '等待供应商返回'
-                  : '未知'}
-            </Descriptions.Item>
-            <Descriptions.Item label="等待原因" span="filled">
-              {activity.waiting_reason || '-'}
-            </Descriptions.Item>
-            <Descriptions.Item label="错误" span="filled">
-              {activity.error_code || '-'}
-            </Descriptions.Item>
-          </Descriptions>
 
           <section>
             <Typography.Title level={5}>实际尝试 {activity.attempts_truncated ? `（最近 ${activity.attempts.length} / ${activity.attempt_count} 次）` : ''}</Typography.Title>

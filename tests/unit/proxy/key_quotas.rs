@@ -458,6 +458,7 @@ async fn quota_rejection_is_logged_as_zero_usage() {
                 response_preview TEXT,
                 context_breakdown_json TEXT,
                 cache_usage_reported INTEGER,
+                performance_json TEXT,
                 last_activity_at TEXT,
                 created_at TEXT NOT NULL DEFAULT ''
             )

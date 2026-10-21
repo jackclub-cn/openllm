@@ -3,7 +3,6 @@ import { App } from 'antd'
 import {
   api,
   formatError,
-  getAdminToken,
   type DatabaseVacuumResult,
   type ClearCooldownsResult,
   type CooldownSnapshot,
@@ -28,8 +27,6 @@ export type CooldownRow = {
 export default function useSettings() {
   const { message } = App.useApp()
   const [settings, setSettings] = useState<Settings>()
-  const [saved, setSaved] = useState(false)
-  const [token, setToken] = useState(getAdminToken())
   const [backingUp, setBackingUp] = useState(false)
   const [vacuuming, setVacuuming] = useState(false)
   const [runningMaintenance, setRunningMaintenance] = useState(false)
@@ -285,10 +282,6 @@ export default function useSettings() {
   return {
     message,
     settings,
-    saved,
-    setSaved,
-    token,
-    setToken,
     backingUp,
     vacuuming,
     runningMaintenance,

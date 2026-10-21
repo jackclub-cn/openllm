@@ -61,16 +61,6 @@
   margin-bottom: 0;
 }
 
-.settings-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.3fr) minmax(300px, 0.7fr);
-  gap: 16px;
-}
-
-.save-note {
-  margin-left: 12px;
-}
-
 .api-key-value {
   white-space: nowrap;
 }

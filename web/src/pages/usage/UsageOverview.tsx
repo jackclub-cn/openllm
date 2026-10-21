@@ -3,6 +3,7 @@ import { Alert, App, Button, Descriptions, Space, Tag, Tooltip, Typography } fro
 import dayjs from 'dayjs'
 import type { UsageLog } from '../../api'
 import { formatCompact, formatCostMicros, formatExact } from '../../format'
+import RequestTimingPanel from '../../components/RequestTimingPanel'
 
 export default function UsageOverview({ detail, onDiagnose }: { detail: UsageLog; onDiagnose: (detail: UsageLog) => void }) {
   const { message } = App.useApp()
@@ -32,6 +33,15 @@ export default function UsageOverview({ detail, onDiagnose }: { detail: UsageLog
                   : `请求失败 · HTTP ${detail.status_code}`}
             </span>
           </div>
+          {!detail.in_flight && (detail.performance ? (
+            <RequestTimingPanel
+              timings={detail.performance.timings}
+              streamed={detail.streamed}
+              performance={detail.performance}
+            />
+          ) : (
+            <Typography.Text type="secondary">暂无阶段耗时数据</Typography.Text>
+          ))}
           <Button icon={<ExperimentOutlined />} onClick={() => onDiagnose(detail)}>
             诊断此请求路由
           </Button>

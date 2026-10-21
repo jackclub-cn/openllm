@@ -55,15 +55,17 @@ impl Drop for RoutingUsageGuard {
         let state = self.state.clone();
         let request_id = self.request_id.clone();
         let latency_ms = self.started.elapsed().as_millis() as i64;
+        let performance_json = activity_performance_json(&state, &request_id);
         runtime.spawn(async move {
             let result = sqlx::query_as::<_, (i64, i64)>(
                 "UPDATE usage_logs SET in_flight = 0, status_code = 499, success = 0, \
-                     latency_ms = ?, \
+                     latency_ms = ?, performance_json = COALESCE(?, performance_json), \
                      error_message = 'request was cancelled while waiting for upstream response', \
                      last_activity_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') \
                  WHERE request_id = ? AND in_flight = 1 RETURNING id, streamed",
             )
             .bind(latency_ms)
+            .bind(performance_json)
             .bind(&request_id)
             .fetch_optional(&state.pool)
             .await;

@@ -224,6 +224,7 @@ pub(crate) async fn log_usage(state: &AppState, mut entry: UsageLogEntry<'_>) {
     }
     let usage = entry.usage.normalized();
     finish_activity_from_usage(state, &entry);
+    let performance_json = activity_performance_json(state, entry.request_id);
     let context_breakdown_json = activity_context_json(state, entry.request_id);
     let cache_usage_reported = state
         .activity
@@ -264,10 +265,10 @@ pub(crate) async fn log_usage(state: &AppState, mut entry: UsageLogEntry<'_>) {
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
             success, streamed, error_message, response_preview,
-            context_breakdown_json, cache_usage_reported, last_activity_at
+            context_breakdown_json, cache_usage_reported, performance_json, last_activity_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?,
-            ?, ?,
+            ?, ?, ?,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
         ON CONFLICT(request_id) DO UPDATE SET
@@ -296,6 +297,7 @@ pub(crate) async fn log_usage(state: &AppState, mut entry: UsageLogEntry<'_>) {
                 usage_logs.context_breakdown_json
             ),
             cache_usage_reported = excluded.cache_usage_reported,
+            performance_json = COALESCE(excluded.performance_json, usage_logs.performance_json),
             last_activity_at = excluded.last_activity_at
         "#,
     )
@@ -321,6 +323,7 @@ pub(crate) async fn log_usage(state: &AppState, mut entry: UsageLogEntry<'_>) {
     .bind(entry.response_preview)
     .bind(context_breakdown_json)
     .bind(cache_usage_reported)
+    .bind(performance_json)
     .execute(&state.pool)
     .await;
 

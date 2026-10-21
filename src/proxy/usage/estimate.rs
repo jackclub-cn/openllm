@@ -30,16 +30,30 @@ pub(crate) fn estimate_request_tokens(value: &Value) -> i64 {
 /// Field names whose string values represent prompt content worth counting.
 /// Anything else (ids, roles, media URLs, base64 blobs) is ignored so the
 /// estimate tracks text, not wire format.
-pub(crate) const TEXT_BEARING_KEYS: [&str; 9] = [
+pub(crate) const TEXT_BEARING_KEYS: [&str; 23] = [
     "text",
     "content",
     "input",
     "prompt",
     "system",
+    "instructions",
+    "output",
+    "thinking",
+    "reasoning_content",
+    "reasoning_text",
     "description",
     "arguments",
     "partial_json",
     "name",
+    "command",
+    "workdir",
+    "path",
+    "file_path",
+    "old_string",
+    "new_string",
+    "pattern",
+    "query",
+    "code",
 ];
 
 /// Sums the characters of text-bearing strings nested anywhere in `value`.

@@ -3,10 +3,6 @@
     padding: 18px;
   }
 
-  .settings-grid {
-    grid-template-columns: 1fr;
-  }
-
   .playground-grid {
     grid-template-columns: 1fr;
   }

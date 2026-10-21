@@ -1,6 +1,8 @@
 use super::*;
 
 use tempfile::tempdir;
+#[path = "lifecycle/release_feed.rs"]
+mod release_feed;
 
 const SEED_SQL: &str = r#"
 INSERT INTO providers (id, name, provider_type, base_url, model_prefix, model_auto_include_rules, headers, api_key, enabled, timeout_seconds, cooldown_seconds, max_concurrency, queue_timeout_seconds)
