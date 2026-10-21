@@ -114,7 +114,7 @@ async fn routing_decision_reports_session_affinity_hits_and_misses() {
     let hit = order_targets_with_decision(
         &state,
         7,
-        "priority",
+        "weighted",
         targets.clone(),
         Some("session-a"),
         None,
@@ -127,7 +127,7 @@ async fn routing_decision_reports_session_affinity_hits_and_misses() {
     let miss = order_targets_with_decision(
         &state,
         7,
-        "priority",
+        "weighted",
         targets.clone(),
         Some("session-b"),
         None,
@@ -136,7 +136,7 @@ async fn routing_decision_reports_session_affinity_hits_and_misses() {
     .unwrap();
     assert_eq!(miss.session_decision, "miss");
 
-    let no_affinity = order_targets_with_decision(&state, 7, "priority", targets, None, None)
+    let no_affinity = order_targets_with_decision(&state, 7, "weighted", targets, None, None)
         .await
         .unwrap();
     assert_eq!(no_affinity.session_decision, "no_affinity");
@@ -189,10 +189,17 @@ async fn put_quota_snapshot(state: &AppState, used: f64, reset_at: Option<String
 }
 
 async fn pinned_provider_id(state: &AppState) -> Option<i64> {
-    session_affinity_context(state, 7, Some("session-a"), None, false)
-        .await?
-        .pinned
-        .map(|pinned| pinned.provider_id)
+    session_affinity_context(
+        state,
+        7,
+        RouteStrategy::CostOptimized,
+        Some("session-a"),
+        None,
+        false,
+    )
+    .await?
+    .pinned
+    .map(|pinned| pinned.provider_id)
 }
 
 #[test]
@@ -416,7 +423,7 @@ async fn session_affinity_factor_marks_the_pinned_target() {
     order_targets(
         &state,
         7,
-        "priority",
+        "weighted",
         vec![second.clone()],
         Some("session-a"),
         None,
@@ -424,12 +431,19 @@ async fn session_affinity_factor_marks_the_pinned_target() {
     .await
     .unwrap();
 
-    let affinity = session_affinity_context(&state, 7, Some("session-a"), None, false)
-        .await
-        .expect("affinity is enabled in this test");
+    let affinity = session_affinity_context(
+        &state,
+        7,
+        RouteStrategy::Weighted,
+        Some("session-a"),
+        None,
+        false,
+    )
+    .await
+    .expect("affinity is enabled in this test");
     let assessments = assess_targets(
         &state,
-        RouteStrategy::Priority,
+        RouteStrategy::Weighted,
         &[first, second],
         None,
         Some(&affinity),
@@ -517,9 +531,16 @@ async fn missing_cache_evidence_does_not_override_cost_order() {
         "without cache evidence, affinity must not block cost ordering"
     );
 
-    let affinity = session_affinity_context(&state, 7, Some("session-a"), None, false)
-        .await
-        .expect("affinity is enabled");
+    let affinity = session_affinity_context(
+        &state,
+        7,
+        RouteStrategy::CostOptimized,
+        Some("session-a"),
+        None,
+        false,
+    )
+    .await
+    .expect("affinity is enabled");
     let assessments = assess_targets(
         &state,
         RouteStrategy::CostOptimized,

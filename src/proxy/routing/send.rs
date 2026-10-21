@@ -222,7 +222,7 @@ where
     let mut stream_retries_used = 0u32;
 
     let mut response = UpstreamResponse::new(
-        send_provider_request(state, target, streamed, || build(body)).await?,
+        send_activity_request(state, target, request_id, streamed, || build(body)).await?,
     );
     let mut transient_retry_used = false;
     let mut reasoning_retry_used = false;
@@ -233,7 +233,11 @@ where
         if status.is_success() {
             if streamed && resilience.stream_recovery_enabled {
                 match response.recover_prefix().await {
-                    Ok(recovered) => return Ok(UpstreamAttempt::Ok(recovered)),
+                    Ok(recovered) => {
+                        return Ok(UpstreamAttempt::Ok(
+                            recovered.with_activity(state, request_id),
+                        ));
+                    }
                     Err(error) if stream_retries_left > 0 => {
                         stream_retries_left -= 1;
                         let delay = retry_backoff(&resilience, stream_retries_used);
@@ -250,7 +254,10 @@ where
                         );
                         tokio::time::sleep(delay).await;
                         response = UpstreamResponse::new(
-                            send_provider_request(state, target, streamed, || build(body)).await?,
+                            send_activity_request(state, target, request_id, streamed, || {
+                                build(body)
+                            })
+                            .await?,
                         );
                         continue;
                     }
@@ -269,7 +276,9 @@ where
                     }
                 }
             }
-            return Ok(UpstreamAttempt::Ok(response));
+            return Ok(UpstreamAttempt::Ok(
+                response.with_activity(state, request_id),
+            ));
         }
         let headers = response.headers().clone();
         let response_body = response
@@ -295,7 +304,7 @@ where
             );
             tokio::time::sleep(delay).await;
             response = UpstreamResponse::new(
-                send_provider_request(state, target, streamed, || build(body)).await?,
+                send_activity_request(state, target, request_id, streamed, || build(body)).await?,
             );
             continue;
         }
@@ -315,7 +324,7 @@ where
                 "upstream returned an opaque 4xx; retrying once"
             );
             response = UpstreamResponse::new(
-                send_provider_request(state, target, streamed, || build(body)).await?,
+                send_activity_request(state, target, request_id, streamed, || build(body)).await?,
             );
             continue;
         }
@@ -357,7 +366,8 @@ where
                 )
                 .await;
                 response = UpstreamResponse::new(
-                    send_provider_request(state, target, streamed, || build(body)).await?,
+                    send_activity_request(state, target, request_id, streamed, || build(body))
+                        .await?,
                 );
                 continue;
             }
@@ -394,7 +404,7 @@ where
             .await;
             *body = compat_body;
             response = UpstreamResponse::new(
-                send_provider_request(state, target, streamed, || build(body)).await?,
+                send_activity_request(state, target, request_id, streamed, || build(body)).await?,
             );
             continue;
         }
@@ -415,7 +425,7 @@ where
             mark_provider_tool_search_unsupported(state, target.provider_id).await;
             *body = compat_body;
             response = UpstreamResponse::new(
-                send_provider_request(state, target, streamed, || build(body)).await?,
+                send_activity_request(state, target, request_id, streamed, || build(body)).await?,
             );
             continue;
         }

@@ -27,7 +27,9 @@ pub(crate) fn openai_stream_to_anthropic(
         let mut done = false;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
 
-        while !done && let Some(chunk) = upstream.next().await {
+        while !done
+            && let Some(chunk) = next_upstream_chunk(&mut upstream, &tx, state.sse_keepalive).await
+        {
             let chunk = match chunk {
                 Ok(chunk) => {
                     heartbeat.touch().await;
@@ -51,10 +53,12 @@ pub(crate) fn openai_stream_to_anthropic(
                     break;
                 }
             }
+            heartbeat.observe_first_token(stream_state.first_token_ms);
         }
         if !done && !buffer.is_empty() {
             process_openai_line_for_anthropic(&buffer, &mut stream_state, &context, &tx).await;
         }
+        heartbeat.observe_first_token(stream_state.first_token_ms);
 
         finish_anthropic_stream(&mut stream_state, &context, &tx).await;
         drop(tx);
@@ -166,6 +170,7 @@ pub(crate) fn responses_stream_to_anthropic(
                 )
                 .await;
             }
+            heartbeat.observe_first_token(stream_state.first_token_ms);
         }
         if !buffer.is_empty() {
             process_responses_line_for_anthropic(
@@ -178,6 +183,7 @@ pub(crate) fn responses_stream_to_anthropic(
             )
             .await;
         }
+        heartbeat.observe_first_token(stream_state.first_token_ms);
         let stream_error = stream_error
             .or_else(|| stream_state.response_error.clone())
             .or_else(|| {

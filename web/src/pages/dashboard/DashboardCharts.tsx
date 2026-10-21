@@ -5,7 +5,6 @@ import {
   Empty,
   Row,
   Segmented,
-  Select,
   Space,
   Tag,
   Typography,
@@ -318,13 +317,11 @@ export default function DashboardCharts({
             </div>
             <div className="trend-split-control">
               <Typography.Text type="secondary">拆分</Typography.Text>
-              <Select
+              <Segmented
                 size="small"
                 value={view}
                 onChange={(value) => setView(value as TrendView)}
                 options={VIEW_OPTIONS}
-                style={{ minWidth: 108 }}
-                popupMatchSelectWidth={false}
               />
             </div>
           </div>

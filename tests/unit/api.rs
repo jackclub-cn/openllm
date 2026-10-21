@@ -177,3 +177,6 @@ mod usage_filters;
 
 #[path = "api/runtime.rs"]
 mod runtime;
+
+#[path = "api/activity.rs"]
+mod activity;

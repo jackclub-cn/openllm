@@ -258,6 +258,92 @@ async fn provider_health_check_uses_responses_for_responses_only_model() {
 }
 
 #[tokio::test]
+async fn opencode_health_probes_send_a_stable_session_header() {
+    let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        axum::routing::post({
+            let seen = seen.clone();
+            move |headers: HeaderMap, Json(_body): Json<Value>| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().await.push(headers);
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "id": "opencode-health",
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 0,
+                                "total_tokens": 1
+                            }
+                        })),
+                    )
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (
+             id, name, provider_type, base_url, model_prefix
+         ) VALUES (1, 'OpenCode Go', 'openai', ?, 'opencode-go/')",
+    )
+    .bind(format!("http://{address}"))
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_models (provider_id, model_name, enabled)
+         VALUES (1, 'probe-model', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+         VALUES (11, 1, 'Primary', 'sk-test', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let result = test_provider_inner(&state, 1).await.unwrap();
+    assert!(result.ok);
+    {
+        let headers = seen.lock().await;
+        assert!(!headers.is_empty());
+        assert!(headers.iter().all(|headers| {
+            headers
+                .get("x-opencode-session")
+                .and_then(|value| value.to_str().ok())
+                == Some("openllm-health-1")
+        }));
+    }
+
+    seen.lock().await.clear();
+    let key_result = test_provider_keys_inner(&state, 1).await.unwrap();
+    assert_eq!(key_result.ok, 1);
+    let headers = seen.lock().await;
+    assert_eq!(headers.len(), 1);
+    assert_eq!(
+        headers[0]
+            .get("x-opencode-session")
+            .and_then(|value| value.to_str().ok()),
+        Some("openllm-health-1")
+    );
+    drop(headers);
+    server.abort();
+}
+
+#[tokio::test]
 async fn provider_key_health_check_tests_every_enabled_key() {
     let seen = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let app = axum::Router::new().route(

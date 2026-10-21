@@ -119,6 +119,14 @@ async fn streaming_busy_wait_commits_an_sse_response_before_retrying() {
         "unexpected SSE body: {body}"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let activity = state
+        .activity
+        .snapshot("streaming-busy-wait-request")
+        .unwrap();
+    assert_eq!(activity.attempt_count, 2);
+    assert_eq!(activity.attempts.len(), 2);
+    assert_eq!(activity.fallback_count, 1);
+    assert_eq!(activity.route_name.as_deref(), Some("streaming"));
 
     server.abort();
 }
@@ -239,6 +247,13 @@ async fn anthropic_streaming_busy_wait_commits_keepalive_before_retrying() {
         "unexpected SSE body: {body}"
     );
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    let activity = state
+        .activity
+        .snapshot("anthropic-streaming-busy-wait-request")
+        .unwrap();
+    assert_eq!(activity.attempt_count, 2);
+    assert_eq!(activity.attempts.len(), 2);
+    assert_eq!(activity.fallback_count, 1);
 
     server.abort();
 }

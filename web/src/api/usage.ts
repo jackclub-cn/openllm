@@ -1,3 +1,5 @@
+import type { ContextBreakdown } from './activity'
+
 export type UsageLog = {
   id: number
   request_id: string
@@ -31,6 +33,8 @@ export type UsageLog = {
   error_message?: string
   request_preview?: string
   response_preview?: string
+  context?: ContextBreakdown | null
+  cache_usage_reported?: boolean | null
   warning_message?: string
   created_at: string
 }

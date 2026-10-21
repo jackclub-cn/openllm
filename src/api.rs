@@ -18,9 +18,13 @@ use tokio::io::AsyncReadExt;
 use crate::error::{AppError, AppResult};
 use crate::models::*;
 use crate::models_dev;
-use crate::proxy::{apply_custom_headers, join_upstream_url, upstream_rejects_tool_search};
+use crate::proxy::{
+    apply_custom_headers, apply_opencode_provider_session_header, join_upstream_url,
+    upstream_rejects_tool_search,
+};
 use crate::state::{AppState, SETTING_GUARDRAILS, SETTING_INSPECTOR, SETTING_RESILIENCE};
 
+mod activity;
 mod admin;
 mod audit;
 pub(crate) mod diagnostics;
@@ -36,6 +40,7 @@ mod routes;
 mod usage;
 mod webhooks;
 
+pub use activity::*;
 pub use admin::*;
 pub use audit::*;
 pub(crate) use diagnostics::*;

@@ -6,7 +6,7 @@
 //! sync, it only means models keep no capability metadata.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -39,6 +39,16 @@ pub struct Catalog {
     /// "qwen3.7-flash"), so an exact-key lookup alone misses metadata that is
     /// actually present. This index lets a normalized match find it.
     by_normalized: HashMap<String, Vec<String>>,
+}
+
+/// The fetched document is retained for the network TTL, but the parsed object
+/// graph is only kept alive by active sync work. Reusing a weak reference lets
+/// concurrent callers share one parse without making the full catalog a
+/// long-lived process allocation.
+pub(crate) struct CatalogCache {
+    fetched_at: Instant,
+    bytes: Arc<Vec<u8>>,
+    parsed: Weak<Catalog>,
 }
 
 impl Catalog {
@@ -89,16 +99,9 @@ impl Catalog {
         Ok(catalog)
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.by_model.is_empty()
-    }
-
+    #[cfg(test)]
     pub fn provider_count(&self) -> usize {
         self.providers.len()
-    }
-
-    pub fn model_count(&self) -> usize {
-        self.by_model.len()
     }
 
     /// Best-effort match of a configured provider to a models.dev provider id,
@@ -266,29 +269,47 @@ fn string_field(model: &Value, key: &str) -> Option<String> {
 
 /// Returns a cached catalog, refreshing it when the TTL has elapsed.
 pub async fn load(state: &AppState) -> AppResult<Arc<Catalog>> {
-    if let Some((fetched_at, catalog)) = state.models_dev.read().await.as_ref()
-        && fetched_at.elapsed() < CATALOG_TTL
+    if let Some(catalog) = state
+        .models_dev
+        .read()
+        .await
+        .as_ref()
+        .and_then(|cache| cache.parsed.upgrade())
     {
-        return Ok(catalog.clone());
+        return Ok(catalog);
     }
 
-    let url = api_url();
-    let response = state
-        .client
-        .get(&url)
-        .send()
+    let cached_bytes = state
+        .models_dev
+        .read()
         .await
-        .map_err(|error| AppError::Upstream(format!("failed to fetch models.dev: {error}")))?;
-    let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| AppError::Upstream(error.to_string()))?;
-    if !status.is_success() {
-        return Err(AppError::Upstream(format!("models.dev returned {status}")));
-    }
+        .as_ref()
+        .filter(|cache| cache.fetched_at.elapsed() < CATALOG_TTL)
+        .map(|cache| (cache.fetched_at, cache.bytes.clone()));
+    let (fetched_at, bytes) = match cached_bytes {
+        Some(cached) => cached,
+        None => {
+            let url = api_url();
+            let response = state.client.get(&url).send().await.map_err(|error| {
+                AppError::Upstream(format!("failed to fetch models.dev: {error}"))
+            })?;
+            let status = response.status();
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|error| AppError::Upstream(error.to_string()))?;
+            if !status.is_success() {
+                return Err(AppError::Upstream(format!("models.dev returned {status}")));
+            }
+            (Instant::now(), Arc::new(bytes.to_vec()))
+        }
+    };
     let catalog = Arc::new(Catalog::parse(&bytes)?);
-    *state.models_dev.write().await = Some((Instant::now(), catalog.clone()));
+    *state.models_dev.write().await = Some(CatalogCache {
+        fetched_at,
+        bytes,
+        parsed: Arc::downgrade(&catalog),
+    });
     Ok(catalog)
 }
 
@@ -340,6 +361,21 @@ mod tests {
           }
         }"#
         .to_vec()
+    }
+
+    #[test]
+    fn parsed_catalog_cache_does_not_retain_the_object_graph() {
+        let bytes = sample();
+        let catalog = Arc::new(Catalog::parse(&bytes).unwrap());
+        let cache = CatalogCache {
+            fetched_at: Instant::now(),
+            bytes: Arc::new(bytes),
+            parsed: Arc::downgrade(&catalog),
+        };
+
+        assert!(cache.parsed.upgrade().is_some());
+        drop(catalog);
+        assert!(cache.parsed.upgrade().is_none());
     }
 
     #[test]

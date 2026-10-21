@@ -4,11 +4,12 @@ pub(super) async fn run_anthropic_attempts(
     state: &AppState,
     context: &AnthropicAttemptContext,
     emit_busy_wait_signal: bool,
+    resume: Option<Box<super::route_trace::AttemptResume>>,
 ) -> AppResult<AnthropicAttemptOutcome> {
     let mut last_error: Option<AppError> = None;
     let mut last_rate_limit: Option<(String, Option<Duration>)> = None;
     let mut last_target: Option<(i64, Option<i64>, String)> = None;
-    let mut attempts = 0usize;
+    let mut attempts = resume.as_ref().map_or(0, |resume| resume.attempts);
     let request_deadline = context.request_deadline;
     let busy_wait_deadline = context.busy_wait_deadline;
     let mut wait_round = 0u32;
@@ -22,12 +23,14 @@ pub(super) async fn run_anthropic_attempts(
     )
     .await?;
     let mut ordered_targets = ordered.targets;
-    let mut trace = super::route_trace::RouteTraceRecorder::new(
-        context.request_id.clone(),
-        context.route_id,
-        context.resolved.strategy.clone(),
-        context.session_id.clone(),
-    );
+    let mut trace = resume.map(|resume| resume.trace).unwrap_or_else(|| {
+        super::route_trace::RouteTraceRecorder::new(
+            context.request_id.clone(),
+            context.route_id,
+            context.resolved.strategy.clone(),
+            context.session_id.clone(),
+        )
+    });
     trace.set_session_decision(ordered.session_decision);
     trace
         .update_candidates(
@@ -37,6 +40,13 @@ pub(super) async fn run_anthropic_attempts(
             context.api_key.as_ref().map(|key| key.id),
         )
         .await;
+    state.activity_set_route(
+        &context.request_id,
+        context.route_id,
+        context.resolved.route_name.as_deref(),
+        &context.resolved.strategy,
+        candidates_for_activity(&ordered_targets, trace.candidates()),
+    );
 
     loop {
         let mut all_targets_busy = true;
@@ -81,6 +91,22 @@ pub(super) async fn run_anthropic_attempts(
                 target_upstream_model.clone(),
             ));
             attempted_any = true;
+            state.activity_begin_attempt(
+                &context.request_id,
+                crate::state::ActivityAttemptStart {
+                    attempt_index: attempts as i64,
+                    round: wait_round as i64,
+                    candidate_order,
+                    target: crate::state::ActivityTarget {
+                        provider_id: target_provider_id,
+                        provider_name: target.provider_name.clone(),
+                        provider_api_key_id: target_provider_key_id,
+                        upstream_model: target_upstream_model.clone(),
+                        context_window_tokens: target.context_limit,
+                        input_limit: target.input_limit,
+                    },
+                },
+            );
             let upstream_slots = match acquire_upstream_slots(state, &target).await {
                 Ok(slots) => slots,
                 Err(error) => {
@@ -104,6 +130,17 @@ pub(super) async fn run_anthropic_attempts(
                         failure_retry: failure.failure_retry.map(str::to_string),
                         failure_confidence: failure.failure_confidence.map(str::to_string),
                     });
+                    state.activity_finish_attempt(
+                        &context.request_id,
+                        crate::state::ActivityAttemptFinish {
+                            attempt_index: attempts as i64,
+                            latency_ms: attempt_started.elapsed().as_millis() as i64,
+                            status_code: failure.status_code,
+                            success: false,
+                            reason_code: failure.reason_code.to_string(),
+                            failure_scope: failure.failure_scope.map(str::to_string),
+                        },
+                    );
                     if provider_exhausted {
                         capacity_exhausted_providers.insert(target_provider_id);
                     }
@@ -141,6 +178,11 @@ pub(super) async fn run_anthropic_attempts(
             let result = if target.provider_type == "anthropic" {
                 let mut native = context.inbound.clone();
                 native["model"] = json!(target.upstream_model);
+                let opencode_session_id = opencode_session_id(
+                    context.session_id.as_deref(),
+                    context.affinity_key.as_deref(),
+                    &context.request_id,
+                );
                 forward_anthropic_native(
                     state,
                     &context.request_id,
@@ -153,10 +195,15 @@ pub(super) async fn run_anthropic_attempts(
                     context.started,
                     context.receipt.clone(),
                     context.anthropic_beta.clone(),
-                    context.session_id.as_deref(),
+                    Some(opencode_session_id),
                 )
                 .await
             } else {
+                let opencode_session_id = opencode_session_id(
+                    context.session_id.as_deref(),
+                    context.affinity_key.as_deref(),
+                    &context.request_id,
+                );
                 forward_openai_as_anthropic(
                     state,
                     &context.request_id,
@@ -168,7 +215,7 @@ pub(super) async fn run_anthropic_attempts(
                     context.api_key.as_ref(),
                     context.started,
                     context.receipt.clone(),
-                    context.session_id.as_deref(),
+                    Some(opencode_session_id),
                 )
                 .await
             };
@@ -197,6 +244,22 @@ pub(super) async fn run_anthropic_attempts(
                         failure_retry: None,
                         failure_confidence: None,
                     });
+                    state.activity_finish_attempt(
+                        &context.request_id,
+                        crate::state::ActivityAttemptFinish {
+                            attempt_index: attempts as i64,
+                            latency_ms: attempt_started.elapsed().as_millis() as i64,
+                            status_code: Some(response_status.as_u16() as i64),
+                            success: response_status.is_success(),
+                            reason_code: if response_status.is_success() {
+                                "upstream_success"
+                            } else {
+                                "upstream_response"
+                            }
+                            .to_string(),
+                            failure_scope: None,
+                        },
+                    );
                     if response_status.is_success() {
                         mark_provider_success(state, target_provider_id).await;
                         mark_target_success(state, target_provider_id, &target_upstream_model)
@@ -256,6 +319,17 @@ pub(super) async fn run_anthropic_attempts(
                         failure_retry: failure.failure_retry.map(str::to_string),
                         failure_confidence: failure.failure_confidence.map(str::to_string),
                     });
+                    state.activity_finish_attempt(
+                        &context.request_id,
+                        crate::state::ActivityAttemptFinish {
+                            attempt_index: attempts as i64,
+                            latency_ms: attempt_started.elapsed().as_millis() as i64,
+                            status_code: failure.status_code,
+                            success: false,
+                            reason_code: failure.reason_code.to_string(),
+                            failure_scope: failure.failure_scope.map(str::to_string),
+                        },
+                    );
                     if !busy_waitable_error(state, &target, &error).await {
                         all_targets_busy = false;
                     }
@@ -290,7 +364,9 @@ pub(super) async fn run_anthropic_attempts(
             break;
         }
         if context.streamed && context.resolved.keepalive_during_wait && emit_busy_wait_signal {
-            return Ok(AnthropicAttemptOutcome::BusyWait);
+            return Ok(AnthropicAttemptOutcome::BusyWait(Box::new(
+                super::route_trace::AttemptResume { trace, attempts },
+            )));
         }
         let remaining = busy_wait_deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -308,6 +384,10 @@ pub(super) async fn run_anthropic_attempts(
             wait_round,
         )
         .min(remaining);
+        state.activity_waiting(
+            &context.request_id,
+            "all route targets are temporarily busy",
+        );
         wait_round = wait_round.saturating_add(1);
         tracing::info!(
             request_id = %context.request_id,
@@ -336,6 +416,13 @@ pub(super) async fn run_anthropic_attempts(
                 context.api_key.as_ref().map(|key| key.id),
             )
             .await;
+        state.activity_set_route(
+            &context.request_id,
+            context.route_id,
+            context.resolved.route_name.as_deref(),
+            &context.resolved.strategy,
+            candidates_for_activity(&ordered_targets, trace.candidates()),
+        );
     }
 
     let error = match last_rate_limit {

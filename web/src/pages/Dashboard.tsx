@@ -12,12 +12,19 @@ import {
   api,
   formatError,
   type Overview,
+  type RequestActivity,
   type UsageLog,
 } from '../api'
 import PageHeader from '../components/PageHeader'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
-import { useCoalescedUsageEvents, useRealtime } from '../realtime'
+import useRecentActivity from '../hooks/useRecentActivity'
+import {
+  useCoalescedUsageEvents,
+  useRealtime,
+} from '../realtime'
+import ActivityDetailDrawer from './dashboard/ActivityDetailDrawer'
 import DashboardDetails from './dashboard/DashboardDetails'
+import DashboardLiveRequests from './dashboard/DashboardLiveRequests'
 import DashboardMetrics from './dashboard/DashboardMetrics'
 import DashboardRequestTimeline from './dashboard/DashboardRequestTimeline'
 import DashboardRuntimeStatus from './dashboard/DashboardRuntimeStatus'
@@ -28,6 +35,7 @@ export default function Dashboard() {
   const [data, setData] = useState<Overview>()
   const [timelineItems, setTimelineItems] = useState<UsageLog[]>([])
   const [timelineError, setTimelineError] = useState('')
+  const [selectedActivity, setSelectedActivity] = useState<RequestActivity>()
   const [error, setError] = useState('')
 
   const loadOverview = useCallback(async () => {
@@ -89,6 +97,7 @@ export default function Dashboard() {
     onRefresh: load,
   })
   const { connected: realtimeConnected } = useRealtime()
+  const live = useRecentActivity(autoRefresh.paused)
   useCoalescedUsageEvents(
     () => {
       void autoRefresh.manualRefresh()
@@ -147,7 +156,7 @@ export default function Dashboard() {
             <Button
               icon={<ReloadOutlined spin={autoRefresh.refreshing} />}
               loading={autoRefresh.refreshing}
-              onClick={() => void autoRefresh.manualRefresh()}
+              onClick={() => { void autoRefresh.manualRefresh(); void live.reload() }}
             >
               刷新
             </Button>
@@ -156,6 +165,16 @@ export default function Dashboard() {
       />
       <DashboardMetrics data={data} />
       <DashboardRuntimeStatus />
+      <DashboardLiveRequests
+        items={live.items}
+        connected={realtimeConnected}
+        error={live.error}
+        activeCount={live.activeCount}
+        loading={live.loading}
+        enabled={live.enabled}
+        paused={autoRefresh.paused}
+        onOpen={setSelectedActivity}
+      />
       <DashboardRequestTimeline
         items={timelineItems}
         error={timelineError}
@@ -164,6 +183,10 @@ export default function Dashboard() {
         }
       />
       <DashboardDetails data={data} />
+      <ActivityDetailDrawer
+        initial={selectedActivity}
+        onClose={() => setSelectedActivity(undefined)}
+      />
     </>
   )
 }

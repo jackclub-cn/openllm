@@ -7,6 +7,22 @@ pub(crate) async fn proxy_anthropic_inner(
     body: &Bytes,
     request_id: &str,
 ) -> AppResult<Response> {
+    track_activity_request(
+        state,
+        request_id,
+        uri.path(),
+        run_anthropic_request(state, headers, uri, body, request_id),
+    )
+    .await
+}
+
+async fn run_anthropic_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    request_id: &str,
+) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
     let inbound: Value = serde_json::from_slice(body).map_err(|error| {
@@ -31,6 +47,21 @@ pub(crate) async fn proxy_anthropic_inner(
     let request_tokens = estimate_request_tokens(&request_json);
 
     let api_key = authenticate_gateway(state, headers).await?;
+    state.activity_describe(
+        request_id,
+        crate::state::ActivityDescription {
+            requested_model: requested_model.clone(),
+            streamed,
+            session_id: session_id.clone(),
+            api_key_id: api_key.as_ref().map(|key| key.id),
+            api_key_name: api_key.as_ref().map(|key| key.name.clone()),
+            request_tokens_estimated: request_tokens,
+            context: state
+                .activity
+                .is_enabled()
+                .then(|| request_context_breakdown(&inbound, &endpoint, request_tokens)),
+        },
+    );
     enforce_policy_or_log(
         state,
         api_key.as_ref(),
@@ -279,12 +310,12 @@ pub(crate) async fn proxy_anthropic_inner(
         state,
         request_id,
         started,
-        run_anthropic_attempts(state, &context, true),
+        run_anthropic_attempts(state, &context, true, None),
     )
     .await?
     {
         AnthropicAttemptOutcome::Response(response) => Ok(response),
-        AnthropicAttemptOutcome::BusyWait => {
+        AnthropicAttemptOutcome::BusyWait(resume) => {
             let state = state.clone();
             let context = context.clone();
             let interval = state.sse_keepalive.unwrap_or(Duration::from_secs(
@@ -298,12 +329,12 @@ pub(crate) async fn proxy_anthropic_inner(
                         &state,
                         &context.request_id,
                         context.started,
-                        run_anthropic_attempts(&state, &context, false),
+                        run_anthropic_attempts(&state, &context, false, Some(resume)),
                     )
                     .await?
                     {
                         AnthropicAttemptOutcome::Response(response) => Ok(response),
-                        AnthropicAttemptOutcome::BusyWait => Err(AppError::Internal(
+                        AnthropicAttemptOutcome::BusyWait(_) => Err(AppError::Internal(
                             anyhow::anyhow!("busy-wait stream did not resume routing"),
                         )),
                     }

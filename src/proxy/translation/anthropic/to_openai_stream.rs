@@ -65,6 +65,7 @@ pub(crate) fn anthropic_stream_response(
                 )
                 .await;
             }
+            heartbeat.observe_first_token(first_token_ms);
         }
 
         if !buffer.is_empty() {
@@ -86,6 +87,7 @@ pub(crate) fn anthropic_stream_response(
             )
             .await;
         }
+        heartbeat.observe_first_token(first_token_ms);
 
         // Prefer the real token counts Anthropic reported (message_start /
         // message_delta) and only fall back to our estimate when absent.

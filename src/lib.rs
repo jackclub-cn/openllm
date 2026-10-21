@@ -38,19 +38,19 @@ use crate::api::{
     create_route, create_webhook, delete_api_key, delete_provider, delete_provider_pool,
     delete_route, delete_webhook, diagnose_route, diagnostic_snapshot, event_stream,
     export_audit_logs, export_config, export_usage, get_guardrails_settings,
-    get_inspector_settings, get_resilience_settings, get_route_trace, get_runtime_settings,
-    get_settings, get_status, get_usage_detail, health, import_config, list_api_keys,
-    list_audit_logs, list_backups, list_cooldowns, list_model_inventory, list_models,
-    list_provider_model_limits, list_provider_pools, list_provider_quota_snapshots, list_providers,
-    list_routes, list_usage, list_webhook_deliveries, list_webhooks, migration_status, overview,
-    preview_provider_model_sync, prometheus_metrics, provider_pool_usage, provider_quota,
-    provider_quota_overview, provider_quota_refresh_interval, ready, rotate_api_key,
-    run_maintenance, run_provider_quota_refresh, self_check, sync_provider_models,
-    test_all_provider_keys, test_all_providers, test_provider, test_provider_keys, test_webhook,
-    update_api_key, update_guardrails_settings, update_inspector_settings, update_provider,
-    update_provider_model_limits, update_provider_pool, update_provider_quota_snapshots,
-    update_resilience_settings, update_route, update_runtime_settings, update_webhook,
-    upgrade_check, vacuum_database, verify_backup,
+    get_inspector_settings, get_request_activity, get_resilience_settings, get_route_trace,
+    get_runtime_settings, get_settings, get_status, get_usage_detail, health, import_config,
+    list_api_keys, list_audit_logs, list_backups, list_cooldowns, list_model_inventory,
+    list_models, list_provider_model_limits, list_provider_pools, list_provider_quota_snapshots,
+    list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks,
+    migration_status, overview, preview_provider_model_sync, prometheus_metrics,
+    provider_pool_usage, provider_quota, provider_quota_overview, provider_quota_refresh_interval,
+    ready, recent_activity, rotate_api_key, run_maintenance, run_provider_quota_refresh,
+    self_check, sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
+    test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
+    update_inspector_settings, update_provider, update_provider_model_limits, update_provider_pool,
+    update_provider_quota_snapshots, update_resilience_settings, update_route,
+    update_runtime_settings, update_webhook, upgrade_check, vacuum_database, verify_backup,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -335,6 +335,8 @@ pub fn build_router(state: AppState) -> Router {
         ));
     let admin = Router::new()
         .route("/status", get(get_status))
+        .route("/activity/recent", get(recent_activity))
+        .route("/activity/{request_id}", get(get_request_activity))
         .route("/diagnostics/self-check", get(self_check))
         .route("/diagnostics/snapshot", get(diagnostic_snapshot))
         .route("/overview", get(overview))

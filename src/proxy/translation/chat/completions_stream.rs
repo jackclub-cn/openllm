@@ -54,6 +54,7 @@ pub(crate) fn chat_stream_to_completions(
                 )
                 .await;
             }
+            heartbeat.observe_first_token(first_token_ms);
         }
         if !buffer.is_empty() {
             process_chat_line_for_completions(
@@ -69,6 +70,7 @@ pub(crate) fn chat_stream_to_completions(
             )
             .await;
         }
+        heartbeat.observe_first_token(first_token_ms);
 
         if stream_error.is_none() {
             let final_chunk = completions_stream_chunk(
@@ -259,6 +261,7 @@ pub(crate) fn anthropic_stream_to_completions(
                 )
                 .await;
             }
+            heartbeat.observe_first_token(first_token_ms);
         }
         if !buffer.is_empty() {
             process_completions_anthropic_line(
@@ -275,6 +278,7 @@ pub(crate) fn anthropic_stream_to_completions(
             )
             .await;
         }
+        heartbeat.observe_first_token(first_token_ms);
 
         let finish_reason = if stop_reason.as_deref() == Some("max_tokens") {
             "length"

@@ -24,8 +24,12 @@ pub(crate) fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<S
         OPENCODE_SESSION_HEADER,
         "session-id",
         "thread-id",
+        "session_id",
+        "thread_id",
         "x-session-id",
         "x-claude-code-session-id",
+        "conversation-id",
+        "conversation_id",
     ] {
         if let Some(value) = headers
             .get(name)
@@ -53,6 +57,26 @@ pub(crate) fn upstream_session_id(headers: &HeaderMap, body: &Value) -> Option<S
     }
 
     None
+}
+
+/// Returns the identifier forwarded to OpenCode Go.
+///
+/// Explicit client identifiers are preferred. Prompt affinity is stable across
+/// turns without exposing prompt text, and the gateway request ID is a final
+/// fallback so an otherwise valid request is never rejected solely because the
+/// client omitted session metadata.
+pub(crate) fn opencode_session_id<'a>(
+    explicit: Option<&'a str>,
+    affinity: Option<&'a str>,
+    request_id: &'a str,
+) -> &'a str {
+    explicit
+        .into_iter()
+        .chain(affinity)
+        .chain(std::iter::once(request_id))
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .unwrap_or(request_id)
 }
 
 /// Stable routing affinity key for a request.
@@ -157,13 +181,14 @@ fn affinity_text(value: &Value) -> Option<String> {
     (!text.is_empty()).then(|| text.to_string())
 }
 
-pub(crate) fn is_opencode_go_target(target: &RouteTarget) -> bool {
-    let provider_name = target.provider_name.to_ascii_lowercase();
-    let model_prefix = target.model_prefix.trim().trim_end_matches('/');
-    let base_url = target.base_url.to_ascii_lowercase();
+fn is_opencode_go_endpoint(provider_name: &str, model_prefix: &str, base_url: &str) -> bool {
+    let provider_name = provider_name.to_ascii_lowercase();
+    let model_prefix = model_prefix.trim().trim_end_matches('/');
+    let base_url = base_url.to_ascii_lowercase();
     provider_name.contains("opencode go")
         || model_prefix.eq_ignore_ascii_case("opencode-go")
         || base_url.contains("opencode.ai/zen/go")
+        || base_url.contains("opencode.ai/inference/go")
 }
 
 pub(crate) fn custom_headers_contain(name: &str, headers: &str) -> bool {
@@ -178,11 +203,29 @@ pub(crate) fn apply_opencode_session_header(
     target: &RouteTarget,
     session_id: Option<&str>,
 ) -> RequestBuilder {
+    apply_opencode_provider_session_header(
+        request,
+        &target.provider_name,
+        &target.model_prefix,
+        &target.base_url,
+        &target.provider_headers,
+        session_id,
+    )
+}
+
+pub(crate) fn apply_opencode_provider_session_header(
+    request: RequestBuilder,
+    provider_name: &str,
+    model_prefix: &str,
+    base_url: &str,
+    provider_headers: &str,
+    session_id: Option<&str>,
+) -> RequestBuilder {
     let Some(session_id) = session_id.filter(|value| !value.trim().is_empty()) else {
         return request;
     };
-    if !is_opencode_go_target(target)
-        || custom_headers_contain(OPENCODE_SESSION_HEADER, &target.provider_headers)
+    if !is_opencode_go_endpoint(provider_name, model_prefix, base_url)
+        || custom_headers_contain(OPENCODE_SESSION_HEADER, provider_headers)
     {
         return request;
     }

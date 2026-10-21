@@ -636,7 +636,8 @@ pub async fn event_stream(
                 .into_response();
         }
     }
-    let mut receiver = state.events.subscribe();
+    let mut usage_receiver = state.events.subscribe();
+    let mut activity_receiver = state.activity_events.subscribe();
     let stream = async_stream::stream! {
         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"event: ready\ndata: {}\n\n"));
         let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
@@ -645,7 +646,7 @@ pub async fn event_stream(
                 _ = heartbeat.tick() => {
                     yield Ok(Bytes::from_static(b": keep-alive\n\n"));
                 }
-                event = receiver.recv() => {
+                event = usage_receiver.recv() => {
                     match event {
                         Ok(event) => {
                             let payload = json!({
@@ -657,6 +658,20 @@ pub async fn event_stream(
                             yield Ok(Bytes::from(format!("event: usage\ndata: {payload}\n\n")));
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                event = activity_receiver.recv() => {
+                    match event {
+                        Ok(event) => {
+                            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
+                            yield Ok(Bytes::from(format!("event: activity\ndata: {payload}\n\n")));
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            yield Ok(Bytes::from_static(
+                                b"event: activity_resync\ndata: {}\n\n",
+                            ));
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
                 }

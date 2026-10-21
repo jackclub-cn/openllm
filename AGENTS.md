@@ -31,3 +31,5 @@ These rules apply to the whole repository.
   dependencies for code organization or checks when the existing toolchain works.
 - Commit, tag and publish only when requested. Do not introduce `auto/*` routing
   or enable latency penalties on unrelated routing strategies.
+- When a release is requested, follow [docs/RELEASING.md](docs/RELEASING.md)
+  through version updates, validation, tag CI and release artifact verification.

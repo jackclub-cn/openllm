@@ -1,4 +1,5 @@
 use super::*;
+use crate::models::{ContextBreakdown, ContextCategory};
 
 #[tokio::test]
 async fn usage_cost_uses_manual_price_overrides() {
@@ -233,4 +234,120 @@ async fn usage_warning_appends_once_per_unique_message() {
             .await
             .unwrap();
     assert_eq!(warning.as_deref(), Some("first warning\nsecond warning"));
+}
+
+#[tokio::test]
+async fn usage_log_persists_and_calibrates_context_breakdown() {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    let state = AppState::new(pool.clone(), None);
+
+    state
+        .activity
+        .start("context-request", OPENAI_CHAT_COMPLETIONS);
+    state.activity.describe(
+        "context-request",
+        crate::state::ActivityDescription {
+            requested_model: "model-a".to_string(),
+            streamed: false,
+            session_id: None,
+            api_key_id: None,
+            api_key_name: None,
+            request_tokens_estimated: 100,
+            context: Some(ContextBreakdown {
+                window_tokens: Some(1_000),
+                input_tokens: 100,
+                estimated: true,
+                input_estimated: true,
+                categories: vec![
+                    ContextCategory {
+                        key: "system".to_string(),
+                        tokens: 20,
+                        items: 1,
+                    },
+                    ContextCategory {
+                        key: "conversation".to_string(),
+                        tokens: 80,
+                        items: 1,
+                    },
+                ],
+                ..Default::default()
+            }),
+        },
+    );
+    log_usage_started(
+        &state,
+        "context-request",
+        None,
+        None,
+        None,
+        "model-a",
+        OPENAI_CHAT_COMPLETIONS,
+        100,
+        false,
+        None,
+    )
+    .await;
+    let initial: Option<String> = sqlx::query_scalar(
+        "SELECT context_breakdown_json FROM usage_logs WHERE request_id = 'context-request'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(initial.is_some());
+
+    state.activity.observe_usage("context-request", true, false);
+    log_usage(
+        &state,
+        UsageLogEntry {
+            request_id: "context-request",
+            api_key_id: None,
+            route_id: None,
+            provider_id: None,
+            requested_model: "model-a",
+            upstream_model: None,
+            endpoint: OPENAI_CHAT_COMPLETIONS,
+            usage: Usage::new(137, 5),
+            latency_ms: 50,
+            first_token_ms: Some(50),
+            status_code: 200,
+            success: true,
+            streamed: false,
+            error_message: None,
+            response_preview: None,
+        },
+    )
+    .await;
+
+    let raw: String = sqlx::query_scalar(
+        "SELECT context_breakdown_json FROM usage_logs WHERE request_id = 'context-request'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let context: ContextBreakdown = serde_json::from_str(&raw).unwrap();
+    assert!(context.estimated);
+    assert!(!context.input_estimated);
+    assert_eq!(context.input_tokens, 137);
+    assert_eq!(
+        context
+            .categories
+            .iter()
+            .map(|category| category.tokens)
+            .sum::<i64>(),
+        137
+    );
+
+    let Json(detail) = crate::api::get_usage_detail(
+        axum::extract::State(state),
+        axum::extract::Path("context-request".to_string()),
+    )
+    .await
+    .unwrap();
+    assert_eq!(detail.context, Some(context));
+    assert_eq!(detail.cache_usage_reported, Some(false));
 }

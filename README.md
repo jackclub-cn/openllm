@@ -95,7 +95,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | 策略 | 行为 |
 | --- | --- |
-| `priority` | 数值越小越优先 |
+| `priority` | 数值越小越优先，不使用会话粘性；首选恢复可用后重新优先尝试 |
 | `weighted` | 按权重随机 |
 | `round_robin` | 进程内轮询 |
 | `cost_optimized` | 按模型输入/输出价格估算成本 |
@@ -182,7 +182,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 备份 | 使用 `VACUUM INTO` 生成事务一致的单文件快照，手动和迁移前备份各保留最近 5 份 |
 | 迁移 | 启动前检测待执行迁移；已有数据且需迁移时自动写迁移前备份，失败则不打开端口 |
 | 探针 | `/api/health` 始终表示进程存活；`/api/ready` 探测数据库，排空时返回 `503` |
-| SQLite | 默认 WAL、`synchronous=NORMAL` 和 busy timeout；仅支持单实例部署 |
+| SQLite | 默认 WAL、`synchronous=NORMAL`、4 条连接、每连接 8 MiB 页缓存，排序临时表落盘；仅支持单实例部署 |
 | 日志保留 | 支持自动清理历史请求；按审计要求和磁盘容量设置保留天数 |
 
 可观测性产物和指标说明见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。后续候选功能与取舍见 [docs/EXTENSIONS.md](docs/EXTENSIONS.md)。
@@ -194,6 +194,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | --- | --- | --- |
 | `OPENLLM_UPSTREAM_IDLE_TIMEOUT_SECS` | `300` | 上游两次读取之间的空闲上限；`0` 关闭 |
 | `OPENLLM_SSE_KEEPALIVE_SECS` | `15` | 下游 SSE 静默心跳间隔；`0` 关闭 |
+| `OPENLLM_LIVE_REQUEST_TRACE` | `1` | 最近请求实时状态与上下文分类；`0` 关闭，历史日志保持原行为 |
 | `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` | `0` | 全局在途请求体字节预算；`0` 不限 |
 | `OPENLLM_ADMISSION_WAIT_MS` | `0` | 达到并发或字节预算后的等待时间；超时返回 `429` |
 | `OPENLLM_BODY_READ_TIMEOUT_SECS` | `600` | 读取完整请求体的最长时间；`0` 关闭 |
@@ -208,7 +209,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `OPENLLM_INSTANCE_LEASE_TTL_SECS` | `300` | 实例租约有效期，范围 30–86400 |
 | `OPENLLM_UPGRADE_FEED_URL` | 空 | 版本升级检查数据源；未设置时不主动外联 |
 | `OPENLLM_MEMORY_SHED_RATIO` | `0.9` | 达到内存上限该比例后拒绝新请求 |
-| `OPENLLM_DB_MAX_CONNECTIONS` | `10` | SQLite 连接池大小，上限 256 |
+| `OPENLLM_DB_MAX_CONNECTIONS` | `4` | SQLite 连接池大小；每条连接会持有独立页缓存，上限 256 |
 | `OPENLLM_DB_BUSY_TIMEOUT_SECS` | `10` | SQLite 写入竞争等待时间 |
 | `OPENLLM_DB_ACQUIRE_TIMEOUT_SECS` | `15` | 获取数据库连接的等待时间 |
 
@@ -230,12 +231,9 @@ cargo test --locked
 
 ## 发布流程
 
-GitHub Actions 在 Pull Request 和手动触发时执行测试与构建；推送 `v*` 标签时创建 Release，并上传三平台二进制和校验文件。
-
-```bash
-git tag v0.3.30
-git push origin v0.3.30
-```
+完整发版步骤见 [docs/RELEASING.md](docs/RELEASING.md)：同步版本、验证、提交、
+推送标签、等待 CI 并验收产物。仅在明确要求发版时执行，日常修改不自动升版本。
+推送 `v*` 标签后，GitHub Actions 在检查和三平台构建通过后发布二进制及 SHA-256 校验文件。
 
 Release 页面：<https://github.com/jackclub-cn/openllm/releases>
 

@@ -47,6 +47,8 @@ impl Drop for RoutingUsageGuard {
         if self.finished {
             return;
         }
+        self.state
+            .activity_cancel(&self.request_id, "client_cancelled");
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };

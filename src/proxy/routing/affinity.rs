@@ -110,10 +110,15 @@ pub(crate) struct SessionAffinityContext {
 pub(super) async fn session_affinity_context(
     state: &AppState,
     route_id: i64,
+    strategy: RouteStrategy,
     session_key: Option<&str>,
     api_key_id: Option<i64>,
     record_metrics: bool,
 ) -> Option<SessionAffinityContext> {
+    // Priority routes must return to their configured primary after recovery.
+    if strategy == RouteStrategy::Priority {
+        return None;
+    }
     let store = state.session_affinity.as_ref()?;
     let session_key = session_key
         .map(str::trim)

@@ -12,6 +12,7 @@ pub(crate) struct UpstreamResponse {
     pub(super) status: StatusCode,
     pub(super) headers: HeaderMap,
     pub(super) stream: UpstreamByteStream,
+    activity: Option<(Box<AppState>, String)>,
 }
 
 impl UpstreamResponse {
@@ -27,6 +28,7 @@ impl UpstreamResponse {
             status,
             headers,
             stream,
+            activity: None,
         }
     }
 
@@ -40,6 +42,7 @@ impl UpstreamResponse {
             status,
             headers: HeaderMap::new(),
             stream,
+            activity: None,
         }
     }
 
@@ -48,11 +51,29 @@ impl UpstreamResponse {
     }
 
     pub(crate) async fn bytes(mut self) -> Result<Bytes, std::io::Error> {
-        collect_bytes_limited(&mut self.stream, crate::state::max_upstream_body_bytes()).await
+        let bytes =
+            collect_bytes_limited(&mut self.stream, crate::state::max_upstream_body_bytes())
+                .await?;
+        if let Some((state, request_id)) = &self.activity
+            && let Ok(value) = serde_json::from_slice::<Value>(&bytes)
+        {
+            observe_activity_value(state, request_id, &value);
+        }
+        Ok(bytes)
     }
 
     pub(crate) fn into_stream(self) -> UpstreamByteStream {
-        self.stream
+        match self.activity {
+            Some((state, request_id)) => observe_activity_stream(self.stream, *state, request_id),
+            None => self.stream,
+        }
+    }
+
+    pub(crate) fn with_activity(mut self, state: &AppState, request_id: &str) -> Self {
+        if state.activity.is_enabled() {
+            self.activity = Some((Box::new(state.clone()), request_id.to_string()));
+        }
+        self
     }
 
     /// Holds the opening stream window long enough to retry a cutoff that
@@ -115,12 +136,14 @@ impl UpstreamResponse {
             status,
             headers,
             stream,
+            activity,
         } = self;
         let prefix = futures_util::stream::iter(chunks.into_iter().map(Ok));
         Self {
             status,
             headers,
             stream: prefix.chain(stream).boxed(),
+            activity,
         }
     }
 }
@@ -276,7 +299,7 @@ pub(crate) fn stream_has_usable_content(bytes: &[u8]) -> bool {
     !saw_sse_field && saw_bare_payload
 }
 
-pub(super) fn event_has_usable_content(value: &Value) -> bool {
+pub(in crate::proxy) fn event_has_usable_content(value: &Value) -> bool {
     let non_empty_str = |value: Option<&Value>| {
         value
             .and_then(Value::as_str)

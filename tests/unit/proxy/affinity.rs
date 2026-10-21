@@ -150,7 +150,7 @@ async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_health
     let first = order_targets(
         &state,
         7,
-        "priority",
+        "weighted",
         vec![preferred.clone()],
         Some("session-a"),
         Some(42),
@@ -162,7 +162,7 @@ async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_health
     let repeated = order_targets(
         &state,
         7,
-        "priority",
+        "weighted",
         vec![fallback.clone(), preferred.clone()],
         Some("session-a"),
         Some(42),
@@ -171,7 +171,7 @@ async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_health
     .unwrap();
     assert_eq!(
         repeated[0].provider_id, 2,
-        "the explicit session pin must outrank a different priority order"
+        "the explicit session pin must keep weighted routing on its healthy target"
     );
 
     state
@@ -182,7 +182,7 @@ async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_health
     let failed_over = order_targets(
         &state,
         7,
-        "priority",
+        "weighted",
         vec![fallback.clone(), preferred],
         Some("session-a"),
         Some(42),
@@ -195,6 +195,170 @@ async fn session_affinity_pins_the_target_and_rebinds_when_it_stops_being_health
     );
     let stats = state.session_affinity.as_ref().unwrap().stats().await;
     assert_eq!(stats.rebinds, 1);
+}
+
+#[tokio::test]
+async fn priority_returns_to_primary_after_one_failure_in_the_same_session() {
+    use crate::session_affinity::SessionAffinityStore;
+    use std::sync::Arc;
+
+    for model_failure in [false, true] {
+        let mut state = circuit_state().await;
+        let store = Arc::new(SessionAffinityStore::new(
+            Duration::from_secs(60),
+            32,
+            false,
+        ));
+        state.session_affinity = Some(store.clone());
+        let primary = endpoint_test_target("openai", None);
+        let mut fallback = primary.clone();
+        fallback.id = 2;
+        fallback.priority = 1;
+        if model_failure {
+            fallback.upstream_model = "fallback-model".to_string();
+        } else {
+            fallback.provider_id = 2;
+        }
+        let targets = vec![fallback.clone(), primary.clone()];
+
+        let first = order_targets_with_decision(
+            &state,
+            7,
+            "priority",
+            targets.clone(),
+            Some("session-a"),
+            Some(42),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.targets[0].id, primary.id);
+
+        if model_failure {
+            mark_target_error(&state, &primary, StatusCode::TOO_MANY_REQUESTS, None).await;
+        } else {
+            mark_provider_error(&state, primary.provider_id, None, None, None).await;
+        }
+        for _ in 0..3 {
+            let cooling = order_targets_with_decision(
+                &state,
+                7,
+                "priority",
+                targets.clone(),
+                Some("session-a"),
+                Some(42),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cooling.targets[0].id, fallback.id);
+        }
+
+        let expired = Instant::now() - Duration::from_secs(1);
+        if model_failure {
+            state.target_cooldown.lock().await.insert(
+                (primary.provider_id, primary.upstream_model.clone()),
+                expired,
+            );
+        } else {
+            state
+                .provider_cooldown
+                .lock()
+                .await
+                .insert(primary.provider_id, expired);
+        }
+        for _ in 0..3 {
+            let recovered = order_targets_with_decision(
+                &state,
+                7,
+                "priority",
+                targets.clone(),
+                Some("session-a"),
+                Some(42),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                recovered.targets[0].id, primary.id,
+                "the same session must return to the primary once its cooldown expires"
+            );
+            assert_eq!(recovered.session_decision, "no_affinity");
+        }
+        let stats = store.stats().await;
+        assert_eq!(stats.entries, 0);
+        assert_eq!(stats.hits + stats.misses + stats.rebinds, 0);
+    }
+}
+
+#[tokio::test]
+async fn priority_ignores_existing_session_pins_in_routing_and_diagnosis() {
+    use crate::session_affinity::{
+        SessionAffinityScope, SessionAffinityStore, SessionAffinityTarget,
+    };
+    use std::sync::Arc;
+
+    let mut state = circuit_state().await;
+    for sql in [
+        "INSERT INTO providers (id, name, provider_type, base_url, last_test_ok) VALUES
+             (1, 'primary', 'openai', 'http://primary', 1),
+             (2, 'fallback', 'openai', 'http://fallback', 1)",
+        "INSERT INTO provider_models (provider_id, model_name) VALUES (1, 'model'), (2, 'model')",
+        "INSERT INTO routes (id, name, model_pattern, strategy)
+             VALUES (7, 'priority route', 'shared', 'priority')",
+        "INSERT INTO route_targets (route_id, provider_id, upstream_model, priority) VALUES
+             (7, 1, 'model', 0), (7, 2, 'model', 1)",
+    ] {
+        sqlx::query(sql).execute(&state.pool).await.unwrap();
+    }
+    let store = Arc::new(SessionAffinityStore::new(Duration::from_secs(60), 32, true));
+    let scope = SessionAffinityScope::new(None, 7, "session-a");
+    store
+        .bind(
+            &state.pool,
+            &scope,
+            SessionAffinityTarget {
+                provider_id: 2,
+                upstream_model: "model".to_string(),
+            },
+        )
+        .await;
+    assert_eq!(store.stats().await.persistence_errors, 0);
+
+    for active_store in [
+        store,
+        Arc::new(SessionAffinityStore::new(Duration::from_secs(60), 32, true)),
+    ] {
+        state.session_affinity = Some(active_store.clone());
+        let resolved = resolve_route(&state, "shared", OPENAI_CHAT_COMPLETIONS)
+            .await
+            .unwrap();
+        let ordered = order_targets_with_decision(
+            &state,
+            7,
+            "priority",
+            resolved.targets,
+            Some("session-a"),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ordered.targets[0].provider_id, 1);
+        assert_eq!(ordered.session_decision, "no_affinity");
+
+        let diagnosis =
+            diagnose_route(&state, "shared", OPENAI_CHAT_COMPLETIONS, Some("session-a"))
+                .await
+                .unwrap();
+        let runtime = diagnosis.runtime_targets.as_ref().unwrap();
+        assert_eq!(runtime[0].provider_id, 1);
+        assert_eq!(runtime[0].decision_reason, "priority_order");
+        assert!(diagnosis.candidates.iter().all(|candidate| {
+            candidate
+                .factors
+                .iter()
+                .all(|factor| factor.name != "session")
+        }));
+        let stats = active_store.stats().await;
+        assert_eq!(stats.hits + stats.misses + stats.rebinds, 0);
+    }
 }
 
 #[tokio::test]

@@ -61,6 +61,7 @@ pub(in crate::proxy) async fn resolve_route(
         );
         return Ok(ResolvedRoute {
             route_id: Some(route.id),
+            route_name: Some(route.name),
             strategy: route.strategy,
             targets,
             barrel: Some(barrel),
@@ -84,6 +85,7 @@ pub(in crate::proxy) async fn resolve_route(
     let barrel = crate::registry::barrel_for_targets(&state.pool, &pairs).await?;
     Ok(ResolvedRoute {
         route_id: None,
+        route_name: None,
         strategy: "priority".to_string(),
         targets,
         barrel: Some(barrel),
@@ -106,7 +108,22 @@ pub(in crate::proxy) async fn resolve_route_or_log(
     started: Instant,
 ) -> AppResult<ResolvedRoute> {
     match resolve_route(state, model, endpoint).await {
-        Ok(route) => Ok(route),
+        Ok(route) => {
+            if let Some(capabilities) = route
+                .barrel
+                .as_ref()
+                .and_then(|barrel| barrel.capabilities.as_ref())
+            {
+                let _ = state.activity.context_window(
+                    request_id,
+                    capabilities
+                        .total_context_tokens
+                        .or(capabilities.context_limit),
+                    capabilities.input_limit,
+                );
+            }
+            Ok(route)
+        }
         Err(error) => {
             let status_code = match &error {
                 AppError::BadRequest(_) => 400,
@@ -191,6 +208,8 @@ pub(in crate::proxy) async fn find_prefixed_targets(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               COALESCE(pm.input_override, pm.input_limit) AS input_limit,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
                p.max_concurrency, p.queue_timeout_seconds,
@@ -230,6 +249,8 @@ pub(in crate::proxy) async fn find_prefixed_targets(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               COALESCE(pm.input_override, pm.input_limit) AS input_limit,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
                p.max_concurrency, p.queue_timeout_seconds,
@@ -280,6 +301,8 @@ pub(in crate::proxy) async fn load_targets(
                pm.cost_output_override,
                pm.cost_cache_read_override,
                pm.cost_cache_write_override,
+               COALESCE(pm.context_override, pm.context_limit) AS context_limit,
+               COALESCE(pm.input_override, pm.input_limit) AS input_limit,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,
                p.max_concurrency, p.queue_timeout_seconds,

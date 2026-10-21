@@ -50,6 +50,7 @@ pub(crate) fn responses_stream_to_chat(
                 )
                 .await;
             }
+            heartbeat.observe_first_token(chat_state.first_token_ms);
         }
         if !buffer.is_empty() {
             process_responses_line_for_chat(
@@ -63,6 +64,7 @@ pub(crate) fn responses_stream_to_chat(
             )
             .await;
         }
+        heartbeat.observe_first_token(chat_state.first_token_ms);
 
         let stream_error = stream_error
             .or_else(|| chat_state.response_error.clone())

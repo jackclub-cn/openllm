@@ -24,6 +24,7 @@ pub(crate) fn passthrough_stream_response(
                 Ok(bytes) => {
                     heartbeat.touch().await;
                     parser.push(&bytes);
+                    heartbeat.observe_first_token(parser.first_token_ms);
                     if tx.send(Ok(bytes)).await.is_err() {
                         break;
                     }

@@ -20,6 +20,7 @@ export default function DashboardDetails({ data }: DashboardDetailsProps) {
             size="middle"
             pagination={false}
             dataSource={data.recent_requests}
+            scroll={{ x: 780 }}
             onRow={(record) => ({
               onClick: () =>
                 navigate(`/usage?request_id=${encodeURIComponent(record.request_id)}`),

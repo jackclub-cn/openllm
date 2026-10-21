@@ -1,5 +1,13 @@
 use super::*;
 
+fn activity_context_json(state: &AppState, request_id: &str) -> Option<String> {
+    state
+        .activity
+        .snapshot(request_id)
+        .and_then(|snapshot| snapshot.context)
+        .and_then(|context| serde_json::to_string(&context).ok())
+}
+
 pub(crate) struct UsageLogEntry<'a> {
     pub(in crate::proxy) request_id: &'a str,
     pub(in crate::proxy) api_key_id: Option<i64>,
@@ -81,6 +89,7 @@ pub(crate) async fn log_usage_started(
     streamed: bool,
     request_preview: Option<&str>,
 ) {
+    let context_breakdown_json = activity_context_json(state, request_id);
     let result = sqlx::query(
         r#"
         INSERT INTO usage_logs (
@@ -89,10 +98,11 @@ pub(crate) async fn log_usage_started(
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
             success, streamed, error_message, request_preview, response_preview,
-            last_activity_at
+            context_breakdown_json, last_activity_at
         ) VALUES (
             ?, ?, ?, ?, NULL, ?, NULL, ?, ?, 0, ?, 0, 0, 0, NULL, NULL, 0, 1, 0, ?,
-            NULL, ?, NULL, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            NULL, ?, NULL, ?,
+            strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
         ON CONFLICT(request_id) DO UPDATE SET
             session_id = COALESCE(excluded.session_id, usage_logs.session_id),
@@ -103,6 +113,10 @@ pub(crate) async fn log_usage_started(
             total_tokens = excluded.total_tokens,
             streamed = excluded.streamed,
             request_preview = COALESCE(excluded.request_preview, usage_logs.request_preview),
+            context_breakdown_json = COALESCE(
+                excluded.context_breakdown_json,
+                usage_logs.context_breakdown_json
+            ),
             last_activity_at = excluded.last_activity_at,
             in_flight = 1
         WHERE usage_logs.in_flight = 1
@@ -118,6 +132,7 @@ pub(crate) async fn log_usage_started(
     .bind(request_tokens)
     .bind(streamed as i64)
     .bind(request_preview)
+    .bind(context_breakdown_json)
     .execute(&state.pool)
     .await;
 
@@ -197,8 +212,23 @@ pub(crate) async fn log_usage_warning(state: &AppState, request_id: &str, warnin
     }
 }
 
-pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
+pub(crate) async fn log_usage(state: &AppState, mut entry: UsageLogEntry<'_>) {
+    if state
+        .activity
+        .snapshot(entry.request_id)
+        .is_some_and(|snapshot| snapshot.outcome == "cancelled")
+    {
+        entry.success = false;
+        entry.status_code = 499;
+        entry.error_message = Some("client_cancelled");
+    }
     let usage = entry.usage.normalized();
+    finish_activity_from_usage(state, &entry);
+    let context_breakdown_json = activity_context_json(state, entry.request_id);
+    let cache_usage_reported = state
+        .activity
+        .snapshot(entry.request_id)
+        .map(|snapshot| i64::from(snapshot.cache.state == "reported"));
     if entry.success
         && entry.streamed
         && let (Some(provider_id), Some(upstream_model)) = (entry.provider_id, entry.upstream_model)
@@ -233,9 +263,11 @@ pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             upstream_model, endpoint, prompt_tokens, completion_tokens,
             total_tokens, cache_read_tokens, cache_write_tokens, latency_ms,
             estimated_cost_micros, first_token_ms, status_code, in_flight,
-            success, streamed, error_message, response_preview, last_activity_at
+            success, streamed, error_message, response_preview,
+            context_breakdown_json, cache_usage_reported, last_activity_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?,
+            ?, ?,
             strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
         )
         ON CONFLICT(request_id) DO UPDATE SET
@@ -259,6 +291,11 @@ pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
             streamed = excluded.streamed,
             error_message = excluded.error_message,
             response_preview = excluded.response_preview,
+            context_breakdown_json = COALESCE(
+                excluded.context_breakdown_json,
+                usage_logs.context_breakdown_json
+            ),
+            cache_usage_reported = excluded.cache_usage_reported,
             last_activity_at = excluded.last_activity_at
         "#,
     )
@@ -282,6 +319,8 @@ pub(crate) async fn log_usage(state: &AppState, entry: UsageLogEntry<'_>) {
     .bind(entry.streamed as i64)
     .bind(entry.error_message)
     .bind(entry.response_preview)
+    .bind(context_breakdown_json)
+    .bind(cache_usage_reported)
     .execute(&state.pool)
     .await;
 

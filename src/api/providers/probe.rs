@@ -370,6 +370,15 @@ pub(crate) fn build_provider_probe_request(
             _ => request.bearer_auth(key),
         };
     }
+    let health_session_id = format!("openllm-health-{}", provider.id);
+    request = apply_opencode_provider_session_header(
+        request,
+        &provider.name,
+        &provider.model_prefix,
+        &provider.base_url,
+        &provider.headers,
+        Some(&health_session_id),
+    );
     apply_custom_headers(request, &provider.headers)
 }
 

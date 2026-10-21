@@ -35,12 +35,16 @@
 | `src/proxy/upstream/` | 上游传输与响应生命周期 | HTTP 转发、流保护、错误处理、SSE、准入响应分开 |
 | `src/proxy/translation/<protocol>/` | 协议转换 | 请求、响应、流状态和流事件处理分开 |
 | `src/proxy/usage/` | 用量采集 | 流解析、估算、预览、能力回执、生命周期、落库分开 |
+| `src/proxy/activity/` | 请求活动观测 | 生命周期 Guard 和上游 usage/首输出观测；不改变转发、路由或记账口径 |
+| `src/state/activity/` | 实时活动内存状态 | 快照、尝试、阶段计时和 usage 合并分工；序号分配与广播在同一短锁内完成 |
+| `src/api/activity.rs` | 最近活动管理查询 | 沿用管理鉴权，不返回请求或响应正文 |
 | `src/state/` | 运行状态 | AppState 初始化、限制参数、内存、准入预算、事件分开 |
 | `src/startup/` | 启动和数据恢复 | 租约、迁移、备份、校验、恢复分开 |
 | `src/quota/` | 额度快照 | 存储、上游归一化、响应头、有效状态和调度信号分开 |
 | `web/src/api/` | 前端接口客户端与领域类型 | `web/src/api.ts` 只保留稳定导出 |
 | `web/src/pages/<domain>/` | 页面领域组件 | 页面负责组装，表单、表格、图表及状态按职责拆分 |
 | `web/src/styles/` | 领域样式 | `styles.css` 只按原有层叠顺序导入 |
+| `web/src/hooks/activityState.ts` | 活动快照和事件合并 | 按进程、全局水位和请求版本对齐；缺口触发重同步 |
 | `tests/unit/<domain>/` | 领域回归测试 | 入口只保存共享夹具和模块声明 |
 
 优先使用 `<domain>.rs` 加 `<domain>/` 子模块的既有组织方式。入口文件负责

@@ -40,10 +40,12 @@ pub(crate) fn openai_chat_stream_to_responses(
                 let line = buffer.drain(..=position).collect::<Vec<_>>();
                 process_chat_chunk_line(&mut stream, &line, &mut tool_index, &tx).await;
             }
+            heartbeat.observe_first_token(stream.first_token_ms);
         }
         if !buffer.is_empty() {
             process_chat_chunk_line(&mut stream, &buffer, &mut tool_index, &tx).await;
         }
+        heartbeat.observe_first_token(stream.first_token_ms);
 
         if let Some(error) = stream_error.as_deref() {
             stream.fail(&tx, error).await;
@@ -155,10 +157,12 @@ pub(crate) fn anthropic_stream_to_responses(
                 let line = buffer.drain(..=position).collect::<Vec<_>>();
                 stream.handle_line(&line, &mut event_name, &tx).await;
             }
+            heartbeat.observe_first_token(stream.first_token_ms);
         }
         if !buffer.is_empty() {
             stream.handle_line(&buffer, &mut event_name, &tx).await;
         }
+        heartbeat.observe_first_token(stream.first_token_ms);
 
         if let Some(error) = stream_error.as_deref() {
             stream.fail(&tx, error).await;

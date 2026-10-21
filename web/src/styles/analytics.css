@@ -47,16 +47,19 @@
     flex-direction: column;
   }
 
-  .trend-metric-control {
+  .trend-metric-control,
+  .trend-split-control {
     flex-direction: column;
     flex: 1 1 auto;
   }
 
-  .trend-metric-control .ant-segmented {
+  .trend-metric-control .ant-segmented,
+  .trend-split-control .ant-segmented {
     width: 100%;
   }
 
-  .trend-split-control .ant-select {
+  .trend-split-control .ant-segmented {
     flex: 1 1 auto;
+    min-width: 0;
   }
 }

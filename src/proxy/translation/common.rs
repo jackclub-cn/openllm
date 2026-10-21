@@ -181,6 +181,7 @@ pub(crate) struct UsageHeartbeat {
     state: AppState,
     request_id: String,
     last_touch: Instant,
+    activity_first_token_reported: bool,
 }
 
 impl UsageHeartbeat {
@@ -189,7 +190,20 @@ impl UsageHeartbeat {
             state,
             request_id,
             last_touch: Instant::now() - USAGE_HEARTBEAT_INTERVAL,
+            activity_first_token_reported: false,
         }
+    }
+
+    pub(crate) fn observe_first_token(&mut self, first_token_ms: Option<i64>) {
+        if self.activity_first_token_reported {
+            return;
+        }
+        let Some(first_token_ms) = first_token_ms else {
+            return;
+        };
+        self.activity_first_token_reported = true;
+        self.state
+            .activity_first_token(&self.request_id, first_token_ms);
     }
 
     pub(crate) async fn touch(&mut self) {

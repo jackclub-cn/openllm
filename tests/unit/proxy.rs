@@ -5,6 +5,9 @@ use crate::state::{
 };
 use tower::ServiceExt;
 
+#[path = "proxy/activity.rs"]
+mod activity;
+
 /// Builds a page of model entries with the given ids, matching the shape
 /// `anthropic_models` produces.
 fn model_page(ids: &[&str]) -> Vec<Value> {

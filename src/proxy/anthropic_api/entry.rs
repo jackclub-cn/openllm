@@ -55,7 +55,9 @@ pub(crate) async fn proxy_anthropic(
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let response = match proxy_anthropic_inner(&state, &headers, &uri, &body, &request_id).await {
+    let result = proxy_anthropic_inner(&state, &headers, &uri, &body, &request_id).await;
+    finish_activity_for_pre_response(&state, &request_id, &result);
+    let response = match result {
         Ok(response) => response,
         Err(error) => anthropic_error_response(error),
     };
@@ -136,5 +138,5 @@ pub(super) struct AnthropicAttemptContext {
 
 pub(super) enum AnthropicAttemptOutcome {
     Response(Response),
-    BusyWait,
+    BusyWait(Box<super::route_trace::AttemptResume>),
 }

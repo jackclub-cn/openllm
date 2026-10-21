@@ -90,9 +90,9 @@ async fn shutdown_returns_promptly_when_drained() {
 #[test]
 fn database_pool_size_parsing_clamps_to_a_sane_range() {
     use crate::db::parse_db_max_connections;
-    assert_eq!(parse_db_max_connections(None), 10);
-    assert_eq!(parse_db_max_connections(Some("")), 10);
-    assert_eq!(parse_db_max_connections(Some("oops")), 10);
+    assert_eq!(parse_db_max_connections(None), 4);
+    assert_eq!(parse_db_max_connections(Some("")), 4);
+    assert_eq!(parse_db_max_connections(Some("oops")), 4);
     assert_eq!(
         parse_db_max_connections(Some("0")),
         1,
@@ -104,6 +104,31 @@ fn database_pool_size_parsing_clamps_to_a_sane_range() {
         256,
         "an oversized value is clamped instead of exhausting the host"
     );
+}
+
+#[tokio::test]
+async fn sqlite_memory_settings_are_bounded() {
+    use crate::db::{SQLITE_CACHE_KIB, sqlite_connect_options};
+
+    let options = sqlite_connect_options("sqlite::memory:", std::time::Duration::from_secs(1))
+        .expect("in-memory SQLite URL should be accepted");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("in-memory SQLite pool should connect");
+
+    let cache_size: i64 = sqlx::query_scalar("PRAGMA cache_size")
+        .fetch_one(&pool)
+        .await
+        .expect("cache_size pragma should be readable");
+    let temp_store: i64 = sqlx::query_scalar("PRAGMA temp_store")
+        .fetch_one(&pool)
+        .await
+        .expect("temp_store pragma should be readable");
+
+    assert_eq!(cache_size, -(SQLITE_CACHE_KIB as i64));
+    assert_eq!(temp_store, 1, "temporary sorting should use files");
 }
 
 #[test]

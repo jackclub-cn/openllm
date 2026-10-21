@@ -1,4 +1,5 @@
 export * from './api/client'
+export * from './api/activity'
 export * from './api/providers'
 export * from './api/routes'
 export * from './api/keys'

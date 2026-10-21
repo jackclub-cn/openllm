@@ -6,6 +6,8 @@ mod estimate;
 pub(crate) use estimate::*;
 mod capabilities;
 pub(crate) use capabilities::*;
+mod context;
+pub(crate) use context::*;
 mod preview;
 pub(crate) use preview::*;
 mod logging;

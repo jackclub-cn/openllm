@@ -9,10 +9,17 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use crate::Config;
 
 /// Default SQLite connection-pool size.
-pub(crate) const DEFAULT_DB_MAX_CONNECTIONS: u32 = 10;
+///
+/// SQLite is a single-writer database and every pooled connection keeps its
+/// own page cache. Four readers are enough for the gateway's concurrent
+/// analytics queries while avoiding the memory cost of a wide pool.
+pub(crate) const DEFAULT_DB_MAX_CONNECTIONS: u32 = 4;
 /// Upper bound for `OPENLLM_DB_MAX_CONNECTIONS` so a typo cannot spawn an
 /// unbounded number of connections.
 const MAX_DB_MAX_CONNECTIONS: u64 = 256;
+/// SQLite page cache per connection, expressed as a positive KiB value. The
+/// pragma uses a negative number for an absolute cache size.
+pub(crate) const SQLITE_CACHE_KIB: i32 = 8 * 1024;
 /// Default `busy_timeout` for a contended SQLite write.
 pub(crate) const DEFAULT_DB_BUSY_TIMEOUT_SECS: u64 = 10;
 /// Default wait for a pooled connection before a request fails.
@@ -63,6 +70,27 @@ pub(crate) fn db_acquire_timeout_secs() -> u64 {
     )
 }
 
+/// Builds the connection options used by the serving pool.
+///
+/// SQLite allocates the page cache per connection and materializes large
+/// `GROUP BY` / window-function queries in a temporary store. Keeping both
+/// bounded prevents a single analytics refresh from multiplying memory across
+/// ten pool connections.
+pub(crate) fn sqlite_connect_options(
+    database_url: &str,
+    busy_timeout: Duration,
+) -> anyhow::Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(database_url)
+        .with_context(|| format!("invalid SQLite URL: {database_url}"))?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .pragma("cache_size", format!("-{SQLITE_CACHE_KIB}"))
+        .pragma("temp_store", "FILE")
+        .busy_timeout(busy_timeout))
+}
+
 pub struct Database {
     pub pool: SqlitePool,
     /// Identity of this process's row in `instance_leases`, refreshed by the
@@ -88,15 +116,8 @@ impl Database {
             }
         };
 
-        let options = SqliteConnectOptions::from_str(&database_url)
-            .with_context(|| format!("invalid SQLite URL: {database_url}"))?
-            .create_if_missing(true)
-            .foreign_keys(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .pragma("cache_size", "-16384")
-            .pragma("temp_store", "MEMORY")
-            .busy_timeout(Duration::from_secs(db_busy_timeout_secs()));
+        let options =
+            sqlite_connect_options(&database_url, Duration::from_secs(db_busy_timeout_secs()))?;
 
         let pool = SqlitePoolOptions::new()
             .max_connections(db_max_connections())

@@ -28,6 +28,7 @@ use crate::models::{
 use crate::registry::BarrelEnvelope;
 use crate::state::AppState;
 
+mod activity;
 mod anthropic_api;
 mod auth;
 mod compat;
@@ -42,6 +43,7 @@ mod translation;
 mod upstream;
 mod usage;
 
+use activity::*;
 pub(crate) use anthropic_api::*;
 pub(crate) use auth::*;
 pub(crate) use compat::*;
@@ -105,6 +107,7 @@ pub(super) struct UpstreamSlots {
 #[derive(Debug, Clone)]
 struct ResolvedRoute {
     route_id: Option<i64>,
+    route_name: Option<String>,
     strategy: String,
     targets: Vec<RouteTarget>,
     /// Strictest common capability envelope across the route's targets. Only

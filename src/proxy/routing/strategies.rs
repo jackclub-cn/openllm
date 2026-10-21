@@ -364,7 +364,16 @@ pub(in crate::proxy) async fn order_targets_with_decision(
     session_id: Option<&str>,
     api_key_id: Option<i64>,
 ) -> AppResult<OrderedTargets> {
-    let affinity = session_affinity_context(state, route_id, session_id, api_key_id, true).await;
+    let parsed_strategy = RouteStrategy::from_str(strategy).map_err(AppError::BadRequest)?;
+    let affinity = session_affinity_context(
+        state,
+        route_id,
+        parsed_strategy,
+        session_id,
+        api_key_id,
+        true,
+    )
+    .await;
     order_targets_with_context_result(
         state,
         route_id,

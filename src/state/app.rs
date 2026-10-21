@@ -20,6 +20,7 @@ impl AppState {
             .expect("failed to build HTTP client");
 
         let (events, _) = broadcast::channel(128);
+        let (activity_events, _) = broadcast::channel(1024);
         let (circuit_events, _) = broadcast::channel(128);
         let request_capacity_limit = parse_concurrency_limit(
             std::env::var("OPENLLM_MAX_CONCURRENT_REQUESTS")
@@ -135,6 +136,8 @@ impl AppState {
             key_touched: Arc::new(Mutex::new(HashMap::new())),
             retention_last_run: Arc::new(Mutex::new(None)),
             models_dev: Arc::new(RwLock::new(None)),
+            activity: Arc::new(RequestActivityStore::from_env(activity_events.clone())),
+            activity_events,
             provider_model_sync: Arc::new(Mutex::new(HashSet::new())),
             provider_health_check: Arc::new(Mutex::new(HashSet::new())),
             resilience_state_persist: crate::resilience_state::resilience_state_persist(),

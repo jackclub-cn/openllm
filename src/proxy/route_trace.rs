@@ -60,6 +60,11 @@ pub(crate) struct RouteTraceRecorder {
     attempts: Vec<TraceAttemptRecord>,
 }
 
+pub(crate) struct AttemptResume {
+    pub trace: RouteTraceRecorder,
+    pub attempts: usize,
+}
+
 impl RouteTraceRecorder {
     pub(crate) fn new(
         request_id: String,
@@ -92,7 +97,7 @@ impl RouteTraceRecorder {
         targets: &[RouteTarget],
         api_key_id: Option<i64>,
     ) {
-        if !self.enabled {
+        if !self.enabled && !state.activity.is_enabled() {
             return;
         }
         let strategy = strategy.parse().unwrap_or(RouteStrategy::Priority);
@@ -112,6 +117,10 @@ impl RouteTraceRecorder {
         if self.enabled {
             self.session_decision = decision.to_string();
         }
+    }
+
+    pub(crate) fn candidates(&self) -> &[RouteTraceCandidate] {
+        &self.candidates
     }
 
     pub(crate) fn finish(mut self, state: &AppState, final_outcome: TraceFinal) {

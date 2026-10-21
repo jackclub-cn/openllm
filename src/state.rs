@@ -221,7 +221,11 @@ pub struct AppState {
     /// Cached models.dev capability catalog plus the instant it was fetched.
     /// Held behind a read-mostly lock because provider sync refreshes it only
     /// once per TTL.
-    pub models_dev: Arc<RwLock<Option<CatalogCache>>>,
+    pub(crate) models_dev: Arc<RwLock<Option<crate::models_dev::CatalogCache>>>,
+    /// Bounded in-memory request activity used by the realtime console.
+    pub(crate) activity: Arc<RequestActivityStore>,
+    /// Activity transitions for the console SSE stream.
+    pub(crate) activity_events: broadcast::Sender<ActivityEvent>,
     /// Prevents a manual sync and the scheduled sync worker from fetching the
     /// same provider concurrently.
     pub provider_model_sync: Arc<Mutex<HashSet<i64>>>,
@@ -243,9 +247,6 @@ pub struct AppState {
     pub allocation_ledger: Arc<Mutex<AllocationLedger>>,
 }
 
-/// A fetched models.dev catalog and the instant it was retrieved.
-pub type CatalogCache = (Instant, Arc<crate::models_dev::Catalog>);
-
 mod limits;
 pub(crate) use limits::*;
 mod memory;
@@ -255,6 +256,9 @@ pub(crate) use memory::sample_process_memory_bytes;
 mod events;
 
 pub use events::*;
+mod activity;
+
+pub use activity::*;
 mod admission;
 pub use admission::*;
 mod app;

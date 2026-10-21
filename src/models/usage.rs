@@ -32,6 +32,10 @@ pub struct UsageLog {
     pub request_preview: Option<String>,
     pub response_preview: Option<String>,
     #[sqlx(default)]
+    pub context_breakdown_json: Option<String>,
+    #[sqlx(default)]
+    pub cache_usage_reported: Option<i64>,
+    #[sqlx(default)]
     pub warning_message: Option<String>,
     pub created_at: String,
 }
@@ -76,6 +80,8 @@ pub struct UsageLogView {
     pub error_message: Option<String>,
     pub request_preview: Option<String>,
     pub response_preview: Option<String>,
+    pub context: Option<ContextBreakdown>,
+    pub cache_usage_reported: Option<bool>,
     pub warning_message: Option<String>,
     pub created_at: String,
 }
@@ -83,6 +89,10 @@ pub struct UsageLogView {
 impl From<UsageLog> for UsageLogView {
     fn from(value: UsageLog) -> Self {
         let streamed = value.streamed != 0;
+        let context = value
+            .context_breakdown_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok());
         let output_tps = output_tps_of(
             value.completion_tokens,
             value.latency_ms,
@@ -120,6 +130,8 @@ impl From<UsageLog> for UsageLogView {
             error_message: value.error_message,
             request_preview: value.request_preview,
             response_preview: value.response_preview,
+            context,
+            cache_usage_reported: value.cache_usage_reported.map(|value| value != 0),
             warning_message: value.warning_message,
             created_at: value.created_at,
         }
@@ -157,6 +169,10 @@ pub struct UsageLogDetailRow {
     pub error_message: Option<String>,
     pub request_preview: Option<String>,
     pub response_preview: Option<String>,
+    #[sqlx(default)]
+    pub context_breakdown_json: Option<String>,
+    #[sqlx(default)]
+    pub cache_usage_reported: Option<i64>,
     pub warning_message: Option<String>,
     pub created_at: String,
 }
@@ -164,6 +180,10 @@ pub struct UsageLogDetailRow {
 impl From<UsageLogDetailRow> for UsageLogView {
     fn from(value: UsageLogDetailRow) -> Self {
         let streamed = value.streamed != 0;
+        let context = value
+            .context_breakdown_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str(raw).ok());
         let output_tps = output_tps_of(
             value.completion_tokens,
             value.latency_ms,
@@ -201,6 +221,8 @@ impl From<UsageLogDetailRow> for UsageLogView {
             error_message: value.error_message,
             request_preview: value.request_preview,
             response_preview: value.response_preview,
+            context,
+            cache_usage_reported: value.cache_usage_reported.map(|value| value != 0),
             warning_message: value.warning_message,
             created_at: value.created_at,
         }

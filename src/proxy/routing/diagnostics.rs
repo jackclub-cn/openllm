@@ -544,7 +544,8 @@ pub(in crate::proxy) async fn diagnostic_candidates(
         .map(|(row, _)| diagnostic_route_target(row, route_id))
         .collect::<Vec<_>>();
     let route_id = route_id.unwrap_or(-1);
-    let affinity = session_affinity_context(state, route_id, session_id, api_key_id, false).await;
+    let affinity =
+        session_affinity_context(state, route_id, strategy, session_id, api_key_id, false).await;
     let assessments =
         assess_targets(state, strategy, &eligible, api_key_id, affinity.as_ref()).await?;
     let ordered = order_targets_with_context(
@@ -687,8 +688,15 @@ pub(in crate::proxy) async fn diagnostic_runtime_targets(
     )
     .await?;
     let route_id = route_id.unwrap_or(-1);
-    let affinity =
-        session_affinity_context(state, route_id, Some(session_id), api_key_id, false).await;
+    let affinity = session_affinity_context(
+        state,
+        route_id,
+        strategy,
+        Some(session_id),
+        api_key_id,
+        false,
+    )
+    .await;
     let ordered = order_targets_with_context(
         state,
         route_id,

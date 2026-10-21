@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useEffectEvent, useRef, useState, type ReactNode } from 'react'
 import { getAdminToken } from './api'
+import type { ActivityEvent } from './api'
 
 export type UsageEvent = {
   id: number
@@ -11,11 +12,13 @@ export type UsageEvent = {
 type RealtimeContextValue = {
   connected: boolean
   subscribe: (listener: (event: UsageEvent) => void) => () => void
+  subscribeActivity: (listener: (event: ActivityEvent | null) => void) => () => void
 }
 
 const RealtimeContext = createContext<RealtimeContextValue>({
   connected: false,
   subscribe: () => () => undefined,
+  subscribeActivity: () => () => undefined,
 })
 
 export function RealtimeProvider({
@@ -28,6 +31,7 @@ export function RealtimeProvider({
   const [connected, setConnected] = useState(false)
   const [epoch, setEpoch] = useState(0)
   const listeners = useRef(new Set<(event: UsageEvent) => void>())
+  const activityListeners = useRef(new Set<(event: ActivityEvent | null) => void>())
   // Backoff attempts are kept in a ref, not state: putting them in the effect
   // dependency list would tear down a freshly opened connection the moment the
   // counter resets on success.
@@ -37,9 +41,16 @@ export function RealtimeProvider({
     listeners.current.add(listener)
     return () => listeners.current.delete(listener)
   }, [])
+  const subscribeActivity = useCallback((listener: (event: ActivityEvent | null) => void) => {
+    activityListeners.current.add(listener)
+    return () => activityListeners.current.delete(listener)
+  }, [])
 
   const emit = useEffectEvent((event: UsageEvent) => {
     listeners.current.forEach((listener) => listener(event))
+  })
+  const emitActivity = useEffectEvent((event: ActivityEvent | null) => {
+    activityListeners.current.forEach((listener) => listener(event))
   })
 
   useEffect(() => {
@@ -54,12 +65,23 @@ export function RealtimeProvider({
       setConnected(true)
       attempts.current = 0
     })
+    source.addEventListener('ready', () => emitActivity(null))
     source.addEventListener('usage', (event) => {
       try {
         emit(JSON.parse((event as MessageEvent).data) as UsageEvent)
       } catch {
         // Ignore malformed frames and keep the stream alive.
       }
+    })
+    source.addEventListener('activity', (event) => {
+      try {
+        emitActivity(JSON.parse((event as MessageEvent).data) as ActivityEvent)
+      } catch {
+        // Ignore malformed frames and keep the stream alive.
+      }
+    })
+    source.addEventListener('activity_resync', () => {
+      emitActivity(null)
     })
     source.addEventListener('error', () => {
       setConnected(false)
@@ -76,7 +98,7 @@ export function RealtimeProvider({
   }, [epoch, revision])
 
   return (
-    <RealtimeContext.Provider value={{ connected, subscribe }}>
+    <RealtimeContext.Provider value={{ connected, subscribe, subscribeActivity }}>
       {children}
     </RealtimeContext.Provider>
   )
@@ -94,6 +116,19 @@ export function useUsageEventSubscription(listener: (event: UsageEvent) => void,
     if (!enabled) return
     return subscribe((event) => callback(event))
   }, [enabled, subscribe])
+}
+
+export function useActivityEventSubscription(
+  listener: (event: ActivityEvent | null) => void,
+  enabled = true,
+) {
+  const { subscribeActivity } = useRealtime()
+  const callback = useEffectEvent(listener)
+
+  useEffect(() => {
+    if (!enabled) return
+    return subscribeActivity((event) => callback(event))
+  }, [enabled, subscribeActivity])
 }
 
 export function useCoalescedUsageEvents(
