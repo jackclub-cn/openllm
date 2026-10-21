@@ -6,13 +6,36 @@
   min-width: 0;
 }
 
-.activity-live-footnote {
+.activity-detail-panel {
   display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 10px;
-  color: #7a8699;
-  font-size: 12px;
+  flex-direction: column;
+  gap: 18px;
+  width: 100%;
+}
+
+.activity-detail-panel > * {
+  min-width: 0;
+}
+
+.activity-detail-metadata .ant-descriptions-item-content {
+  overflow-wrap: anywhere;
+}
+
+.activity-detail-metadata .ant-descriptions-item-label {
+  width: 104px;
+  white-space: nowrap;
+}
+
+.activity-live-card .activity-detail-panel {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px 24px;
+}
+
+.activity-live-card .detail-status,
+.activity-live-card .activity-detail-chain,
+.activity-live-card .activity-detail-metadata {
+  grid-column: 1 / -1;
 }
 
 .activity-chain {
@@ -184,6 +207,10 @@
 }
 
 @media (max-width: 720px) {
+  .activity-live-card .activity-detail-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
   .activity-live-card .ant-card-head-wrapper {
     flex-wrap: wrap;
     gap: 8px;
@@ -193,6 +220,12 @@
   .activity-live-card .ant-card-extra {
     max-width: 100%;
     margin-inline-start: 0;
+  }
+
+  .activity-live-card .ant-card-head-title {
+    flex: 1 0 100%;
+    overflow: visible;
+    white-space: normal;
   }
 
   .activity-chain {
@@ -221,7 +254,7 @@
   }
 
   .activity-timing-row {
-    grid-template-columns: 80px minmax(60px, 1fr) 62px;
+    grid-template-columns: 80px minmax(0, 1fr) 62px;
     gap: 6px;
   }
 

@@ -81,12 +81,14 @@ export default function ContextBreakdownPanel({
           </div>
         ))}
       </div>
-      <Segmented
-        className="context-filter" value={filter} onChange={setFilter}
-        options={[{ value: 'all', label: '全部' }, ...context.categories.map((item) => ({
-          value: item.key, label: categoryLabels[item.key] || item.key,
-        }))]}
-      />
+      <div className="context-filter">
+        <Segmented
+          value={filter} onChange={setFilter}
+          options={[{ value: 'all', label: '全部' }, ...context.categories.map((item) => ({
+            value: item.key, label: categoryLabels[item.key] || item.key,
+          }))]}
+        />
+      </div>
       <Table
         size="small" pagination={false} rowKey="key" dataSource={categories}
         columns={[

@@ -6,7 +6,7 @@ import {
   LoadingOutlined,
   NodeIndexOutlined,
 } from '@ant-design/icons'
-import { Descriptions, Empty, Space, Table, Tag, Tooltip, Typography } from 'antd'
+import { Descriptions, Empty, Table, Tag, Tooltip, Typography } from 'antd'
 import type { TableColumnsType } from 'antd'
 import type { ActivityAttempt, RequestActivity } from '../../api'
 import ContextBreakdownPanel from '../../components/ContextBreakdownPanel'
@@ -58,8 +58,14 @@ function TimingRow({
   )
 }
 
-export default function ActivityDetailPanel({ activity }: { activity: RequestActivity }) {
-  const now = useActivityClock(activity.outcome === 'running')
+export default function ActivityDetailPanel({
+  activity,
+  paused = false,
+}: {
+  activity: RequestActivity
+  paused?: boolean
+}) {
+  const now = useActivityClock(!paused && activity.outcome === 'running')
   const total = activityElapsedMs(activity, now)
   const timings = activityLiveTimings(activity, now)
   const attemptColumns: TableColumnsType<ActivityAttempt> = [
@@ -102,7 +108,7 @@ export default function ActivityDetailPanel({ activity }: { activity: RequestAct
   ]
 
   return (
-<Space direction="vertical" size={18} style={{ width: '100%' }}>
+<div className="activity-detail-panel">
           <div
             className={`detail-status ${
               activity.outcome === 'running'
@@ -128,7 +134,7 @@ export default function ActivityDetailPanel({ activity }: { activity: RequestAct
             </Tag>
           </div>
 
-          <section>
+          <section className="activity-detail-chain">
             <Typography.Title level={5}>请求链路</Typography.Title>
             <div className="activity-chain">
               <div className="activity-chain-node">
@@ -192,8 +198,8 @@ export default function ActivityDetailPanel({ activity }: { activity: RequestAct
             <ContextBreakdownPanel context={activity.context} />
           </section>
 
-          <Descriptions column={2} size="small" bordered>
-            <Descriptions.Item label="请求 ID" span={2}>
+          <Descriptions className="activity-detail-metadata" column={{ xs: 1, sm: 2 }} size="small" bordered>
+            <Descriptions.Item label="请求 ID" span="filled">
               <Typography.Text copyable={{ text: activity.request_id }}>
                 {activity.request_id}
               </Typography.Text>
@@ -238,10 +244,10 @@ export default function ActivityDetailPanel({ activity }: { activity: RequestAct
                   ? '等待供应商返回'
                   : '未知'}
             </Descriptions.Item>
-            <Descriptions.Item label="等待原因">
+            <Descriptions.Item label="等待原因" span="filled">
               {activity.waiting_reason || '-'}
             </Descriptions.Item>
-            <Descriptions.Item label="错误" span={2}>
+            <Descriptions.Item label="错误" span="filled">
               {activity.error_code || '-'}
             </Descriptions.Item>
           </Descriptions>
@@ -274,6 +280,6 @@ export default function ActivityDetailPanel({ activity }: { activity: RequestAct
               ]}
             />
           </section>
-        </Space>
+        </div>
   )
 }

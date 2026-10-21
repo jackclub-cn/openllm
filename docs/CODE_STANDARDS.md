@@ -45,6 +45,7 @@
 | `web/src/pages/<domain>/` | 页面领域组件 | 页面负责组装，表单、表格、图表及状态按职责拆分 |
 | `web/src/styles/` | 领域样式 | `styles.css` 只按原有层叠顺序导入 |
 | `web/src/hooks/activityState.ts` | 活动快照和事件合并 | 按进程、全局水位和请求版本对齐；缺口触发重同步 |
+| `web/src/pages/dashboard/DashboardRequestActivity.tsx`、`requestActivity.ts` | 仪表盘单请求实时详情及选择 | 优先最新进行中请求，空闲显示最近一条；复用 `ActivityDetailPanel`，历史请求仍由用量页承接 |
 | `tests/unit/<domain>/` | 领域回归测试 | 入口只保存共享夹具和模块声明 |
 
 优先使用 `<domain>.rs` 加 `<domain>/` 子模块的既有组织方式。入口文件负责
