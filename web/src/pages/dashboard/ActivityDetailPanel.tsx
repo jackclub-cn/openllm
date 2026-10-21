@@ -147,42 +147,45 @@ export default function ActivityDetailPanel({
                 attempts_truncated: activity.attempts_truncated,
               }}
             />
-            <ActivityRequestSummary activity={activity} totalMs={total} />
+            <div className="activity-routing-column">
+              <section>
+                <Typography.Title level={5}>实际尝试 {activity.attempts_truncated ? `（最近 ${activity.attempts.length} / ${activity.attempt_count} 次）` : ''}</Typography.Title>
+                {activity.attempts.length ? (
+                  <Table
+                    rowKey="attempt_index"
+                    size="small"
+                    pagination={false}
+                    columns={attemptColumns}
+                    dataSource={activity.attempts}
+                    scroll={{ x: 560 }}
+                  />
+                ) : (
+                  <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未开始上游尝试" />
+                )}
+              </section>
+              <section>
+                <Typography.Title level={5}>路由候选（{activity.candidates.length} / {activity.candidate_count}）</Typography.Title>
+                <Table
+                  size="small" rowKey="order" pagination={false} scroll={{ x: 560 }}
+                  dataSource={activity.candidates}
+                  columns={[
+                    { title: '#', dataIndex: 'order', width: 45 },
+                    { title: '提供商 / 模型', render: (_, item) => `${item.provider_name || item.provider_id} / ${item.upstream_model}` },
+                    { title: 'Key', dataIndex: 'provider_api_key_id', render: (value) => value ?? '-' },
+                    { title: '原因', render: (_, item) => <Tag color={item.deprioritized ? 'orange' : 'default'}>{traceReasonLabel(item.reason_code)}</Tag> },
+                  ]}
+                />
+              </section>
+            </div>
           </div>
 
-          <section className="activity-context-section">
-            <Typography.Title level={5}>上下文窗口</Typography.Title>
-            <ContextBreakdownPanel context={activity.context} />
-          </section>
-
-          <section>
-            <Typography.Title level={5}>实际尝试 {activity.attempts_truncated ? `（最近 ${activity.attempts.length} / ${activity.attempt_count} 次）` : ''}</Typography.Title>
-            {activity.attempts.length ? (
-              <Table
-                rowKey="attempt_index"
-                size="small"
-                pagination={false}
-                columns={attemptColumns}
-                dataSource={activity.attempts}
-                scroll={{ x: 620 }}
-              />
-            ) : (
-              <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="尚未开始上游尝试" />
-            )}
-          </section>
-          <section>
-            <Typography.Title level={5}>路由候选（{activity.candidates.length} / {activity.candidate_count}）</Typography.Title>
-            <Table
-              size="small" rowKey="order" pagination={false} scroll={{ x: 560 }}
-              dataSource={activity.candidates}
-              columns={[
-                { title: '#', dataIndex: 'order', width: 45 },
-                { title: '提供商 / 模型', render: (_, item) => `${item.provider_name || item.provider_id} / ${item.upstream_model}` },
-                { title: 'Key', dataIndex: 'provider_api_key_id', render: (value) => value ?? '-' },
-                { title: '原因', render: (_, item) => <Tag color={item.deprioritized ? 'orange' : 'default'}>{traceReasonLabel(item.reason_code)}</Tag> },
-              ]}
-            />
-          </section>
+          <div className="activity-detail-grid">
+            <section className="activity-context-section">
+              <Typography.Title level={5}>上下文窗口</Typography.Title>
+              <ContextBreakdownPanel context={activity.context} />
+            </section>
+            <ActivityRequestSummary activity={activity} totalMs={total} />
+          </div>
         </div>
   )
 }

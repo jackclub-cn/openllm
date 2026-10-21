@@ -4,8 +4,10 @@
 @import './styles/shared.css';
 @import './styles/timeline.css';
 @import './styles/activity.css';
+@import './styles/activity-detail.css';
 @import './styles/requests.css';
 @import './styles/forms.css';
+@import './styles/settings.css';
 @import './styles/providers.css';
 @import './styles/playground.css';
 @import './styles/diagnostics.css';

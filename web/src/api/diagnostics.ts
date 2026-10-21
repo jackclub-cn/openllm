@@ -1,4 +1,9 @@
-import type { CooldownSnapshot, RuntimeStatus, Settings } from './runtime'
+import type {
+  CooldownSnapshot,
+  RuntimeLimits,
+  RuntimeStatus,
+  Settings,
+} from './runtime'
 import type { PoolUsage } from './pools'
 import type { Provider } from './providers'
 
@@ -50,6 +55,7 @@ export type DiagnosticSnapshot = {
     ours: boolean
   } | null
   status: RuntimeStatus
+  limits: RuntimeLimits
   settings: Settings
   self_check: SelfCheckReport
   resilience: CooldownSnapshot

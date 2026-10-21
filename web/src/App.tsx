@@ -217,7 +217,7 @@ function AppLayout({
         <Menu
           mode="inline"
           theme="dark"
-          selectedKeys={[location.pathname]}
+          selectedKeys={[location.pathname.startsWith('/settings/') ? '/settings' : location.pathname]}
           items={navigation}
           onClick={({ key }) => {
             navigate(key)
@@ -236,7 +236,10 @@ function AppLayout({
               onClick={() => setCollapsed((value) => !value)}
             />
             <Typography.Text strong>
-              {navigation.find((item) => item.key === location.pathname)?.label || 'OpenLLM'}
+              {navigation.find((item) =>
+                item.key === location.pathname ||
+                (item.key === '/settings' && location.pathname.startsWith('/settings/'))
+              )?.label || 'OpenLLM'}
             </Typography.Text>
           </Space>
           <Space>
@@ -267,7 +270,7 @@ function AppLayout({
               <Route path="/audit" element={<AuditLogs />} />
               <Route path="/diagnostics" element={<DiagnosticsPage />} />
               <Route path="/maintenance" element={<MaintenancePage />} />
-              <Route path="/settings" element={<SettingsPage />} />
+              <Route path="/settings/*" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Routes>
           </Suspense>

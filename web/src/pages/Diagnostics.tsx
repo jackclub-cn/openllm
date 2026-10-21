@@ -1,7 +1,9 @@
 import { formatSeconds, formatTimestamp } from './diagnostics/format'
 import DiagnosticCapacity from './diagnostics/DiagnosticCapacity'
+import DiagnosticCooldowns from './diagnostics/DiagnosticCooldowns'
 import DiagnosticPools from './diagnostics/DiagnosticPools'
 import DiagnosticFailures from './diagnostics/DiagnosticFailures'
+import DiagnosticRuntimeSettings from './diagnostics/DiagnosticRuntimeSettings'
 import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
@@ -28,12 +30,10 @@ import {
   api,
   formatError,
   type ApiKey,
-  type ClearCooldownsResult,
   type DiagnosticSnapshot,
   type SelfCheckItem,
   type SelfCheckStatus,
 } from '../api'
-import { formatFailureClassification } from '../format'
 
 const statusMeta: Record<SelfCheckStatus, { label: string; color: string }> = {
   pass: { label: '通过', color: 'success' },
@@ -49,21 +49,12 @@ const categoryLabels: Record<string, string> = {
   observability: '可观测与维护',
 }
 
-type CooldownRow = {
-  key: string
-  kind: string
-  target: string
-  remaining: number
-  detail: string
-}
-
 export default function DiagnosticsPage() {
   const { message } = App.useApp()
   const [snapshot, setSnapshot] = useState<DiagnosticSnapshot>()
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
   const [loading, setLoading] = useState(true)
   const [exporting, setExporting] = useState(false)
-  const [clearing, setClearing] = useState(false)
   const [includeSecrets, setIncludeSecrets] = useState(false)
 
   const load = useCallback(
@@ -113,60 +104,8 @@ export default function DiagnosticsPage() {
     }
   }
 
-  const clearCooldowns = async () => {
-    setClearing(true)
-    try {
-      const result = await api.post<ClearCooldownsResult>(
-        '/api/resilience/cooldowns/clear',
-        { all: true }
-      )
-      const total =
-        result.cleared_provider_cooldowns +
-        result.cleared_model_cooldowns +
-        result.cleared_provider_key_cooldowns
-      message.success(`已清除 ${total} 条冷却记录`)
-      await load(true)
-    } catch (error) {
-      message.error(formatError(error))
-    } finally {
-      setClearing(false)
-    }
-  }
-
   const check = snapshot?.self_check
   const keyNames = new Map(apiKeys.map((item) => [item.id, item.name]))
-
-  const cooldownRows: CooldownRow[] = [
-    ...(snapshot?.resilience.provider_cooldowns || []).map((item) => ({
-      key: `provider-${item.provider_id}`,
-      kind: '提供商熔断',
-      target: item.provider_name || `#${item.provider_id}`,
-      remaining: item.remaining_seconds,
-      detail: [
-        `失败 ${item.failure_streak} 次`,
-        item.state,
-        formatFailureClassification(item),
-      ]
-        .filter(Boolean)
-        .join(' · '),
-    })),
-    ...(snapshot?.resilience.model_cooldowns || []).map((item) => ({
-      key: `model-${item.provider_id}-${item.model}`,
-      kind: '模型冷却',
-      target: `${item.provider_name || `#${item.provider_id}`} · ${item.model}`,
-      remaining: item.remaining_seconds,
-      detail: formatFailureClassification(item) || '该模型暂不参与路由',
-    })),
-    ...(snapshot?.resilience.provider_key_cooldowns || []).map((item) => ({
-      key: `key-${item.provider_key_id}`,
-      kind: '上游密钥冷却',
-      target: `${item.provider_name || '未知提供商'} · ${
-        item.key_name || `#${item.provider_key_id}`
-      }`,
-      remaining: item.remaining_seconds,
-      detail: formatFailureClassification(item) || '该上游密钥暂不参与路由',
-    })),
-  ].sort((a, b) => b.remaining - a.remaining)
 
   return (
     <Space
@@ -268,46 +207,13 @@ export default function DiagnosticsPage() {
 
       <DiagnosticCapacity snapshot={snapshot} />
 
-      <Card
-        title="冷却与熔断"
-        extra={
-          <Space>
-            <Typography.Text type="secondary">
-              开环阈值 {snapshot?.resilience.provider_open_threshold ?? '—'} 次
-            </Typography.Text>
-            <Button
-              danger
-              size="small"
-              loading={clearing}
-              disabled={cooldownRows.length === 0}
-              onClick={() => void clearCooldowns()}
-            >
-              清除全部冷却
-            </Button>
-          </Space>
-        }
-      >
-        <Table<CooldownRow>
-          size="small"
-          scroll={{ x: 560 }}
-          rowKey="key"
-          pagination={false}
-          loading={loading}
-          dataSource={cooldownRows}
-          locale={{ emptyText: '当前没有处于冷却或熔断状态的对象' }}
-          columns={[
-            { title: '类型', dataIndex: 'kind', width: 130 },
-            { title: '对象', dataIndex: 'target' },
-            {
-              title: '剩余时间',
-              dataIndex: 'remaining',
-              width: 120,
-              render: (value: number) => formatSeconds(value),
-            },
-            { title: '说明', dataIndex: 'detail' },
-          ]}
-        />
-      </Card>
+      <DiagnosticRuntimeSettings limits={snapshot?.limits} />
+
+      <DiagnosticCooldowns
+        snapshot={snapshot}
+        loading={loading}
+        onRefresh={() => load(true)}
+      />
 
       <DiagnosticPools snapshot={snapshot} loading={loading} keyNames={keyNames} />
 

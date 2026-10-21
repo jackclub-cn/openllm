@@ -46,11 +46,14 @@
 | `src/quota/` | 额度快照 | 存储、上游归一化、响应头、有效状态和调度信号分开 |
 | `web/src/api/` | 前端接口客户端与领域类型 | `web/src/api.ts` 只保留稳定导出 |
 | `web/src/pages/<domain>/` | 页面领域组件 | 页面负责组装，表单、表格、图表及状态按职责拆分 |
+| `web/src/pages/settings/` | 请求策略、日志隐私、访问安全 | 设置入口管理标签地址；独立区域加载、保存与撤销，统一拦截未保存修改的导航；运行状态和运维动作由诊断、运维页面承接 |
+| `web/src/pages/diagnostics/DiagnosticRuntimeSettings.tsx`、`DiagnosticCooldowns.tsx` | 生效运行参数与故障恢复操作 | 参数复用诊断快照；冷却集中提供单项与全部清除，保留半开探测状态 |
+| `web/src/pages/maintenance/` | 数据库维护与备份恢复展示 | 数据库统计、下载备份与整理集中在运维；沿用现有维护、备份和校验接口 |
 | `web/src/pages/AdminLogin.tsx` | 管理令牌登录入口 | 仅在启用 `OPENLLM_ADMIN_TOKEN` 时验证并进入控制台；令牌只保存在当前浏览器 |
 | `web/src/styles/` | 领域样式 | `styles.css` 只按原有层叠顺序导入 |
 | `web/src/hooks/activityState.ts` | 活动快照和事件合并 | 按进程、全局水位和请求版本对齐；缺口触发重同步 |
 | `web/src/pages/dashboard/DashboardRequestActivity.tsx`、`requestActivity.ts` | 仪表盘单请求实时详情及选择 | 优先最新进行中请求，空闲显示最近一条；复用 `ActivityDetailPanel`，历史请求仍由用量页承接 |
-| `web/src/pages/dashboard/ActivityDetailPanel.tsx`、`ActivityRequestSummary.tsx` | 实时请求详情编排与摘要 | 展示已观测链路、耗时和上下文；摘要只复用活动快照字段，不推测未上报数据 |
+| `web/src/pages/dashboard/ActivityDetailPanel.tsx`、`ActivityRequestSummary.tsx` | 实时请求详情编排与摘要 | 展示已观测链路、耗时和上下文；摘要只复用活动快照字段，不推测未上报数据；`styles/activity-detail.css` 只负责详情区域布局 |
 | `web/src/components/RequestTimingPanel.tsx`、`requestTimings.ts` | 实时与历史耗时展示及归因 | 仅使用已测量阶段；TTFT 不重复计入阶段；旧记录显示未知 |
 | `web/src/components/VersionStatus.tsx`、`GithubLink.tsx` | 全局版本提示与项目入口 | 复用管理升级接口，发布失败不误报已是最新 |
 | `tests/unit/<domain>/` | 领域回归测试 | 入口只保存共享夹具和模块声明 |
