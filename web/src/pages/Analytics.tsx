@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { ClearOutlined, FileSearchOutlined } from '@ant-design/icons'
-import { Alert, App, Button, Card, Segmented, Skeleton, Space, Tabs } from 'antd'
+import { Alert, App, Button, Card, Segmented, Skeleton, Space } from 'antd'
 import dayjs, { type Dayjs } from 'dayjs'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -19,15 +19,10 @@ import UsageRangePicker from '../components/UsageRangePicker'
 import UsageRangeToolbar from '../components/UsageRangeToolbar'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
-import AnalyticsErrors from './analytics/AnalyticsErrors'
-import AnalyticsDimensions from './analytics/AnalyticsDimensions'
 import AnalyticsMetrics from './analytics/AnalyticsMetrics'
-import AnalyticsProviderUsage from './analytics/AnalyticsProviderUsage'
-import AnalyticsRouteQuality from './analytics/AnalyticsRouteQuality'
+import AnalyticsTabs from './analytics/AnalyticsTabs'
 import { withDevProviderMock } from './analytics/devProviderMock'
 import { buildAnalyticsParams } from './analytics/queryParams'
-import DashboardCharts from './dashboard/DashboardCharts'
-import DashboardModelUsage from './dashboard/DashboardModelUsage'
 
 const EMPTY_FILTERS: UsageDimensionFilterValues = {
   model: '',
@@ -208,70 +203,15 @@ export default function Analytics() {
         </Space>
       </Card>
       <AnalyticsMetrics data={data} />
-      <Tabs
-        className="section-row"
-        defaultActiveKey="trend"
-        items={[
-          {
-            key: 'trend',
-            label: '趋势',
-            children: (
-              <DashboardCharts
-                data={data}
-                providerDataMocked={providerDataMocked}
-              />
-            ),
-          },
-          {
-            key: 'models',
-            label: '模型',
-            children: (
-              <DashboardModelUsage
-                data={data}
-                fullBreakdown={fullBreakdown}
-                onToggleFullBreakdown={() => setFullBreakdown((value) => !value)}
-                loading={autoRefresh.refreshing}
-              />
-            ),
-          },
-          {
-            key: 'providers',
-            label: '提供商',
-            children: (
-              <AnalyticsProviderUsage
-                data={data}
-                providerDataMocked={providerDataMocked}
-              />
-            ),
-          },
-          {
-            key: 'dimensions',
-            label: '维度',
-            children: (
-              <AnalyticsDimensions
-                dates={dates}
-                filters={filters}
-                granularity={granularity}
-              />
-            ),
-          },
-          {
-            key: 'errors',
-            label: '错误',
-            children: <AnalyticsErrors data={data} />,
-          },
-          {
-            key: 'routing',
-            label: '路由',
-            children: (
-              <AnalyticsRouteQuality
-                dates={dates}
-                filters={filters}
-                granularity={granularity}
-              />
-            ),
-          },
-        ]}
+      <AnalyticsTabs
+        data={data}
+        dates={dates}
+        filters={filters}
+        granularity={granularity}
+        fullBreakdown={fullBreakdown}
+        providerDataMocked={providerDataMocked}
+        refreshing={autoRefresh.refreshing}
+        onToggleFullBreakdown={() => setFullBreakdown((value) => !value)}
       />
     </>
   )

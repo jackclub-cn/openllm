@@ -83,6 +83,7 @@ async fn forward_repairs_tool_history_and_normalizes_command_code_request() {
         context_limit: None,
         input_limit: None,
         output_limit: None,
+        reasoning_efforts: None,
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,

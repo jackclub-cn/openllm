@@ -121,6 +121,9 @@ pub struct RouteTarget {
     pub input_limit: Option<i64>,
     #[sqlx(default)]
     pub output_limit: Option<i64>,
+    /// JSON array of reasoning effort values accepted by this upstream model.
+    #[sqlx(default)]
+    pub reasoning_efforts: Option<String>,
     /// Provider/model availability as loaded by management queries. Runtime
     /// queries may omit these columns because they already filter disabled
     /// targets.

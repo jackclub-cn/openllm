@@ -12,5 +12,7 @@ mod overview;
 pub use overview::overview;
 mod dimensions;
 pub use dimensions::analytics_dimensions;
+mod context;
+pub use context::analytics_context;
 mod route_quality;
 pub use route_quality::analytics_route_quality;

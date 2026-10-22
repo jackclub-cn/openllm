@@ -36,6 +36,20 @@ export default function UsageRangePicker({
         dayjs().endOf('day'),
       ] as [Dayjs, Dayjs],
     },
+    {
+      label: '近 90 天',
+      value: [
+        dayjs().subtract(89, 'day').startOf('day'),
+        dayjs().endOf('day'),
+      ] as [Dayjs, Dayjs],
+    },
+    {
+      label: '近 365 天',
+      value: [
+        dayjs().subtract(364, 'day').startOf('day'),
+        dayjs().endOf('day'),
+      ] as [Dayjs, Dayjs],
+    },
   ]
 
   return (

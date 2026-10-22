@@ -259,6 +259,7 @@ fn test_target(provider_id: i64, provider_name: &str) -> RouteTarget {
         context_limit: None,
         input_limit: None,
         output_limit: None,
+        reasoning_efforts: None,
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,

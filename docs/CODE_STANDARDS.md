@@ -28,7 +28,7 @@
 | --- | --- | --- |
 | `src/api/` | 管理接口和查询编排 | 输入校验、数据库查询与运行时代理逻辑分开 |
 | `src/api/helpers/` | 管理接口共享能力 | 按 models、credentials、views、validation 等明确归属组织 |
-| `src/api/usage/` | 请求日志、分析和维护 | 日志、时间窗口、overview、维度、路由质量分别维护 |
+| `src/api/usage/` | 请求日志、分析和维护 | 日志、时间窗口、overview、维度、上下文、路由质量分别维护 |
 | `src/api/lifecycle/` | 配置导入导出、备份、升级检查 | 导入器再按 settings、providers、routes、pools 分工；旧配置的 Webhook 项仅报告跳过，不再写入 |
 | `src/api/metrics/` | Prometheus 快照和文本渲染 | 一次采集数据，各指标领域分别输出；指标名和统计口径保持稳定 |
 | `src/proxy/routing/` | 路由决策 | 解析、诊断、指标、策略、粘性、并发、熔断、凭据、发送分别维护 |
@@ -52,6 +52,7 @@
 | `web/src/hooks/useFormCloseGuard.ts` | 提供商与路由表单关闭保护 | 比较打开时与当前表单值，统一确认关闭、切换模板与离页；保存期间阻止关闭 |
 | `web/src/hooks/useLoadableList.ts`、`components/LoadErrorAlert.tsx` | 列表加载与失败恢复 | 独立保留各资源上次成功的数据，忽略过期响应，持续显示错误并提供原地重试 |
 | `web/src/pages/usage/UsageTable.tsx`、`usageTableColumns.tsx` | 请求日志树表及列展示 | 列表接口批量读取已有失败尝试到 `children`；父行保留最终结果和统计口径，子行复用同一组列，异步加载后默认展开 |
+| `web/src/pages/analytics/` | 用量分析各视图 | 概览、请求热力图、上下文画像与会话趋势分别维护；只展示后台已采集字段 |
 | `web/src/pages/settings/` | 请求策略、日志隐私、访问安全 | 设置入口管理标签地址；独立区域加载、保存与撤销，统一拦截未保存修改的导航；运行状态和运维动作由诊断、运维页面承接 |
 | `web/src/pages/diagnostics/DiagnosticRuntimeSettings.tsx`、`DiagnosticCooldowns.tsx` | 生效运行参数与故障恢复操作 | 参数复用诊断快照；冷却集中提供单项与全部清除，保留半开探测状态 |
 | `web/src/pages/maintenance/` | 数据库维护与备份恢复展示 | 数据库统计、下载备份与整理集中在运维；沿用现有维护、备份和校验接口 |

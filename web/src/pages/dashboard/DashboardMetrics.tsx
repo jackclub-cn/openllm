@@ -4,6 +4,7 @@ import {
   DatabaseOutlined,
   DollarOutlined,
   NodeIndexOutlined,
+  RocketOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import { Col, Row } from 'antd'
@@ -80,11 +81,13 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="今日缓存写入"
-            value={data.range_cache_write}
-            compact
-            icon={<DatabaseOutlined />}
+            label="今日平均 TPS"
+            value={data.range_output_tps}
+            precision={1}
+            suffix="tok/s"
+            icon={<RocketOutlined />}
             tone="cyan"
+            hint="输出 tokens / 生成耗时"
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>

@@ -162,6 +162,42 @@ pub(crate) async fn record_capability(
     }
 }
 
+/// Persists effort values learned from a precise upstream enum rejection.
+///
+/// This updates the synced model row so subsequent requests can normalize
+/// before sending. Targets without a `provider_models` row still benefit from
+/// the current in-flight retry.
+pub(crate) async fn record_reasoning_efforts(
+    state: &AppState,
+    provider_id: i64,
+    model: &str,
+    efforts: &[String],
+) {
+    if efforts.is_empty() {
+        return;
+    }
+    let Ok(encoded) = serde_json::to_string(efforts) else {
+        return;
+    };
+    if let Err(error) = sqlx::query(
+        "UPDATE provider_models SET reasoning_efforts = ? \
+         WHERE provider_id = ? AND model_name = ?",
+    )
+    .bind(encoded)
+    .bind(provider_id)
+    .bind(model)
+    .execute(&state.pool)
+    .await
+    {
+        tracing::warn!(
+            %error,
+            provider_id,
+            model,
+            "failed to persist upstream reasoning effort compatibility"
+        );
+    }
+}
+
 async fn ensure_loaded(state: &AppState) -> AppResult<()> {
     if state.capability_profiles.lock().await.loaded {
         return Ok(());

@@ -148,6 +148,9 @@ pub(in crate::proxy) async fn send_provider_request(
 /// - if an upstream rejects replayed reasoning history or strict tool fields,
 ///   repair the request once, retry the same target, and persist the learned
 ///   capability for the provider/model/endpoint scope.
+/// - if an upstream reports the accepted reasoning effort enum, map the
+///   requested value to the nearest supported level, remember the enum on the
+///   synced model, and retry once.
 ///
 /// `body` is the exact body sent upstream, so compatibility retries update the
 /// request rather than replaying the rejected payload.
@@ -225,6 +228,7 @@ where
         send_activity_request(state, target, request_id, streamed, || build(body)).await?,
     );
     let mut transient_retry_used = false;
+    let mut reasoning_effort_retry_used = false;
     let mut reasoning_retry_used = false;
     let mut strict_tools_retry_used = false;
 
@@ -327,6 +331,36 @@ where
                 send_activity_request(state, target, request_id, streamed, || build(body)).await?,
             );
             continue;
+        }
+
+        if !reasoning_effort_retry_used
+            && let Some(supported) =
+                super::compat::rejected_reasoning_effort_options(status, &response_body)
+        {
+            let repaired = super::compat::normalize_reasoning_effort(body, &supported);
+            if repaired > 0 {
+                reasoning_effort_retry_used = true;
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    request_id,
+                    endpoint,
+                    supported = ?supported,
+                    "upstream rejected reasoning effort; retrying with the nearest supported value"
+                );
+                crate::capabilities::record_reasoning_efforts(
+                    state,
+                    target.provider_id,
+                    &target.upstream_model,
+                    &supported,
+                )
+                .await;
+                response = UpstreamResponse::new(
+                    send_activity_request(state, target, request_id, streamed, || build(body))
+                        .await?,
+                );
+                continue;
+            }
         }
 
         if !reasoning_retry_used

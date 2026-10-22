@@ -44,6 +44,7 @@ fn endpoint_test_target(provider_type: &str, supported_endpoints: Option<&str>) 
         context_limit: None,
         input_limit: None,
         output_limit: None,
+        reasoning_efforts: None,
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,
@@ -252,6 +253,9 @@ mod quota_fallback;
 
 #[path = "proxy/reasoning_compat.rs"]
 mod reasoning_compat;
+
+#[path = "proxy/reasoning_effort.rs"]
+mod reasoning_effort;
 
 #[path = "proxy/stream_recovery.rs"]
 mod stream_recovery;

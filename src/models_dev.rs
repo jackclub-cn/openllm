@@ -228,6 +228,7 @@ fn parse_capabilities(model: &Value) -> ModelCapabilities {
         input_limit: number("input"),
         attachment: model.get("attachment").and_then(Value::as_bool),
         reasoning: model.get("reasoning").and_then(Value::as_bool),
+        reasoning_efforts: reasoning_efforts(model),
         tool_call: model.get("tool_call").and_then(Value::as_bool),
         structured_output: model.get("structured_output").and_then(Value::as_bool),
         temperature: model.get("temperature").and_then(Value::as_bool),
@@ -245,6 +246,26 @@ fn parse_capabilities(model: &Value) -> ModelCapabilities {
     // models.dev also publishes both a window and a smaller input cap; collapse
     // them so the gateway never advertises two different context numbers.
     .with_effective_input_limit()
+}
+
+fn reasoning_efforts(model: &Value) -> Option<Vec<String>> {
+    let options = model.get("reasoning_options")?.as_array()?;
+    let mut efforts = Vec::new();
+    for option in options {
+        if option.get("type").and_then(Value::as_str) != Some("effort") {
+            continue;
+        }
+        let Some(values) = option.get("values").and_then(Value::as_array) else {
+            continue;
+        };
+        for value in values.iter().filter_map(Value::as_str) {
+            let value = value.trim().to_ascii_lowercase();
+            if !value.is_empty() && !efforts.contains(&value) {
+                efforts.push(value);
+            }
+        }
+    }
+    (!efforts.is_empty()).then_some(efforts)
 }
 
 /// Reads `modalities.input` / `modalities.output` and flattens each to a list of
@@ -340,6 +361,10 @@ mod tests {
                 "limit": {"context": 400000, "output": 128000},
                 "attachment": true,
                 "reasoning": true,
+                "reasoning_options": [
+                  {"type": "effort", "values": ["low", "medium", "high"]},
+                  {"type": "toggle"}
+                ],
                 "tool_call": true,
                 "modalities": {"input": ["text","image"], "output": ["text"]},
                 "cost": {"input": 1.25, "output": 10},
@@ -397,6 +422,14 @@ mod tests {
         let catalog = Catalog::parse(&sample()).unwrap();
         let preferred = catalog.lookup(Some("openai"), "gpt-5.4").unwrap();
         assert_eq!(preferred.output_limit, Some(128000));
+        assert_eq!(
+            preferred.reasoning_efforts,
+            Some(vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string()
+            ])
+        );
         let other = catalog.lookup(Some("openrouter"), "gpt-5.4").unwrap();
         assert_eq!(other.output_limit, Some(64000));
         // No hint: canonical entry wins deterministically.

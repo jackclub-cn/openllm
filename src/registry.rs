@@ -54,6 +54,7 @@ const CAPABILITY_COLUMNS: &str = "COALESCE(pm.context_override, pm.context_limit
      COALESCE(pm.output_override, pm.output_limit) AS output_limit, \
      COALESCE(pm.input_override, pm.input_limit) AS input_limit, \
      pm.attachment AS attachment, pm.reasoning AS reasoning, \
+     pm.reasoning_efforts AS reasoning_efforts, \
      pm.tool_call AS tool_call, pm.structured_output AS structured_output, \
      pm.temperature AS temperature, pm.open_weights AS open_weights, \
      pm.modalities AS modalities, pm.cost AS cost, \
@@ -72,6 +73,7 @@ struct CapabilityRow {
     input_limit: Option<i64>,
     attachment: Option<i64>,
     reasoning: Option<i64>,
+    reasoning_efforts: Option<String>,
     tool_call: Option<i64>,
     structured_output: Option<i64>,
     temperature: Option<i64>,
@@ -99,6 +101,7 @@ impl CapabilityRow {
             input_limit: self.input_limit,
             attachment: boolean(self.attachment),
             reasoning: boolean(self.reasoning),
+            reasoning_efforts: stored_string_list(self.reasoning_efforts),
             tool_call: boolean(self.tool_call),
             structured_output: boolean(self.structured_output),
             temperature: boolean(self.temperature),
@@ -138,6 +141,11 @@ fn stored_modality(raw: &Option<String>, key: &str) -> Option<Vec<String>> {
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     (!values.is_empty()).then_some(values)
+}
+
+fn stored_string_list(raw: Option<String>) -> Option<Vec<String>> {
+    let items = serde_json::from_str::<Vec<String>>(raw.as_deref()?).ok()?;
+    (!items.is_empty()).then_some(items)
 }
 
 fn parse_json_column(value: Option<String>) -> Option<Value> {
@@ -449,6 +457,7 @@ fn capability_from_row(row: &CapabilityRow) -> Option<ModelCapabilities> {
         input_limit: row.input_limit,
         attachment: boolean(row.attachment),
         reasoning: boolean(row.reasoning),
+        reasoning_efforts: stored_string_list(row.reasoning_efforts.clone()),
         tool_call: boolean(row.tool_call),
         structured_output: boolean(row.structured_output),
         temperature: boolean(row.temperature),

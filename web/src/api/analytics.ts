@@ -168,6 +168,40 @@ export type SessionUsage = {
   last_seen: string
 }
 
+export type ContextCategoryUsage = {
+  key: string
+  tokens: number
+  items: number
+}
+
+export type ContextAgentUsage = {
+  api_key_id?: number | null
+  label: string
+  requests: number
+  sessions: number
+  context_samples: number
+  measured_samples: number
+  estimated_samples: number
+  prompt_tokens: number
+  avg_prompt_tokens: number
+  max_prompt_tokens: number
+  cache_hit_rate: number
+  category_tokens: ContextCategoryUsage[]
+  unmetered_items: number
+  opaque_reasoning_items: number
+  models: string[]
+  last_seen: string
+}
+
+export type ContextAnalytics = {
+  requests: number
+  sessions: number
+  context_requests: number
+  measured_requests: number
+  estimated_requests: number
+  agents: ContextAgentUsage[]
+}
+
 export type AnalyticsDimensions = {
   api_key_usage: DimensionUsage[]
   provider_api_key_usage: DimensionUsage[]

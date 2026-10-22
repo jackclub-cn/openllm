@@ -1,9 +1,6 @@
 import {
-  ClockCircleOutlined,
   DatabaseOutlined,
   DollarOutlined,
-  FieldTimeOutlined,
-  HourglassOutlined,
   NodeIndexOutlined,
   RocketOutlined,
   ThunderboltOutlined,
@@ -21,8 +18,6 @@ type AnalyticsMetricsProps = {
 
 export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
   const navigate = useNavigate()
-  const formatMs = (value?: number | null) =>
-    value == null || !Number.isFinite(value) ? '-' : `${Math.round(value)} ms`
   const sessionsHint =
     data.range_sessions > 0
       ? `会话 ${formatCompact(data.range_sessions)} · 每会话 ${data.range_avg_requests_per_session.toFixed(1)} 次`
@@ -99,43 +94,7 @@ export default function AnalyticsMetrics({ data }: AnalyticsMetricsProps) {
       </Col>
       <Col xs={24} sm={12} xl={8}>
         <MetricCard
-          label="平均总用时"
-          value={data.range_avg_latency_ms}
-          precision={0}
-          suffix="ms"
-          icon={<ClockCircleOutlined />}
-          tone="orange"
-          comparison={{
-            previous: data.previous_range.avg_latency_ms,
-            lowerIsBetter: true,
-          }}
-        />
-      </Col>
-      <Col xs={24} sm={12} xl={8}>
-        <MetricCard
-          label="P95 总用时"
-          value={data.range_latency_p95_ms}
-          precision={0}
-          suffix="ms"
-          icon={<FieldTimeOutlined />}
-          tone="orange"
-          hint={`P50 ${formatMs(data.range_latency_p50_ms)} · P99 ${formatMs(data.range_latency_p99_ms)}`}
-        />
-      </Col>
-      <Col xs={24} sm={12} xl={8}>
-        <MetricCard
-          label="P95 首字延迟"
-          value={data.range_first_token_p95_ms}
-          precision={0}
-          suffix="ms"
-          icon={<HourglassOutlined />}
-          tone="blue"
-          hint={`P50 ${formatMs(data.range_first_token_p50_ms)} · P99 ${formatMs(data.range_first_token_p99_ms)}`}
-        />
-      </Col>
-      <Col xs={24} sm={12} xl={8}>
-        <MetricCard
-          label="生成速度"
+          label="平均 TPS"
           value={data.range_output_tps}
           precision={1}
           suffix="tok/s"

@@ -64,6 +64,24 @@ fn intersection_keeps_only_shared_modalities() {
 }
 
 #[test]
+fn intersection_keeps_only_shared_reasoning_efforts() {
+    let first = ModelCapabilities {
+        reasoning_efforts: Some(vec![
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ]),
+        ..Default::default()
+    };
+    let second = ModelCapabilities {
+        reasoning_efforts: Some(vec!["high".to_string(), "max".to_string()]),
+        ..Default::default()
+    };
+    let result = ModelCapabilities::intersect([&first, &second]).unwrap();
+    assert_eq!(result.reasoning_efforts, Some(vec!["high".to_string()]));
+}
+
+#[test]
 fn empty_intersection_returns_none() {
     assert!(ModelCapabilities::intersect(std::iter::empty()).is_none());
     let empty = ModelCapabilities::default();

@@ -81,6 +81,12 @@ pub struct ModelCapabilities {
     pub attachment: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    /// Reasoning effort values accepted by the model, in provider order.
+    ///
+    /// A missing list means the provider did not publish values; `reasoning`
+    /// still records whether the model can reason at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -180,6 +186,7 @@ impl ModelCapabilities {
             input_limit: min(|c| c.input_limit),
             attachment: all_true(|c| c.attachment),
             reasoning: all_true(|c| c.reasoning),
+            reasoning_efforts: intersect_modalities(&targets, |c| c.reasoning_efforts.as_ref()),
             tool_call: all_true(|c| c.tool_call),
             structured_output: all_true(|c| c.structured_output),
             temperature: all_true(|c| c.temperature),

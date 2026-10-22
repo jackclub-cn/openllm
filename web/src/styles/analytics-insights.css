@@ -1,0 +1,265 @@
+.analytics-subheading {
+  margin: 20px 0 12px;
+}
+
+.analytics-provider-card {
+  min-height: 146px;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.analytics-provider-card .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.analytics-provider-title {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.analytics-provider-icon {
+  width: 28px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: #0958d9;
+  background: #e6f4ff;
+}
+
+.analytics-provider-values {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.analytics-provider-values span {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.analytics-provider-values strong {
+  overflow: hidden;
+  color: #172033;
+  font-size: 16px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.heatmap-range {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.heatmap-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 2px 2px 8px;
+}
+
+.heatmap-layout {
+  width: max-content;
+  display: flex;
+  gap: 8px;
+}
+
+.heatmap-weekdays {
+  display: grid;
+  grid-template-rows: repeat(7, 14px);
+  gap: 4px;
+  padding-top: 1px;
+  color: #667085;
+  font-size: 11px;
+  line-height: 14px;
+}
+
+.heatmap-weekdays span {
+  width: 18px;
+  text-align: right;
+}
+
+.heatmap-grid {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 14px;
+  grid-template-rows: repeat(7, 14px);
+  gap: 4px;
+}
+
+.heatmap-cell {
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  display: inline-block;
+  flex: 0 0 14px;
+}
+
+button.heatmap-cell {
+  cursor: pointer;
+}
+
+button.heatmap-cell:hover {
+  outline: 2px solid #91caff;
+  outline-offset: 1px;
+}
+
+.heatmap-cell-outside {
+  visibility: hidden;
+}
+
+.heatmap-level-0 {
+  background: #f0f2f5;
+}
+
+.heatmap-level-1 {
+  background: #d6e4ff;
+}
+
+.heatmap-level-2 {
+  background: #85a5ff;
+}
+
+.heatmap-level-3 {
+  background: #2f54eb;
+}
+
+.heatmap-level-4 {
+  background: #10239e;
+}
+
+.heatmap-legend {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
+  margin-top: 6px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.heatmap-legend span:first-child {
+  margin-right: 2px;
+}
+
+.heatmap-legend span:last-child {
+  margin-left: 2px;
+}
+
+.context-agent-card {
+  height: 100%;
+  cursor: pointer;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.04);
+}
+
+.context-agent-card .ant-card-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.context-agent-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.context-agent-metrics {
+  padding: 12px 0;
+  border-top: 1px solid #edf0f4;
+  border-bottom: 1px solid #edf0f4;
+}
+
+.context-agent-metrics .ant-statistic-title {
+  font-size: 12px;
+}
+
+.context-agent-metrics .ant-statistic-content {
+  font-size: 19px;
+}
+
+.context-categories {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.context-category {
+  display: grid;
+  gap: 1px;
+}
+
+.context-category-label {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: #475467;
+  font-size: 12px;
+  line-height: 17px;
+}
+
+.context-category-label span:last-child {
+  color: #667085;
+  font-variant-numeric: tabular-nums;
+}
+
+.context-agent-footer {
+  min-height: 24px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: auto;
+}
+
+.session-model-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.session-model-row {
+  width: 100%;
+  padding: 0;
+  border: 0;
+  display: grid;
+  gap: 4px;
+  color: inherit;
+  text-align: left;
+  background: transparent;
+  cursor: pointer;
+}
+
+.session-model-row > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-model-row > div:first-child > span {
+  flex: 0 0 auto;
+  color: #667085;
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .heatmap-range {
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .context-agent-footer {
+    flex-direction: column;
+  }
+}

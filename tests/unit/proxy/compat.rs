@@ -284,6 +284,45 @@ fn normalizes_command_code_output_caps_and_reasoning_effort() {
 }
 
 #[test]
+fn maps_reasoning_effort_to_the_nearest_model_value() {
+    let supported = ["auto", "low", "high"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+
+    let mut responses = json!({
+        "input": "hi",
+        "reasoning": {"effort": "original"}
+    });
+    assert_eq!(normalize_reasoning_effort(&mut responses, &supported), 1);
+    assert_eq!(responses["reasoning"]["effort"], "auto");
+
+    let mut chat = json!({
+        "messages": [{"role": "user", "content": "hi"}],
+        "reasoning_effort": "medium"
+    });
+    assert_eq!(normalize_reasoning_effort(&mut chat, &supported), 1);
+    assert_eq!(chat["reasoning_effort"], "high");
+}
+
+#[test]
+fn extracts_supported_efforts_from_an_enum_rejection() {
+    let body = br#"{"error":{"code":"server_error","message":"Upstream request failed: [invalid_request_error] content part: unknown variant `original`, expected one of `auto`, `low`, `high` (request_id: gw-test)"}}"#;
+    assert_eq!(
+        rejected_reasoning_effort_options(StatusCode::BAD_REQUEST, body),
+        Some(vec![
+            "auto".to_string(),
+            "low".to_string(),
+            "high".to_string()
+        ])
+    );
+    assert!(
+        rejected_reasoning_effort_options(StatusCode::OK, body).is_none(),
+        "successful or unrelated responses must not be treated as effort errors"
+    );
+}
+
+#[test]
 fn identifies_command_code_targets_by_base_url_or_prefix() {
     let mut target = endpoint_test_target("openai", None);
     target.base_url = "https://api.commandcode.ai/provider/v1".to_string();

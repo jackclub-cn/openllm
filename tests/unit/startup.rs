@@ -4,6 +4,9 @@ use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
+#[path = "startup/migration_checksums.rs"]
+mod migration_checksums;
+
 async fn memory_pool() -> SqlitePool {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)

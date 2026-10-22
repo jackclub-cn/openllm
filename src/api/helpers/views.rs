@@ -56,6 +56,7 @@ pub(in crate::api) async fn route_targets(
                COALESCE(pm.context_override, pm.context_limit) AS context_limit,
                COALESCE(pm.input_override, pm.input_limit) AS input_limit,
                COALESCE(pm.output_override, pm.output_limit) AS output_limit,
+               pm.reasoning_efforts,
                COALESCE(pm.enabled, 1) AS model_enabled,
                p.tool_search_supported,
                p.timeout_seconds, p.cooldown_seconds,

@@ -116,6 +116,7 @@ async fn retries_openai_requests_without_tool_search_when_upstream_rejects_it() 
             context_limit: None,
             input_limit: None,
             output_limit: None,
+            reasoning_efforts: None,
             provider_enabled: None,
             model_enabled: None,
             tool_search_supported: 1,

@@ -498,6 +498,7 @@ pub(super) fn diagnostic_route_target(
         context_limit: None,
         input_limit: None,
         output_limit: None,
+        reasoning_efforts: None,
         provider_enabled: None,
         model_enabled: None,
         tool_search_supported: 1,

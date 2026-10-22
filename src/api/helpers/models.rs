@@ -191,14 +191,15 @@ pub(super) async fn write_provider_models(
             r#"
             INSERT INTO provider_models (
                 provider_id, model_name, enabled, context_limit, output_limit,
-                input_limit, attachment, reasoning, tool_call, structured_output,
+                input_limit, attachment, reasoning, reasoning_efforts,
+                tool_call, structured_output,
                 temperature, open_weights, modalities, cost, family, knowledge,
                 release_date, last_updated, canonical_model_id, capabilities_synced_at,
                 upstream_context_limit, supported_endpoints, display_name,
                 context_override, input_override, output_override,
                 supported_endpoints_override, cost_input_override, cost_output_override,
                 cost_cache_read_override, cost_cache_write_override
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(provider_id, model_name) DO UPDATE SET
                 enabled = excluded.enabled,
                 context_limit = excluded.context_limit,
@@ -206,6 +207,7 @@ pub(super) async fn write_provider_models(
                 input_limit = excluded.input_limit,
                 attachment = excluded.attachment,
                 reasoning = excluded.reasoning,
+                reasoning_efforts = excluded.reasoning_efforts,
                 tool_call = excluded.tool_call,
                 structured_output = excluded.structured_output,
                 temperature = excluded.temperature,
@@ -239,6 +241,14 @@ pub(super) async fn write_provider_models(
         .bind(input_limit)
         .bind(capabilities.attachment.map(i64::from))
         .bind(capabilities.reasoning.map(i64::from))
+        .bind(
+            capabilities
+                .reasoning_efforts
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .unwrap_or_default(),
+        )
         .bind(capabilities.tool_call.map(i64::from))
         .bind(capabilities.structured_output.map(i64::from))
         .bind(capabilities.temperature.map(i64::from))

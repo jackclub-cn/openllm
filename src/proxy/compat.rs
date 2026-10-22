@@ -566,6 +566,133 @@ pub(crate) fn normalize_command_code_reasoning_effort(body: &mut Value) -> usize
     changes
 }
 
+/// Maps an effort value to the nearest value accepted by the upstream model.
+///
+/// `original` is the client's request for the model's default behavior, so it
+/// prefers `auto` and otherwise behaves like `medium`. For normal named levels,
+/// the closest numeric level wins; ties choose the higher level.
+pub(crate) fn normalize_reasoning_effort(body: &mut Value, supported: &[String]) -> usize {
+    if supported.is_empty() {
+        return 0;
+    }
+    let mut changes = 0;
+    let normalize = |value: &mut Value, changes: &mut usize| {
+        let Some(current) = value.as_str() else {
+            return;
+        };
+        let Some(mapped) = nearest_reasoning_effort(current, supported) else {
+            return;
+        };
+        if mapped != current {
+            *value = json!(mapped);
+            *changes += 1;
+        }
+    };
+
+    if let Some(value) = body.get_mut("reasoning_effort") {
+        normalize(value, &mut changes);
+    }
+    if let Some(value) = body
+        .get_mut("reasoning")
+        .and_then(Value::as_object_mut)
+        .and_then(|reasoning| reasoning.get_mut("effort"))
+    {
+        normalize(value, &mut changes);
+    }
+    changes
+}
+
+fn nearest_reasoning_effort(current: &str, supported: &[String]) -> Option<String> {
+    let current = current.trim().to_ascii_lowercase();
+    if let Some(exact) = supported
+        .iter()
+        .find(|value| value.eq_ignore_ascii_case(&current))
+    {
+        return Some(exact.clone());
+    }
+    if current == "original"
+        && let Some(auto) = supported
+            .iter()
+            .find(|value| value.eq_ignore_ascii_case("auto"))
+    {
+        return Some(auto.clone());
+    }
+
+    let target_rank = reasoning_effort_rank(&current).unwrap_or(3);
+    supported
+        .iter()
+        .filter_map(|value| {
+            reasoning_effort_rank(value).map(|rank| (value, rank, target_rank.abs_diff(rank)))
+        })
+        .min_by_key(|(_, rank, distance)| (*distance, std::cmp::Reverse(*rank)))
+        .map(|(value, _, _)| value.clone())
+        .or_else(|| supported.first().cloned())
+}
+
+fn reasoning_effort_rank(value: &str) -> Option<u8> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "none" => Some(0),
+        "minimal" => Some(1),
+        "low" => Some(2),
+        "medium" => Some(3),
+        "high" => Some(4),
+        "xhigh" => Some(5),
+        "max" => Some(6),
+        _ => None,
+    }
+}
+
+/// Extracts accepted reasoning effort values from a precise upstream enum
+/// rejection such as:
+///
+/// `unknown variant 'original', expected one of 'auto', 'low', 'high'`.
+///
+/// Only 400/422 responses are considered, and values are limited to the plain
+/// token shape used by effort enums.
+pub(crate) fn rejected_reasoning_effort_options(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<Vec<String>> {
+    if !matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
+    ) {
+        return None;
+    }
+    let text = String::from_utf8_lossy(body).to_ascii_lowercase();
+    if !text.contains("unknown variant") || !text.contains("expected one of") {
+        return None;
+    }
+    let start = text.find("expected one of")? + "expected one of".len();
+    let expected = &text[start..start.saturating_add(256).min(text.len())];
+    let mut values = Vec::new();
+    let mut rest = expected;
+    while let Some(quote_index) = rest.find(['\'', '"', '`']) {
+        let quote = rest.as_bytes()[quote_index] as char;
+        rest = &rest[quote_index + 1..];
+        let Some(end) = rest.find(quote) else {
+            break;
+        };
+        let value = rest[..end].trim();
+        if !value.is_empty()
+            && value.len() <= 32
+            && value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+            && !values.iter().any(|existing| existing == value)
+        {
+            values.push(value.to_string());
+        }
+        rest = &rest[end + 1..];
+    }
+    (!values.is_empty()).then_some(values)
+}
+
+fn target_reasoning_efforts(target: &RouteTarget) -> Option<Vec<String>> {
+    let values = serde_json::from_str::<Vec<String>>(target.reasoning_efforts.as_deref()?).ok()?;
+    (!values.is_empty()).then_some(values)
+}
+
 pub(crate) fn is_command_code_target(target: &RouteTarget) -> bool {
     let base_url = target.base_url.to_ascii_lowercase();
     let prefix = target
@@ -704,6 +831,25 @@ pub(crate) async fn apply_upstream_compat(
         && let Some(compat_body) = strip_strict_tools(body)
     {
         *body = compat_body;
+    }
+
+    if let Some(supported) = target_reasoning_efforts(target) {
+        let changes = normalize_reasoning_effort(body, &supported);
+        if changes > 0 {
+            tracing::warn!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                supported = ?supported,
+                "mapped reasoning effort to a value supported by the upstream model"
+            );
+            log_usage_warning(
+                state,
+                request_id,
+                "Mapped the requested reasoning effort to a value supported by the upstream model.",
+            )
+            .await;
+        }
     }
 
     if is_command_code_target(target) {

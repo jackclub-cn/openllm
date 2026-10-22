@@ -4,6 +4,7 @@ export type ModelCapabilities = {
   input_limit?: number
   attachment?: boolean
   reasoning?: boolean
+  reasoning_efforts?: string[]
   tool_call?: boolean
   structured_output?: boolean
   temperature?: boolean

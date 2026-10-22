@@ -1,0 +1,3 @@
+# SQLx validates the exact migration bytes recorded in SQLite. Keep those bytes
+# identical on Windows, macOS, and Linux so databases remain portable.
+migrations/*.sql text eol=lf

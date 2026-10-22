@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha384};
 
 /// Prefix of a pre-migration backup file, used for pruning.
 pub(crate) const MIGRATION_BACKUP_PREFIX: &str = "openllm-pre-migration-";
@@ -42,6 +43,76 @@ pub(super) async fn applied_versions(pool: &SqlitePool) -> anyhow::Result<Vec<i6
             .fetch_all(pool)
             .await?,
     )
+}
+
+/// Normalizes migration checksums written by builds that checked out SQL files
+/// with Windows line endings.
+///
+/// Older Windows builds embedded CRLF migration bytes while Linux and macOS
+/// builds embedded LF. SQLx validates the exact bytes before applying a new
+/// migration, so a database could otherwise refuse a valid cross-platform
+/// upgrade. Only checksums matching the same SQL with either line ending are
+/// rewritten; a genuinely edited migration still fails validation.
+pub(crate) async fn normalize_legacy_migration_checksums(
+    pool: &SqlitePool,
+    migrator: &sqlx::migrate::Migrator,
+) -> anyhow::Result<usize> {
+    let table_exists: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = '_sqlx_migrations'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if table_exists.is_none() {
+        return Ok(0);
+    }
+
+    let rows = sqlx::query_as::<_, (i64, Vec<u8>)>(
+        "SELECT version, checksum FROM _sqlx_migrations WHERE success = 1",
+    )
+    .fetch_all(pool)
+    .await?;
+    let applied = rows
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut transaction = pool.begin().await?;
+    let mut normalized = 0;
+
+    for migration in migrator.iter() {
+        let Some(stored) = applied.get(&migration.version) else {
+            continue;
+        };
+        let lf_sql = migration.sql.replace("\r\n", "\n").replace('\r', "\n");
+        let crlf_sql = lf_sql.replace('\n', "\r\n");
+        let lf_checksum = Sha384::digest(lf_sql.as_bytes());
+        let crlf_checksum = Sha384::digest(crlf_sql.as_bytes());
+        if stored.as_slice() != lf_checksum.as_slice()
+            && stored.as_slice() != crlf_checksum.as_slice()
+        {
+            continue;
+        }
+        if stored.as_slice() == migration.checksum.as_ref() {
+            continue;
+        }
+        normalized += sqlx::query(
+            "UPDATE _sqlx_migrations SET checksum = ? \
+             WHERE version = ? AND checksum = ?",
+        )
+        .bind(migration.checksum.as_ref())
+        .bind(migration.version)
+        .bind(stored)
+        .execute(&mut *transaction)
+        .await?
+        .rows_affected() as usize;
+    }
+
+    transaction.commit().await?;
+    if normalized > 0 {
+        tracing::warn!(
+            migrations = normalized,
+            "normalized legacy line-ending migration checksums"
+        );
+    }
+    Ok(normalized)
 }
 
 /// Whether the database already holds anything worth protecting.

@@ -157,7 +157,12 @@ impl Database {
         let backup =
             crate::startup::backup_before_migrations(&pool, database_path.as_deref(), &migrator)
                 .await?;
-        if let Err(error) = migrator.run(&pool).await {
+        let migration_result =
+            match crate::startup::normalize_legacy_migration_checksums(&pool, &migrator).await {
+                Ok(_) => migrator.run(&pool).await.map_err(anyhow::Error::new),
+                Err(error) => Err(error),
+            };
+        if let Err(error) = migration_result {
             // Fail closed: never serve on a half-migrated schema. The lease is
             // released so a retry after the operator fixes the problem is not
             // blocked by this process's own row.
@@ -169,9 +174,7 @@ impl Database {
                 ),
                 None => "; the database was not changed".to_string(),
             };
-            return Err(
-                anyhow::Error::new(error).context(format!("database migration failed{hint}"))
-            );
+            return Err(error).context(format!("database migration failed{hint}"));
         }
 
         Ok(Self { pool, instance_id })
