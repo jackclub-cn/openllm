@@ -15,6 +15,7 @@ import {
   type FormInstance,
 } from 'antd'
 import type { GatewayRoute, Provider, RouteTarget } from '../../api'
+import { useFormCloseGuard } from '../../hooks/useFormCloseGuard'
 import { strategyLabels, type RouteFormValues } from './types'
 
 type RouteEditorModalProps = {
@@ -40,12 +41,13 @@ export default function RouteEditorModal({
   onCancel,
   onSave,
 }: RouteEditorModalProps) {
+  const requestClose = useFormCloseGuard(form, open, saving)
   const watchedTargets = Form.useWatch('targets', form)
   const [draggedTargetIndex, setDraggedTargetIndex] = useState<number>()
   const [dragOverTargetIndex, setDragOverTargetIndex] = useState<number>()
 
   const reorderTargets = (from: number, to: number) => {
-    if (from === to) return
+    if (saving || from === to) return
     const targets = [...((form.getFieldValue('targets') as RouteTarget[] | undefined) ?? [])]
     const [moved] = targets.splice(from, 1)
     if (!moved) return
@@ -60,13 +62,17 @@ export default function RouteEditorModal({
     <Modal
       title={editing ? '编辑路由' : '创建路由'}
       open={open}
-      onCancel={onCancel}
+      onCancel={() => requestClose(onCancel)}
       onOk={onSave}
       confirmLoading={saving}
+      cancelButtonProps={{ disabled: saving }}
+      closable={!saving}
+      keyboard={!saving}
+      mask={{ closable: !saving }}
       width={860}
       destroyOnHidden
     >
-      <Form form={form} layout="vertical">
+      <Form form={form} layout="vertical" disabled={saving}>
         <div className="form-grid">
           <Form.Item
             name="name"
@@ -205,7 +211,7 @@ export default function RouteEditorModal({
                     <span
                       aria-label="拖拽调整顺序"
                       className="target-drag-handle"
-                      draggable
+                      draggable={!saving}
                       role="button"
                       tabIndex={0}
                       onDragStart={(event) => {

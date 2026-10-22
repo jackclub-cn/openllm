@@ -95,8 +95,6 @@ export default function DatabaseStatusCard({
             <Tag>上游密钥 {formatCompact(stats.provider_api_keys)}</Tag>
             <Tag>路由 {formatCompact(stats.routes)}</Tag>
             <Tag>访问密钥 {formatCompact(stats.access_keys)}</Tag>
-            <Tag>Webhook {formatCompact(stats.webhooks)}</Tag>
-            <Tag>投递记录 {formatCompact(stats.webhook_deliveries)}</Tag>
             <Tag>审计日志 {formatCompact(stats.audit_logs)}</Tag>
             <Tag>请求日志 {formatCompact(stats.usage_logs)}</Tag>
             <Tag color={stats.in_flight_requests ? 'processing' : 'default'}>

@@ -206,7 +206,6 @@ async fn a_build_failure_releases_the_half_open_probe() {
 #[tokio::test]
 async fn provider_circuit_trip_counter_registers_hard_opens() {
     let state = circuit_state().await;
-    let mut circuit_events = state.circuit_events.subscribe();
     let failure = StatusCode::SERVICE_UNAVAILABLE;
 
     // Two failures sit below the default threshold of three.
@@ -238,14 +237,8 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         1,
         "crossing the threshold must register a trip"
     );
-    let opened = circuit_events
-        .try_recv()
-        .expect("crossing the threshold must publish a circuit event");
-    assert_eq!(opened.provider_id, 1);
-    assert_eq!(opened.state, "open");
-    assert_eq!(opened.reason, "failure_threshold");
-    assert_eq!(opened.failure_streak, 3);
-    assert!(opened.cooldown_seconds > 0);
+    assert_eq!(state.provider_failure_streak.lock().await.get(&1), Some(&3));
+    assert!(state.provider_cooldown.lock().await[&1] > Instant::now());
 
     // A further failure from a request that was already in flight when the
     // circuit opened must not extend the streak or move the cooldown deadline.
@@ -288,13 +281,8 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
 
     // Recovery resets the streak, so a fresh streak trips the circuit again.
     mark_provider_success(&state, 1).await;
-    let closed = circuit_events
-        .try_recv()
-        .expect("recovery must publish a circuit event");
-    assert_eq!(closed.provider_id, 1);
-    assert_eq!(closed.state, "closed");
-    assert_eq!(closed.reason, "successful_request");
-    assert_eq!(closed.failure_streak, 0);
+    assert!(!state.provider_failure_streak.lock().await.contains_key(&1));
+    assert!(!state.provider_cooldown.lock().await.contains_key(&1));
     for _ in 0..3 {
         mark_provider_error(&state, 1, Some(failure), None, None).await;
     }
@@ -309,14 +297,8 @@ async fn provider_circuit_trip_counter_registers_hard_opens() {
         2,
         "a fresh streak after recovery trips the circuit again"
     );
-    assert_eq!(
-        circuit_events
-            .try_recv()
-            .expect("the fresh streak must publish another event")
-            .state,
-        "open"
-    );
-    assert!(circuit_events.try_recv().is_err());
+    assert_eq!(state.provider_failure_streak.lock().await.get(&1), Some(&3));
+    assert!(state.provider_cooldown.lock().await[&1] > Instant::now());
 }
 
 #[tokio::test]

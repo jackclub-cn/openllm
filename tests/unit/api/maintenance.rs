@@ -34,8 +34,6 @@ async fn settings_expose_database_stats() {
     assert!(settings.database_stats.size_bytes > 0);
     assert_eq!(settings.database_stats.providers, 1);
     assert_eq!(settings.database_stats.provider_api_keys, 1);
-    assert_eq!(settings.database_stats.webhooks, 0);
-    assert_eq!(settings.database_stats.webhook_deliveries, 0);
     assert_eq!(settings.database_stats.audit_logs, 0);
     assert_eq!(settings.database_stats.in_flight_requests, 0);
 }

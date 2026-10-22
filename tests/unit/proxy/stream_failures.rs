@@ -61,7 +61,14 @@ async fn a_mid_stream_upstream_failure_cools_the_provider() {
         })
         .to_string(),
     );
-    let response = proxy_openai(State(state.clone()), HeaderMap::new(), uri, body).await;
+    let response = proxy_openai(
+        State(state.clone()),
+        Extension(GatewayAuth(None)),
+        HeaderMap::new(),
+        uri,
+        body,
+    )
+    .await;
     let status = response.status();
     if status != StatusCode::OK {
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)

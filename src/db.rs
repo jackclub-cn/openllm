@@ -116,6 +116,14 @@ impl Database {
             }
         };
 
+        let database_path = crate::startup::sqlite_file_path(&database_url);
+        if let Some(path) = database_path.as_deref() {
+            crate::secure_file::create_or_open_private(path)
+                .with_context(|| format!("failed to secure database file {}", path.display()))?;
+            crate::secure_file::set_private_permissions(path)
+                .with_context(|| format!("failed to secure database file {}", path.display()))?;
+        }
+
         let options =
             sqlite_connect_options(&database_url, Duration::from_secs(db_busy_timeout_secs()))?;
 
@@ -146,11 +154,6 @@ impl Database {
         }
 
         let migrator = sqlx::migrate!("./migrations");
-        let database_path = config
-            .database_url
-            .as_deref()
-            .map(crate::startup::sqlite_file_path)
-            .unwrap_or_else(|| Some(config.data_dir.join("openllm.db")));
         let backup =
             crate::startup::backup_before_migrations(&pool, database_path.as_deref(), &migrator)
                 .await?;

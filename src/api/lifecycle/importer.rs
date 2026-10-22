@@ -33,7 +33,14 @@ pub async fn import_config(
         run.providers(&document.providers).await;
         run.routes(&document.routes).await;
         run.pools(&document.provider_pools).await;
-        run.webhooks(&document.webhooks).await;
+        for webhook in &document.retired_webhooks {
+            run.record(
+                "webhook",
+                &webhook.name,
+                ACTION_SKIP,
+                "Webhook 功能已移除，此项不会导入。".to_string(),
+            );
+        }
     }
     for key in &document.gateway_keys {
         run.record(
@@ -126,19 +133,6 @@ pub(super) struct ProviderFacts {
     pub(super) key_channels: Vec<ProviderKeyChannel>,
 }
 
-/// A webhook as it currently exists, reduced to the fields the importer
-/// compares. The signing secret is loaded only when the document carries
-/// secrets; `kind` and `body_fields` are configuration and always compared.
-pub(super) struct WebhookFacts {
-    pub(super) url: String,
-    pub(super) enabled: bool,
-    pub(super) event_types: Vec<String>,
-    pub(super) headers: Value,
-    pub(super) kind: String,
-    pub(super) body_fields: Value,
-    pub(super) secret: Option<String>,
-}
-
 pub(super) struct ImportRun<'a> {
     pub(super) state: &'a AppState,
     pub(super) apply: bool,
@@ -153,7 +147,6 @@ pub(super) struct ImportRun<'a> {
     pub(super) api_keys: HashMap<String, Vec<i64>>,
     pub(super) routes: Vec<RouteLookup>,
     pub(super) pools: Vec<(i64, i64, String)>,
-    pub(super) webhooks: Vec<(i64, String, String)>,
 }
 
 impl<'a> ImportRun<'a> {
@@ -170,7 +163,6 @@ impl<'a> ImportRun<'a> {
             api_keys: HashMap::new(),
             routes: Vec::new(),
             pools: Vec::new(),
-            webhooks: Vec::new(),
         }
     }
 
@@ -215,11 +207,6 @@ impl<'a> ImportRun<'a> {
         )
         .fetch_all(&self.state.pool)
         .await?;
-        self.webhooks = sqlx::query_as::<_, (i64, String, String)>(
-            "SELECT id, name, url FROM webhooks ORDER BY id",
-        )
-        .fetch_all(&self.state.pool)
-        .await?;
         Ok(())
     }
 
@@ -256,8 +243,7 @@ impl<'a> ImportRun<'a> {
         }
         if applied {
             notes.push(
-                "导入逐项写入（设置→提供商→配额池→路由→Webhook），中途失败会保留已写入的部分。"
-                    .to_string(),
+                "导入逐项写入（设置→提供商→路由→配额池），中途失败会保留已写入的部分。".to_string(),
             );
         }
         ImportPlan {
@@ -281,4 +267,3 @@ mod pools;
 mod providers;
 mod routes;
 mod settings;
-mod webhooks;

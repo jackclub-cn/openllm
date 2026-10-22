@@ -1,6 +1,70 @@
 use super::*;
 
 #[tokio::test]
+async fn usage_page_nests_failed_attempts_before_final_outcome() {
+    let state = provider_key_test_state().await;
+    sqlx::query(
+        "INSERT INTO providers (id, name, provider_type, base_url)
+         VALUES (1, 'Provider', 'openai', 'https://example.com/v1')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_api_keys (id, provider_id, name, secret, enabled)
+         VALUES (11, 1, 'Primary', 'sk-primary', 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO usage_logs (
+             request_id, provider_id, provider_api_key_id, requested_model,
+             upstream_model, endpoint, status_code, success, in_flight
+         ) VALUES ('tree-api', 1, 11, 'model-a', 'model-a',
+                   '/v1/chat/completions', 200, 1, 0)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_traces (
+             request_id, strategy, candidates_json, attempt_count, fallback_count,
+             final_provider_id, final_provider_api_key_id, final_upstream_model,
+             final_status_code, success
+         ) VALUES ('tree-api', 'priority', '[]', 2, 1, 1, 11, 'model-a', 200, 1)",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO routing_attempts (
+             request_id, attempt_index, round, candidate_order,
+             provider_id, provider_api_key_id, upstream_model,
+             started_at, latency_ms, status_code, success, retryable, reason_code
+         ) VALUES
+             ('tree-api', 1, 0, 1, 1, 11, 'model-a',
+              '2026-10-16T00:00:00Z', 42, 502, 0, 1, 'upstream_unavailable'),
+             ('tree-api', 2, 0, 2, 1, 11, 'model-a',
+              '2026-10-16T00:00:01Z', 10, 200, 1, 0, 'upstream_success')",
+    )
+    .execute(&state.pool)
+    .await
+    .unwrap();
+
+    let query: UsageQuery = serde_json::from_value(json!({})).unwrap();
+    let Json(page) = list_usage(State(state), Query(query)).await.unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].children.len(), 1);
+    let attempt = &page.items[0].children[0];
+    assert_eq!(attempt.attempt_index, 1);
+    assert!(!attempt.success);
+    assert_eq!(attempt.status_code, Some(502));
+    assert_eq!(attempt.provider_name.as_deref(), Some("Provider"));
+    assert_eq!(attempt.provider_api_key_name.as_deref(), Some("Primary"));
+}
+
+#[tokio::test]
 async fn route_trace_api_exposes_candidates_and_attempts() {
     let state = provider_key_test_state().await;
     sqlx::query(

@@ -107,6 +107,7 @@ async fn gateway_errors_expose_the_request_id_header() {
 
     let response = proxy_openai(
         State(state.clone()),
+        Extension(GatewayAuth(None)),
         HeaderMap::new(),
         "/v1/chat/completions".parse().unwrap(),
         Bytes::from_static(b"{"),
@@ -123,6 +124,7 @@ async fn gateway_errors_expose_the_request_id_header() {
 
     let response = proxy_anthropic(
         State(state),
+        Extension(GatewayAuth(None)),
         HeaderMap::new(),
         "/v1/messages".parse().unwrap(),
         Bytes::from_static(b"{"),

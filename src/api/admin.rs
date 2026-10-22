@@ -1,5 +1,10 @@
 use super::*;
 
+mod access;
+mod events;
+pub use access::*;
+pub use events::*;
+
 pub async fn health() -> Json<Value> {
     Json(json!({
         "status": "ok",
@@ -227,28 +232,6 @@ pub(crate) async fn collect_status(state: &AppState) -> RuntimeStatus {
     }
 }
 
-pub async fn admin_auth(
-    State(state): State<AppState>,
-    request: Request,
-    next: Next,
-) -> AppResult<Response> {
-    if let Some(expected) = &state.admin_token {
-        let token = request
-            .headers()
-            .get("x-admin-token")
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| bearer_token(request.headers()));
-
-        if token != Some(expected.as_str()) {
-            return Err(AppError::Unauthorized(
-                "a valid admin token is required".to_string(),
-            ));
-        }
-    }
-
-    Ok(next.run(request).await)
-}
-
 pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<SettingsView>> {
     Ok(Json(SettingsView {
         admin_auth_enabled: state.admin_token.is_some(),
@@ -277,20 +260,16 @@ pub(super) async fn load_database_stats(state: &AppState) -> AppResult<DatabaseS
         provider_api_keys,
         routes,
         access_keys,
-        webhooks,
-        webhook_deliveries,
         audit_logs,
         usage_logs,
         in_flight_requests,
-    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64)>(
+    ) = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64, i64)>(
         "SELECT \
             (SELECT COUNT(*) FROM providers), \
             (SELECT COUNT(*) FROM provider_models), \
             (SELECT COUNT(*) FROM provider_api_keys), \
             (SELECT COUNT(*) FROM routes), \
             (SELECT COUNT(*) FROM api_keys), \
-            (SELECT COUNT(*) FROM webhooks), \
-            (SELECT COUNT(*) FROM webhook_deliveries), \
             (SELECT COUNT(*) FROM audit_logs), \
             (SELECT requests FROM usage_lifetime_stats WHERE id = 1) \
                 + (SELECT COUNT(*) FROM usage_logs WHERE in_flight = 1), \
@@ -307,8 +286,6 @@ pub(super) async fn load_database_stats(state: &AppState) -> AppResult<DatabaseS
         provider_api_keys,
         routes,
         access_keys,
-        webhooks,
-        webhook_deliveries,
         audit_logs,
         usage_logs,
         in_flight_requests,
@@ -618,73 +595,4 @@ fn normalize_resilience_settings(mut input: ResilienceSettings) -> AppResult<Res
             ResilienceSettings::default().stream_recovery_max_retries;
     }
     Ok(input)
-}
-
-pub async fn event_stream(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<AdminTokenQuery>,
-) -> Response {
-    if let Some(expected) = &state.admin_token {
-        let query_token = query.admin_token.as_deref();
-        let header_token = headers
-            .get("x-admin-token")
-            .and_then(|value| value.to_str().ok())
-            .or_else(|| bearer_token(&headers));
-        if query_token != Some(expected.as_str()) && header_token != Some(expected.as_str()) {
-            return AppError::Unauthorized("a valid admin token is required".to_string())
-                .into_response();
-        }
-    }
-    let mut usage_receiver = state.events.subscribe();
-    let mut activity_receiver = state.activity_events.subscribe();
-    let stream = async_stream::stream! {
-        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from_static(b"event: ready\ndata: {}\n\n"));
-        let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(20));
-        loop {
-            tokio::select! {
-                _ = heartbeat.tick() => {
-                    yield Ok(Bytes::from_static(b": keep-alive\n\n"));
-                }
-                event = usage_receiver.recv() => {
-                    match event {
-                        Ok(event) => {
-                            let payload = json!({
-                                "id": event.id,
-                                "request_id": event.request_id,
-                                "success": event.success,
-                                "streamed": event.streamed
-                            });
-                            yield Ok(Bytes::from(format!("event: usage\ndata: {payload}\n\n")));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-                event = activity_receiver.recv() => {
-                    match event {
-                        Ok(event) => {
-                            let payload = serde_json::to_string(&event).unwrap_or_else(|_| "{}".to_string());
-                            yield Ok(Bytes::from(format!("event: activity\ndata: {payload}\n\n")));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            yield Ok(Bytes::from_static(
-                                b"event: activity_resync\ndata: {}\n\n",
-                            ));
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            }
-        }
-    };
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "text/event-stream")
-        .header("cache-control", "no-cache")
-        .header("connection", "keep-alive")
-        .header("x-accel-buffering", "no")
-        .body(Body::from_stream(stream))
-        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }

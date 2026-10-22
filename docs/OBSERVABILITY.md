@@ -155,8 +155,7 @@ scrape_configs:
 
 | 指标 | 含义 |
 | --- | --- |
-| `openllm_providers{state}`、`openllm_provider_keys{state}`、`openllm_models{state}`、`openllm_routes{state}`、`openllm_api_keys{state}`、`openllm_webhooks{state}` | 各类配置对象按状态分组计数 |
-| `openllm_webhook_deliveries{state}` | Webhook 投递结果分组计数 |
+| `openllm_providers{state}`、`openllm_provider_keys{state}`、`openllm_models{state}`、`openllm_routes{state}`、`openllm_api_keys{state}` | 各类配置对象按状态分组计数 |
 | `openllm_audit_logs` | 审计日志条数 |
 | `openllm_db_pool_connections` / `openllm_db_pool_idle` / `openllm_db_pool_max_connections` | SQLite 连接池占用/空闲/上限 |
 | `openllm_database_size_bytes` / `openllm_database_free_bytes` | 数据库文件大小与可回收空间 |
@@ -239,16 +238,14 @@ x-request-id / x-openllm-request-id  响应头
       │
       ├─► GET /api/usage/{request_id}        单条请求明细（延迟、首字、Token、状态码、错误）
       ├─► GET /api/events  (SSE, event: usage) data.request_id   实时事件流
-      ├─► webhook 投递载荷的 request_id 字段   外部系统对账
       └─► GET /api/usage/export (CSV) 的 request_id 列           离线分析
 ```
 
 - 客户端侧：所有响应都带 `x-request-id` 头（同值的 `x-openllm-request-id` 也在），SSE 流式响应同样带；把它写进调用方日志即可与服务端对齐。
 - 服务端侧：控制台「请求记录」里点开某一条即是 `/api/usage/{request_id}` 的明细视图。
 - 事件侧：`/api/events` 的 `usage` 事件带 `request_id`、`success`、`streamed`，是「事件 → 请求」的连接点。
-- 外部侧：Webhook 投递记录与投递载荷都带 `request_id`，失败重试时可用它去 `/api/usage/{request_id}` 复查。
 
-需要注意：**审计日志（audit_logs）是配置变更史，不携带 `request_id`**。它按 `entity`/`entity_id`（provider / route / api_key / webhook / settings / database / usage）组织，回答的是「谁在什么时候改了什么」，与请求平面是两条独立的追溯线索。请求平面用 `request_id`，配置平面用 `entity_id`。
+需要注意：**审计日志（audit_logs）是配置变更史，不携带 `request_id`**。它按 `entity`/`entity_id`（provider / route / api_key / settings / database / usage）组织，回答的是「谁在什么时候改了什么」，与请求平面是两条独立的追溯线索。请求平面用 `request_id`，配置平面用 `entity_id`。
 
 典型闭环：`OpenLlmPoolDenials` 或 `OpenLlmProviderCircuitOpen` 报警 → 在控制台按时间/提供商筛请求记录 → 复制失败请求的 `request_id` → `/api/usage/{request_id}` 看到具体错误码与上游响应 → 对照 `/api/events` 确认是否成片失败。
 

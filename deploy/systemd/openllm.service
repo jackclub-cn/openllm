@@ -23,8 +23,11 @@ User=openllm
 Group=openllm
 EnvironmentFile=-/etc/openllm/openllm.env
 # StateDirectory gives /var/lib/openllm the right owner and mode, and systemd
-# keeps it across upgrades.
+# keeps it across upgrades. UMask protects SQLite sidecars and any operator
+# files created by the service from other local users.
 StateDirectory=openllm
+StateDirectoryMode=0700
+UMask=0077
 WorkingDirectory=/var/lib/openllm
 ExecStart=/usr/local/bin/openllm --bind 0.0.0.0:8080 --data-dir /var/lib/openllm
 

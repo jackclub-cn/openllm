@@ -1,5 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useEffectEvent, useRef, useState, type ReactNode } from 'react'
-import { getAdminToken } from './api'
+import { api } from './api'
 import type { ActivityEvent } from './api'
 
 export type UsageEvent = {
@@ -54,45 +54,62 @@ export function RealtimeProvider({
   })
 
   useEffect(() => {
-    const query = new URLSearchParams()
-    const token = getAdminToken()
-    if (token) query.set('admin_token', token)
-    const suffix = query.size ? `?${query}` : ''
-    const source = new EventSource(`/api/events${suffix}`)
+    let source: EventSource | undefined
+    let cancelled = false
     let retryTimer: number | undefined
-
-    source.addEventListener('open', () => {
-      setConnected(true)
-      attempts.current = 0
-    })
-    source.addEventListener('ready', () => emitActivity(null))
-    source.addEventListener('usage', (event) => {
-      try {
-        emit(JSON.parse((event as MessageEvent).data) as UsageEvent)
-      } catch {
-        // Ignore malformed frames and keep the stream alive.
-      }
-    })
-    source.addEventListener('activity', (event) => {
-      try {
-        emitActivity(JSON.parse((event as MessageEvent).data) as ActivityEvent)
-      } catch {
-        // Ignore malformed frames and keep the stream alive.
-      }
-    })
-    source.addEventListener('activity_resync', () => {
-      emitActivity(null)
-    })
-    source.addEventListener('error', () => {
+    const retry = () => {
+      if (cancelled) return
       setConnected(false)
-      source.close()
       const delay = Math.min(30_000, 2_000 * 2 ** Math.min(attempts.current, 4))
       attempts.current += 1
       retryTimer = window.setTimeout(() => setEpoch((value) => value + 1), delay)
-    })
+    }
+
+    const connect = async () => {
+      try {
+        const { ticket } = await api.post<{ ticket: string }>('/api/events/ticket')
+        if (cancelled) return
+        const query = new URLSearchParams({ ticket })
+        const current = new EventSource(`/api/events?${query}`)
+        source = current
+
+        current.addEventListener('open', () => {
+          setConnected(true)
+          attempts.current = 0
+        })
+        current.addEventListener('ready', () => emitActivity(null))
+        current.addEventListener('usage', (event) => {
+          try {
+            emit(JSON.parse((event as MessageEvent).data) as UsageEvent)
+          } catch {
+            // Ignore malformed frames and keep the stream alive.
+          }
+        })
+        current.addEventListener('activity', (event) => {
+          try {
+            emitActivity(JSON.parse((event as MessageEvent).data) as ActivityEvent)
+          } catch {
+            // Ignore malformed frames and keep the stream alive.
+          }
+        })
+        current.addEventListener('activity_resync', () => {
+          emitActivity(null)
+        })
+        current.addEventListener('error', () => {
+          current.close()
+          if (source === current) source = undefined
+          retry()
+        })
+      } catch {
+        retry()
+      }
+    }
+
+    void connect()
 
     return () => {
-      source.close()
+      cancelled = true
+      source?.close()
       if (retryTimer) window.clearTimeout(retryTimer)
     }
   }, [epoch, revision])

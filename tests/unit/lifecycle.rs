@@ -17,8 +17,6 @@ VALUES (1, 1, 'gpt-4o', 100, 0, 1);
 INSERT INTO provider_pools (provider_id, name, enabled, window_seconds, request_limit, token_limit, saturation_threshold_pct)
 VALUES (1, 'shared', 1, 60, 100, NULL, 50);
 INSERT INTO provider_pool_allocations (pool_id, api_key_id, weight_pct, policy) VALUES (1, 1, 100, 'hard');
-INSERT INTO webhooks (name, url, secret, event_types, headers, enabled)
-VALUES ('hook', 'https://hook.example/x', 'whsec-1', '["request.completed"]', '{}', 1);
 INSERT INTO settings (key, value)
 VALUES ('guardrails', '{"blocked_terms":["bad-word"],"max_prompt_tokens":null}'), ('usage_retention_days', '30');
 "#;

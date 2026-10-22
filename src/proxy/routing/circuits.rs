@@ -59,7 +59,7 @@ pub(in crate::proxy) async fn mark_provider_error(
         .remove(&provider_id)
         .is_some();
     let threshold = provider_open_threshold();
-    let (failures, opened, cooldown) = {
+    let (failures, opened) = {
         // Keep the streak and deadline under one lock so a burst of requests
         // that failed just before the circuit opened cannot keep extending the
         // same outage. A half-open probe is the one exception: its failure must
@@ -94,7 +94,7 @@ pub(in crate::proxy) async fn mark_provider_error(
             .entry(provider_id)
             .and_modify(|until| *until = (*until).max(deadline))
             .or_insert(deadline);
-        (*failures, opened, cooldown)
+        (*failures, opened)
     };
     if opened {
         *state
@@ -111,21 +111,6 @@ pub(in crate::proxy) async fn mark_provider_error(
     }
     // Mirror the trip so a restart still knows this provider is unhealthy.
     state.mark_provider_resilience_dirty(provider_id);
-    if opened {
-        let _ = state
-            .circuit_events
-            .send(crate::state::ProviderCircuitEvent {
-                provider_id,
-                state: "open",
-                reason: if probe_was_in_flight {
-                    "probe_failed"
-                } else {
-                    "failure_threshold"
-                },
-                failure_streak: failures,
-                cooldown_seconds: cooldown.as_secs(),
-            });
-    }
 }
 
 pub(in crate::proxy) async fn mark_target_error(
@@ -469,15 +454,6 @@ pub(super) async fn close_provider_circuit(
     let threshold = provider_open_threshold();
     if threshold > 0 && streak >= threshold {
         tracing::info!(provider_id, reason, "provider circuit closed");
-        let _ = state
-            .circuit_events
-            .send(crate::state::ProviderCircuitEvent {
-                provider_id,
-                state: "closed",
-                reason,
-                failure_streak: 0,
-                cooldown_seconds: 0,
-            });
     }
 }
 

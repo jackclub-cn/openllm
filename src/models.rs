@@ -13,7 +13,6 @@ mod quota;
 mod route;
 mod settings;
 mod usage;
-mod webhook;
 
 pub(crate) use api_key::*;
 pub(crate) use audit::*;
@@ -27,7 +26,6 @@ pub(crate) use quota::*;
 pub(crate) use route::*;
 pub(crate) use settings::*;
 pub(crate) use usage::*;
-pub(crate) use webhook::*;
 
 #[cfg(test)]
 #[path = "../tests/unit/models.rs"]

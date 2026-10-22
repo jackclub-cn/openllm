@@ -1267,7 +1267,6 @@ dependencies = [
  "clap",
  "futures-util",
  "globset",
- "hmac",
  "http",
  "httpdate",
  "mime_guess",

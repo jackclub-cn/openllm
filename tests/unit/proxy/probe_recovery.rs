@@ -183,7 +183,6 @@ async fn non_retryable_probe_response_closes_half_open_circuit() {
         .lock()
         .await
         .insert(1, Instant::now() - Duration::from_secs(1));
-    let mut circuit_events = state.circuit_events.subscribe();
 
     let body = Bytes::from(
         json!({
@@ -205,11 +204,7 @@ async fn non_retryable_probe_response_closes_half_open_circuit() {
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert!(state.provider_probe.lock().await.is_empty());
     assert!(!state.provider_failure_streak.lock().await.contains_key(&1));
-    let closed = circuit_events
-        .try_recv()
-        .expect("a reachable probe response must publish a circuit recovery event");
-    assert_eq!(closed.state, "closed");
-    assert_eq!(closed.reason, "reachable_response");
+    assert!(!state.provider_cooldown.lock().await.contains_key(&1));
 
     let response = proxy_openai_inner(
         &state,

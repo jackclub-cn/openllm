@@ -13,15 +13,10 @@ async fn persisted_provider_circuit_survives_a_restart() {
     assert_eq!(count_rows(&state, "provider_circuit_state").await, 1);
 
     let restarted = AppState::new(state.pool.clone(), None);
-    let mut events = restarted.circuit_events.subscribe();
     assert_eq!(
         crate::resilience_state::restore(&restarted).await.unwrap(),
         1,
         "the provider circuit must be restored"
-    );
-    assert!(
-        events.try_recv().is_err(),
-        "restoring state is not a circuit transition and must not alert"
     );
     assert_eq!(
         restarted

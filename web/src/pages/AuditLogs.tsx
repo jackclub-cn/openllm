@@ -27,7 +27,6 @@ const entityLabels: Record<string, string> = {
   provider: '提供商',
   route: '路由',
   api_key: '访问密钥',
-  webhook: 'Webhook',
   settings: '设置',
   database: '数据库',
   usage: '请求日志',

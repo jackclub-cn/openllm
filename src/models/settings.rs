@@ -18,8 +18,6 @@ pub struct DatabaseStats {
     pub provider_api_keys: i64,
     pub routes: i64,
     pub access_keys: i64,
-    pub webhooks: i64,
-    pub webhook_deliveries: i64,
     pub audit_logs: i64,
     pub usage_logs: i64,
     pub in_flight_requests: i64,
@@ -196,9 +194,4 @@ impl Default for ResilienceSettings {
             retry_max_backoff_ms: default_retry_max_backoff_ms(),
         }
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct AdminTokenQuery {
-    pub admin_token: Option<String>,
 }

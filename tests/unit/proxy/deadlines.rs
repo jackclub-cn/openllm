@@ -67,6 +67,7 @@ async fn admission_bounds_a_hanging_request_body() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     state.body_read_timeout = Some(Duration::from_millis(80));
     let router = crate::build_router(state);

@@ -17,7 +17,7 @@ pub struct ConfigDocument {
     pub openllm_config_version: i64,
     pub exported_at: String,
     pub gateway_version: String,
-    /// Whether upstream credentials and webhook secrets are in this file.
+    /// Whether upstream credentials are in this file.
     pub secrets_included: bool,
     #[serde(default)]
     pub notes: Vec<String>,
@@ -29,8 +29,9 @@ pub struct ConfigDocument {
     pub routes: Vec<ConfigRoute>,
     #[serde(default)]
     pub provider_pools: Vec<ConfigPool>,
-    #[serde(default)]
-    pub webhooks: Vec<ConfigWebhook>,
+    /// Read legacy documents without restoring the retired integration.
+    #[serde(default, rename = "webhooks", skip_serializing)]
+    pub retired_webhooks: Vec<RetiredWebhook>,
     /// Informational only. Gateway keys cannot be imported because the gateway
     /// stores a hash, never the key itself.
     #[serde(default)]
@@ -188,36 +189,10 @@ pub struct ConfigPoolAllocation {
     pub policy: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ConfigWebhook {
+#[derive(Debug, Deserialize)]
+pub struct RetiredWebhook {
+    #[serde(default)]
     pub name: String,
-    pub url: String,
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    /// Body shape the receiver expects; `generic` keeps the gateway envelope.
-    #[serde(default = "default_webhook_kind")]
-    pub kind: String,
-    /// Extra static fields merged into a rendered channel body (a Telegram
-    /// `chat_id`, a DingTalk mention list).
-    #[serde(default = "empty_json_object")]
-    pub body_fields: serde_json::Value,
-    #[serde(default)]
-    pub event_types: Vec<String>,
-    #[serde(default)]
-    pub headers: serde_json::Value,
-    #[serde(default)]
-    pub secret_set: bool,
-    /// Only present when secrets were exported.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub secret: Option<String>,
-}
-
-fn default_webhook_kind() -> String {
-    super::WEBHOOK_DEFAULT_CHANNEL_KIND.to_string()
-}
-
-fn empty_json_object() -> serde_json::Value {
-    serde_json::Value::Object(serde_json::Map::new())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -317,7 +292,6 @@ pub struct DatabaseFileReport {
     pub providers: i64,
     pub routes: i64,
     pub api_keys: i64,
-    pub webhooks: i64,
     pub provider_pools: i64,
     pub problems: Vec<String>,
 }

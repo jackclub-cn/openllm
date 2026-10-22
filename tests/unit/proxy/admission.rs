@@ -1,5 +1,47 @@
 use super::*;
 
+#[tokio::test]
+async fn invalid_gateway_key_is_rejected_before_the_body_is_polled() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO api_keys (name, key_prefix, key_suffix, key_hash, enabled) \
+         VALUES ('test', 'sk-test', 'test', ?, 1)",
+    )
+    .bind(hash_secret("sk-valid"))
+    .execute(&pool)
+    .await
+    .unwrap();
+    let router = crate::build_router(AppState::new(pool, None));
+    let polled = Arc::new(AtomicBool::new(false));
+    let body_polled = polled.clone();
+    let body = Body::from_stream(futures_util::stream::once(async move {
+        body_polled.store(true, Ordering::SeqCst);
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(b"{}"))
+    }));
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri(OPENAI_CHAT_COMPLETIONS)
+        .header("content-type", "application/json")
+        .header("authorization", "Bearer sk-invalid")
+        .body(body)
+        .unwrap();
+
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(
+        !polled.load(Ordering::SeqCst),
+        "invalid credentials must not trigger a request-body read"
+    );
+}
+
 #[test]
 fn overloaded_response_is_a_retryable_429_with_limit_headers() {
     let response = overloaded_response(4, false);
@@ -193,6 +235,7 @@ async fn admission_rejects_before_reading_the_body() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     // Zero permits: every request is over the cap.
     state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
@@ -225,6 +268,7 @@ async fn admission_uses_the_anthropic_envelope_for_message_routes() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     state.request_capacity = Some(std::sync::Arc::new(tokio::sync::Semaphore::new(0)));
     state.request_capacity_limit = 2;
@@ -299,6 +343,7 @@ async fn admission_sheds_bodies_over_the_inflight_byte_budget() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     let budget = std::sync::Arc::new(RequestByteBudget::new(16));
     state.inflight_request_bytes = Some(budget.clone());
@@ -427,6 +472,7 @@ async fn admission_wait_lets_a_request_through_once_a_slot_frees() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
     state.request_capacity = Some(semaphore.clone());

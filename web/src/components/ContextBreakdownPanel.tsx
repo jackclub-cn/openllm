@@ -98,7 +98,13 @@ export default function ContextBreakdownPanel({
         columns={[
           { title: '分类', dataIndex: 'key', render: (key: string) => categoryLabels[key] || key },
           { title: '条目', dataIndex: 'items', render: (value?: number) => value ?? '-' },
-          { title: 'Token', dataIndex: 'tokens', render: (value: number) => formatExact(value) },
+          {
+            title: 'Token',
+            dataIndex: 'tokens',
+            render: (value: number) => (
+              <Tooltip title={formatExact(value)}>{formatCompact(value)}</Tooltip>
+            ),
+          },
         ]}
       />
     </Space>

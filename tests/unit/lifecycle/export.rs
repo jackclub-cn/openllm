@@ -13,7 +13,7 @@ async fn a_masked_export_documents_credentials_without_carrying_them() {
     assert_eq!(document.gateway_version, env!("CARGO_PKG_VERSION"));
 
     let serialized = serde_json::to_string(&document).unwrap();
-    for secret in ["sk-alpha-secret", "sk-alpha-backup", "whsec-1"] {
+    for secret in ["sk-alpha-secret", "sk-alpha-backup"] {
         assert!(
             !serialized.contains(secret),
             "the masked document must not contain {secret}"
@@ -32,8 +32,6 @@ async fn a_masked_export_documents_credentials_without_carrying_them() {
             .iter()
             .all(|key| key.api_key.is_none())
     );
-    assert!(document.webhooks[0].secret_set);
-    assert_eq!(document.webhooks[0].secret, None);
     assert!(
         document.notes.iter().any(|note| note.contains("掩码")),
         "the document should explain that credentials are masked: {:?}",
@@ -76,8 +74,6 @@ async fn the_export_carries_everything_needed_to_rebuild_the_configuration() {
     assert_eq!(document.routes[0].targets[0].upstream_model, "gpt-4o");
     assert_eq!(document.provider_pools.len(), 1);
     assert_eq!(document.provider_pools[0].allocations[0].api_key, "caller");
-    assert_eq!(document.webhooks.len(), 1);
-    assert_eq!(document.webhooks[0].secret.as_deref(), Some("whsec-1"));
     assert_eq!(
         document.settings.usage_retention_days,
         Some(30),
@@ -96,4 +92,26 @@ async fn the_export_carries_everything_needed_to_rebuild_the_configuration() {
         "the document must say that gateway keys cannot be restored: {:?}",
         document.notes
     );
+}
+
+#[tokio::test]
+async fn retired_webhook_credentials_are_never_exported() {
+    let state = seeded_state().await;
+    exec(
+        &state,
+        "INSERT INTO webhooks (name, url, secret, headers) \
+         VALUES ('legacy-hook', 'https://hook.example/x', 'whsec-legacy', \
+                 '{\"Authorization\":\"Bearer legacy-header-secret\"}')",
+    )
+    .await;
+
+    for include_secrets in [false, true] {
+        let document = export(&state, include_secrets).await;
+        let serialized = serde_json::to_value(&document).unwrap();
+        assert!(serialized.get("webhooks").is_none());
+        let text = serialized.to_string();
+        assert!(!text.contains("whsec-legacy"));
+        assert!(!text.contains("legacy-header-secret"));
+        assert!(!text.contains("https://hook.example/x"));
+    }
 }

@@ -8,6 +8,23 @@ export type RequestPerformance = {
   attempts_truncated: boolean
 }
 
+export type UsageAttempt = {
+  request_id: string
+  attempt_index: number
+  round: number
+  provider_id?: number | null
+  provider_name?: string | null
+  provider_api_key_id?: number | null
+  provider_api_key_name?: string | null
+  upstream_model?: string | null
+  started_at: string
+  latency_ms: number
+  status_code?: number | null
+  success: boolean
+  retryable: boolean
+  reason_code: string
+}
+
 export type UsageLog = {
   id: number
   request_id: string
@@ -45,6 +62,7 @@ export type UsageLog = {
   cache_usage_reported?: boolean | null
   performance?: RequestPerformance | null
   warning_message?: string
+  children?: UsageAttempt[]
   created_at: string
 }
 

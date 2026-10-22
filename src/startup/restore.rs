@@ -90,6 +90,8 @@ pub(crate) async fn restore_backup(
             staging.display()
         )
     })?;
+    crate::secure_file::set_private_permissions(&staging)
+        .with_context(|| format!("failed to secure {}", staging.display()))?;
 
     // Set the current database aside *with* its WAL sidecars before the restore
     // lands. Deleting the sidecars first would lose committed-but-not-yet-

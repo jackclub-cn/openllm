@@ -43,13 +43,3 @@ pub(crate) struct ClearedCooldowns {
     pub(crate) provider_keys: usize,
     pub(crate) sinks: usize,
 }
-
-/// One provider circuit transition, delivered to subscribed webhooks.
-#[derive(Debug, Clone)]
-pub struct ProviderCircuitEvent {
-    pub provider_id: i64,
-    pub state: &'static str,
-    pub reason: &'static str,
-    pub failure_streak: u32,
-    pub cooldown_seconds: u64,
-}

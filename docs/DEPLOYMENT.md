@@ -13,7 +13,7 @@
 | 阶段 | 控制台 | 命令行 / 接口 | 文档 |
 | --- | --- | --- | --- |
 | 部署 | — | `docker compose up -d`、systemd 单元 | 本文第 1–3 节；`deploy/` |
-| 观测 | 仪表盘、请求日志、Webhook | `GET /metrics`、`GET /api/status` | [OBSERVABILITY.md](OBSERVABILITY.md)、README「运维路径」一节 |
+| 观测 | 仪表盘、请求日志、Prometheus 告警 | `GET /metrics`、`GET /api/status` | [OBSERVABILITY.md](OBSERVABILITY.md)、README「运维路径」一节 |
 | 排障 | 诊断、设置（冷却管理） | `GET /api/diagnostics/self-check`、`GET /api/diagnostics/snapshot`、`GET /api/resilience/cooldowns`、`POST /api/routes/diagnose` | 本文第 7 节 |
 | 升级与回滚 | 运维 | `openllm --check-migrations`、`--backup`、`--list-backups`、`--restore-backup`、`GET /api/maintenance/*`、`GET /api/config/export` | 本文第 4–5 节 |
 
@@ -62,11 +62,14 @@ systemctl status openllm --no-pager
 curl -fsS http://127.0.0.1:8080/api/ready
 ```
 
-单元文件里三处与可用性直接相关：
+单元文件里四处与可用性和本地数据安全直接相关：
 
 - `KillSignal=SIGTERM` 走正常的排空路径（`SIGKILL` 不会排空，等于丢在途请求）；
 - `TimeoutStopSec=90` 高于默认的 30 秒排空预算，避免 systemd 在排空中途强杀；
 - `StateDirectory=openllm` + `ReadWritePaths=/var/lib/openllm` + `ProtectSystem=strict`，让服务以非 root 身份只写自己的数据目录。
+- `StateDirectoryMode=0700` + `UMask=0077` 限制数据目录、SQLite 文件和备份只对服务用户可读；网关自身也会把数据库、备份及导出文件显式收紧为 `0600`。
+
+管理 API 默认只接受同源浏览器请求。若控制台与网关确实跨域部署，使用精确匹配的 `OPENLLM_CORS_ORIGINS` 白名单（如 `https://console.example.com`），不要配置通配符。监听非回环地址时必须设置 `OPENLLM_ADMIN_TOKEN`，否则进程拒绝启动。
 
 `systemctl reload` 不受支持：网关没有可重载的配置文件（设置存在数据库与环境变量里），改动环境变量后需要 `systemctl restart openllm`。
 

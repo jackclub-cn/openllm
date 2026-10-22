@@ -138,7 +138,6 @@ export default function BackupRecoveryCard({
                   <Descriptions.Item label="提供商">{report.providers}</Descriptions.Item>
                   <Descriptions.Item label="路由">{report.routes}</Descriptions.Item>
                   <Descriptions.Item label="API Key">{report.api_keys}</Descriptions.Item>
-                  <Descriptions.Item label="Webhook">{report.webhooks}</Descriptions.Item>
                   <Descriptions.Item label="配额池">{report.provider_pools}</Descriptions.Item>
                 </Descriptions>
                 {report.missing_tables.length > 0 && (

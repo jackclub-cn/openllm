@@ -203,7 +203,14 @@ async fn all_rate_limited_targets_surface_429_to_the_client() {
         })
         .to_string(),
     );
-    let response = proxy_openai(State(state), HeaderMap::new(), uri, body).await;
+    let response = proxy_openai(
+        State(state),
+        Extension(GatewayAuth(None)),
+        HeaderMap::new(),
+        uri,
+        body,
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(

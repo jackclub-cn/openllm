@@ -30,6 +30,7 @@ async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
         .connect("sqlite::memory:")
         .await
         .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
     let mut state = AppState::new(pool, None);
     state.memory_pressure = Some(std::sync::Arc::new(MemoryPressure::with_usage(
         1_000, 0.9, 950,

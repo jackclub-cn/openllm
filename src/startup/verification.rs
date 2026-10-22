@@ -8,7 +8,6 @@ pub(crate) const REQUIRED_TABLES: &[&str] = &[
     "providers",
     "route_targets",
     "routes",
-    "webhooks",
 ];
 
 /// Open a database file read-only and report what is inside it.
@@ -50,7 +49,6 @@ pub(crate) async fn verify_database_file(
         providers: 0,
         routes: 0,
         api_keys: 0,
-        webhooks: 0,
         provider_pools: 0,
         problems: Vec::new(),
     };
@@ -90,7 +88,6 @@ pub(crate) async fn verify_database_file(
             report.providers = table_count(&pool, "providers").await;
             report.routes = table_count(&pool, "routes").await;
             report.api_keys = table_count(&pool, "api_keys").await;
-            report.webhooks = table_count(&pool, "webhooks").await;
             report.provider_pools = table_count(&pool, "provider_pools").await;
             pool.close().await;
         }

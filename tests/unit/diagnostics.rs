@@ -102,6 +102,7 @@ async fn self_check_reports_structured_items() {
         report.counts.pass + report.counts.warn + report.counts.fail,
         report.checks.len(),
     );
+    assert!(report.checks.iter().all(|check| check.id != "webhooks"));
 
     let mut ids = std::collections::HashSet::new();
     for check in &report.checks {

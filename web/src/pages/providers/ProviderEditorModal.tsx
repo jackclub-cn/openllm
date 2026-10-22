@@ -14,6 +14,7 @@ import {
 } from 'antd'
 import type { Provider } from '../../api'
 import { providerPresets } from '../../providerPresets'
+import { useFormCloseGuard } from '../../hooks/useFormCloseGuard'
 import { providerLabels, type ProviderForm } from './types'
 
 type ProviderEditorModalProps = {
@@ -39,17 +40,23 @@ export default function ProviderEditorModal({
   onSave,
   onChangeTemplate,
 }: ProviderEditorModalProps) {
+  const requestClose = useFormCloseGuard(form, open, saving)
+
   return (
     <Modal
       title={editing ? '编辑提供商' : '添加提供商'}
       open={open}
-      onCancel={onCancel}
+      onCancel={() => requestClose(onCancel)}
       onOk={onSave}
       confirmLoading={saving}
+      cancelButtonProps={{ disabled: saving }}
+      closable={!saving}
+      keyboard={!saving}
+      mask={{ closable: !saving }}
       width={680}
       destroyOnHidden
     >
-      <Form form={form} layout="vertical" className="modal-form">
+      <Form form={form} layout="vertical" className="modal-form" disabled={saving}>
         {!editing && selectedPreset && (
           <div className="provider-template-selected">
             <Space>
@@ -61,7 +68,7 @@ export default function ProviderEditorModal({
                 </div>
               </div>
             </Space>
-            <Button onClick={onChangeTemplate}>更换模板</Button>
+            <Button onClick={() => requestClose(onChangeTemplate)}>更换模板</Button>
           </div>
         )}
         <div className="form-grid">

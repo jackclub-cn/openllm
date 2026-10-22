@@ -38,7 +38,6 @@ mod providers;
 mod resilience;
 mod routes;
 mod usage;
-mod webhooks;
 
 pub use activity::*;
 pub use admin::*;
@@ -54,7 +53,6 @@ pub(crate) use providers::*;
 pub use resilience::*;
 pub use routes::*;
 pub use usage::*;
-pub use webhooks::*;
 
 #[cfg(test)]
 #[path = "../tests/unit/api.rs"]

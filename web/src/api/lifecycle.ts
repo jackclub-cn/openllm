@@ -42,7 +42,6 @@ export type ConfigDocument = {
   providers: { name: string }[]
   routes: { name: string }[]
   provider_pools: { name: string }[]
-  webhooks: { name: string }[]
   gateway_keys: { name: string }[]
   settings: Record<string, unknown>
 }
@@ -67,7 +66,6 @@ export type DatabaseFileReport = {
   providers: number
   routes: number
   api_keys: number
-  webhooks: number
   provider_pools: number
   problems: string[]
 }

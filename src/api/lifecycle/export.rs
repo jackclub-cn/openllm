@@ -25,17 +25,13 @@ pub(crate) async fn build_config_document(
 ) -> AppResult<ConfigDocument> {
     let mut notes = vec![
         "网关 API Key 只保存哈希，导出文件仅包含名称与限额，导入时按“跳过”处理。".to_string(),
-        "用量、审计与 Webhook 投递历史属于运行时数据，不在导出范围内。".to_string(),
+        "用量与审计历史属于运行时数据，不在导出范围内。".to_string(),
         "并发、内存、超时等上限来自环境变量，不在导出范围内。".to_string(),
     ];
     if include_secrets {
-        notes.push(
-            "该文件包含明文上游凭据与 Webhook 签名，请按密钥管理并限制访问权限。".to_string(),
-        );
+        notes.push("该文件包含明文上游凭据，请按密钥管理并限制访问权限。".to_string());
     } else {
-        notes.push(
-            "上游凭据、Webhook 签名与凭据类请求头已掩码为 ***；导入时不会被覆盖。".to_string(),
-        );
+        notes.push("上游凭据与凭据类请求头已掩码为 ***；导入时不会被覆盖。".to_string());
     }
 
     let settings = ConfigSettings {
@@ -321,58 +317,6 @@ pub(crate) async fn build_config_document(
         )
         .collect();
 
-    let mut webhook_secrets = HashMap::<i64, String>::new();
-    let mut webhook_headers = HashMap::<i64, String>::new();
-    for (id, secret, headers) in sqlx::query_as::<_, (i64, Option<String>, String)>(
-        "SELECT id, secret, headers FROM webhooks ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await?
-    {
-        if let Some(secret) = secret.filter(|secret| !secret.is_empty()) {
-            webhook_secrets.insert(id, secret);
-        }
-        webhook_headers.insert(id, headers);
-    }
-
-    let webhooks = sqlx::query_as::<_, (i64, String, String, String, String, String, i64)>(
-        "SELECT id, name, url, event_types, kind, body_fields, enabled \
-         FROM webhooks ORDER BY id",
-    )
-    .fetch_all(&state.pool)
-    .await?
-    .into_iter()
-    .map(|(id, name, url, event_types, kind, body_fields, enabled)| {
-        let headers = webhook_headers.get(&id).cloned().unwrap_or_default();
-        let headers = parse_json_or_empty(&headers);
-        ConfigWebhook {
-            name,
-            url,
-            enabled: enabled != 0,
-            kind,
-            // Destination parameters such as a Telegram chat id are
-            // configuration, not credentials, so they travel with the
-            // document; the signing secret and credential-bearing headers
-            // keep the existing masking rules.
-            body_fields: parse_json_or_empty(&body_fields),
-            event_types: parse_string_list(&event_types),
-            headers: if include_secrets {
-                headers.clone()
-            } else {
-                redact_headers(&headers)
-            },
-            secret_set: webhook_secrets.contains_key(&id),
-            // Masked by omission: a `***` placeholder would be applied by an
-            // import if the operator ticked "apply", replacing the signature.
-            secret: if include_secrets {
-                webhook_secrets.get(&id).cloned()
-            } else {
-                None
-            },
-        }
-    })
-    .collect();
-
     let gateway_keys = sqlx::query_as::<
         _,
         (
@@ -426,7 +370,7 @@ pub(crate) async fn build_config_document(
         providers,
         routes,
         provider_pools,
-        webhooks,
+        retired_webhooks: Vec::new(),
         gateway_keys,
     })
 }

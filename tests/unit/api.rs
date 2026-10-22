@@ -180,3 +180,9 @@ mod runtime;
 
 #[path = "api/activity.rs"]
 mod activity;
+
+#[path = "api/events.rs"]
+mod events;
+
+#[path = "api/retired_integrations.rs"]
+mod retired_integrations;

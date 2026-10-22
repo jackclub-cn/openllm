@@ -10,6 +10,12 @@ async fn a_backup_is_created_listed_verified_and_still_restorable() {
     let (state, database) = file_state(directory.path()).await;
     seed_gateway_key(&state, "caller").await;
     exec(&state, SEED_SQL).await;
+    exec(
+        &state,
+        "INSERT INTO webhooks (name, url, secret) \
+         VALUES ('legacy-hook', 'https://hook.example/x', 'whsec-preserved')",
+    )
+    .await;
 
     let (status, Json(info)) = create_backup(State(state.clone())).await.unwrap();
     assert_eq!(status, StatusCode::CREATED);
@@ -46,7 +52,6 @@ async fn a_backup_is_created_listed_verified_and_still_restorable() {
     assert!(report.schema_version > 0);
     assert_eq!(report.providers, 1);
     assert_eq!(report.routes, 1);
-    assert_eq!(report.webhooks, 1);
     assert_eq!(report.provider_pools, 1);
     assert_eq!(report.file, info.path);
 
@@ -64,6 +69,12 @@ async fn a_backup_is_created_listed_verified_and_still_restorable() {
         .await
         .unwrap();
     assert_eq!(name, "alpha");
+    let legacy_secret: String =
+        sqlx::query_scalar("SELECT secret FROM webhooks WHERE name = 'legacy-hook'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy_secret, "whsec-preserved");
     pool.close().await;
 }
 

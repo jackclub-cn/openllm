@@ -7,6 +7,7 @@
     "check:structure": "node ../scripts/check-code-structure.mjs",
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "test": "node --test tests/*.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

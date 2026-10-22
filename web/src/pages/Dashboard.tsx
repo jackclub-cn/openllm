@@ -38,9 +38,12 @@ export default function Dashboard() {
   const loadOverview = useCallback(async () => {
     try {
       const offset = -new Date().getTimezoneOffset()
+      const today = dayjs().startOf('day')
       const params = new URLSearchParams({
         tz_offset_minutes: String(offset),
         include_session_metrics: 'false',
+        from: today.toISOString(),
+        to: today.add(1, 'day').toISOString(),
       })
       setData(await api.get<Overview>(`/api/overview?${params}`))
       setError('')
@@ -119,7 +122,7 @@ export default function Dashboard() {
     <>
       <PageHeader
         title="运行概览"
-        description="网关生命周期累计统计与最近 60 秒请求"
+        description="今日请求统计、运行状态与最近请求"
         extra={
           <>
             <Button

@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use chrono::{Timelike, Utc};
@@ -52,7 +52,10 @@ use guardrails::*;
 pub(crate) use models_api::*;
 pub(crate) use openai_api::*;
 use routing::*;
-pub(crate) use routing::{clear_target_sinks_for_route, diagnose_route, diagnose_route_for_key};
+pub(crate) use routing::{
+    clear_target_sinks_for_route, diagnose_route, diagnose_route_for_key,
+    refresh_runtime_target_p95,
+};
 pub(crate) use session::*;
 use translation::*;
 pub(crate) use upstream::*;

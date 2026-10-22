@@ -509,15 +509,14 @@
       "id": 46,
       "type": "timeseries",
       "title": "Configured inventory",
-      "description": "Providers, models, routes, api keys and webhooks by state.",
+      "description": "Providers, models, routes and api keys by state.",
       "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 48 },
       "targets": [
         { "refId": "A", "expr": "sum(openllm_providers{instance=~\"$instance\"})", "legendFormat": "providers" },
         { "refId": "B", "expr": "sum(openllm_models{instance=~\"$instance\"})", "legendFormat": "models" },
         { "refId": "C", "expr": "sum(openllm_routes{instance=~\"$instance\"})", "legendFormat": "routes" },
-        { "refId": "D", "expr": "sum(openllm_api_keys{instance=~\"$instance\"})", "legendFormat": "api keys" },
-        { "refId": "E", "expr": "sum(openllm_webhooks{instance=~\"$instance\"})", "legendFormat": "webhooks" }
+        { "refId": "D", "expr": "sum(openllm_api_keys{instance=~\"$instance\"})", "legendFormat": "api keys" }
       ],
       "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] }
     }

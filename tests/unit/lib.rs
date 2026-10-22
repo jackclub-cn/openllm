@@ -132,6 +132,59 @@ async fn sqlite_memory_settings_are_bounded() {
 }
 
 #[test]
+fn serving_off_loopback_requires_an_admin_token() {
+    let config = |bind: &str, admin_token: Option<&str>| crate::Config {
+        bind: bind.parse().unwrap(),
+        data_dir: PathBuf::from("data"),
+        database_url: None,
+        admin_token: admin_token.map(ToOwned::to_owned),
+    };
+
+    assert!(validate_runtime_security(&config("127.0.0.1:8080", None)).is_ok());
+    assert!(
+        validate_runtime_security(&config("0.0.0.0:8080", None)).is_err(),
+        "a non-loopback listener without a token exposes an open admin API"
+    );
+    assert!(validate_runtime_security(&config("0.0.0.0:8080", Some("secret"))).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_exports_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("snapshot.json");
+    crate::secure_file::write_private(&path, b"{}").unwrap();
+    let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sqlite_database_file_is_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let data_dir = directory.path().join("data");
+    let database = crate::db::Database::connect(&crate::Config {
+        bind: "127.0.0.1:8080".parse().unwrap(),
+        data_dir: data_dir.clone(),
+        database_url: None,
+        admin_token: None,
+    })
+    .await
+    .unwrap();
+    let mode = std::fs::metadata(data_dir.join("openllm.db"))
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o600);
+    database.pool.close().await;
+}
+
+#[test]
 fn database_timeout_parsing_keeps_a_positive_default() {
     use crate::db::parse_db_timeout_secs;
     assert_eq!(parse_db_timeout_secs(None, 15), 15);
@@ -145,8 +198,8 @@ fn database_timeout_parsing_keeps_a_positive_default() {
     assert_eq!(parse_db_timeout_secs(Some("30"), 15), 30);
 }
 
-/// A panicking background worker must come back: maintenance and webhook
-/// delivery are spawned once, so an unsupervised panic would silently disable
+/// A panicking background worker must come back: maintenance and scheduled
+/// refreshes are spawned once, so an unsupervised panic would silently disable
 /// them for the rest of the process's life.
 #[tokio::test]
 async fn supervised_worker_restarts_after_a_panic() {

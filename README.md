@@ -18,17 +18,14 @@ OpenLLM Gateway 是一个自托管的 LLM 网关，提供多提供商聚合、�
 默认监听 `http://127.0.0.1:8080`，数据保存在 `./data/openllm.db`。首次打开控制台后，按“提供商 → 模型 → 路由 → 访问密钥”的顺序配置。
 
 ```powershell
-# 自定义监听地址和数据目录
-.\openllm-windows.exe --bind 0.0.0.0:8080 --data-dir D:\openllm-data
-
-# 也可以使用环境变量
+# 自定义监听地址、数据目录和管理令牌
 $env:OPENLLM_BIND = "0.0.0.0:8080"
 $env:OPENLLM_DATA_DIR = "D:\openllm-data"
 $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 .\openllm-windows.exe
 ```
 
-> 未设置 `OPENLLM_ADMIN_TOKEN` 时管理接口默认开放，仅适合本机。对公网或局域网提供服务时，应设置管理令牌并放在反向代理或私网之后。
+> 未设置 `OPENLLM_ADMIN_TOKEN` 时管理接口默认开放，仅适合回环地址。监听非回环地址却没有配置令牌时网关会拒绝启动；对公网或局域网提供服务时还必须放在反向代理或私网之后。
 > 设置令牌后，控制台会先进入独立的管理登录页；令牌只保存在当前浏览器，设置页不保存管理令牌。
 
 ### 常用配置
@@ -40,6 +37,7 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 | `OPENLLM_BIND` | `127.0.0.1:8080` | HTTP 监听地址 |
 | `OPENLLM_DATA_DIR` | `./data` | SQLite 与备份目录 |
 | `OPENLLM_ADMIN_TOKEN` | 空 | 管理接口和 `/metrics` 鉴权令牌 |
+| `OPENLLM_CORS_ORIGINS` | 空 | 允许跨域访问管理 API 的精确 Origin，逗号分隔；空表示仅同源 |
 | `OPENLLM_LOG_FORMAT` | `text` | 设为 `json` 输出结构化日志 |
 | `RUST_LOG` | `info` | 日志级别 |
 | `OPENLLM_MAX_CONCURRENT_REQUESTS` | `0` | 全局在途请求上限，`0` 不限 |
@@ -61,7 +59,6 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 | 用量 | 请求、会话、Token、缓存、费用、首 Token 用时、TPS、错误；支持筛选、导出和请求详情 |
 | 会话粘性 | 按会话 ID 或稳定提示前缀保持健康目标，降低 prompt cache 中断 |
 | 配额池 | 按权重为网关密钥分配上游容量，支持 `hard`、`soft`、`burst` 策略 |
-| Webhook | 成功/失败、熔断/恢复事件；HMAC-SHA256 签名、自动重试、投递历史 |
 | 安全 | 请求防护、可选请求预览、配置审计、数据库备份与恢复、单实例租约 |
 | 可观测性 | Prometheus 指标、自检、诊断快照、告警规则和 Grafana 看板 |
 | 协议 | `/v1/chat/completions`、`/v1/responses`、`/v1/completions`、`/v1/embeddings`、Anthropic Messages |
@@ -117,7 +114,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | 推理内容 | Anthropic `thinking`、Chat `reasoning_content`、Responses reasoning 尽力互转 |
 | 上游故障 | 临时错误、限流与余额耗尽进入冷却和故障切换；同目标按有界退避重试 |
 
-### 配额池与 Webhook
+### 配额池
 
 | 功能 | 说明 |
 | --- | --- |
@@ -125,9 +122,6 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 | `hard` | 池饱和后拒绝超出份额的请求 |
 | `soft` | 不拒绝，只把超出份额的请求排到后面 |
 | `burst` | 仍可借用剩余容量 |
-| Webhook 事件 | `request.completed`、`request.failed`、`provider.circuit_open`、`provider.circuit_closed` |
-| Webhook 格式 | `generic`、`slack`、`discord`、`telegram`、`feishu`、`dingtalk` |
-| 签名 | `x-openllm-signature: t=<timestamp>,v1=<hmac>`，签名内容为 `"{timestamp}.{原始请求体}"` |
 
 ## 从源码构建
 
@@ -176,15 +170,18 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 | 项目 | 说明 |
 | --- | --- |
-| 凭据存储 | 上游密钥和 Webhook 请求头按原值保存在 SQLite；网关密钥只保存 SHA-256 摘要 |
+| 凭据存储 | 上游密钥和附加请求头按原值保存在 SQLite；网关密钥只保存 SHA-256 摘要 |
 | 请求防护 | 支持阻止词和提示词 Token 上限，拦截发生在路由与上游调用前 |
 | 请求检查 | 默认关闭；开启后递归遮蔽常见凭据字段，但仍可能包含业务敏感内容 |
-| 审计日志 | 记录提供商、路由、密钥、Webhook、设置与数据库操作；写入失败不影响主操作 |
+| 审计日志 | 记录提供商、路由、密钥、设置与数据库操作；写入失败不影响主操作 |
 | 备份 | 使用 `VACUUM INTO` 生成事务一致的单文件快照，手动和迁移前备份各保留最近 5 份 |
 | 迁移 | 启动前检测待执行迁移；已有数据且需迁移时自动写迁移前备份，失败则不打开端口 |
 | 探针 | `/api/health` 始终表示进程存活；`/api/ready` 探测数据库，排空时返回 `503` |
 | SQLite | 默认 WAL、`synchronous=NORMAL`、4 条连接、每连接 8 MiB 页缓存，排序临时表落盘；仅支持单实例部署 |
 | 日志保留 | 支持自动清理历史请求；按审计要求和磁盘容量设置保留天数 |
+
+Webhook 功能已移除；旧数据库中的相关表和历史数据保留，但不再投递或导出配置。
+导入旧配置文件时，Webhook 项会报告为“跳过”，其他配置照常处理。告警通知可由 Prometheus 与 Alertmanager 承接。
 
 可观测性产物和指标说明见 [docs/OBSERVABILITY.md](docs/OBSERVABILITY.md)。后续候选功能与取舍见 [docs/EXTENSIONS.md](docs/EXTENSIONS.md)。
 

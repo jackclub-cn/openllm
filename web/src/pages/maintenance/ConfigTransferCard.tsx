@@ -116,8 +116,8 @@ export default function ConfigTransferCard({ onImported }: { onImported: () => P
       }
     >
       <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-        导出的文档包含设置项、提供商（含模型启用状态）、路由、配额池与 Webhook，引用一律使用名称，
-        因此可以导入到另一套网关。默认情况下上游密钥、Webhook 签名与凭据类请求头都会掩码为
+        导出的文档包含设置项、提供商（含模型启用状态）、路由与配额池，引用一律使用名称，
+        因此可以导入到另一套网关。默认情况下上游密钥与凭据类请求头都会掩码为
         <Typography.Text code>***</Typography.Text>，掩码值永远不会被导入覆盖。
         网关 API Key 只保存哈希，只能按名称提示，无法导出或导入。
       </Typography.Paragraph>

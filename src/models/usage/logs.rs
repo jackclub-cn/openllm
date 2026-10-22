@@ -86,7 +86,67 @@ pub struct UsageLogView {
     pub cache_usage_reported: Option<bool>,
     pub performance: Option<RequestPerformance>,
     pub warning_message: Option<String>,
+    /// Failed upstream attempts before the final request outcome.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<UsageAttemptView>,
     pub created_at: String,
+}
+
+#[derive(Debug, FromRow)]
+pub struct UsageAttemptRow {
+    pub request_id: String,
+    pub attempt_index: i64,
+    pub round: i64,
+    pub provider_id: Option<i64>,
+    pub provider_name: Option<String>,
+    pub provider_api_key_id: Option<i64>,
+    pub provider_api_key_name: Option<String>,
+    pub upstream_model: Option<String>,
+    pub started_at: String,
+    pub latency_ms: i64,
+    pub status_code: Option<i64>,
+    pub success: i64,
+    pub retryable: i64,
+    pub reason_code: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UsageAttemptView {
+    pub request_id: String,
+    pub attempt_index: i64,
+    pub round: i64,
+    pub provider_id: Option<i64>,
+    pub provider_name: Option<String>,
+    pub provider_api_key_id: Option<i64>,
+    pub provider_api_key_name: Option<String>,
+    pub upstream_model: Option<String>,
+    pub started_at: String,
+    pub latency_ms: i64,
+    pub status_code: Option<i64>,
+    pub success: bool,
+    pub retryable: bool,
+    pub reason_code: String,
+}
+
+impl From<UsageAttemptRow> for UsageAttemptView {
+    fn from(value: UsageAttemptRow) -> Self {
+        Self {
+            request_id: value.request_id,
+            attempt_index: value.attempt_index,
+            round: value.round,
+            provider_id: value.provider_id,
+            provider_name: value.provider_name,
+            provider_api_key_id: value.provider_api_key_id,
+            provider_api_key_name: value.provider_api_key_name,
+            upstream_model: value.upstream_model,
+            started_at: value.started_at,
+            latency_ms: value.latency_ms,
+            status_code: value.status_code,
+            success: value.success != 0,
+            retryable: value.retryable != 0,
+            reason_code: value.reason_code,
+        }
+    }
 }
 
 impl From<UsageLog> for UsageLogView {
@@ -140,6 +200,7 @@ impl From<UsageLog> for UsageLogView {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok()),
             warning_message: value.warning_message,
+            children: Vec::new(),
             created_at: value.created_at,
         }
     }
@@ -237,6 +298,7 @@ impl From<UsageLogDetailRow> for UsageLogView {
                 .as_deref()
                 .and_then(|raw| serde_json::from_str(raw).ok()),
             warning_message: value.warning_message,
+            children: Vec::new(),
             created_at: value.created_at,
         }
     }

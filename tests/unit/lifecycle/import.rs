@@ -105,13 +105,6 @@ async fn a_config_document_round_trips_into_an_empty_database() {
     .unwrap();
     assert_eq!(allocation, (caller_id, 100, "hard".to_string()));
 
-    let (url, secret) = sqlx::query_as::<_, (String, String)>("SELECT url, secret FROM webhooks")
-        .fetch_one(&target.pool)
-        .await
-        .unwrap();
-    assert_eq!(url, "https://hook.example/x");
-    assert_eq!(secret, "whsec-1");
-
     let guardrails: String =
         sqlx::query_scalar("SELECT value FROM settings WHERE key = 'guardrails'")
             .fetch_one(&target.pool)
@@ -143,7 +136,7 @@ async fn reimporting_the_same_document_changes_nothing() {
     assert_eq!(second.counts.update, 0, "{:#?}", second.items);
     assert_eq!(second.counts.error, 0, "{:#?}", second.items);
     assert!(
-        second.counts.unchanged >= 6,
+        second.counts.unchanged >= 5,
         "every entity should report as unchanged: {:#?}",
         second.items
     );
@@ -153,50 +146,48 @@ async fn reimporting_the_same_document_changes_nothing() {
     );
 }
 
-/// A chat channel is configuration, not a credential: its kind and extra body
-/// fields have to survive a masked export/import round trip, or an alert
-/// channel could not be reviewed and re-created from a document.
 #[tokio::test]
-async fn a_chat_channel_round_trips_through_a_masked_document() {
+async fn legacy_webhooks_are_skipped_without_changing_other_configuration() {
     let source = seeded_state().await;
-    exec(
-        &source,
-        "UPDATE webhooks SET kind = 'slack', body_fields = '{\"channel\":\"#ops\"}' \
-         WHERE name = 'hook'",
-    )
-    .await;
-
-    // A masked export still carries the channel configuration: only the
-    // credentials are held back.
-    let masked = export(&source, false).await;
-    assert_eq!(masked.webhooks[0].kind, "slack");
-    assert_eq!(masked.webhooks[0].body_fields["channel"], "#ops");
-
-    let target = empty_state().await;
-    let plan = import(&target, export(&source, true).await, true).await;
-    assert!(plan.applied, "{:#?}", plan.items);
-    assert_eq!(plan.counts.error, 0, "{:#?}", plan.items);
-
-    let (kind, body_fields) = sqlx::query_as::<_, (String, String)>(
-        "SELECT kind, body_fields FROM webhooks WHERE name = 'hook'",
-    )
-    .fetch_one(&target.pool)
-    .await
-    .unwrap();
-    assert_eq!(kind, "slack");
-    let body: Value = serde_json::from_str(&body_fields).unwrap();
-    assert_eq!(body["channel"], "#ops");
-
-    // Re-importing must see the row as unchanged, which is what proves the
-    // comparison covers the two new columns.
-    let again = import(&target, export(&target, true).await, false).await;
-    assert!(again.valid, "{:#?}", again.problems);
-    assert_eq!(
-        item(&again, "webhook", "hook").action,
-        "unchanged",
-        "{:#?}",
-        again.items
-    );
+    let mut legacy = serde_json::to_value(export(&source, true).await).unwrap();
+    legacy["webhooks"] = json!([{
+        "name": "legacy-hook", "url": "https://new.example/hook",
+        "kind": "slack", "body_fields": { "channel": "#ops" },
+        "secret": "whsec-import", "headers": {}, "event_types": ["request.completed"],
+        "enabled": true
+    }]);
+    for apply in [false, true] {
+        let target = empty_state().await;
+        exec(
+            &target,
+            "INSERT INTO webhooks (name, url, secret) \
+             VALUES ('legacy-hook', 'https://old.example/hook', 'whsec-stored')",
+        )
+        .await;
+        let document = serde_json::from_value(legacy.clone()).unwrap();
+        let plan = import(&target, document, apply).await;
+        assert!(plan.valid, "{:#?}", plan.problems);
+        assert_eq!(plan.applied, apply);
+        let skipped = item(&plan, "webhook", "legacy-hook");
+        assert_eq!(skipped.action, "skip");
+        assert!(skipped.detail.contains("已移除"));
+        assert_eq!(
+            count(&target, "SELECT COUNT(*) FROM providers").await,
+            i64::from(apply)
+        );
+        let stored: (String, String) = sqlx::query_as("SELECT url, secret FROM webhooks")
+            .fetch_one(&target.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            stored,
+            (
+                "https://old.example/hook".to_string(),
+                "whsec-stored".to_string()
+            )
+        );
+        assert_eq!(count(&target, "SELECT COUNT(*) FROM webhooks").await, 1);
+    }
 }
 
 #[tokio::test]
@@ -248,8 +239,8 @@ async fn a_dry_run_reports_a_plan_without_writing_anything() {
     assert!(!plan.applied);
     assert!(plan.valid, "{:#?}", plan.problems);
     assert!(
-        plan.counts.create >= 4,
-        "provider, route, pool and webhook should be created: {:#?}",
+        plan.counts.create >= 3,
+        "provider, route and pool should be created: {:#?}",
         plan.items
     );
     assert!(
@@ -263,7 +254,6 @@ async fn a_dry_run_reports_a_plan_without_writing_anything() {
         item(&plan, "provider_pool", "alpha / shared").action,
         "create"
     );
-    assert_eq!(item(&plan, "webhook", "hook").action, "create");
     assert_eq!(item(&plan, "gateway_key", "caller").action, "skip");
 
     assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, 0);
@@ -272,7 +262,6 @@ async fn a_dry_run_reports_a_plan_without_writing_anything() {
         count(&target, "SELECT COUNT(*) FROM provider_pools").await,
         0
     );
-    assert_eq!(count(&target, "SELECT COUNT(*) FROM webhooks").await, 0);
     assert_eq!(
         count(
             &target,
@@ -310,8 +299,8 @@ async fn an_import_skips_references_it_cannot_resolve() {
         plan.problems
     );
 
-    // The provider, the pool (without the unresolvable allocation) and the
-    // webhook were still created; only the broken route was dropped.
+    // The provider and the pool (without the unresolvable allocation) were
+    // still created; only the broken route was dropped.
     assert_eq!(count(&target, "SELECT COUNT(*) FROM providers").await, 1);
     assert_eq!(count(&target, "SELECT COUNT(*) FROM routes").await, 0);
     assert_eq!(
@@ -322,7 +311,6 @@ async fn an_import_skips_references_it_cannot_resolve() {
         count(&target, "SELECT COUNT(*) FROM provider_pool_allocations").await,
         0
     );
-    assert_eq!(count(&target, "SELECT COUNT(*) FROM webhooks").await, 1);
 }
 
 #[tokio::test]

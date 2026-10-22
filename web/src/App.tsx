@@ -40,7 +40,6 @@ const RoutesPage = lazy(() => import('./pages/Routes'))
 const ApiKeys = lazy(() => import('./pages/ApiKeys'))
 const ProviderPools = lazy(() => import('./pages/ProviderPools'))
 const Usage = lazy(() => import('./pages/Usage'))
-const Webhooks = lazy(() => import('./pages/Webhooks'))
 const AuditLogs = lazy(() => import('./pages/AuditLogs'))
 const SettingsPage = lazy(() => import('./pages/Settings'))
 const Playground = lazy(() => import('./pages/Playground'))
@@ -266,7 +265,6 @@ function AppLayout({
               <Route path="/keys" element={<ApiKeys />} />
               <Route path="/pools" element={<ProviderPools />} />
               <Route path="/usage" element={<Usage />} />
-              <Route path="/webhooks" element={<Webhooks />} />
               <Route path="/audit" element={<AuditLogs />} />
               <Route path="/diagnostics" element={<DiagnosticsPage />} />
               <Route path="/maintenance" element={<MaintenancePage />} />

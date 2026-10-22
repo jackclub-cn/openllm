@@ -60,6 +60,8 @@ pub(super) async fn vault_into(pool: &SqlitePool, path: &Path) -> anyhow::Result
         .execute(pool)
         .await
         .with_context(|| format!("failed to back up the database to {}", path.display()))?;
+    crate::secure_file::set_private_permissions(path)
+        .with_context(|| format!("failed to secure backup {}", path.display()))?;
     Ok(())
 }
 

@@ -62,33 +62,6 @@ impl MetricsSnapshot {
         }
         metric_header(
             body,
-            "openllm_webhooks",
-            "Webhook subscription count by enabled state",
-        );
-        for (state, value) in [
-            ("enabled", statuses.webhooks_enabled),
-            ("disabled", statuses.webhooks_disabled),
-        ] {
-            push_metric(body, "openllm_webhooks", &[("state", state)], value);
-        }
-        metric_header(
-            body,
-            "openllm_webhook_deliveries",
-            "Retained webhook delivery records by outcome",
-        );
-        for (state, value) in [
-            ("succeeded", statuses.webhook_deliveries_succeeded),
-            ("failed", statuses.webhook_deliveries_failed),
-        ] {
-            push_metric(
-                body,
-                "openllm_webhook_deliveries",
-                &[("state", state)],
-                value,
-            );
-        }
-        metric_header(
-            body,
             "openllm_audit_logs",
             "Retained configuration change audit records",
         );

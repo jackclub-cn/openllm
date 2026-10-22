@@ -80,6 +80,9 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub client: Client,
     pub admin_token: Option<String>,
+    /// Exact browser origins allowed to call the management API cross-origin.
+    /// Empty keeps the console same-origin only.
+    pub(crate) cors_origins: Arc<[String]>,
     pub round_robin: Arc<Mutex<HashMap<i64, usize>>>,
     /// Process-local prompt/session affinity, optionally mirrored to SQLite.
     pub(crate) session_affinity: Option<Arc<SessionAffinityStore>>,
@@ -138,6 +141,11 @@ pub struct AppState {
     pub provider_key_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     /// Optional semaphores bounding each credential's waiting queue.
     pub provider_key_queue: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
+    /// One-day target P95 snapshot refreshed by a background worker. Request
+    /// routing only reads this cache, never the window-function query.
+    pub(crate) routing_p95_latency: Arc<RwLock<HashMap<(i64, String), f64>>>,
+    /// Short-lived, one-use credentials for browser EventSource connections.
+    pub(crate) event_stream_tickets: Arc<Mutex<HashMap<String, Instant>>>,
     /// Shared semaphores enforcing each provider's concurrency cap.
     pub provider_concurrency: Arc<Mutex<HashMap<i64, Arc<Semaphore>>>>,
     /// Shared semaphores enforcing each provider model's concurrency cap.
@@ -196,8 +204,6 @@ pub struct AppState {
     /// Unix timestamp at startup, for the Prometheus start-time gauge.
     pub started_unix: i64,
     pub events: broadcast::Sender<UsageEvent>,
-    /// Provider circuit transitions, consumed by the webhook dispatcher.
-    pub circuit_events: broadcast::Sender<ProviderCircuitEvent>,
     /// Cached "does the gateway require an API key" flag. `None` means it must
     /// be re-read from SQLite. Invalidated whenever keys are mutated.
     pub auth_required: Arc<RwLock<Option<bool>>>,

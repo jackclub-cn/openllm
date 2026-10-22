@@ -8,6 +8,8 @@ import {
   type Provider,
 } from '../api'
 import { validateOrUndefined } from '../forms'
+import LoadErrorAlert from '../components/LoadErrorAlert'
+import { useLoadableList } from '../hooks/useLoadableList'
 import RouteDiagnosisModal, {
   type RouteDiagnosisRequest,
 } from './routes/RouteDiagnosisModal'
@@ -18,9 +20,12 @@ import type { RouteFormValues } from './routes/types'
 
 export default function RoutesPage() {
   const { message } = App.useApp()
-  const [items, setItems] = useState<GatewayRoute[]>([])
-  const [providers, setProviders] = useState<Provider[]>([])
-  const [loading, setLoading] = useState(true)
+  const { items, loading, error, reload: loadRoutes } =
+    useLoadableList<GatewayRoute>('/api/routes')
+  const {
+    items: providers, loading: providersLoading, error: providersError,
+    reload: loadProviders,
+  } = useLoadableList<Provider>('/api/providers')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<'all' | 'enabled' | 'disabled'>('all')
   const [strategy, setStrategy] = useState<'all' | GatewayRoute['strategy']>('all')
@@ -34,25 +39,7 @@ export default function RoutesPage() {
   const handledDiagnosisQuery = useRef('')
   const [form] = Form.useForm<RouteFormValues>()
 
-  const load = async () => {
-    setLoading(true)
-    try {
-      const [routes, providerItems] = await Promise.all([
-        api.get<GatewayRoute[]>('/api/routes'),
-        api.get<Provider[]>('/api/providers'),
-      ])
-      setItems(routes)
-      setProviders(providerItems)
-    } catch (error) {
-      message.error(formatError(error))
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    void load()
-  }, [])
+  const load = () => Promise.all([loadRoutes(), loadProviders()])
 
   const openEditor = (item?: GatewayRoute) => {
     setEditing(item)
@@ -194,17 +181,31 @@ export default function RoutesPage() {
         onDiagnose={() => setDiagnosisRequest({})}
         onCreate={() => openEditor()}
       />
-      <RoutesTable
-        routes={filteredItems}
-        routeCount={items.length}
+      <LoadErrorAlert
+        title="路由加载失败"
+        error={error}
         loading={loading}
-        page={page}
-        togglingId={togglingId}
-        onPageChange={setPage}
-        onToggleEnabled={(record, enabled) => void toggleEnabled(record, enabled)}
-        onEdit={openEditor}
-        onRemove={(id) => void remove(id)}
+        onRetry={() => void loadRoutes()}
       />
+      <LoadErrorAlert
+        title="提供商选项加载失败"
+        error={providersError}
+        loading={providersLoading}
+        onRetry={() => void loadProviders()}
+      />
+      {(!error || items.length > 0) && (
+        <RoutesTable
+          routes={filteredItems}
+          routeCount={items.length}
+          loading={loading}
+          page={page}
+          togglingId={togglingId}
+          onPageChange={setPage}
+          onToggleEnabled={(record, enabled) => void toggleEnabled(record, enabled)}
+          onEdit={openEditor}
+          onRemove={(id) => void remove(id)}
+        />
+      )}
 
       <RouteEditorModal
         open={open}

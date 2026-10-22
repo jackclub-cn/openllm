@@ -6,7 +6,7 @@
 //! each keeping its own in-memory cooldowns and pool windows). The schema
 //! comment in the README said "do not run two instances"; this module turns
 //! that note into a startup check that names the other instance instead of
-//! leaving an operator to discover it through duplicated webhook deliveries.
+//! leaving an operator to discover it through conflicting runtime state.
 //!
 //! Two mechanisms live here:
 //!

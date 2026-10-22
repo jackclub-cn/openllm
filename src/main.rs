@@ -55,7 +55,7 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     snapshot: Option<PathBuf>,
 
-    /// Include plaintext upstream credentials and webhook secrets in an export.
+    /// Include plaintext upstream credentials in an export.
     #[arg(long)]
     include_secrets: bool,
 

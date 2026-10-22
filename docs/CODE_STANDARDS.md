@@ -29,9 +29,10 @@
 | `src/api/` | 管理接口和查询编排 | 输入校验、数据库查询与运行时代理逻辑分开 |
 | `src/api/helpers/` | 管理接口共享能力 | 按 models、credentials、views、validation 等明确归属组织 |
 | `src/api/usage/` | 请求日志、分析和维护 | 日志、时间窗口、overview、维度、路由质量分别维护 |
-| `src/api/lifecycle/` | 配置导入导出、备份、升级检查 | 导入器再按 settings、providers、routes、pools、webhooks 分工 |
+| `src/api/lifecycle/` | 配置导入导出、备份、升级检查 | 导入器再按 settings、providers、routes、pools 分工；旧配置的 Webhook 项仅报告跳过，不再写入 |
 | `src/api/metrics/` | Prometheus 快照和文本渲染 | 一次采集数据，各指标领域分别输出；指标名和统计口径保持稳定 |
 | `src/proxy/routing/` | 路由决策 | 解析、诊断、指标、策略、粘性、并发、熔断、凭据、发送分别维护 |
+| `src/proxy/routing/metrics.rs` | 路由指标快照 | 后台刷新 P95；请求路径只读内存快照，不执行窗口聚合 |
 | `src/proxy/upstream/` | 上游传输与响应生命周期 | HTTP 转发、流保护、错误处理、SSE、准入响应分开 |
 | `src/proxy/translation/<protocol>/` | 协议转换 | 请求、响应、流状态和流事件处理分开 |
 | `src/proxy/usage/` | 用量采集 | 流解析、估算、预览、能力回执、生命周期、落库分开 |
@@ -41,11 +42,16 @@
 | `src/state/activity/` | 实时活动内存状态 | 快照、尝试、阶段计时和 usage 合并分工；序号分配与广播在同一短锁内完成 |
 | `src/api/activity.rs` | 最近活动管理查询 | 沿用管理鉴权，不返回请求或响应正文 |
 | `src/state/` | 运行状态 | AppState 初始化、限制参数、内存、准入预算、事件分开 |
+| `src/secure_file.rs` | 本地文件权限 | 数据库、备份和导出文件统一创建为仅属主可读写；不承载业务格式 |
 | `src/startup/` | 启动和数据恢复 | 租约、迁移、备份、校验、恢复分开 |
 | `src/release_feed.rs` | 稳定发布源读取与缓存 | 合并并发检查，成功缓存一小时、失败缓存一分钟；不进入代理热路径 |
 | `src/quota/` | 额度快照 | 存储、上游归一化、响应头、有效状态和调度信号分开 |
 | `web/src/api/` | 前端接口客户端与领域类型 | `web/src/api.ts` 只保留稳定导出 |
 | `web/src/pages/<domain>/` | 页面领域组件 | 页面负责组装，表单、表格、图表及状态按职责拆分 |
+| `web/src/pages/usage/query.ts` | 请求日志筛选参数 | 地址栏、列表查询和 CSV 导出共用转换，保留所选时间点，不扩大到整天 |
+| `web/src/hooks/useFormCloseGuard.ts` | 提供商与路由表单关闭保护 | 比较打开时与当前表单值，统一确认关闭、切换模板与离页；保存期间阻止关闭 |
+| `web/src/hooks/useLoadableList.ts`、`components/LoadErrorAlert.tsx` | 列表加载与失败恢复 | 独立保留各资源上次成功的数据，忽略过期响应，持续显示错误并提供原地重试 |
+| `web/src/pages/usage/UsageTable.tsx`、`usageTableColumns.tsx` | 请求日志树表及列展示 | 列表接口批量读取已有失败尝试到 `children`；父行保留最终结果和统计口径，子行复用同一组列，异步加载后默认展开 |
 | `web/src/pages/settings/` | 请求策略、日志隐私、访问安全 | 设置入口管理标签地址；独立区域加载、保存与撤销，统一拦截未保存修改的导航；运行状态和运维动作由诊断、运维页面承接 |
 | `web/src/pages/diagnostics/DiagnosticRuntimeSettings.tsx`、`DiagnosticCooldowns.tsx` | 生效运行参数与故障恢复操作 | 参数复用诊断快照；冷却集中提供单项与全部清除，保留半开探测状态 |
 | `web/src/pages/maintenance/` | 数据库维护与备份恢复展示 | 数据库统计、下载备份与整理集中在运维；沿用现有维护、备份和校验接口 |

@@ -105,10 +105,16 @@ async fn activity_routes_require_admin_auth_and_limit_recent_items() {
 async fn activity_sse_delivers_both_domains_and_resyncs_after_lag() {
     use futures_util::StreamExt;
     let state = provider_key_test_state().await;
+    let ticket_response = event_stream_ticket(State(state.clone())).await.unwrap();
+    let ticket_body = axum::body::to_bytes(ticket_response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let ticket: Value = serde_json::from_slice(&ticket_body).unwrap();
+    let ticket = ticket["ticket"].as_str().unwrap();
     let response = crate::build_router(state.clone())
         .oneshot(
             axum::http::Request::builder()
-                .uri("/api/events")
+                .uri(format!("/api/events?ticket={ticket}"))
                 .body(Body::empty())
                 .unwrap(),
         )

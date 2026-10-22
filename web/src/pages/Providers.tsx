@@ -13,6 +13,8 @@ import {
 } from '../api'
 import { providerPresets } from '../providerPresets'
 import { validateOrUndefined } from '../forms'
+import LoadErrorAlert from '../components/LoadErrorAlert'
+import { useLoadableList } from '../hooks/useLoadableList'
 import ProviderEditorModal from './providers/ProviderEditorModal'
 import ProviderKeyTestModal from './providers/ProviderKeyTestModal'
 import ProviderLimitsModal from './providers/ProviderLimitsModal'
@@ -32,10 +34,13 @@ import type {
 export default function Providers() {
   const { message } = App.useApp()
   const [searchParams, setSearchParams] = useSearchParams()
-  const [items, setItems] = useState<Provider[]>([])
-  const [quotaOverviews, setQuotaOverviews] = useState<ProviderQuotaOverview[]>([])
-  const [loading, setLoading] = useState(true)
-  const [quotaLoading, setQuotaLoading] = useState(true)
+  const {
+    items, setItems, loading, error, reload: loadProviders,
+  } = useLoadableList<Provider>('/api/providers')
+  const {
+    items: quotaOverviews, loading: quotaLoading, error: quotaError,
+    reload: loadQuotaOverview,
+  } = useLoadableList<ProviderQuotaOverview>('/api/providers/quota-overview')
   const [saving, setSaving] = useState(false)
   const [togglingProviderId, setTogglingProviderId] = useState<number>()
   const [resettingProviderId, setResettingProviderId] = useState<number>()
@@ -85,40 +90,8 @@ export default function Providers() {
   }, [providerCircuit, providerHealth, providerSearch, providerStatus, setSearchParams])
 
   const load = async () => {
-    setLoading(true)
-    setQuotaLoading(true)
-    const [providersResult, quotaResult] = await Promise.allSettled([
-      api.get<Provider[]>('/api/providers'),
-      api.get<ProviderQuotaOverview[]>('/api/providers/quota-overview'),
-    ])
-    if (providersResult.status === 'fulfilled') {
-      setItems(providersResult.value)
-    } else {
-      message.error(formatError(providersResult.reason))
-    }
-    if (quotaResult.status === 'fulfilled') {
-      setQuotaOverviews(quotaResult.value)
-    } else {
-      message.error(formatError(quotaResult.reason))
-    }
-    setLoading(false)
-    setQuotaLoading(false)
+    await Promise.all([loadProviders(), loadQuotaOverview()])
   }
-
-  const loadQuotaOverview = async () => {
-    setQuotaLoading(true)
-    try {
-      setQuotaOverviews(await api.get<ProviderQuotaOverview[]>('/api/providers/quota-overview'))
-    } catch (error) {
-      message.error(formatError(error))
-    } finally {
-      setQuotaLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    void load()
-  }, [])
 
   const resetNewProviderForm = () => {
     form.setFieldsValue({
@@ -443,31 +416,47 @@ export default function Providers() {
         onTestAllKeys={() => void testAllKeys()}
         onAdd={() => openEditor()}
       />
-      <ProviderTable
-        providers={filteredProviders}
-        providerCount={items.length}
+      <LoadErrorAlert
+        title="提供商加载失败"
+        error={error}
         loading={loading}
-        page={providerPage}
-        togglingProviderId={togglingProviderId}
-        testingProviderId={testingProviderId}
-        resettingProviderId={resettingProviderId}
-        onPageChange={setProviderPage}
-        onToggleEnabled={(provider, enabled) => void toggleEnabled(provider, enabled)}
-        onTest={(id) => void test(id)}
-        onResetCircuit={(provider) => void resetProviderCircuit(provider)}
-        onTestKeys={setKeyTestProvider}
-        onOpenQuota={setQuotaProvider}
-        onManageModels={setLimitProvider}
-        onEdit={openEditor}
-        onRemove={(id) => void remove(id)}
-        onPreviewSync={setSyncTarget}
+        onRetry={() => void loadProviders()}
       />
-      <ProviderQuotaCards
-        providers={filteredProviders}
-        overviews={quotaOverviews}
-        loading={loading || quotaLoading}
-        onOpenQuota={setQuotaProvider}
+      {(!error || items.length > 0) && (
+        <ProviderTable
+          providers={filteredProviders}
+          providerCount={items.length}
+          loading={loading}
+          page={providerPage}
+          togglingProviderId={togglingProviderId}
+          testingProviderId={testingProviderId}
+          resettingProviderId={resettingProviderId}
+          onPageChange={setProviderPage}
+          onToggleEnabled={(provider, enabled) => void toggleEnabled(provider, enabled)}
+          onTest={(id) => void test(id)}
+          onResetCircuit={(provider) => void resetProviderCircuit(provider)}
+          onTestKeys={setKeyTestProvider}
+          onOpenQuota={setQuotaProvider}
+          onManageModels={setLimitProvider}
+          onEdit={openEditor}
+          onRemove={(id) => void remove(id)}
+          onPreviewSync={setSyncTarget}
+        />
+      )}
+      <LoadErrorAlert
+        title="提供商配额加载失败"
+        error={quotaError}
+        loading={quotaLoading}
+        onRetry={() => void loadQuotaOverview()}
       />
+      {(!quotaError || quotaOverviews.length > 0) && (
+        <ProviderQuotaCards
+          providers={filteredProviders}
+          overviews={quotaOverviews}
+          loading={(loading || quotaLoading) && quotaOverviews.length === 0}
+          onOpenQuota={setQuotaProvider}
+        />
+      )}
 
       <ProviderTemplateModal
         open={templateOpen}

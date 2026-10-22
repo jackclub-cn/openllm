@@ -116,7 +116,6 @@ pub(crate) async fn run_self_check(state: &AppState) -> SelfCheckReport {
     checks.push(check_capacity(state).await);
     checks.push(check_runtime_lag(state).await);
     checks.push(check_maintenance(state).await);
-    checks.push(check_webhooks(state).await);
 
     let mut counts = SelfCheckCounts {
         pass: 0,

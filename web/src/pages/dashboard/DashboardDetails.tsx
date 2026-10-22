@@ -200,51 +200,51 @@ export default function DashboardDetails({ data }: DashboardDetailsProps) {
               </div>
             )}
             <div>
-              <Typography.Text type="secondary">累计请求</Typography.Text>
+              <Typography.Text type="secondary">今日请求</Typography.Text>
               <div className="stat-line">
-                <strong>{data.requests_total}</strong> 次
+                <strong>{data.range_requests}</strong> 次
               </div>
             </div>
             <div>
-              <Typography.Text type="secondary">累计输入 tokens</Typography.Text>
+              <Typography.Text type="secondary">今日输入 tokens</Typography.Text>
               <div className="stat-line">
-                <Tooltip title={formatExact(data.prompt_tokens_total)}>
-                  <strong>{formatCompact(data.prompt_tokens_total)}</strong>
+                <Tooltip title={formatExact(data.range_prompt_tokens)}>
+                  <strong>{formatCompact(data.range_prompt_tokens)}</strong>
                 </Tooltip>
               </div>
             </div>
             <div>
-              <Typography.Text type="secondary">累计输出 tokens</Typography.Text>
+              <Typography.Text type="secondary">今日输出 tokens</Typography.Text>
               <div className="stat-line">
-                <Tooltip title={formatExact(data.completion_tokens_total)}>
-                  <strong>{formatCompact(data.completion_tokens_total)}</strong>
+                <Tooltip title={formatExact(data.range_completion_tokens)}>
+                  <strong>{formatCompact(data.range_completion_tokens)}</strong>
                 </Tooltip>
               </div>
             </div>
             <div>
-              <Typography.Text type="secondary">累计缓存读取</Typography.Text>
+              <Typography.Text type="secondary">今日缓存读取</Typography.Text>
               <div className="stat-line">
-                <Tooltip title={formatExact(data.cache_read_total)}>
-                  <strong>{formatCompact(data.cache_read_total)}</strong>
+                <Tooltip title={formatExact(data.range_cache_read)}>
+                  <strong>{formatCompact(data.range_cache_read)}</strong>
                 </Tooltip>
               </div>
             </div>
             <div>
-              <Typography.Text type="secondary">累计费用</Typography.Text>
+              <Typography.Text type="secondary">今日费用</Typography.Text>
               <div className="stat-line">
-                <strong>{formatCostMicros(data.cost_total_micros)}</strong>
-                {data.unpriced_total > 0 && (
+                <strong>{formatCostMicros(data.range_cost_micros)}</strong>
+                {data.range_unpriced > 0 && (
                   <Typography.Text type="secondary">
                     {' '}
-                    {data.unpriced_total} 条未定价
+                    {data.range_unpriced} 条未定价
                   </Typography.Text>
                 )}
               </div>
             </div>
             <div>
-              <Typography.Text type="secondary">累计成功率</Typography.Text>
+              <Typography.Text type="secondary">今日成功率</Typography.Text>
               <Progress
-                percent={Math.round(data.success_rate)}
+                percent={Math.round(data.range_success_rate)}
                 status="active"
                 strokeColor="#52c41a"
               />

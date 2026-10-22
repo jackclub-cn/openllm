@@ -87,12 +87,14 @@ enum OpenAiAttemptOutcome {
 
 pub(crate) async fn proxy_openai(
     State(state): State<AppState>,
+    Extension(auth): Extension<GatewayAuth>,
     headers: HeaderMap,
     uri: Uri,
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let result = proxy_openai_inner(&state, &headers, &uri, &body, &request_id, None).await;
+    let result =
+        proxy_openai_with_auth(&state, &headers, &uri, &body, &request_id, Some(auth.0)).await;
     finish_activity_for_pre_response(&state, &request_id, &result);
     let response = match result {
         Ok(response) => response,
@@ -144,11 +146,30 @@ pub(crate) async fn proxy_openai_inner(
     request_id: &str,
     api_key_override: Option<ApiKeyRecord>,
 ) -> AppResult<Response> {
+    proxy_openai_with_auth(
+        state,
+        headers,
+        uri,
+        body,
+        request_id,
+        api_key_override.map(Some),
+    )
+    .await
+}
+
+async fn proxy_openai_with_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    request_id: &str,
+    authenticated_api_key: Option<Option<ApiKeyRecord>>,
+) -> AppResult<Response> {
     track_activity_request(
         state,
         request_id,
         uri.path(),
-        run_openai_request(state, headers, uri, body, request_id, api_key_override),
+        run_openai_request(state, headers, uri, body, request_id, authenticated_api_key),
     )
     .await
 }
@@ -159,7 +180,7 @@ async fn run_openai_request(
     uri: &Uri,
     body: &Bytes,
     request_id: &str,
-    api_key_override: Option<ApiKeyRecord>,
+    authenticated_api_key: Option<Option<ApiKeyRecord>>,
 ) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
@@ -175,8 +196,8 @@ async fn run_openai_request(
         .unwrap_or(false);
     let request_tokens = estimate_request_tokens(&request_json);
 
-    let api_key = match api_key_override {
-        Some(api_key) => Some(api_key),
+    let api_key = match authenticated_api_key {
+        Some(api_key) => api_key,
         None => authenticate_gateway(state, headers).await?,
     };
     state.activity_describe(

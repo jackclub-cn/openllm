@@ -154,6 +154,7 @@ async fn p95_latency_optimized_prefers_a_better_tail_over_a_lower_average() {
         .unwrap();
     }
     let state = AppState::new(pool, None);
+    refresh_runtime_target_p95(&state).await.unwrap();
     let targets = (1..=2)
         .map(|id| {
             let mut target = endpoint_test_target("openai", None);

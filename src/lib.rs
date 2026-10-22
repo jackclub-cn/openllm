@@ -12,10 +12,10 @@ mod quota;
 mod registry;
 mod release_feed;
 mod resilience_state;
+mod secure_file;
 mod session_affinity;
 mod startup;
 mod state;
-mod webhooks;
 
 #[cfg(test)]
 #[path = "../tests/unit/lib.rs"]
@@ -25,33 +25,34 @@ use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderValue;
 use axum::routing::{get, post, put};
 use tokio::net::TcpListener;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 
 use crate::api::{
-    admin_auth, analytics_dimensions, analytics_route_quality, backup_database, cleanup_usage,
-    clear_cooldowns, create_api_key, create_backup, create_provider, create_provider_pool,
-    create_route, create_webhook, delete_api_key, delete_provider, delete_provider_pool,
-    delete_route, delete_webhook, diagnose_route, diagnostic_snapshot, event_stream,
+    admin_auth, admin_origin_guard, analytics_dimensions, analytics_route_quality, backup_database,
+    cleanup_usage, clear_cooldowns, create_api_key, create_backup, create_provider,
+    create_provider_pool, create_route, delete_api_key, delete_provider, delete_provider_pool,
+    delete_route, diagnose_route, diagnostic_snapshot, event_stream, event_stream_ticket,
     export_audit_logs, export_config, export_usage, get_guardrails_settings,
     get_inspector_settings, get_request_activity, get_resilience_settings, get_route_trace,
     get_runtime_settings, get_settings, get_status, get_usage_detail, health, import_config,
     list_api_keys, list_audit_logs, list_backups, list_cooldowns, list_model_inventory,
     list_models, list_provider_model_limits, list_provider_pools, list_provider_quota_snapshots,
-    list_providers, list_routes, list_usage, list_webhook_deliveries, list_webhooks,
-    migration_status, overview, preview_provider_model_sync, prometheus_metrics,
-    provider_pool_usage, provider_quota, provider_quota_overview, provider_quota_refresh_interval,
-    ready, recent_activity, rotate_api_key, run_maintenance, run_provider_quota_refresh,
-    self_check, sync_provider_models, test_all_provider_keys, test_all_providers, test_provider,
-    test_provider_keys, test_webhook, update_api_key, update_guardrails_settings,
-    update_inspector_settings, update_provider, update_provider_model_limits, update_provider_pool,
-    update_provider_quota_snapshots, update_resilience_settings, update_route,
-    update_runtime_settings, update_webhook, upgrade_check, vacuum_database, verify_backup,
+    list_providers, list_routes, list_usage, migration_status, overview,
+    preview_provider_model_sync, prometheus_metrics, provider_pool_usage, provider_quota,
+    provider_quota_overview, provider_quota_refresh_interval, ready, recent_activity,
+    rotate_api_key, run_maintenance, run_provider_quota_refresh, self_check, sync_provider_models,
+    test_all_provider_keys, test_all_providers, test_provider, test_provider_keys, update_api_key,
+    update_guardrails_settings, update_inspector_settings, update_provider,
+    update_provider_model_limits, update_provider_pool, update_provider_quota_snapshots,
+    update_resilience_settings, update_route, update_runtime_settings, upgrade_check,
+    vacuum_database, verify_backup,
 };
 use crate::assets::static_handler;
 use crate::db::Database;
@@ -104,13 +105,15 @@ async fn monitor_runtime_lag(state: AppState) {
 
 /// How long to wait before restarting a background worker that stopped.
 const WORKER_RESTART_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+/// Request routing reads a precomputed one-day P95 snapshot; this worker owns
+/// the window-function query and keeps the request path off SQLite sorting.
+const ROUTING_P95_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Runs a long-lived background worker, restarting it if it ever stops.
 ///
-/// Maintenance and webhook delivery are spawned once at startup and loop
-/// forever. Without supervision a single panic would take that worker down for
-/// the rest of the process's life — maintenance would stop running and webhooks
-/// would stop delivering, with only a one-off panic message as a clue. This
+/// Maintenance and scheduled refreshes are spawned once at startup and loop
+/// forever. Without supervision a single panic would take a worker down for
+/// the rest of the process's life, with only a one-off panic message as a clue. This
 /// catches the panic (or an unexpected early return), logs it, and starts the
 /// worker again after a short backoff. `make` must build a fresh future per
 /// attempt because a future cannot be polled after it completes.
@@ -133,9 +136,25 @@ where
 }
 
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    validate_runtime_security(&config)?;
     let database = Database::connect(&config).await?;
     let instance_id = database.instance_id.clone();
     let state = AppState::new(database.pool.clone(), config.admin_token.clone());
+    if let Err(error) = crate::proxy::refresh_runtime_target_p95(&state).await {
+        tracing::warn!(%error, "failed to initialize routing P95 snapshot");
+    }
+    let p95_state = state.clone();
+    spawn_supervised("routing-p95-refresh", move || {
+        let state = p95_state.clone();
+        async move {
+            loop {
+                tokio::time::sleep(ROUTING_P95_REFRESH_INTERVAL).await;
+                if let Err(error) = crate::proxy::refresh_runtime_target_p95(&state).await {
+                    tracing::warn!(%error, "failed to refresh routing P95 snapshot");
+                }
+            }
+        }
+    });
     if let Err(error) = crate::resilience_state::restore(&state).await {
         tracing::warn!(%error, "failed to restore persisted resilience state");
     }
@@ -179,10 +198,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     } else {
         tracing::info!("scheduled provider quota refresh is disabled");
     }
-    let webhook_state = state.clone();
-    spawn_supervised("webhook-dispatcher", move || {
-        crate::webhooks::run_dispatcher(webhook_state.clone())
-    });
     // Keep the instance lease fresh so a second process on the same database
     // can tell a live instance from a crashed one.
     let lease_pool = state.pool.clone();
@@ -328,14 +343,21 @@ where
 }
 
 pub fn build_router(state: AppState) -> Router {
+    // Retired API paths must not fall through to the console's HTML fallback.
+    let retired_webhooks = axum::routing::any(|| async { axum::http::StatusCode::NOT_FOUND });
     let metrics = Router::new()
         .route("/metrics", get(prometheus_metrics))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_origin_guard,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth,
         ));
     let admin = Router::new()
         .route("/status", get(get_status))
+        .route("/events/ticket", post(event_stream_ticket))
         .route("/activity/recent", get(recent_activity))
         .route("/activity/{request_id}", get(get_request_activity))
         .route("/diagnostics/self-check", get(self_check))
@@ -420,10 +442,12 @@ pub fn build_router(state: AppState) -> Router {
             "/settings/resilience",
             get(get_resilience_settings).put(update_resilience_settings),
         )
-        .route("/webhooks", get(list_webhooks).post(create_webhook))
-        .route("/webhooks/{id}", put(update_webhook).delete(delete_webhook))
-        .route("/webhooks/{id}/test", post(test_webhook))
-        .route("/webhooks/{id}/deliveries", get(list_webhook_deliveries))
+        .route("/webhooks", retired_webhooks.clone())
+        .route("/webhooks/{*path}", retired_webhooks)
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            admin_origin_guard,
+        ))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             admin_auth,
@@ -442,7 +466,8 @@ pub fn build_router(state: AppState) -> Router {
             admission,
         ));
 
-    Router::new()
+    let cors = configured_cors_layer(state.cors_origins.as_ref());
+    let app = Router::new()
         .merge(metrics)
         .merge(proxy)
         .route("/api/health", get(health))
@@ -453,18 +478,45 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/models", get(public_models))
         .route("/v1/models/{*model}", get(public_model))
         .fallback(static_handler)
-        .layer(DefaultBodyLimit::max(crate::state::max_request_body_bytes()))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-                // Let a cross-origin console read the export-truncation header
-                // so a capped download is never silent.
-                .expose_headers(Any),
-        )
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(crate::state::max_request_body_bytes()));
+    let app = match cors {
+        Some(cors) => app.layer(cors),
+        None => app,
+    };
+    app.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+fn configured_cors_layer(origins: &[String]) -> Option<CorsLayer> {
+    let origins = origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        return None;
+    }
+    Some(
+        CorsLayer::new()
+            .allow_origin(AllowOrigin::list(origins))
+            .allow_methods(Any)
+            .allow_headers(Any)
+            // Let a cross-origin console read the export-truncation header so
+            // a capped download is never silent.
+            .expose_headers(Any),
+    )
+}
+
+fn validate_runtime_security(config: &Config) -> anyhow::Result<()> {
+    let has_admin_token = config
+        .admin_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+    if !config.bind.ip().is_loopback() && !has_admin_token {
+        bail!(
+            "refusing to serve {bind} without OPENLLM_ADMIN_TOKEN; bind to a loopback address or configure a token",
+            bind = config.bind
+        );
+    }
+    Ok(())
 }
 
 async fn shutdown_signal() {

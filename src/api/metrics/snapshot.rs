@@ -31,10 +31,6 @@ pub(super) struct StatusMetricsRow {
     pub(super) routes_disabled: i64,
     pub(super) api_keys_enabled: i64,
     pub(super) api_keys_disabled: i64,
-    pub(super) webhooks_enabled: i64,
-    pub(super) webhooks_disabled: i64,
-    pub(super) webhook_deliveries_succeeded: i64,
-    pub(super) webhook_deliveries_failed: i64,
     pub(super) audit_logs: i64,
 }
 
@@ -134,14 +130,6 @@ pub(super) async fn collect(state: &AppState) -> AppResult<MetricsSnapshot> {
             (SELECT COUNT(*) FROM routes WHERE enabled = 0) AS routes_disabled,
             (SELECT COUNT(*) FROM api_keys WHERE enabled = 1) AS api_keys_enabled,
             (SELECT COUNT(*) FROM api_keys WHERE enabled = 0) AS api_keys_disabled,
-
-            (SELECT COUNT(*) FROM webhooks WHERE enabled = 1) AS webhooks_enabled,
-            (SELECT COUNT(*) FROM webhooks WHERE enabled = 0) AS webhooks_disabled,
-            (SELECT COUNT(*) FROM webhook_deliveries
-              WHERE status_code >= 200 AND status_code < 300) AS webhook_deliveries_succeeded,
-            (SELECT COUNT(*) FROM webhook_deliveries
-              WHERE status_code IS NULL OR status_code < 200 OR status_code >= 300)
-              AS webhook_deliveries_failed,
 
             (SELECT COUNT(*) FROM audit_logs) AS audit_logs
         "#,

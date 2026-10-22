@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::HashMap;
 
 pub async fn list_usage(
     State(state): State<AppState>,
@@ -56,13 +57,58 @@ pub async fn list_usage(
         .build_query_as::<UsageLogDetailRow>()
         .fetch_all(&state.pool)
         .await?;
+    let mut views = rows.into_iter().map(Into::into).collect::<Vec<_>>();
+    attach_usage_attempts(&state.pool, &mut views).await?;
 
     Ok(Json(UsagePage {
-        items: rows.into_iter().map(Into::into).collect(),
+        items: views,
         total,
         page,
         page_size,
     }))
+}
+
+async fn attach_usage_attempts(
+    pool: &sqlx::SqlitePool,
+    items: &mut [UsageLogView],
+) -> Result<(), sqlx::Error> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    let mut query = QueryBuilder::<Sqlite>::new(
+        "SELECT ra.request_id, ra.attempt_index, ra.round, ra.provider_id, \
+                p.name AS provider_name, ra.provider_api_key_id, \
+                pk.name AS provider_api_key_name, ra.upstream_model, ra.started_at, \
+                ra.latency_ms, ra.status_code, ra.success, ra.retryable, ra.reason_code \
+         FROM routing_attempts ra \
+         JOIN routing_traces rt ON rt.request_id = ra.request_id \
+         LEFT JOIN providers p ON p.id = ra.provider_id \
+         LEFT JOIN provider_api_keys pk ON pk.id = ra.provider_api_key_id \
+         WHERE ra.success = 0 AND ra.attempt_index < rt.attempt_count \
+           AND ra.request_id IN (",
+    );
+    {
+        let mut separated = query.separated(", ");
+        for item in items.iter() {
+            separated.push_bind(item.request_id.as_str());
+        }
+    }
+    query.push(") ORDER BY ra.request_id, ra.attempt_index");
+    let rows = query
+        .build_query_as::<UsageAttemptRow>()
+        .fetch_all(pool)
+        .await?;
+    let mut attempts = HashMap::<String, Vec<UsageAttemptView>>::new();
+    for row in rows {
+        attempts
+            .entry(row.request_id.clone())
+            .or_default()
+            .push(row.into());
+    }
+    for item in items {
+        item.children = attempts.remove(&item.request_id).unwrap_or_default();
+    }
+    Ok(())
 }
 
 pub(in crate::api) const USAGE_EXPORT_LIMIT: i64 = 100_000;

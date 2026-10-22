@@ -158,7 +158,7 @@ pub async fn export_config(
     if output == std::path::Path::new("-") {
         println!("{rendered}");
     } else {
-        std::fs::write(output, format!("{rendered}\n"))
+        crate::secure_file::write_private(output, format!("{rendered}\n").as_bytes())
             .with_context(|| format!("failed to write {}", output.display()))?;
         if json {
             println!(
@@ -169,17 +169,15 @@ pub async fn export_config(
                     "providers": document.providers.len(),
                     "routes": document.routes.len(),
                     "provider_pools": document.provider_pools.len(),
-                    "webhooks": document.webhooks.len(),
                 }))?
             );
         } else {
             println!(
-                "已导出配置: {}（provider {} / route {} / pool {} / webhook {}{}）",
+                "已导出配置: {}（provider {} / route {} / pool {}{}）",
                 output.display(),
                 document.providers.len(),
                 document.routes.len(),
                 document.provider_pools.len(),
-                document.webhooks.len(),
                 if include_secrets {
                     "，含明文凭据"
                 } else {
@@ -276,7 +274,7 @@ pub async fn diagnostic_snapshot(
     if output == std::path::Path::new("-") {
         println!("{rendered}");
     } else {
-        std::fs::write(output, format!("{rendered}\n"))
+        crate::secure_file::write_private(output, format!("{rendered}\n").as_bytes())
             .with_context(|| format!("failed to write {}", output.display()))?;
         if json {
             println!(

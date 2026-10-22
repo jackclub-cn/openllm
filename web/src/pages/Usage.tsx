@@ -11,12 +11,14 @@ import {
   type UsageLog,
 } from '../api'
 import { useAutoRefresh } from '../hooks/useAutoRefresh'
+import LoadErrorAlert from '../components/LoadErrorAlert'
 import { useCoalescedUsageEvents, useRealtime } from '../realtime'
 import UsageCleanupModal from './usage/UsageCleanupModal'
 import UsageDetailDrawer from './usage/UsageDetailDrawer'
 import UsageFilters from './usage/UsageFilters'
 import UsageTable from './usage/UsageTable'
 import UsageToolbar from './usage/UsageToolbar'
+import { usageFilterParams } from './usage/query'
 import {
   positiveIntegerParam,
   statusParam,
@@ -33,6 +35,7 @@ export default function Usage() {
   const [apiKeys, setApiKeys] = useState<ApiKey[]>([])
   const [routes, setRoutes] = useState<GatewayRoute[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(20)
   const [total, setTotal] = useState(0)
@@ -126,21 +129,7 @@ export default function Usage() {
   }, [filterKey])
 
   useEffect(() => {
-    const next = new URLSearchParams()
-    if (model) next.set('model', model)
-    if (requestId) next.set('request_id', requestId)
-    if (sessionId) next.set('session_id', sessionId)
-    if (endpoint) next.set('endpoint', endpoint)
-    if (providerId) next.set('provider_id', String(providerId))
-    if (providerApiKeyId) next.set('provider_api_key_id', String(providerApiKeyId))
-    if (apiKeyId) next.set('api_key_id', String(apiKeyId))
-    if (routeId) next.set('route_id', String(routeId))
-    if (statusFilter === 'success') next.set('success', 'true')
-    if (statusFilter === 'failed') next.set('success', 'false')
-    if (statusFilter === 'pending') next.set('in_flight', 'true')
-    if (onlyAdjusted) next.set('gateway_adjusted', 'true')
-    if (dates?.[0]) next.set('from', dates[0].toISOString())
-    if (dates?.[1]) next.set('to', dates[1].toISOString())
+    const next = usageFilterParams(queryRef.current)
     if (next.toString() !== searchParams.toString()) {
       setSearchParams(next, { replace: true })
     }
@@ -171,22 +160,13 @@ export default function Usage() {
         page: String(nextPage),
         page_size: String(nextPageSize),
       })
-      if (model) params.set('model', model)
-      if (requestId) params.set('request_id', requestId)
-      if (sessionId) params.set('session_id', sessionId)
-      if (endpoint) params.set('endpoint', endpoint)
-      if (providerId) params.set('provider_id', String(providerId))
-      if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
-      if (apiKeyId) params.set('api_key_id', String(apiKeyId))
-      if (routeId) params.set('route_id', String(routeId))
-      if (statusFilter === 'success') params.set('success', 'true')
-      if (statusFilter === 'failed') params.set('success', 'false')
-      if (statusFilter === 'pending') params.set('in_flight', 'true')
-      if (onlyAdjusted) params.set('gateway_adjusted', 'true')
-      if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
-      if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
+      usageFilterParams({
+        model, requestId, sessionId, endpoint, providerId, providerApiKeyId,
+        apiKeyId, routeId, statusFilter, onlyAdjusted, dates,
+      }).forEach((value, key) => params.set(key, value))
       try {
         const result = await api.get<UsagePageResponse>(`/api/usage?${params}`)
+        setLoadError('')
         const currentFilter = JSON.stringify([
           model,
           requestId,
@@ -228,7 +208,7 @@ export default function Usage() {
         setPage(result.page)
         setPageSize(result.page_size)
       } catch (error) {
-        message.error(formatError(error))
+        setLoadError(formatError(error))
       } finally {
         if (mode === 'manual') setLoading(false)
       }
@@ -374,21 +354,7 @@ export default function Usage() {
   const exportCsv = async () => {
     setExporting(true)
     try {
-      const params = new URLSearchParams()
-      if (model) params.set('model', model)
-      if (requestId) params.set('request_id', requestId)
-      if (sessionId) params.set('session_id', sessionId)
-      if (endpoint) params.set('endpoint', endpoint)
-      if (providerId) params.set('provider_id', String(providerId))
-      if (providerApiKeyId) params.set('provider_api_key_id', String(providerApiKeyId))
-      if (apiKeyId) params.set('api_key_id', String(apiKeyId))
-      if (routeId) params.set('route_id', String(routeId))
-      if (statusFilter === 'success') params.set('success', 'true')
-      if (statusFilter === 'failed') params.set('success', 'false')
-      if (statusFilter === 'pending') params.set('in_flight', 'true')
-      if (onlyAdjusted) params.set('gateway_adjusted', 'true')
-      if (dates?.[0]) params.set('from', dates[0].startOf('day').toISOString())
-      if (dates?.[1]) params.set('to', dates[1].endOf('day').toISOString())
+      const params = usageFilterParams(queryRef.current)
       const { blob, truncated } = await api.downloadWithMeta(`/api/usage/export?${params}`)
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
@@ -466,15 +432,23 @@ export default function Usage() {
         onReset={resetFilters}
         onSearch={reloadFiltered}
       />
-      <UsageTable
-        items={items}
-        loading={loading}
-        page={page}
-        pageSize={pageSize}
-        total={total}
-        onPageChange={(nextPage, nextPageSize) => void load(nextPage, nextPageSize)}
-        onOpenDetail={(record) => void openDetail(record)}
+      <LoadErrorAlert
+        title="请求日志加载失败"
+        error={loadError}
+        loading={loading || autoRefresh.refreshing}
+        onRetry={() => void loadFromRef('manual')}
       />
+      {(!loadError || items.length > 0) && (
+        <UsageTable
+          items={items}
+          loading={loading}
+          page={page}
+          pageSize={pageSize}
+          total={total}
+          onPageChange={(nextPage, nextPageSize) => void load(nextPage, nextPageSize)}
+          onOpenDetail={(record) => void openDetail(record)}
+        />
+      )}
       <UsageDetailDrawer
         detail={detail}
         loading={detailLoading}

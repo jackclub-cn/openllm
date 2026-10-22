@@ -11,19 +11,30 @@ use super::*;
 /// same count, which clients rely on to detect real context growth.
 pub(crate) async fn count_tokens_anthropic(
     State(state): State<AppState>,
+    Extension(auth): Extension<GatewayAuth>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    match count_tokens_inner(&state, &headers, &body).await {
+    match count_tokens_with_auth(&state, &headers, &body, Some(auth.0)).await {
         Ok(response) => response,
         Err(error) => anthropic_error_response(error),
     }
 }
 
+#[cfg(test)]
 pub(crate) async fn count_tokens_inner(
     state: &AppState,
     headers: &HeaderMap,
     body: &Bytes,
+) -> AppResult<Response> {
+    count_tokens_with_auth(state, headers, body, None).await
+}
+
+async fn count_tokens_with_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: &Bytes,
+    authenticated_api_key: Option<Option<ApiKeyRecord>>,
 ) -> AppResult<Response> {
     let inbound: Value = serde_json::from_slice(body).map_err(|error| {
         AppError::BadRequest(format!("request body must be valid JSON: {error}"))
@@ -31,7 +42,10 @@ pub(crate) async fn count_tokens_inner(
     // `model` is required by the real endpoint; reject early rather than
     // silently counting a body the client meant for a different model.
     let requested_model = requested_model_of(&inbound)?;
-    let api_key = authenticate_gateway(state, headers).await?;
+    let api_key = match authenticated_api_key {
+        Some(api_key) => api_key,
+        None => authenticate_gateway(state, headers).await?,
+    };
     enforce_api_key_model_access(api_key.as_ref(), &requested_model)?;
     let input_tokens = estimate_request_tokens(&inbound);
     let guardrails = state.guardrail_settings().await?;
@@ -50,12 +64,15 @@ pub(crate) async fn count_tokens_inner(
 /// event protocol. Native Anthropic targets skip the conversion entirely.
 pub(crate) async fn proxy_anthropic(
     State(state): State<AppState>,
+    Extension(auth): Extension<GatewayAuth>,
     headers: HeaderMap,
     uri: Uri,
     body: Bytes,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
-    let result = proxy_anthropic_inner(&state, &headers, &uri, &body, &request_id).await;
+    let result =
+        proxy_anthropic_authenticated_inner(&state, &headers, &uri, &body, &request_id, auth.0)
+            .await;
     finish_activity_for_pre_response(&state, &request_id, &result);
     let response = match result {
         Ok(response) => response,

@@ -37,6 +37,7 @@ pub(crate) use affinity::SessionAffinityContext;
 
 pub(super) use affinity::*;
 mod metrics;
+pub(crate) use metrics::refresh_runtime_target_p95;
 use metrics::*;
 mod overrides;
 pub(super) use overrides::*;

@@ -44,20 +44,6 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO webhooks (id, name, url, enabled)
-         VALUES (1, 'Audit hook', 'https://example.com/hook', 1)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO webhook_deliveries (webhook_id, event_type, status_code, attempts)
-         VALUES (1, 'request.completed', 200, 1), (1, 'request.failed', 500, 3)",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
     let state = AppState::new(pool, Some("metrics-secret".to_string()));
     state
         .provider_concurrency
@@ -176,9 +162,7 @@ async fn prometheus_metrics_render_and_require_admin_token() {
     assert!(body.contains(
         "openllm_provider_key_cooling{provider=\"Healthy provider\",key=\"Backup\",key_id=\"2\"} 0"
     ));
-    assert!(body.contains("openllm_webhooks{state=\"enabled\"} 1"));
-    assert!(body.contains("openllm_webhook_deliveries{state=\"succeeded\"} 1"));
-    assert!(body.contains("openllm_webhook_deliveries{state=\"failed\"} 1"));
+    assert!(!body.contains("openllm_webhook"));
     assert!(body.contains("openllm_audit_logs 0"));
     assert!(body.contains("openllm_database_size_bytes"));
     assert!(body.contains("openllm_ready 1"));

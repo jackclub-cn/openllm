@@ -16,36 +16,31 @@ type DashboardMetricsProps = {
 }
 
 export default function DashboardMetrics({ data }: DashboardMetricsProps) {
-  const cacheHitRate =
-    data.prompt_tokens_total > 0
-      ? (data.cache_read_total / data.prompt_tokens_total) * 100
-      : 0
-
   return (
     <>
       <Row gutter={[16, 16]}>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计请求"
-            value={data.requests_total}
+            label="今日请求"
+            value={data.range_requests}
             icon={<ThunderboltOutlined />}
             tone="blue"
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计 tokens"
-            value={data.tokens_total}
+            label="今日 tokens"
+            value={data.range_tokens}
             compact
             icon={<ApiOutlined />}
             tone="cyan"
-            hint={`输入 ${formatCompact(data.prompt_tokens_total)} · 输出 ${formatCompact(data.completion_tokens_total)}`}
+            hint={`输入 ${formatCompact(data.range_prompt_tokens)} · 输出 ${formatCompact(data.range_completion_tokens)}`}
           />
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计成功率"
-            value={data.success_rate}
+            label="今日成功率"
+            value={data.range_success_rate}
             precision={1}
             suffix="%"
             icon={<NodeIndexOutlined />}
@@ -54,8 +49,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计平均总用时"
-            value={data.avg_latency_ms}
+            label="今日平均总用时"
+            value={data.range_avg_latency_ms}
             precision={0}
             suffix="ms"
             icon={<ClockCircleOutlined />}
@@ -66,8 +61,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
       <Row gutter={[16, 16]} className="section-row">
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计缓存命中率"
-            value={cacheHitRate}
+            label="今日缓存命中率"
+            value={data.range_cache_hit_rate}
             precision={1}
             suffix="%"
             icon={<DollarOutlined />}
@@ -76,8 +71,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计缓存读取"
-            value={data.cache_read_total}
+            label="今日缓存读取"
+            value={data.range_cache_read}
             compact
             icon={<DatabaseOutlined />}
             tone="green"
@@ -85,8 +80,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计缓存写入"
-            value={data.cache_write_total}
+            label="今日缓存写入"
+            value={data.range_cache_write}
             compact
             icon={<DatabaseOutlined />}
             tone="cyan"
@@ -94,8 +89,8 @@ export default function DashboardMetrics({ data }: DashboardMetricsProps) {
         </Col>
         <Col xs={24} sm={12} xl={6}>
           <MetricCard
-            label="累计费用"
-            value={data.cost_total_micros / 1_000_000}
+            label="今日费用"
+            value={data.range_cost_micros / 1_000_000}
             precision={4}
             suffix="USD"
             icon={<DatabaseOutlined />}

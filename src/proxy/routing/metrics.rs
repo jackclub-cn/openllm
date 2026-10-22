@@ -130,21 +130,29 @@ pub(super) async fn runtime_target_metrics(
     Ok(metrics)
 }
 
-/// Nearest-rank P95 for the same one-day success window as the average metric.
-///
-/// The query only runs for the P95 strategy, so the extra window-function pass
-/// never enters the hot path of the other strategies.
+/// Reads the background-refreshed nearest-rank P95 snapshot.
 pub(super) async fn runtime_target_p95_latency(
     state: &AppState,
     targets: &[RouteTarget],
 ) -> AppResult<HashMap<(i64, String), f64>> {
-    if targets.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let provider_ids = targets
+    let snapshot = state.routing_p95_latency.read().await;
+    Ok(targets
         .iter()
-        .map(|target| target.provider_id)
-        .collect::<std::collections::BTreeSet<_>>();
+        .filter_map(|target| {
+            snapshot
+                .get(&(target.provider_id, target.upstream_model.clone()))
+                .copied()
+                .map(|latency| ((target.provider_id, target.upstream_model.clone()), latency))
+        })
+        .collect())
+}
+
+/// Recomputes the one-day P95 snapshot used by request routing.
+///
+/// This query is intentionally kept off the request path. A supervised worker
+/// refreshes it every ten seconds; a failed refresh leaves the previous
+/// snapshot in place rather than making routing fail.
+pub(crate) async fn refresh_runtime_target_p95(state: &AppState) -> AppResult<()> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
         r#"
         WITH samples AS (
@@ -160,17 +168,7 @@ pub(super) async fn runtime_target_p95_latency(
               AND success = 1
               AND created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 day')
               AND (first_token_ms > 0 OR latency_ms > 0)
-              AND provider_id IN (
-        "#,
-    );
-    {
-        let mut separated = query.separated(", ");
-        for provider_id in provider_ids {
-            separated.push_bind(provider_id);
-        }
-    }
-    query.push(
-        r#")
+              AND provider_id IS NOT NULL
         ),
         ranked AS (
             SELECT provider_id,
@@ -196,10 +194,12 @@ pub(super) async fn runtime_target_p95_latency(
         .build_query_as::<(i64, String, f64)>()
         .fetch_all(&state.pool)
         .await?;
-    Ok(rows
+    let snapshot = rows
         .into_iter()
         .map(|(provider_id, model, latency)| ((provider_id, model), latency))
-        .collect())
+        .collect();
+    *state.routing_p95_latency.write().await = snapshot;
+    Ok(())
 }
 
 pub(super) fn target_cost_prices(target: &RouteTarget) -> (Option<f64>, Option<f64>) {

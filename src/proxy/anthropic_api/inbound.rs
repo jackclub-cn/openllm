@@ -1,5 +1,6 @@
 use super::*;
 
+#[cfg(test)]
 pub(crate) async fn proxy_anthropic_inner(
     state: &AppState,
     headers: &HeaderMap,
@@ -7,11 +8,33 @@ pub(crate) async fn proxy_anthropic_inner(
     body: &Bytes,
     request_id: &str,
 ) -> AppResult<Response> {
+    proxy_anthropic_with_auth(state, headers, uri, body, request_id, None).await
+}
+
+pub(crate) async fn proxy_anthropic_authenticated_inner(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    request_id: &str,
+    api_key: Option<ApiKeyRecord>,
+) -> AppResult<Response> {
+    proxy_anthropic_with_auth(state, headers, uri, body, request_id, Some(api_key)).await
+}
+
+async fn proxy_anthropic_with_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+    uri: &Uri,
+    body: &Bytes,
+    request_id: &str,
+    authenticated_api_key: Option<Option<ApiKeyRecord>>,
+) -> AppResult<Response> {
     track_activity_request(
         state,
         request_id,
         uri.path(),
-        run_anthropic_request(state, headers, uri, body, request_id),
+        run_anthropic_request(state, headers, uri, body, request_id, authenticated_api_key),
     )
     .await
 }
@@ -22,6 +45,7 @@ async fn run_anthropic_request(
     uri: &Uri,
     body: &Bytes,
     request_id: &str,
+    authenticated_api_key: Option<Option<ApiKeyRecord>>,
 ) -> AppResult<Response> {
     let started = Instant::now();
     let endpoint = uri.path().to_string();
@@ -46,7 +70,10 @@ async fn run_anthropic_request(
     let affinity_key = session_affinity_key(headers, &inbound);
     let request_tokens = estimate_request_tokens(&request_json);
 
-    let api_key = authenticate_gateway(state, headers).await?;
+    let api_key = match authenticated_api_key {
+        Some(api_key) => api_key,
+        None => authenticate_gateway(state, headers).await?,
+    };
     state.activity_describe(
         request_id,
         crate::state::ActivityDescription {

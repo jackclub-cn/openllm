@@ -21,7 +21,6 @@ impl AppState {
 
         let (events, _) = broadcast::channel(128);
         let (activity_events, _) = broadcast::channel(1024);
-        let (circuit_events, _) = broadcast::channel(128);
         let request_capacity_limit = parse_concurrency_limit(
             std::env::var("OPENLLM_MAX_CONCURRENT_REQUESTS")
                 .ok()
@@ -74,7 +73,8 @@ impl AppState {
             pool,
             client,
             release_feed: Arc::new(crate::release_feed::ReleaseFeed::default()),
-            admin_token: admin_token.filter(|token| !token.is_empty()),
+            admin_token: admin_token.filter(|token| !token.trim().is_empty()),
+            cors_origins: configured_cors_origins(),
             round_robin: Arc::new(Mutex::new(HashMap::new())),
             session_affinity,
             provider_key_cursor: Arc::new(Mutex::new(HashMap::new())),
@@ -93,6 +93,8 @@ impl AppState {
             provider_key_rpm: Arc::new(Mutex::new(HashMap::new())),
             provider_key_concurrency: Arc::new(Mutex::new(HashMap::new())),
             provider_key_queue: Arc::new(Mutex::new(HashMap::new())),
+            routing_p95_latency: Arc::new(RwLock::new(HashMap::new())),
+            event_stream_tickets: Arc::new(Mutex::new(HashMap::new())),
             provider_concurrency: Arc::new(Mutex::new(HashMap::new())),
             model_concurrency: Arc::new(Mutex::new(HashMap::new())),
             request_capacity,
@@ -120,7 +122,6 @@ impl AppState {
                 .map(|elapsed| elapsed.as_secs() as i64)
                 .unwrap_or(0),
             events,
-            circuit_events,
             auth_required: Arc::new(RwLock::new(None)),
             guardrails: Arc::new(RwLock::new(None)),
             inspector: Arc::new(RwLock::new(None)),
@@ -478,4 +479,34 @@ impl AppState {
             db_acquire_timeout_secs: crate::db::db_acquire_timeout_secs(),
         }
     }
+}
+
+fn configured_cors_origins() -> Arc<[String]> {
+    let Some(raw) = std::env::var("OPENLLM_CORS_ORIGINS").ok() else {
+        return Arc::from(Vec::<String>::new());
+    };
+    let mut origins = raw
+        .split(',')
+        .map(str::trim)
+        .map(|origin| origin.trim_end_matches('/'))
+        .filter(|origin| !origin.is_empty())
+        .filter_map(|origin| {
+            if origin == "*" {
+                tracing::warn!(
+                    "OPENLLM_CORS_ORIGINS cannot contain '*'; list exact origins instead"
+                );
+                return None;
+            }
+            match origin.parse::<http::HeaderValue>() {
+                Ok(_) => Some(origin.to_string()),
+                Err(error) => {
+                    tracing::warn!(%error, origin, "ignoring invalid CORS origin");
+                    None
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    origins.sort();
+    origins.dedup();
+    Arc::from(origins)
 }
