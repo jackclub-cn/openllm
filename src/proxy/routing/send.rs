@@ -151,6 +151,8 @@ pub(in crate::proxy) async fn send_provider_request(
 /// - if an upstream reports the accepted reasoning effort enum, map the
 ///   requested value to the nearest supported level, remember the enum on the
 ///   synced model, and retry once.
+/// - if an upstream rejects the `original` image detail level, downlevel it
+///   and remember the capability for the provider/model/endpoint scope.
 ///
 /// `body` is the exact body sent upstream, so compatibility retries update the
 /// request rather than replaying the rejected payload.
@@ -228,6 +230,7 @@ where
         send_activity_request(state, target, request_id, streamed, || build(body)).await?,
     );
     let mut transient_retry_used = false;
+    let mut image_detail_retry_used = false;
     let mut reasoning_effort_retry_used = false;
     let mut reasoning_retry_used = false;
     let mut strict_tools_retry_used = false;
@@ -333,9 +336,47 @@ where
             continue;
         }
 
+        if !image_detail_retry_used
+            && let Some(supported) =
+                super::compat::rejected_image_detail_options(status, &response_body)
+        {
+            let repaired = super::compat::normalize_image_detail_original(body, &supported);
+            if repaired > 0 {
+                image_detail_retry_used = true;
+                tracing::warn!(
+                    provider = %target.provider_name,
+                    model = %target.upstream_model,
+                    request_id,
+                    endpoint,
+                    supported = ?supported,
+                    image_parts = repaired,
+                    "upstream rejected original image detail; retrying with a supported level"
+                );
+                crate::capabilities::record_capability(
+                    state,
+                    crate::capabilities::CapabilityKey {
+                        provider_id: target.provider_id,
+                        model: target.upstream_model.clone(),
+                        endpoint: endpoint.to_string(),
+                        capability: crate::capabilities::CAPABILITY_IMAGE_DETAIL_ORIGINAL
+                            .to_string(),
+                    },
+                    false,
+                    crate::capabilities::SOURCE_RUNTIME,
+                    "exact",
+                )
+                .await;
+                response = UpstreamResponse::new(
+                    send_activity_request(state, target, request_id, streamed, || build(body))
+                        .await?,
+                );
+                continue;
+            }
+        }
+
         if !reasoning_effort_retry_used
             && let Some(supported) =
-                super::compat::rejected_reasoning_effort_options(status, &response_body)
+                super::compat::rejected_reasoning_effort_options(status, &response_body, body)
         {
             let repaired = super::compat::normalize_reasoning_effort(body, &supported);
             if repaired > 0 {

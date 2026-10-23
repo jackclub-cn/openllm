@@ -514,9 +514,9 @@ pub(crate) async fn assess_targets(
         let quota_low = quota.is_some_and(|quota| quota.state == "low");
         let quota_exhausted = quota.is_some_and(|quota| quota.state == "exhausted");
         let quota_alternative = targets.iter().any(|other| {
-            !quota_states
+            quota_states
                 .get(&crate::quota::quota_target_key(other))
-                .is_some_and(|quota| quota.state == "exhausted")
+                .is_none_or(|quota| quota.state != "exhausted")
         });
         if strategy == RouteStrategy::QuotaPaced {
             factors.push(score_factor(

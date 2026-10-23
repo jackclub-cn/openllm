@@ -8,6 +8,7 @@ use crate::state::AppState;
 pub(crate) const CAPABILITY_TOOL_SEARCH: &str = "tool_search";
 pub(crate) const CAPABILITY_REASONING_HISTORY: &str = "reasoning_history";
 pub(crate) const CAPABILITY_STRICT_TOOLS: &str = "strict_tools";
+pub(crate) const CAPABILITY_IMAGE_DETAIL_ORIGINAL: &str = "image_detail_original";
 
 pub(crate) const SOURCE_RUNTIME: &str = "runtime";
 pub(crate) const SOURCE_TEMPLATE: &str = "template";

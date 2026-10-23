@@ -15,7 +15,11 @@ fn responses_text_content_uses_chat_strings_and_preserves_images() {
                 ]},
                 {"role": "user", "content": [
                     {"type": "input_text", "text": "inspect"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+                    {
+                        "type": "input_image",
+                        "image_url": "data:image/png;base64,AAAA",
+                        "detail": "original"
+                    }
                 ]}
             ]
         }),
@@ -28,7 +32,53 @@ fn responses_text_content_uses_chat_strings_and_preserves_images() {
         converted["messages"][2]["content"],
         json!([
             {"type": "text", "text": "inspect"},
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,AAAA",
+                    "detail": "original"
+                }
+            }
+        ])
+    );
+}
+
+#[test]
+fn chat_image_parts_keep_detail_when_converted_to_responses() {
+    let converted = chat_request_to_responses(
+        &json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,AAAA",
+                            "detail": "high"
+                        }
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": "data:image/jpeg;base64,BBBB"
+                    }
+                ]
+            }]
+        }),
+        "upstream",
+        false,
+    );
+    assert_eq!(
+        converted["input"][0]["content"],
+        json!([
+            {
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+                "detail": "high"
+            },
+            {
+                "type": "input_image",
+                "image_url": "data:image/jpeg;base64,BBBB"
+            }
         ])
     );
 }

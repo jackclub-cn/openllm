@@ -81,7 +81,7 @@ pub(crate) async fn forward_to_target(
         &target,
         api_key.map(|key| key.id),
         request_id,
-        endpoint,
+        upstream_endpoint,
         shape,
         streamed,
         &mut request_body,

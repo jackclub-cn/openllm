@@ -191,9 +191,9 @@ pub(super) async fn apply_quota_pacing(
     });
     if targets
         .iter()
-        .any(|target| !quota_for(target).is_some_and(|quota| quota.state == "exhausted"))
+        .any(|target| quota_for(target).is_none_or(|quota| quota.state != "exhausted"))
     {
-        targets.retain(|target| !quota_for(target).is_some_and(|quota| quota.state == "exhausted"));
+        targets.retain(|target| quota_for(target).is_none_or(|quota| quota.state != "exhausted"));
     }
 }
 

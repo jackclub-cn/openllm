@@ -39,11 +39,10 @@ pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     if !message.contains("tool_search") {
         return false;
     }
-    [
+    if [
         "unknown tool type",
         "unsupported tool type",
         "invalid tool type",
-        "tool.type",
         "tool_search is not supported",
         "tool_search not supported",
         "tool_search is unsupported",
@@ -55,6 +54,19 @@ pub(crate) fn upstream_rejects_tool_search(body: &[u8]) -> bool {
     ]
     .iter()
     .any(|pattern| message.contains(pattern))
+    {
+        return true;
+    }
+    message.contains("tool.type")
+        && [
+            "unknown",
+            "unsupported",
+            "invalid",
+            "not valid",
+            "not supported",
+        ]
+        .iter()
+        .any(|marker| message.contains(marker))
 }
 
 #[allow(clippy::too_many_arguments)]

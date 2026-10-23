@@ -32,6 +32,7 @@
 | `src/api/lifecycle/` | 配置导入导出、备份、升级检查 | 导入器再按 settings、providers、routes、pools 分工；旧配置的 Webhook 项仅报告跳过，不再写入 |
 | `src/api/metrics/` | Prometheus 快照和文本渲染 | 一次采集数据，各指标领域分别输出；指标名和统计口径保持稳定 |
 | `src/proxy/routing/` | 路由决策 | 解析、诊断、指标、策略、粘性、并发、熔断、凭据、发送分别维护 |
+| `src/proxy/compat/media.rs` | 图片输入兼容 | 独立识别图片清晰度枚举拒绝并调整 `original`；不改动推理强度，能力按提供商、模型和端点记录 |
 | `src/proxy/routing/metrics.rs` | 路由指标快照 | 后台刷新 P95；请求路径只读内存快照，不执行窗口聚合 |
 | `src/proxy/upstream/` | 上游传输与响应生命周期 | HTTP 转发、流保护、错误处理、SSE、准入响应分开 |
 | `src/proxy/translation/<protocol>/` | 协议转换 | 请求、响应、流状态和流事件处理分开 |

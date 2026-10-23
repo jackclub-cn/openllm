@@ -161,12 +161,12 @@ git ls-remote origin "refs/tags/v$version" "refs/tags/v$version^{}"
 
 | 任务 | 当前检查 |
 | --- | --- |
-| `quality` | 文件规模、结构检查脚本测试、Rust 格式 |
+| `quality` | 前端行为测试、前端依赖审计、文件规模、结构检查脚本测试、Rust 格式 |
 | `build` | Linux、Windows、macOS 分别安装并构建前端，执行严格 Clippy、Rust 测试、release 构建，生成校验文件 |
 | `monitoring` | 告警规则、规则测试、Grafana JSON、引用指标名检查；注意脚本输出是否跳过检查 |
 | `release` | 依赖以上所有任务，合并下载三平台产物，通过 `softprops/action-gh-release` 上传；标签推送时使用发布提交说明，并附自动生成的变更记录 |
 
-工作流目前没有执行 `web/tests/`，存在相关测试时仍需按第 3 节本地执行。
+工作流通过 `npm test` 执行 `web/tests/`，本地仍需按第 3 节执行并记录测试数量。
 
 按发布提交查询运行记录，选择 `headBranch` 对应本次标签的那一次，
 不要将 `master` 的绿色运行误认为标签发布已完成：

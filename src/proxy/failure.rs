@@ -179,7 +179,11 @@ pub(crate) fn classify_upstream_failure(
 ) -> UpstreamFailure {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
 
-    if is_content_policy_refusal(&text) {
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::FORBIDDEN | StatusCode::UNPROCESSABLE_ENTITY
+    ) && is_content_policy_refusal(&text)
+    {
         return UpstreamFailure::request(
             FailureScope::RequestContent,
             "content_policy_refusal",
@@ -199,7 +203,11 @@ pub(crate) fn classify_upstream_failure(
         );
     }
 
-    if is_context_limit_error(&text) {
+    if matches!(
+        status,
+        StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE | StatusCode::UNPROCESSABLE_ENTITY
+    ) && is_context_limit_error(&text)
+    {
         return UpstreamFailure::request(
             FailureScope::Model,
             "context_limit_exceeded",

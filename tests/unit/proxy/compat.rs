@@ -54,6 +54,7 @@ fn recognizes_unsupported_strict_tool_error() {
     }
     for error in [
         r#"{"error":{"message":"strict mode is enabled for the request"}}"#,
+        r#"{"error":{"message":"invalid output in strict mode for a tool call"}}"#,
         r#"{"error":{"message":"rate limit exceeded for tool calls"}}"#,
     ] {
         assert!(!upstream_rejects_strict_tools(error.as_bytes()));
@@ -285,17 +286,17 @@ fn normalizes_command_code_output_caps_and_reasoning_effort() {
 
 #[test]
 fn maps_reasoning_effort_to_the_nearest_model_value() {
-    let supported = ["auto", "low", "high"]
+    let supported = ["low", "high", "max"]
         .into_iter()
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
 
     let mut responses = json!({
         "input": "hi",
-        "reasoning": {"effort": "original"}
+        "reasoning": {"effort": "xhigh"}
     });
     assert_eq!(normalize_reasoning_effort(&mut responses, &supported), 1);
-    assert_eq!(responses["reasoning"]["effort"], "auto");
+    assert_eq!(responses["reasoning"]["effort"], "max");
 
     let mut chat = json!({
         "messages": [{"role": "user", "content": "hi"}],
@@ -306,10 +307,64 @@ fn maps_reasoning_effort_to_the_nearest_model_value() {
 }
 
 #[test]
-fn extracts_supported_efforts_from_an_enum_rejection() {
-    let body = br#"{"error":{"code":"server_error","message":"Upstream request failed: [invalid_request_error] content part: unknown variant `original`, expected one of `auto`, `low`, `high` (request_id: gw-test)"}}"#;
+fn maps_original_image_detail_to_a_supported_level() {
+    let supported = ["auto", "low", "high"]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut responses = json!({
+        "input": [{
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_image",
+                "image_url": "data:image/png;base64,AAAA",
+                "detail": "original"
+            }]
+        }]
+    });
     assert_eq!(
-        rejected_reasoning_effort_options(StatusCode::BAD_REQUEST, body),
+        normalize_image_detail_original(&mut responses, &supported),
+        1
+    );
+    assert_eq!(
+        responses["input"][0]["content"][0]["detail"],
+        Value::String("high".to_string())
+    );
+
+    let mut chat = json!({
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": {
+                    "url": "data:image/png;base64,AAAA",
+                    "detail": "original"
+                }
+            }]
+        }]
+    });
+    assert_eq!(normalize_image_detail_original(&mut chat, &supported), 1);
+    assert_eq!(
+        chat["messages"][0]["content"][0]["image_url"]["detail"],
+        Value::String("high".to_string())
+    );
+}
+
+#[test]
+fn distinguishes_image_detail_from_reasoning_effort_rejections() {
+    let body = br#"{"error":{"code":"server_error","message":"Upstream request failed: [invalid_request_error] content part: unknown variant `original`, expected one of `auto`, `low`, `high` (request_id: gw-test)"}}"#;
+    assert!(
+        rejected_reasoning_effort_options(
+            StatusCode::BAD_REQUEST,
+            body,
+            &json!({"reasoning": {"effort": "xhigh"}})
+        )
+        .is_none(),
+        "image detail options are not reasoning efforts"
+    );
+    assert_eq!(
+        rejected_image_detail_options(StatusCode::BAD_REQUEST, body),
         Some(vec![
             "auto".to_string(),
             "low".to_string(),
@@ -317,9 +372,29 @@ fn extracts_supported_efforts_from_an_enum_rejection() {
         ])
     );
     assert!(
-        rejected_reasoning_effort_options(StatusCode::OK, body).is_none(),
-        "successful or unrelated responses must not be treated as effort errors"
+        rejected_image_detail_options(StatusCode::OK, body).is_none(),
+        "successful responses must not be treated as compatibility errors"
     );
+
+    let reasoning = br#"{"error":{"message":"unknown variant `auto` for reasoning effort, expected one of `low`, `high`"}}"#;
+    assert_eq!(
+        rejected_reasoning_effort_options(
+            StatusCode::BAD_REQUEST,
+            reasoning,
+            &json!({"reasoning": {"effort": "auto"}})
+        ),
+        Some(vec!["low".to_string(), "high".to_string()])
+    );
+    assert!(
+        rejected_reasoning_effort_options(
+            StatusCode::BAD_REQUEST,
+            reasoning,
+            &json!({"reasoning": {"effort": "xhigh"}})
+        )
+        .is_none(),
+        "an enum rejection for another field must not change reasoning effort"
+    );
+    assert!(rejected_image_detail_options(StatusCode::BAD_REQUEST, reasoning).is_none());
 }
 
 #[test]
@@ -353,6 +428,7 @@ fn recognizes_unsupported_tool_search_error() {
     for error in [
         r#"{"error":{"message":"rate limit exceeded"}}"#,
         r#"{"error":{"message":"tool_search returned an invalid result"}}"#,
+        r#"{"error":{"message":"tool.type is required when tool_search is present"}}"#,
     ] {
         assert!(!upstream_rejects_tool_search(error.as_bytes()));
     }

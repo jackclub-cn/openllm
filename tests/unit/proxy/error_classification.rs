@@ -144,6 +144,14 @@ fn upstream_failure_classifier_separates_failure_scopes() {
 
     let failure = classify_upstream_failure(
         &target,
+        StatusCode::UNAUTHORIZED,
+        br#"{"error":{"message":"invalid API key for the content filter service"}}"#,
+    );
+    assert_eq!(failure.scope, FailureScope::Credential);
+    assert_eq!(failure.reason_code, "credential_rejected");
+
+    let failure = classify_upstream_failure(
+        &target,
         StatusCode::FORBIDDEN,
         b"The request was rejected because it was considered high risk",
     );
@@ -151,6 +159,13 @@ fn upstream_failure_classifier_separates_failure_scopes() {
     assert_eq!(failure.reason_code, "content_policy_refusal");
     assert_eq!(failure.retry, RetryDecision::NextTarget);
     assert_eq!(failure.rest, RestAction::None);
+
+    let failure = classify_upstream_failure(
+        &target,
+        StatusCode::TOO_MANY_REQUESTS,
+        br#"{"error":{"message":"input is too long; retry later"}}"#,
+    );
+    assert_eq!(failure.reason_code, "rate_limited");
 
     let failure = classify_upstream_failure(
         &target,

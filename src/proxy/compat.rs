@@ -1,5 +1,9 @@
 use super::*;
 
+mod media;
+
+pub(crate) use media::{normalize_image_detail_original, rejected_image_detail_options};
+
 pub(crate) fn strip_tool_search_tools(body: &Value) -> Option<Value> {
     let mut compat = body.clone();
     let tools = compat.get_mut("tools")?.as_array_mut()?;
@@ -32,20 +36,23 @@ pub(crate) fn strip_strict_tools(body: &Value) -> Option<Value> {
 
 pub(crate) fn upstream_rejects_strict_tools(body: &[u8]) -> bool {
     let text = String::from_utf8_lossy(body).to_ascii_lowercase();
-    text.contains("strict")
-        && (text.contains("tool") || text.contains("function") || text.contains("schema"))
-        && [
-            "unsupported",
-            "not supported",
-            "unknown",
-            "invalid",
-            "not allowed",
-            "unexpected",
-            "extra field",
-            "additional property",
-        ]
-        .iter()
-        .any(|marker| text.contains(marker))
+    let strict_field = [
+        "unknown strict",
+        "unsupported strict",
+        "strict is not supported",
+        "strict not supported",
+        "strict is unsupported",
+        "does not support strict",
+        "doesn't support strict",
+        "strict field",
+        "strict parameter",
+        "strict property",
+        "property strict",
+        "parameter strict",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker));
+    strict_field && (text.contains("tool") || text.contains("function") || text.contains("schema"))
 }
 
 pub(crate) fn responses_tool_call_id(item: &Value) -> Option<&str> {
@@ -568,9 +575,7 @@ pub(crate) fn normalize_command_code_reasoning_effort(body: &mut Value) -> usize
 
 /// Maps an effort value to the nearest value accepted by the upstream model.
 ///
-/// `original` is the client's request for the model's default behavior, so it
-/// prefers `auto` and otherwise behaves like `medium`. For normal named levels,
-/// the closest numeric level wins; ties choose the higher level.
+/// The closest numeric level wins; ties choose the higher level.
 pub(crate) fn normalize_reasoning_effort(body: &mut Value, supported: &[String]) -> usize {
     if supported.is_empty() {
         return 0;
@@ -610,14 +615,6 @@ fn nearest_reasoning_effort(current: &str, supported: &[String]) -> Option<Strin
     {
         return Some(exact.clone());
     }
-    if current == "original"
-        && let Some(auto) = supported
-            .iter()
-            .find(|value| value.eq_ignore_ascii_case("auto"))
-    {
-        return Some(auto.clone());
-    }
-
     let target_rank = reasoning_effort_rank(&current).unwrap_or(3);
     supported
         .iter()
@@ -645,14 +642,43 @@ fn reasoning_effort_rank(value: &str) -> Option<u8> {
 /// Extracts accepted reasoning effort values from a precise upstream enum
 /// rejection such as:
 ///
-/// `unknown variant 'original', expected one of 'auto', 'low', 'high'`.
-///
-/// Only 400/422 responses are considered, and values are limited to the plain
-/// token shape used by effort enums.
+/// Only 400/422 responses are considered. Image-detail rejections use the
+/// same enum wording and are deliberately excluded here.
 pub(crate) fn rejected_reasoning_effort_options(
     status: StatusCode,
     body: &[u8],
+    request: &Value,
 ) -> Option<Vec<String>> {
+    let (text, values) = rejected_enum_options(status, body)?;
+    if is_image_detail_rejection(&text, &values) {
+        return None;
+    }
+    let rejected = rejected_enum_variant(&text)?;
+    let requested = request
+        .get("reasoning_effort")
+        .or_else(|| request.pointer("/reasoning/effort"))
+        .and_then(Value::as_str)?;
+    rejected
+        .eq_ignore_ascii_case(requested.trim())
+        .then_some(values)
+}
+
+fn rejected_enum_variant(text: &str) -> Option<&str> {
+    let rest = text.split_once("unknown variant")?.1.trim_start();
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    let quote = rest
+        .chars()
+        .next()
+        .filter(|ch| matches!(ch, '\'' | '"' | '`'))?;
+    let rest = rest.get(quote.len_utf8()..)?;
+    let value = rest[..rest.find(quote)?].trim();
+    (!value.is_empty()).then_some(value)
+}
+
+pub(super) fn rejected_enum_options(
+    status: StatusCode,
+    body: &[u8],
+) -> Option<(String, Vec<String>)> {
     if !matches!(
         status,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY
@@ -685,7 +711,21 @@ pub(crate) fn rejected_reasoning_effort_options(
         }
         rest = &rest[end + 1..];
     }
-    (!values.is_empty()).then_some(values)
+    (!values.is_empty()).then_some((text, values))
+}
+
+pub(super) fn is_image_detail_rejection(text: &str, values: &[String]) -> bool {
+    if text.contains("reasoning") || text.contains("effort") {
+        return false;
+    }
+    let image_context =
+        text.contains("content part") || text.contains("image") || text.contains("detail");
+    let classic_detail_enum = values.iter().any(|value| value == "auto")
+        && values.iter().any(|value| value == "high")
+        && values
+            .iter()
+            .all(|value| matches!(value.as_str(), "auto" | "low" | "high"));
+    text.contains("original") && (image_context || classic_detail_enum)
 }
 
 fn target_reasoning_efforts(target: &RouteTarget) -> Option<Vec<String>> {
@@ -716,6 +756,7 @@ pub(crate) fn normalize_command_code_request(body: &mut Value) -> usize {
 /// - drop unpaired tool calls and orphan tool results (aggregators and strict
 ///   providers reject these with opaque 400s),
 /// - strip `tool_search` for providers known not to support it,
+/// - normalize image detail levels unsupported by strict upstreams,
 /// - clamp/normalize CommandCode output limits and reasoning effort.
 ///
 /// `shape` describes the wire format actually being sent, because OpenAI
@@ -751,6 +792,14 @@ pub(crate) async fn apply_upstream_compat(
         &target.upstream_model,
         endpoint,
         crate::capabilities::CAPABILITY_STRICT_TOOLS,
+    )
+    .await;
+    let image_detail_profile = crate::capabilities::capability_support(
+        state,
+        target.provider_id,
+        &target.upstream_model,
+        endpoint,
+        crate::capabilities::CAPABILITY_IMAGE_DETAIL_ORIGINAL,
     )
     .await;
     let repaired_tool_items = match shape {
@@ -833,22 +882,29 @@ pub(crate) async fn apply_upstream_compat(
         *body = compat_body;
     }
 
+    if image_detail_profile == Some(false) || is_command_code_target(target) {
+        let changes = normalize_image_detail_original(body, &[]);
+        if changes > 0 {
+            tracing::debug!(
+                provider = %target.provider_name,
+                model = %target.upstream_model,
+                request_id,
+                image_parts = changes,
+                "downleveled original image detail before upstream request"
+            );
+        }
+    }
+
     if let Some(supported) = target_reasoning_efforts(target) {
         let changes = normalize_reasoning_effort(body, &supported);
         if changes > 0 {
-            tracing::warn!(
+            tracing::debug!(
                 provider = %target.provider_name,
                 model = %target.upstream_model,
                 request_id,
                 supported = ?supported,
                 "mapped reasoning effort to a value supported by the upstream model"
             );
-            log_usage_warning(
-                state,
-                request_id,
-                "Mapped the requested reasoning effort to a value supported by the upstream model.",
-            )
-            .await;
         }
     }
 

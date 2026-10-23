@@ -311,6 +311,9 @@ mod capabilities;
 #[path = "proxy/compat.rs"]
 mod compat;
 
+#[path = "proxy/image_detail.rs"]
+mod image_detail;
+
 #[path = "proxy/tool_search.rs"]
 mod tool_search;
 

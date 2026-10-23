@@ -142,10 +142,17 @@ pub(crate) fn chat_content_to_responses_parts(content: &Value, text_type: &str) 
         Value::Array(items) => items
             .iter()
             .filter_map(|item| match item.get("type").and_then(Value::as_str) {
-                Some("image_url") => item
-                    .pointer("/image_url/url")
-                    .and_then(Value::as_str)
-                    .map(|url| json!({"type": "input_image", "image_url": url})),
+                Some("image_url") => {
+                    let image = item.get("image_url")?;
+                    let url = image
+                        .as_str()
+                        .or_else(|| image.get("url").and_then(Value::as_str))?;
+                    let mut part = json!({"type": "input_image", "image_url": url});
+                    if let Some(detail) = image.get("detail").or_else(|| item.get("detail")) {
+                        part["detail"] = detail.clone();
+                    }
+                    Some(part)
+                }
                 _ => item
                     .get("text")
                     .and_then(Value::as_str)

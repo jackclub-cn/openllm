@@ -215,11 +215,15 @@ pub(crate) fn responses_content_part_to_chat(item: &Value) -> Option<Value> {
             .and_then(Value::as_str)
             .map(|text| json!({"type": "text", "text": text})),
         Some("input_image") => {
-            let url = item
-                .get("image_url")
-                .or_else(|| item.get("url"))
-                .and_then(Value::as_str)?;
-            Some(json!({"type": "image_url", "image_url": {"url": url}}))
+            let image = item.get("image_url").or_else(|| item.get("url"))?;
+            let url = image
+                .as_str()
+                .or_else(|| image.get("url").and_then(Value::as_str))?;
+            let mut image_url = json!({"url": url});
+            if let Some(detail) = item.get("detail").or_else(|| image.get("detail")) {
+                image_url["detail"] = detail.clone();
+            }
+            Some(json!({"type": "image_url", "image_url": image_url}))
         }
         Some("image_url") => Some(item.clone()),
         _ => item

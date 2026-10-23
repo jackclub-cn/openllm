@@ -243,7 +243,7 @@ pub(crate) async fn forward_openai_as_anthropic(
         &target,
         api_key.map(|key| key.id),
         request_id,
-        ANTHROPIC_MESSAGES,
+        upstream_endpoint,
         shape,
         streamed,
         &mut body,
