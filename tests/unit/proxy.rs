@@ -353,6 +353,9 @@ mod runtime_limits;
 #[path = "proxy/admission.rs"]
 mod admission;
 
+#[path = "proxy/body_budget.rs"]
+mod body_budget;
+
 #[path = "proxy/deadlines.rs"]
 mod deadlines;
 

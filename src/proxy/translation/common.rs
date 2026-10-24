@@ -7,6 +7,54 @@ use super::*;
 /// a model is thinking and the upstream has sent nothing.
 pub(crate) const SSE_KEEPALIVE_LINE: &[u8] = b": keep-alive\n\n";
 
+/// Largest SSE line retained while waiting for its terminating newline.
+///
+/// Event payloads are small JSON objects. A broken or hostile upstream must not
+/// be able to grow a translator's line buffer for the full stream lifetime.
+pub(crate) const MAX_SSE_LINE_BYTES: usize = 1024 * 1024;
+
+/// Splits upstream chunks into complete SSE lines without retaining an
+/// oversized line. An over-limit line is discarded through its next newline so
+/// the stream can continue at the next valid event.
+#[derive(Default)]
+pub(crate) struct SseLineBuffer {
+    line: Vec<u8>,
+    discarding: bool,
+}
+
+impl SseLineBuffer {
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<Vec<u8>> {
+        let mut lines = Vec::new();
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            if !self.discarding {
+                if self.line.len().saturating_add(part.len()) > MAX_SSE_LINE_BYTES {
+                    self.line.clear();
+                    self.discarding = true;
+                } else {
+                    self.line.extend_from_slice(part);
+                }
+            }
+            if part.last() == Some(&b'\n') {
+                if self.discarding {
+                    self.discarding = false;
+                } else {
+                    lines.push(std::mem::take(&mut self.line));
+                }
+            }
+        }
+        lines
+    }
+
+    pub(crate) fn finish(&mut self) -> Option<Vec<u8>> {
+        if self.discarding || self.line.is_empty() {
+            self.line.clear();
+            self.discarding = false;
+            return None;
+        }
+        Some(std::mem::take(&mut self.line))
+    }
+}
+
 /// Reads thinking text from a chat-completions message.
 ///
 /// Different OpenAI-compatible providers use `reasoning_content`,

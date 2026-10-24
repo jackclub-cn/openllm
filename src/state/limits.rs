@@ -1,5 +1,12 @@
 use super::*;
 
+/// Default global cap on concurrent proxied requests.
+///
+/// Large coding-agent payloads can each create several temporary copies while
+/// being parsed and translated. Keep a bounded number in flight by default;
+/// operators can raise it or set the environment variable to `0` to disable it.
+pub(crate) const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 8;
+
 /// Default request-body cap in MiB.
 ///
 /// The gateway buffers the whole body in memory, so this is a memory-safety
@@ -21,10 +28,10 @@ pub(crate) const DEFAULT_MAX_UPSTREAM_BODY_MIB: usize = 64;
 ///
 /// The gateway buffers every request body in memory, so a burst of large
 /// coding-agent payloads can exhaust RAM long before the request-count cap
-/// trips. This is an opt-in budget: `0` disables it, matching the request-count
-/// cap. Set `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` to a positive value to shed
-/// requests whose combined buffered bodies would exceed it.
-pub(crate) const DEFAULT_MAX_INFLIGHT_REQUEST_MIB: usize = 0;
+/// trips. The default bounds the combined buffered bodies; set
+/// `OPENLLM_MAX_INFLIGHT_REQUEST_MIB=0` to disable the budget or another
+/// positive value to tune it.
+pub(crate) const DEFAULT_MAX_INFLIGHT_REQUEST_MIB: usize = 128;
 
 /// Default admission wait in milliseconds.
 ///
@@ -57,6 +64,14 @@ pub(crate) const DEFAULT_BODY_READ_TIMEOUT_SECS: u64 = 600;
 /// starts shedding new proxied requests. A little headroom is left above it so
 /// the process can still finish the work already in flight.
 pub(crate) const DEFAULT_MEMORY_SHED_RATIO: f64 = 0.9;
+
+/// Default process-memory ceiling in MiB when no tighter cgroup limit exists.
+///
+/// This leaves ample room for normal traffic while ensuring the pressure guard
+/// is active on bare-metal and unconstrained-container deployments. A smaller
+/// cgroup limit always wins, and `OPENLLM_MEMORY_LIMIT_MIB=0` disables the
+/// guard explicitly.
+pub(crate) const DEFAULT_MEMORY_LIMIT_MIB: u64 = 768;
 
 /// Default wall-clock budget for a request's fallback loop, in seconds.
 ///
@@ -172,20 +187,31 @@ pub(crate) fn parse_optional_secs(value: Option<&str>, default: u64) -> Option<D
 
 /// Parses an operator-provided global concurrency cap.
 ///
-/// Empty, zero, and unparsable values all disable the cap, matching the
-/// opt-in default: no admission limit unless an operator asks for one.
+/// Missing, empty, or unparsable values use the bounded default. An explicit
+/// zero disables the cap.
 pub(crate) fn parse_concurrency_limit(value: Option<&str>) -> Option<usize> {
-    value
-        .and_then(|value| value.trim().parse::<usize>().ok())
-        .filter(|limit| *limit > 0)
+    parse_optional_limit(value, DEFAULT_MAX_CONCURRENT_REQUESTS)
 }
 
 /// Parses an operator-provided in-flight request-byte budget in MiB.
 ///
-/// Empty, zero, and unparsable values all disable the budget, matching the
-/// opt-in default so an upgrade never starts shedding bodies by surprise.
+/// Missing, empty, or unparsable values use the bounded default. An explicit
+/// zero disables the budget.
 pub(crate) fn parse_inflight_bytes_mib(value: Option<&str>) -> Option<usize> {
-    parse_concurrency_limit(value).map(|mib| mib.saturating_mul(1024 * 1024))
+    parse_optional_limit(value, DEFAULT_MAX_INFLIGHT_REQUEST_MIB)
+        .map(|mib| mib.saturating_mul(1024 * 1024))
+}
+
+fn parse_optional_limit(value: Option<&str>, default: usize) -> Option<usize> {
+    match value.map(str::trim) {
+        None | Some("") => Some(default),
+        Some("0") => None,
+        Some(raw) => raw
+            .parse::<usize>()
+            .ok()
+            .filter(|limit| *limit > 0)
+            .or(Some(default)),
+    }
 }
 
 /// Parses the admission wait budget, in milliseconds.
@@ -209,9 +235,8 @@ pub(crate) fn parse_admission_wait_ms(value: Option<&str>) -> Duration {
 ///
 /// `configured` is the raw `OPENLLM_MEMORY_LIMIT_MIB` value and `auto` is the
 /// ceiling discovered from the container. An explicit positive value wins, an
-/// explicit `0` disables the guard, and an unset or blank value falls back to
-/// the discovered limit, so container deployments are protected without any
-/// tuning while bare-metal hosts (no cgroup limit) stay unaffected.
+/// explicit `0` disables the guard, and an unset or blank value uses the
+/// smaller of the discovered cgroup limit and the built-in default.
 pub(crate) fn resolve_memory_limit(
     configured: Option<&str>,
     auto: Option<u64>,
@@ -229,9 +254,10 @@ pub(crate) fn resolve_memory_limit(
 }
 
 pub(super) fn resolve_auto_memory_limit(auto: Option<u64>) -> (Option<u64>, &'static str) {
+    let default_bytes = DEFAULT_MEMORY_LIMIT_MIB * 1024 * 1024;
     match auto {
-        Some(bytes) => (Some(bytes), "cgroup"),
-        None => (None, "off"),
+        Some(bytes) if bytes < default_bytes => (Some(bytes), "cgroup"),
+        _ => (Some(default_bytes), "default"),
     }
 }
 

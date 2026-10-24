@@ -90,7 +90,8 @@ COPY --from=build /src/openllm /usr/local/bin/openllm
 # Bind on all interfaces so the container is reachable, and keep state in the
 # volume declared below.
 ENV OPENLLM_BIND=0.0.0.0:8080 \
-    OPENLLM_DATA_DIR=/data
+    OPENLLM_DATA_DIR=/data \
+    MALLOC_ARENA_MAX=2
 
 VOLUME ["/data"]
 EXPOSE 8080

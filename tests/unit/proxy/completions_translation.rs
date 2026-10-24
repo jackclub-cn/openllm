@@ -79,6 +79,7 @@ fn chat_response_converts_to_completions() {
 async fn chat_stream_converts_to_completions_chunks() {
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let mut text = String::new();
+    let mut output_chars = 0;
     let mut usage = Usage::default();
     let mut finish_reason = None;
     let mut first_token_ms = None;
@@ -91,6 +92,7 @@ async fn chat_stream_converts_to_completions_chunks() {
             process_chat_line_for_completions(
                 line,
                 &mut text,
+                &mut output_chars,
                 &mut usage,
                 &mut finish_reason,
                 &mut first_token_ms,
@@ -109,6 +111,7 @@ async fn chat_stream_converts_to_completions_chunks() {
     assert!(joined.contains("\"object\":\"text_completion\""));
     assert!(joined.contains("\"text\":\"hi\""));
     assert_eq!(text, "hi!");
+    assert_eq!(output_chars, 3);
     assert_eq!(usage.prompt_tokens, 3);
     assert_eq!(usage.completion_tokens, 2);
     assert_eq!(finish_reason.as_deref(), Some("stop"));
@@ -139,6 +142,7 @@ async fn anthropic_stream_converts_to_completions_events() {
     let mut event_name = String::new();
     let mut usage = Usage::default();
     let mut text = String::new();
+    let mut output_chars = 0;
     let mut stop_reason = None;
     let mut first_token_ms = None;
     for line in [
@@ -154,6 +158,7 @@ async fn anthropic_stream_converts_to_completions_events() {
                 &mut event_name,
                 &mut usage,
                 &mut text,
+                &mut output_chars,
                 &mut stop_reason,
                 &mut first_token_ms,
                 Instant::now(),
@@ -172,6 +177,7 @@ async fn anthropic_stream_converts_to_completions_events() {
     assert!(joined.contains("\"object\":\"text_completion\""));
     assert!(joined.contains("\"text\":\"hi\""));
     assert_eq!(text, "hi");
+    assert_eq!(output_chars, 2);
     assert_eq!(usage.prompt_tokens, 5);
     assert_eq!(usage.completion_tokens, 2);
     assert_eq!(stop_reason.as_deref(), Some("end_turn"));

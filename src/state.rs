@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use sqlx::SqlitePool;
-use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, RwLock, Semaphore, broadcast};
 
 use crate::allocation::{AllocationLedger, PoolCatalog};
 use crate::capabilities::CapabilityCache;
@@ -71,6 +71,7 @@ impl Drop for BusyWaitLease {
 
 /// Process-wide ceiling for requests waiting on an all-busy route.
 pub(crate) const MAX_BUSY_WAITERS: usize = 64;
+pub(crate) const MAX_BACKGROUND_DB_TASKS: usize = 64;
 
 pub type FailureClassifications = HashMap<(String, String, String), u64>;
 pub type ModelConcurrency = HashMap<(i64, String), Arc<Semaphore>>;
@@ -167,6 +168,9 @@ pub struct AppState {
     pub request_bytes_limit: usize,
     /// Requests refused by the in-flight byte budget since startup.
     pub request_bytes_shed: Arc<AtomicU64>,
+    /// Bounds detached database writers so a slow SQLite instance cannot create
+    /// an unbounded queue of per-request tasks.
+    pub(crate) background_db_capacity: Arc<Semaphore>,
     /// How long an over-capacity request waits for an admission slot before it
     /// is shed. Zero sheds immediately.
     pub admission_wait: Duration,
@@ -178,9 +182,10 @@ pub struct AppState {
     /// error, so a route full of failing targets cannot pin an admission slot
     /// for minutes. `None` disables the budget.
     pub request_timeout: Option<Duration>,
-    /// Opt-in process-memory pressure guard; `None` disables it.
+    /// Process-memory pressure guard; `None` disables it explicitly.
     pub memory_pressure: Option<Arc<MemoryPressure>>,
-    /// Where the memory ceiling came from: `"off"`, `"env"`, or `"cgroup"`.
+    /// Where the memory ceiling came from: `"off"`, `"env"`, `"cgroup"`, or
+    /// the built-in `"default"`.
     pub memory_limit_source: &'static str,
     /// Configured memory shed ratio, kept for the runtime-limits view even when
     /// the guard is disabled.

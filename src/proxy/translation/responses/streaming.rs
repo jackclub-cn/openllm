@@ -17,7 +17,7 @@ pub(crate) fn openai_chat_stream_to_responses(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut tool_index: Option<i64> = None;
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
@@ -35,15 +35,13 @@ pub(crate) fn openai_chat_stream_to_responses(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_chat_chunk_line(&mut stream, &line, &mut tool_index, &tx).await;
             }
             heartbeat.observe_first_token(stream.first_token_ms);
         }
-        if !buffer.is_empty() {
-            process_chat_chunk_line(&mut stream, &buffer, &mut tool_index, &tx).await;
+        if let Some(line) = buffer.finish() {
+            process_chat_chunk_line(&mut stream, &line, &mut tool_index, &tx).await;
         }
         heartbeat.observe_first_token(stream.first_token_ms);
 
@@ -134,7 +132,7 @@ pub(crate) fn anthropic_stream_to_responses(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let mut stream = ResponsesStreamState::new(requested_model.clone(), started);
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut event_name = String::new();
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
@@ -152,15 +150,13 @@ pub(crate) fn anthropic_stream_to_responses(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 stream.handle_line(&line, &mut event_name, &tx).await;
             }
             heartbeat.observe_first_token(stream.first_token_ms);
         }
-        if !buffer.is_empty() {
-            stream.handle_line(&buffer, &mut event_name, &tx).await;
+        if let Some(line) = buffer.finish() {
+            stream.handle_line(&line, &mut event_name, &tx).await;
         }
         heartbeat.observe_first_token(stream.first_token_ms);
 

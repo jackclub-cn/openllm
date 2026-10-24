@@ -17,8 +17,9 @@ pub(crate) fn chat_stream_to_completions(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut text = String::new();
+        let mut output_chars = 0usize;
         let mut usage = Usage::default();
         let mut finish_reason: Option<String> = None;
         let mut first_token_ms = None;
@@ -38,12 +39,11 @@ pub(crate) fn chat_stream_to_completions(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_chat_line_for_completions(
                     &line,
                     &mut text,
+                    &mut output_chars,
                     &mut usage,
                     &mut finish_reason,
                     &mut first_token_ms,
@@ -56,10 +56,11 @@ pub(crate) fn chat_stream_to_completions(
             }
             heartbeat.observe_first_token(first_token_ms);
         }
-        if !buffer.is_empty() {
+        if let Some(line) = buffer.finish() {
             process_chat_line_for_completions(
-                &buffer,
+                &line,
                 &mut text,
+                &mut output_chars,
                 &mut usage,
                 &mut finish_reason,
                 &mut first_token_ms,
@@ -92,7 +93,7 @@ pub(crate) fn chat_stream_to_completions(
             usage.prompt_tokens = request_tokens;
         }
         if usage.completion_tokens == 0 {
-            usage.completion_tokens = (text.chars().count() / 4) as i64;
+            usage.completion_tokens = (output_chars / 4) as i64;
         }
         let usage = usage.normalized();
         let latency_ms = started.elapsed().as_millis() as i64;
@@ -138,6 +139,7 @@ pub(crate) fn chat_stream_to_completions(
 pub(crate) async fn process_chat_line_for_completions(
     line: &[u8],
     text: &mut String,
+    output_chars: &mut usize,
     usage: &mut Usage,
     finish_reason: &mut Option<String>,
     first_token_ms: &mut Option<i64>,
@@ -167,7 +169,8 @@ pub(crate) async fn process_chat_line_for_completions(
     if let Some(delta) = choice.pointer("/delta/content").and_then(Value::as_str)
         && !delta.is_empty()
     {
-        text.push_str(delta);
+        *output_chars = output_chars.saturating_add(delta.chars().count());
+        push_preview_text(text, delta);
         if first_token_ms.is_none() {
             *first_token_ms = Some(started.elapsed().as_millis() as i64);
         }
@@ -222,10 +225,11 @@ pub(crate) fn anthropic_stream_to_completions(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let completion_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut event_name = String::new();
         let mut usage = Usage::default();
         let mut text = String::new();
+        let mut output_chars = 0usize;
         let mut stop_reason: Option<String> = None;
         let mut first_token_ms = None;
         let mut stream_error = None;
@@ -244,14 +248,13 @@ pub(crate) fn anthropic_stream_to_completions(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_completions_anthropic_line(
                     &line,
                     &mut event_name,
                     &mut usage,
                     &mut text,
+                    &mut output_chars,
                     &mut stop_reason,
                     &mut first_token_ms,
                     started,
@@ -263,12 +266,13 @@ pub(crate) fn anthropic_stream_to_completions(
             }
             heartbeat.observe_first_token(first_token_ms);
         }
-        if !buffer.is_empty() {
+        if let Some(line) = buffer.finish() {
             process_completions_anthropic_line(
-                &buffer,
+                &line,
                 &mut event_name,
                 &mut usage,
                 &mut text,
+                &mut output_chars,
                 &mut stop_reason,
                 &mut first_token_ms,
                 started,
@@ -301,7 +305,7 @@ pub(crate) fn anthropic_stream_to_completions(
             usage.prompt_tokens = request_tokens;
         }
         if usage.completion_tokens == 0 {
-            usage.completion_tokens = (text.chars().count() / 4) as i64;
+            usage.completion_tokens = (output_chars / 4) as i64;
         }
         let usage = usage.normalized();
         let latency_ms = started.elapsed().as_millis() as i64;
@@ -349,6 +353,7 @@ pub(crate) async fn process_completions_anthropic_line(
     event_name: &mut String,
     usage: &mut Usage,
     text: &mut String,
+    output_chars: &mut usize,
     stop_reason: &mut Option<String>,
     first_token_ms: &mut Option<i64>,
     started: Instant,
@@ -390,7 +395,8 @@ pub(crate) async fn process_completions_anthropic_line(
             if delta.get("type").and_then(Value::as_str) == Some("text_delta")
                 && let Some(part) = delta.get("text").and_then(Value::as_str)
             {
-                text.push_str(part);
+                *output_chars = output_chars.saturating_add(part.chars().count());
+                push_preview_text(text, part);
                 if first_token_ms.is_none() {
                     *first_token_ms = Some(started.elapsed().as_millis() as i64);
                 }

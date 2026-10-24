@@ -307,6 +307,32 @@ async fn responses_stream_converts_to_chat_chunks() {
 }
 
 #[tokio::test]
+async fn chat_stream_preview_stays_bounded_for_long_answers() {
+    let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let mut state = ChatStreamState::default();
+    let mut event_name = String::new();
+    let content = "x".repeat(PREVIEW_CHAR_LIMIT + 128);
+    let line = format!(
+        "data: {}\n",
+        json!({"type":"response.output_text.delta","delta":content})
+    );
+
+    process_responses_line_for_chat(
+        line.as_bytes(),
+        &mut event_name,
+        &mut state,
+        "chatcmpl_test",
+        "coding",
+        Instant::now(),
+        &tx,
+    )
+    .await;
+
+    assert_eq!(state.text.chars().count(), PREVIEW_CHAR_LIMIT);
+    assert_eq!(state.output_chars, PREVIEW_CHAR_LIMIT + 128);
+}
+
+#[tokio::test]
 async fn responses_reasoning_text_stream_converts_to_chat_reasoning_content() {
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let mut event_name = String::new();

@@ -127,6 +127,48 @@ async fn persists_and_reports_api_key_rate_limits() {
 }
 
 #[tokio::test]
+async fn rotating_and_deleting_api_keys_drops_touched_cache_entries() {
+    let state = provider_key_test_state().await;
+    let (_, Json(created)) = create_api_key(
+        State(state.clone()),
+        Json(ApiKeyInput {
+            name: "touched".to_string(),
+            daily_token_limit: None,
+            daily_cost_limit_micros: None,
+            requests_per_minute: None,
+            max_concurrency: None,
+            allowed_models: None,
+            expires_at: None,
+            routing_policy: None,
+        }),
+    )
+    .await
+    .unwrap();
+    let id = created.item.id;
+
+    state
+        .key_touched
+        .lock()
+        .await
+        .insert(id, std::time::Instant::now());
+    let Json(rotated) = rotate_api_key(State(state.clone()), Path(id))
+        .await
+        .unwrap();
+    assert!(rotated.key.starts_with("sk-openllm-"));
+    assert!(!state.key_touched.lock().await.contains_key(&id));
+
+    state
+        .key_touched
+        .lock()
+        .await
+        .insert(id, std::time::Instant::now());
+    delete_api_key(State(state.clone()), Path(id))
+        .await
+        .unwrap();
+    assert!(!state.key_touched.lock().await.contains_key(&id));
+}
+
+#[tokio::test]
 async fn api_key_routing_policy_round_trips_and_validates() {
     let state = provider_key_test_state().await;
     let (_, Json(created)) = create_api_key(

@@ -36,6 +36,8 @@ struct ActivityRecord {
 struct ActivityInner {
     records: HashMap<String, ActivityRecord>,
     finished_order: VecDeque<String>,
+    /// One terminal snapshot survives normal TTL and capacity cleanup.
+    last_finished: Option<RequestActivitySnapshot>,
     sequence: u64,
     instance_id: String,
     active_count: usize,
@@ -66,6 +68,7 @@ impl RequestActivityStore {
             inner: Arc::new(Mutex::new(ActivityInner {
                 records: HashMap::new(),
                 finished_order: VecDeque::new(),
+                last_finished: None,
                 sequence: 0,
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 active_count: 0,
@@ -83,6 +86,7 @@ impl RequestActivityStore {
             inner: Arc::new(Mutex::new(ActivityInner {
                 records: HashMap::new(),
                 finished_order: VecDeque::new(),
+                last_finished: None,
                 sequence: 0,
                 instance_id: uuid::Uuid::new_v4().to_string(),
                 active_count: 0,
@@ -171,9 +175,19 @@ impl RequestActivityStore {
     pub fn snapshot(&self, request_id: &str) -> Option<RequestActivitySnapshot> {
         let mut inner = self.lock();
         inner.cleanup(self.finished_capacity, self.finished_ttl);
-        let mut snapshot = inner.records.get(request_id)?.snapshot.clone();
-        inner.refresh_timings(request_id, &mut snapshot);
-        Some(snapshot)
+        if let Some(mut snapshot) = inner
+            .records
+            .get(request_id)
+            .map(|record| record.snapshot.clone())
+        {
+            inner.refresh_timings(request_id, &mut snapshot);
+            return Some(snapshot);
+        }
+        inner
+            .last_finished
+            .as_ref()
+            .filter(|snapshot| snapshot.request_id == request_id)
+            .cloned()
     }
 
     pub fn recent(&self, limit: usize) -> ActivityList {
@@ -189,6 +203,11 @@ impl RequestActivityStore {
                 snapshot
             })
             .collect::<Vec<_>>();
+        if let Some(last_finished) = &inner.last_finished
+            && !inner.records.contains_key(&last_finished.request_id)
+        {
+            items.push(last_finished.clone());
+        }
         items.sort_by(|left, right| {
             right
                 .started_at
@@ -228,7 +247,7 @@ impl RequestActivityStore {
         }
         let mut inner = self.lock();
         inner.cleanup(self.finished_capacity, self.finished_ttl);
-        let became_finished = {
+        let (became_finished, finished_snapshot) = {
             let record = inner.records.get_mut(request_id)?;
             let was_finished = record.finished_instant.is_some();
             if (!allow_terminal && record.finished_instant.is_some()) || !update(record) {
@@ -236,8 +255,18 @@ impl RequestActivityStore {
             }
             record.snapshot.revision = record.snapshot.revision.saturating_add(1);
             record.snapshot.updated_at = Utc::now().to_rfc3339();
-            !was_finished && record.finished_instant.is_some()
+            let became_finished = !was_finished && record.finished_instant.is_some();
+            (
+                became_finished,
+                record
+                    .finished_instant
+                    .is_some()
+                    .then(|| record.snapshot.clone()),
+            )
         };
+        if let Some(snapshot) = finished_snapshot {
+            inner.remember_last_finished(snapshot);
+        }
         if became_finished {
             inner.finished_order.push_back(request_id.to_string());
             inner.active_count = inner.active_count.saturating_sub(1);
@@ -251,6 +280,18 @@ impl RequestActivityStore {
 }
 
 impl ActivityInner {
+    fn remember_last_finished(&mut self, snapshot: RequestActivitySnapshot) {
+        let is_newer = self.last_finished.as_ref().is_none_or(|current| {
+            snapshot.request_id == current.request_id
+                || snapshot.started_at > current.started_at
+                || (snapshot.started_at == current.started_at
+                    && snapshot.request_id > current.request_id)
+        });
+        if is_newer {
+            self.last_finished = Some(snapshot);
+        }
+    }
+
     fn event(&mut self, kind: &'static str, request_id: &str) -> ActivityEvent {
         self.sequence = self.sequence.saturating_add(1);
         let mut snapshot = self

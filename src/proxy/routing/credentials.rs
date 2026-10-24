@@ -18,6 +18,7 @@ pub(in crate::proxy) async fn mark_provider_api_key_used(
         touched.insert(provider_api_key_id, Instant::now());
     }
 
+    let capacity = state.acquire_background_db_slot().await;
     let state = state.clone();
     tokio::spawn(async move {
         if let Err(error) = sqlx::query(
@@ -31,6 +32,7 @@ pub(in crate::proxy) async fn mark_provider_api_key_used(
         {
             tracing::warn!(%error, provider_api_key_id, "failed to update provider key usage");
         }
+        drop(capacity);
     });
 }
 
@@ -59,6 +61,7 @@ pub(in crate::proxy) async fn mark_provider_api_key_error(
         .await
         .insert(provider_api_key_id);
     let message = message.chars().take(1000).collect::<String>();
+    let capacity = state.acquire_background_db_slot().await;
     let state = state.clone();
     tokio::spawn(async move {
         if let Err(error) = sqlx::query(
@@ -75,6 +78,7 @@ pub(in crate::proxy) async fn mark_provider_api_key_error(
         {
             tracing::warn!(%error, provider_api_key_id, "failed to record provider key error");
         }
+        drop(capacity);
     });
 }
 

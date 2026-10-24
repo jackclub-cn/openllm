@@ -15,7 +15,7 @@ pub(crate) fn anthropic_stream_response(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut event_name = String::new();
         let mut usage = Usage::default();
         let mut output_chars = 0usize;
@@ -44,9 +44,7 @@ pub(crate) fn anthropic_stream_response(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_anthropic_line(
                     &line,
                     &mut event_name,
@@ -68,9 +66,9 @@ pub(crate) fn anthropic_stream_response(
             heartbeat.observe_first_token(first_token_ms);
         }
 
-        if !buffer.is_empty() {
+        if let Some(line) = buffer.finish() {
             process_anthropic_line(
-                &buffer,
+                &line,
                 &mut event_name,
                 &mut usage,
                 &mut output_chars,

@@ -95,6 +95,14 @@ pub(in crate::api) async fn clear_provider_key_cooldowns(
             queues.remove(provider_api_key_id);
         }
     }
+    {
+        let mut touched = state.provider_key_touched.lock().await;
+        let mut errors = state.provider_key_error_state.lock().await;
+        for provider_api_key_id in &provider_api_key_ids {
+            touched.remove(provider_api_key_id);
+            errors.remove(provider_api_key_id);
+        }
+    }
     let removed_sinks = {
         let mut sinks = state.target_sink.lock().await;
         let keys = sinks

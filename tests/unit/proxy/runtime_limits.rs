@@ -3,8 +3,9 @@ use super::*;
 #[test]
 fn gateway_tuning_env_parsers_fall_back_safely() {
     use crate::state::{
-        DEFAULT_MAX_BODY_MIB, DEFAULT_SSE_KEEPALIVE_SECS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS,
-        parse_concurrency_limit, parse_keepalive_secs, parse_max_body_mib, parse_positive_secs,
+        DEFAULT_MAX_BODY_MIB, DEFAULT_MAX_CONCURRENT_REQUESTS, DEFAULT_MAX_INFLIGHT_REQUEST_MIB,
+        DEFAULT_SSE_KEEPALIVE_SECS, DEFAULT_UPSTREAM_IDLE_TIMEOUT_SECS, parse_concurrency_limit,
+        parse_inflight_bytes_mib, parse_keepalive_secs, parse_max_body_mib, parse_positive_secs,
     };
 
     // Missing, empty, unparsable, and non-positive values keep the default so a
@@ -45,14 +46,43 @@ fn gateway_tuning_env_parsers_fall_back_safely() {
         Some(Duration::from_secs(5))
     );
 
-    // The global cap is opt-in: only a positive integer turns it on.
-    assert_eq!(parse_concurrency_limit(None), None);
-    assert_eq!(parse_concurrency_limit(Some("")), None);
-    assert_eq!(parse_concurrency_limit(Some("  ")), None);
+    // Admission limits are enabled by default, while an explicit zero is still
+    // available as an operator escape hatch.
+    assert_eq!(
+        parse_concurrency_limit(None),
+        Some(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    );
+    assert_eq!(
+        parse_concurrency_limit(Some("")),
+        Some(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    );
+    assert_eq!(
+        parse_concurrency_limit(Some("  ")),
+        Some(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    );
     assert_eq!(parse_concurrency_limit(Some("0")), None);
-    assert_eq!(parse_concurrency_limit(Some("-3")), None);
-    assert_eq!(parse_concurrency_limit(Some("many")), None);
+    assert_eq!(
+        parse_concurrency_limit(Some("-3")),
+        Some(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    );
+    assert_eq!(
+        parse_concurrency_limit(Some("many")),
+        Some(DEFAULT_MAX_CONCURRENT_REQUESTS)
+    );
     assert_eq!(parse_concurrency_limit(Some(" 12 ")), Some(12));
+    assert_eq!(
+        parse_inflight_bytes_mib(None),
+        Some(DEFAULT_MAX_INFLIGHT_REQUEST_MIB * 1024 * 1024)
+    );
+    assert_eq!(parse_inflight_bytes_mib(Some("0")), None);
+    assert_eq!(
+        parse_inflight_bytes_mib(Some("invalid")),
+        Some(DEFAULT_MAX_INFLIGHT_REQUEST_MIB * 1024 * 1024)
+    );
+    assert_eq!(
+        parse_inflight_bytes_mib(Some("256")),
+        Some(256 * 1024 * 1024)
+    );
 
     // The upstream-body cap shares the MiB parser but keeps its own default.
     use crate::state::{DEFAULT_MAX_UPSTREAM_BODY_MIB, parse_body_mib};

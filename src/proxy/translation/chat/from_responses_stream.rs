@@ -17,7 +17,7 @@ pub(crate) fn responses_stream_to_chat(
     let (tx, rx) = mpsc::channel::<Result<Bytes, io::Error>>(32);
     tokio::spawn(async move {
         let message_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().simple());
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut event_name = String::new();
         let mut chat_state = ChatStreamState::default();
         let mut stream_error = None;
@@ -36,9 +36,7 @@ pub(crate) fn responses_stream_to_chat(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_responses_line_for_chat(
                     &line,
                     &mut event_name,
@@ -52,9 +50,9 @@ pub(crate) fn responses_stream_to_chat(
             }
             heartbeat.observe_first_token(chat_state.first_token_ms);
         }
-        if !buffer.is_empty() {
+        if let Some(line) = buffer.finish() {
             process_responses_line_for_chat(
-                &buffer,
+                &line,
                 &mut event_name,
                 &mut chat_state,
                 &message_id,
@@ -112,7 +110,7 @@ pub(crate) fn responses_stream_to_chat(
         let completion_tokens = if chat_state.completion_tokens > 0 {
             chat_state.completion_tokens
         } else {
-            (chat_state.text.chars().count() / 4) as i64
+            (chat_state.output_chars / 4) as i64
         };
         let usage = Usage {
             prompt_tokens,
@@ -161,7 +159,9 @@ pub(crate) fn responses_stream_to_chat(
 
 #[derive(Default)]
 pub(crate) struct ChatStreamState {
+    /// Bounded output preview; never the complete generated response.
     pub(crate) text: String,
+    pub(crate) output_chars: usize,
     pub(crate) prompt_tokens: i64,
     pub(crate) completion_tokens: i64,
     pub(crate) cache_read_tokens: i64,
@@ -277,7 +277,8 @@ pub(crate) async fn process_responses_line_for_chat(
         }
         "response.output_text.delta" => {
             if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                state.text.push_str(delta);
+                state.output_chars = state.output_chars.saturating_add(delta.chars().count());
+                push_preview_text(&mut state.text, delta);
                 if state.first_token_ms.is_none() {
                     state.first_token_ms = Some(started.elapsed().as_millis() as i64);
                 }

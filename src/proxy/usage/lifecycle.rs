@@ -52,6 +52,13 @@ impl Drop for RoutingUsageGuard {
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
+        let Some(capacity) = self.state.try_acquire_background_db_slot() else {
+            tracing::debug!(
+                request_id = %self.request_id,
+                "skipping cancelled-request persistence while database writers are saturated"
+            );
+            return;
+        };
         let state = self.state.clone();
         let request_id = self.request_id.clone();
         let latency_ms = self.started.elapsed().as_millis() as i64;
@@ -83,6 +90,7 @@ impl Drop for RoutingUsageGuard {
                     tracing::warn!(%error, request_id, "failed to finalize cancelled usage request");
                 }
             }
+            drop(capacity);
         });
     }
 }

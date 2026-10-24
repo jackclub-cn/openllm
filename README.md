@@ -40,11 +40,11 @@ $env:OPENLLM_ADMIN_TOKEN = "replace-with-a-long-random-value"
 | `OPENLLM_CORS_ORIGINS` | 空 | 允许跨域访问管理 API 的精确 Origin，逗号分隔；空表示仅同源 |
 | `OPENLLM_LOG_FORMAT` | `text` | 设为 `json` 输出结构化日志 |
 | `RUST_LOG` | `info` | 日志级别 |
-| `OPENLLM_MAX_CONCURRENT_REQUESTS` | `0` | 全局在途请求上限，`0` 不限 |
+| `OPENLLM_MAX_CONCURRENT_REQUESTS` | `8` | 全局在途请求上限，`0` 不限 |
 | `OPENLLM_MAX_BODY_MIB` | `32` | 请求体上限，MiB；多图或 PDF 可调大 |
 | `OPENLLM_MAX_UPSTREAM_BODY_MIB` | `64` | 非流式上游响应缓冲上限，MiB |
 | `OPENLLM_STREAM_MAX_SECS` | `1260` | 上游流最长存活时间；`0` 关闭 |
-| `OPENLLM_MEMORY_LIMIT_MIB` | 自动 | 进程内存上限；`0` 关闭压力保护 |
+| `OPENLLM_MEMORY_LIMIT_MIB` | `768` 或更小的 cgroup 限制 | 进程内存上限；`0` 关闭压力保护 |
 | `OPENLLM_SHUTDOWN_GRACE_SECS` | `30` | 关闭信号后的排空时间；`0` 表示一直等待 |
 
 ## 核心能力
@@ -193,7 +193,7 @@ Webhook 功能已移除；旧数据库中的相关表和历史数据保留，但
 | `OPENLLM_UPSTREAM_IDLE_TIMEOUT_SECS` | `300` | 上游两次读取之间的空闲上限；`0` 关闭 |
 | `OPENLLM_SSE_KEEPALIVE_SECS` | `15` | 下游 SSE 静默心跳间隔；`0` 关闭 |
 | `OPENLLM_LIVE_REQUEST_TRACE` | `1` | 最近请求实时状态与上下文分类；`0` 关闭，历史日志保持原行为 |
-| `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` | `0` | 全局在途请求体字节预算；`0` 不限 |
+| `OPENLLM_MAX_INFLIGHT_REQUEST_MIB` | `128` | 全局在途请求体字节预算；`0` 不限 |
 | `OPENLLM_ADMISSION_WAIT_MS` | `0` | 达到并发或字节预算后的等待时间；超时返回 `429` |
 | `OPENLLM_BODY_READ_TIMEOUT_SECS` | `600` | 读取完整请求体的最长时间；`0` 关闭 |
 | `OPENLLM_REQUEST_TIMEOUT_SECS` | `600` | 单次请求回退循环总预算；`0` 关闭 |
@@ -207,6 +207,7 @@ Webhook 功能已移除；旧数据库中的相关表和历史数据保留，但
 | `OPENLLM_INSTANCE_LEASE_TTL_SECS` | `300` | 实例租约有效期，范围 30–86400 |
 | `OPENLLM_UPGRADE_FEED_URL` | 空 | 自定义版本升级源；控制台默认检查项目 GitHub 正式发布，服务端缓存一小时 |
 | `OPENLLM_MEMORY_SHED_RATIO` | `0.9` | 达到内存上限该比例后拒绝新请求 |
+| `MALLOC_ARENA_MAX` | `2` | 容器内 glibc 分配器 arena 上限，降低大请求后的高水位保留 |
 | `OPENLLM_DB_MAX_CONNECTIONS` | `4` | SQLite 连接池大小；每条连接会持有独立页缓存，上限 256 |
 | `OPENLLM_DB_BUSY_TIMEOUT_SECS` | `10` | SQLite 写入竞争等待时间 |
 | `OPENLLM_DB_ACQUIRE_TIMEOUT_SECS` | `15` | 获取数据库连接的等待时间 |

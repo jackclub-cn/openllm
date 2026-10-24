@@ -22,7 +22,7 @@ pub(crate) fn openai_stream_to_anthropic(
             started,
         };
         let mut stream_state = AnthropicStreamState::default();
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut stream_error = None;
         let mut done = false;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
@@ -42,9 +42,7 @@ pub(crate) fn openai_stream_to_anthropic(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 // `false` means `[DONE]`: the upstream body is complete.
                 if !process_openai_line_for_anthropic(&line, &mut stream_state, &context, &tx).await
                 {
@@ -55,8 +53,8 @@ pub(crate) fn openai_stream_to_anthropic(
             }
             heartbeat.observe_first_token(stream_state.first_token_ms);
         }
-        if !done && !buffer.is_empty() {
-            process_openai_line_for_anthropic(&buffer, &mut stream_state, &context, &tx).await;
+        if !done && let Some(line) = buffer.finish() {
+            process_openai_line_for_anthropic(&line, &mut stream_state, &context, &tx).await;
         }
         heartbeat.observe_first_token(stream_state.first_token_ms);
 
@@ -139,7 +137,7 @@ pub(crate) fn responses_stream_to_anthropic(
         };
         let mut stream_state = AnthropicStreamState::default();
         let mut tool_indices = std::collections::HashMap::<String, usize>::new();
-        let mut buffer = Vec::<u8>::new();
+        let mut buffer = SseLineBuffer::default();
         let mut event_name = String::new();
         let mut stream_error = None;
         let mut heartbeat = UsageHeartbeat::new(state.clone(), request_id.clone());
@@ -157,9 +155,7 @@ pub(crate) fn responses_stream_to_anthropic(
                     break;
                 }
             };
-            buffer.extend_from_slice(&chunk);
-            while let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
-                let line = buffer.drain(..=position).collect::<Vec<_>>();
+            for line in buffer.push(&chunk) {
                 process_responses_line_for_anthropic(
                     &line,
                     &mut event_name,
@@ -172,9 +168,9 @@ pub(crate) fn responses_stream_to_anthropic(
             }
             heartbeat.observe_first_token(stream_state.first_token_ms);
         }
-        if !buffer.is_empty() {
+        if let Some(line) = buffer.finish() {
             process_responses_line_for_anthropic(
-                &buffer,
+                &line,
                 &mut event_name,
                 &mut stream_state,
                 &mut tool_indices,
@@ -205,7 +201,7 @@ pub(crate) fn responses_stream_to_anthropic(
         let completion_tokens = if stream_state.output_tokens > 0 {
             stream_state.output_tokens
         } else {
-            (stream_state.text.chars().count() / 4) as i64
+            (stream_state.output_chars / 4) as i64
         };
         let usage = Usage {
             prompt_tokens,
@@ -352,7 +348,8 @@ pub(crate) async fn process_responses_line_for_anthropic(
                         index
                     }
                 };
-                state.text.push_str(text);
+                state.output_chars = state.output_chars.saturating_add(text.chars().count());
+                push_preview_text(&mut state.text, text);
                 send_anthropic_event(
                     tx,
                     "content_block_delta",

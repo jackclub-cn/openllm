@@ -31,6 +31,7 @@ services:
       OPENLLM_BIND: 0.0.0.0:8080
       OPENLLM_DATA_DIR: /data
       OPENLLM_LOG_FORMAT: ${OPENLLM_LOG_FORMAT:-json}
+      MALLOC_ARENA_MAX: ${MALLOC_ARENA_MAX:-2}
     ports:
       - "127.0.0.1:8080:8080"
     volumes:

@@ -170,6 +170,7 @@ pub async fn rotate_api_key(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("API key not found".to_string()));
     }
+    state.key_touched.lock().await.remove(&id);
     let record = sqlx::query_as::<_, ApiKeyRecord>("SELECT * FROM api_keys WHERE id = ?")
         .bind(id)
         .fetch_one(&state.pool)
@@ -200,6 +201,7 @@ pub async fn delete_api_key(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("API key not found".to_string()));
     }
+    state.key_touched.lock().await.remove(&id);
     *state.auth_required.write().await = None;
     record_audit(
         &state,

@@ -40,7 +40,25 @@ pub(crate) struct CapabilityCache {
 
 impl CapabilityCache {
     pub(crate) fn record(&mut self, record: CapabilityRecord) {
+        let now = Utc::now();
+        self.prune_expired(now);
+        if record_is_fresh(&record, now) {
+            self.insert(record);
+        }
+    }
+
+    fn insert(&mut self, record: CapabilityRecord) {
         self.records.insert(record.key.clone(), record);
+    }
+
+    fn prune_expired(&mut self, now: DateTime<Utc>) {
+        self.records
+            .retain(|_, record| record_is_fresh(record, now));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.records.len()
     }
 }
 
@@ -49,7 +67,7 @@ pub(crate) async fn restore(state: &AppState) -> AppResult<()> {
     let mut cache = state.capability_profiles.lock().await;
     cache.records.clear();
     for record in rows {
-        cache.record(record);
+        cache.insert(record);
     }
     cache.loaded = true;
     Ok(())
@@ -63,8 +81,9 @@ pub(crate) async fn capability_support(
     capability: &str,
 ) -> Option<bool> {
     ensure_loaded(state).await.ok()?;
-    let cache = state.capability_profiles.lock().await;
+    let mut cache = state.capability_profiles.lock().await;
     let now = Utc::now();
+    cache.prune_expired(now);
     matching_candidates(&cache, provider_id, model, endpoint, capability, now)
         .into_iter()
         .max_by(|left, right| {
@@ -208,14 +227,42 @@ async fn ensure_loaded(state: &AppState) -> AppResult<()> {
     if !cache.loaded {
         cache.records.clear();
         for record in rows {
-            cache.record(record);
+            cache.insert(record);
         }
         cache.loaded = true;
     }
     Ok(())
 }
 
+pub(crate) async fn prune_expired(state: &AppState) -> AppResult<u64> {
+    let cutoff = Utc::now().to_rfc3339();
+    let result = sqlx::query("DELETE FROM provider_capability_profiles WHERE valid_until <= ?")
+        .bind(&cutoff)
+        .execute(&state.pool)
+        .await?;
+    state
+        .capability_profiles
+        .lock()
+        .await
+        .prune_expired(Utc::now());
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn remove_provider(state: &AppState, provider_id: i64) {
+    state
+        .capability_profiles
+        .lock()
+        .await
+        .records
+        .retain(|key, _| key.provider_id != provider_id);
+}
+
 async fn load_records(state: &AppState) -> AppResult<Vec<CapabilityRecord>> {
+    let cutoff = Utc::now().to_rfc3339();
+    sqlx::query("DELETE FROM provider_capability_profiles WHERE valid_until <= ?")
+        .bind(cutoff)
+        .execute(&state.pool)
+        .await?;
     let rows = sqlx::query_as::<
         _,
         (

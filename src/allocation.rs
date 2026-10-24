@@ -301,6 +301,11 @@ impl AllocationLedger {
         self.denials.get(&pool_id).copied().unwrap_or(0)
     }
 
+    pub(crate) fn remove_pool(&mut self, pool_id: i64) {
+        self.windows.remove(&pool_id);
+        self.denials.remove(&pool_id);
+    }
+
     fn bucket_index(&self, spec: &PoolSpec, now: Instant) -> u64 {
         let elapsed_ms = now.saturating_duration_since(self.origin).as_millis() as u64;
         elapsed_ms / spec.bucket_width_ms.max(1)

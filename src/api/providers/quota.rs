@@ -589,7 +589,8 @@ async fn command_code_plan_models(
     plan_id: &str,
 ) -> AppResult<Vec<ProviderQuotaModel>> {
     {
-        let cache = COMMAND_CODE_PLAN_CACHE.lock().await;
+        let mut cache = COMMAND_CODE_PLAN_CACHE.lock().await;
+        cache.retain(|_, entry| entry.fetched_at.elapsed() < COMMAND_CODE_PLAN_CACHE_TTL);
         if let Some(entry) = cache.get(plan_id)
             && entry.fetched_at.elapsed() < COMMAND_CODE_PLAN_CACHE_TTL
         {

@@ -174,7 +174,8 @@ pub(crate) async fn forward_anthropic_native(
             error_message: None,
             response_preview: preview,
         },
-    );
+    )
+    .await;
     let mut response = Response::builder()
         .status(status)
         .header(reqwest::header::CONTENT_TYPE, "application/json")

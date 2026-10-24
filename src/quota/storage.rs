@@ -1,6 +1,7 @@
 use super::*;
 
 pub(crate) async fn restore(state: &AppState) -> AppResult<()> {
+    prune_expired(state).await?;
     let records = sqlx::query_as::<_, ProviderQuotaSnapshotRecord>(
         "SELECT provider_id, provider_key_id, model, window_key, \
                 limit_value, used, remaining, unit, reset_at, source, \
@@ -15,6 +16,35 @@ pub(crate) async fn restore(state: &AppState) -> AppResult<()> {
         cache.insert(record.key(), record);
     }
     Ok(())
+}
+
+pub(crate) async fn prune_expired(state: &AppState) -> AppResult<u64> {
+    let cutoff = Utc::now().to_rfc3339();
+    let result = sqlx::query("DELETE FROM provider_quota_snapshots WHERE valid_until <= ?")
+        .bind(cutoff)
+        .execute(&state.pool)
+        .await?;
+    let now = Utc::now();
+    let mut cache = state.quota_snapshots.lock().await;
+    cache.retain(|_, record| snapshot_is_fresh(record, now));
+    let now = Instant::now();
+    HEADER_PERSIST_THROTTLE
+        .lock()
+        .await
+        .retain(|_, last| now.saturating_duration_since(*last) < HEADER_PERSIST_INTERVAL);
+    Ok(result.rows_affected())
+}
+
+pub(crate) async fn remove_provider(state: &AppState, provider_id: i64) {
+    state
+        .quota_snapshots
+        .lock()
+        .await
+        .retain(|key, _| key.provider_id != provider_id);
+    HEADER_PERSIST_THROTTLE
+        .lock()
+        .await
+        .retain(|key, _| key.provider_id != provider_id);
 }
 
 pub(crate) async fn store_provider_quota_view(
@@ -87,8 +117,10 @@ pub(super) async fn cache_and_persist_records(
     source: &str,
     records: Vec<ProviderQuotaSnapshotRecord>,
 ) {
+    let now_utc = Utc::now();
     {
         let mut cache = state.quota_snapshots.lock().await;
+        cache.retain(|_, record| snapshot_is_fresh(record, now_utc));
         for record in &records {
             cache.insert(record.key(), record.clone());
         }
@@ -98,6 +130,7 @@ pub(super) async fn cache_and_persist_records(
     let mut persist = Vec::new();
     {
         let mut throttle = HEADER_PERSIST_THROTTLE.lock().await;
+        throttle.retain(|_, last| now.saturating_duration_since(*last) < HEADER_PERSIST_INTERVAL);
         for record in records {
             let key = record.key();
             let should_write = throttle
@@ -112,12 +145,14 @@ pub(super) async fn cache_and_persist_records(
     if persist.is_empty() {
         return;
     }
+    let capacity = state.acquire_background_db_slot().await;
     let state = state.clone();
     let source = source.to_string();
     tokio::spawn(async move {
         if let Err(error) = upsert_source_records(&state, &source, &persist).await {
             tracing::warn!(%error, %source, "failed to persist provider quota observation");
         }
+        drop(capacity);
     });
 }
 
@@ -315,6 +350,8 @@ pub(super) async fn update_cache(
     records: &[ProviderQuotaSnapshotRecord],
 ) {
     let mut cache = state.quota_snapshots.lock().await;
+    let now = Utc::now();
+    cache.retain(|_, record| snapshot_is_fresh(record, now));
     cache.retain(|key, _| {
         !(key.provider_id == provider_id
             && key.provider_key_id == provider_key_id
@@ -323,4 +360,10 @@ pub(super) async fn update_cache(
     for record in records {
         cache.insert(record.key(), record.clone());
     }
+}
+
+fn snapshot_is_fresh(record: &ProviderQuotaSnapshotRecord, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(&record.valid_until)
+        .map(|valid_until| valid_until.with_timezone(&Utc) > now)
+        .unwrap_or(false)
 }

@@ -35,9 +35,15 @@ where
         match result {
             Ok(response) if response.status().is_success() => {
                 let mut body = response.into_body().into_data_stream();
-                while let Some(chunk) = body.next().await {
-                    let chunk = chunk.map_err(std::io::Error::other);
-                    if tx.send(chunk).await.is_err() {
+                loop {
+                    let chunk = tokio::select! {
+                        _ = tx.closed() => break,
+                        chunk = body.next() => chunk,
+                    };
+                    let Some(chunk) = chunk else {
+                        break;
+                    };
+                    if tx.send(chunk.map_err(std::io::Error::other)).await.is_err() {
                         break;
                     }
                 }

@@ -521,6 +521,7 @@ async fn pool_configuration_is_validated_audited_and_cache_invalidating() {
     let catalog = state.pool_catalog().await.unwrap();
     assert_eq!(catalog.pools_for_provider(1).len(), 1);
     assert!(catalog.pools_for_provider(2).is_empty());
+    state.allocation_ledger.lock().await.record_denial(view.id);
 
     // Deleting the pool removes it (and its allocations) from the catalog.
     crate::api::delete_provider_pool(
@@ -531,6 +532,7 @@ async fn pool_configuration_is_validated_audited_and_cache_invalidating() {
     .unwrap();
     let catalog = state.pool_catalog().await.unwrap();
     assert!(catalog.is_empty());
+    assert_eq!(state.allocation_ledger.lock().await.denials(view.id), 0);
     let orphans: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM provider_pool_allocations")
         .fetch_one(&state.pool)
         .await

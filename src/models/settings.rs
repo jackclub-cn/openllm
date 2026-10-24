@@ -80,7 +80,7 @@ pub struct RuntimeLimits {
     /// Process-memory ceiling that arms the pressure guard, in MiB; `0`
     /// disables it.
     pub memory_limit_mib: u64,
-    /// Where the memory ceiling came from: `"off"`, `"env"`, or `"cgroup"`.
+    /// Where the memory ceiling came from: `"off"`, `"env"`, `"cgroup"`, or `"default"`.
     pub memory_limit_source: String,
     /// Fraction of the ceiling at which new requests are shed, as a percent.
     pub memory_shed_ratio_pct: u64,

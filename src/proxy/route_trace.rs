@@ -123,11 +123,12 @@ impl RouteTraceRecorder {
         &self.candidates
     }
 
-    pub(crate) fn finish(mut self, state: &AppState, final_outcome: TraceFinal) {
+    pub(crate) async fn finish(mut self, state: &AppState, final_outcome: TraceFinal) {
         if !self.enabled {
             return;
         }
         self.enabled = false;
+        let capacity = state.acquire_background_db_slot().await;
         let state = state.clone();
         tokio::spawn(async move {
             if let Err(error) = persist_trace(&state, &self, &final_outcome).await {
@@ -137,6 +138,7 @@ impl RouteTraceRecorder {
                     "failed to persist routing trace"
                 );
             }
+            drop(capacity);
         });
     }
 }

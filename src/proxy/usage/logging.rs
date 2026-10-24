@@ -68,11 +68,13 @@ impl OwnedUsageLogEntry {
     }
 }
 
-/// Writes the usage row off the response path so a slow SQLite write lock does
-/// not inflate the latency the caller observes.
-pub(crate) fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
+/// Writes the usage row off the response path while bounding how many detached
+/// SQLite writers can exist at once.
+pub(crate) async fn log_usage_detached(state: AppState, entry: OwnedUsageLogEntry) {
+    let capacity = state.acquire_background_db_slot().await;
     tokio::spawn(async move {
         log_usage(&state, entry.as_borrowed()).await;
+        drop(capacity);
     });
 }
 

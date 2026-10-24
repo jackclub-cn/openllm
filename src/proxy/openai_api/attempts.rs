@@ -291,17 +291,19 @@ pub(super) async fn run_openai_attempts(
                         context.budget_excluded_targets,
                     );
                     apply_override_headers(&mut response, &context.routing_overrides);
-                    trace.finish(
-                        state,
-                        super::route_trace::TraceFinal {
-                            final_provider_id: Some(target_provider_id),
-                            final_provider_api_key_id: target_provider_key_id,
-                            final_upstream_model: Some(target_upstream_model),
-                            final_status_code: Some(response_status.as_u16() as i64),
-                            success: response_status.is_success(),
-                            fallback_count: fallback_count as i64,
-                        },
-                    );
+                    trace
+                        .finish(
+                            state,
+                            super::route_trace::TraceFinal {
+                                final_provider_id: Some(target_provider_id),
+                                final_provider_api_key_id: target_provider_key_id,
+                                final_upstream_model: Some(target_upstream_model),
+                                final_status_code: Some(response_status.as_u16() as i64),
+                                success: response_status.is_success(),
+                                fallback_count: fallback_count as i64,
+                            },
+                        )
+                        .await;
                     return Ok(OpenAiAttemptOutcome::Response(attach_provider_slot(
                         response,
                         upstream_slots,
@@ -470,18 +472,20 @@ pub(super) async fn run_openai_attempts(
         },
     )
     .await;
-    trace.finish(
-        state,
-        super::route_trace::TraceFinal {
-            final_provider_id: last_target.as_ref().map(|(provider_id, _, _)| *provider_id),
-            final_provider_api_key_id: last_target.as_ref().and_then(|(_, key_id, _)| *key_id),
-            final_upstream_model: last_target
-                .as_ref()
-                .map(|(_, _, upstream_model)| upstream_model.clone()),
-            final_status_code: Some(status_code),
-            success: false,
-            fallback_count: attempts.saturating_sub(1) as i64,
-        },
-    );
+    trace
+        .finish(
+            state,
+            super::route_trace::TraceFinal {
+                final_provider_id: last_target.as_ref().map(|(provider_id, _, _)| *provider_id),
+                final_provider_api_key_id: last_target.as_ref().and_then(|(_, key_id, _)| *key_id),
+                final_upstream_model: last_target
+                    .as_ref()
+                    .map(|(_, _, upstream_model)| upstream_model.clone()),
+                final_status_code: Some(status_code),
+                success: false,
+                fallback_count: attempts.saturating_sub(1) as i64,
+            },
+        )
+        .await;
     Err(error)
 }

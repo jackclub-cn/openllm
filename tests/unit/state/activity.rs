@@ -145,7 +145,7 @@ fn activity_terminal_updates_are_idempotent_and_revisioned() {
 }
 
 #[tokio::test]
-async fn finished_activity_is_bounded_by_capacity_and_ttl() {
+async fn finished_activity_is_bounded_while_retaining_the_latest_snapshot() {
     let store = RequestActivityStore::for_test(1, Duration::from_millis(20));
     for request_id in ["old", "new"] {
         store.start(request_id, "/v1/chat/completions");
@@ -166,7 +166,11 @@ async fn finished_activity_is_bounded_by_capacity_and_ttl() {
     assert_eq!(recent.items[0].request_id, "new");
 
     tokio::time::sleep(Duration::from_millis(30)).await;
-    assert!(store.recent(10).items.is_empty());
+    let recent = store.recent(10);
+    assert_eq!(recent.items.len(), 1);
+    assert_eq!(recent.items[0].request_id, "new");
+    assert!(store.snapshot("new").is_some());
+    assert!(store.snapshot("old").is_none());
 }
 
 fn test_attempt(index: i64) -> ActivityAttemptStart {
@@ -183,6 +187,48 @@ fn test_attempt(index: i64) -> ActivityAttemptStart {
             input_limit: None,
         },
     }
+}
+
+#[tokio::test]
+async fn retained_snapshot_preserves_attempt_results_reported_after_completion() {
+    let store = RequestActivityStore::for_test(1, Duration::from_millis(20));
+    store.start("late-attempt", "/v1/chat/completions");
+    store.begin_attempt("late-attempt", test_attempt(1));
+    store.finish(
+        "late-attempt",
+        ActivityFinish {
+            status_code: 200,
+            success: true,
+            error_code: None,
+            latency_ms: 25,
+            first_token_ms: None,
+            usage: Usage::new(1, 1),
+        },
+    );
+    let event = store
+        .finish_attempt(
+            "late-attempt",
+            ActivityAttemptFinish {
+                attempt_index: 1,
+                latency_ms: 20,
+                status_code: Some(200),
+                success: true,
+                reason_code: "upstream_success".to_string(),
+                failure_scope: None,
+            },
+        )
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let snapshot = store.snapshot("late-attempt").unwrap();
+    assert_eq!(snapshot.revision, event.snapshot.revision);
+    assert_eq!(snapshot.attempts[0].status_code, Some(200));
+    assert!(snapshot.attempts[0].success);
+    assert_eq!(
+        snapshot.attempts[0].reason_code.as_deref(),
+        Some("upstream_success")
+    );
+    assert_eq!(store.recent(10).items[0].revision, snapshot.revision);
 }
 
 #[test]

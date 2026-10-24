@@ -34,7 +34,7 @@ impl AppState {
                 .ok()
                 .as_deref(),
         )
-        .unwrap_or(DEFAULT_MAX_INFLIGHT_REQUEST_MIB * 1024 * 1024);
+        .unwrap_or(0);
         let inflight_request_bytes = (request_bytes_limit > 0)
             .then(|| Arc::new(RequestByteBudget::new(request_bytes_limit)));
         let memory_shed_ratio = parse_shed_ratio(
@@ -46,10 +46,11 @@ impl AppState {
             resolve_memory_limit(memory_limit_env.as_deref(), cgroup_memory_max_bytes());
         let memory_pressure =
             memory_limit_bytes.map(|bytes| Arc::new(MemoryPressure::new(bytes, memory_shed_ratio)));
-        if memory_limit_source == "cgroup" {
+        if matches!(memory_limit_source, "cgroup" | "default") {
             tracing::info!(
                 limit_mib = memory_limit_bytes.unwrap_or(0) / (1024 * 1024),
-                "memory-pressure guard armed from the container cgroup limit"
+                %memory_limit_source,
+                "memory-pressure guard armed"
             );
         }
         if memory_pressure.is_some() && !(cfg!(target_os = "linux") || cfg!(target_os = "windows"))
@@ -103,6 +104,7 @@ impl AppState {
             inflight_request_bytes,
             request_bytes_limit,
             request_bytes_shed: Arc::new(AtomicU64::new(0)),
+            background_db_capacity: Arc::new(Semaphore::new(MAX_BACKGROUND_DB_TASKS)),
             admission_wait: parse_admission_wait_ms(
                 std::env::var("OPENLLM_ADMISSION_WAIT_MS").ok().as_deref(),
             ),
@@ -313,6 +315,18 @@ impl AppState {
             by_route: self.busy_waiting_by_route.clone(),
             route_id,
         })
+    }
+
+    pub(crate) async fn acquire_background_db_slot(&self) -> OwnedSemaphorePermit {
+        self.background_db_capacity
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("background database semaphore is never closed")
+    }
+
+    pub(crate) fn try_acquire_background_db_slot(&self) -> Option<OwnedSemaphorePermit> {
+        self.background_db_capacity.clone().try_acquire_owned().ok()
     }
 
     pub(super) fn mark_resilience_dirty(&self, mark: impl FnOnce(&mut DirtyResilienceState)) {

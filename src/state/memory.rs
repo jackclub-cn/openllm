@@ -3,14 +3,15 @@ use super::*;
 /// How long a sampled memory reading is reused before it is refreshed.
 pub(super) const MEMORY_SAMPLE_TTL: Duration = Duration::from_millis(500);
 
-/// Opt-in process-memory pressure guard.
+/// Process-memory pressure guard.
 ///
 /// Under sustained load the process's own footprint can grow past the point
 /// where new work is safe (large bodies, translations, SQLite). This guard
 /// compares the live resident-set size against an operator-declared ceiling and
 /// sheds new proxied requests once usage crosses a fraction of it, so the
 /// process keeps headroom to finish what is already in flight instead of being
-/// killed by the OOM killer. Disabled unless `OPENLLM_MEMORY_LIMIT_MIB` is set.
+/// killed by the OOM killer. It uses the built-in 768 MiB default unless a
+/// tighter cgroup limit is discovered or `OPENLLM_MEMORY_LIMIT_MIB=0` is set.
 pub struct MemoryPressure {
     pub(super) limit_bytes: u64,
     pub(super) shed_ratio: f64,
@@ -160,8 +161,7 @@ pub(crate) fn sample_process_memory_bytes() -> Option<u64> {
 ///
 /// Reads the cgroup v2 unified hierarchy first, then the cgroup v1 memory
 /// controller. `None` means "not in a constrained container" (or a non-Linux
-/// host), which leaves the pressure guard off unless the operator sets a
-/// ceiling explicitly.
+/// host), which leaves the built-in default as the automatic ceiling.
 #[cfg(target_os = "linux")]
 pub(super) fn cgroup_memory_max_bytes() -> Option<u64> {
     let v2 = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok();

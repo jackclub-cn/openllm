@@ -187,6 +187,28 @@ async fn rewrites_openai_stream_into_anthropic_events() {
 }
 
 #[tokio::test]
+async fn anthropic_stream_preview_stays_bounded_for_long_answers() {
+    let (tx, _rx) = mpsc::channel::<Result<Bytes, io::Error>>(4);
+    let context = StreamContext {
+        message_id: "msg_test".to_string(),
+        model: "claude-x".to_string(),
+        input_tokens: 7,
+        started: Instant::now(),
+    };
+    let mut state = AnthropicStreamState::default();
+    let content = "x".repeat(PREVIEW_CHAR_LIMIT + 128);
+    let line = format!(
+        "data: {}\n",
+        json!({"choices":[{"index":0,"delta":{"content":content}}]})
+    );
+
+    process_openai_line_for_anthropic(line.as_bytes(), &mut state, &context, &tx).await;
+
+    assert_eq!(state.text.chars().count(), PREVIEW_CHAR_LIMIT);
+    assert_eq!(state.output_chars, PREVIEW_CHAR_LIMIT + 128);
+}
+
+#[tokio::test]
 async fn anthropic_stream_maps_tool_calls_to_tool_use_blocks() {
     let (tx, mut rx) = mpsc::channel::<Result<Bytes, io::Error>>(16);
     let context = StreamContext {

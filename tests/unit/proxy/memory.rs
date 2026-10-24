@@ -73,26 +73,37 @@ async fn memory_pressure_sheds_proxied_requests_but_not_probes() {
 }
 
 #[test]
-fn memory_limit_resolution_prefers_env_then_cgroup() {
+fn memory_limit_resolution_prefers_env_then_tighter_cgroup_or_default() {
     let gib = 1024 * 1024 * 1024;
+    let default = crate::state::DEFAULT_MEMORY_LIMIT_MIB * 1024 * 1024;
     assert_eq!(
         resolve_memory_limit(Some("512"), Some(gib)),
         (Some(512 * 1024 * 1024), "env")
     );
     assert_eq!(resolve_memory_limit(Some("0"), Some(gib)), (None, "off"));
-    assert_eq!(resolve_memory_limit(None, Some(gib)), (Some(gib), "cgroup"));
-    assert_eq!(resolve_memory_limit(None, None), (None, "off"));
+    assert_eq!(
+        resolve_memory_limit(None, Some(gib)),
+        (Some(default), "default")
+    );
+    assert_eq!(
+        resolve_memory_limit(None, Some(512 * 1024 * 1024)),
+        (Some(512 * 1024 * 1024), "cgroup")
+    );
+    assert_eq!(resolve_memory_limit(None, None), (Some(default), "default"));
     assert_eq!(
         resolve_memory_limit(Some("  "), Some(gib)),
-        (Some(gib), "cgroup"),
-        "a blank value falls back to the discovered container limit"
+        (Some(default), "default"),
+        "a blank value falls back to the bounded default"
     );
     assert_eq!(
         resolve_memory_limit(Some("oops"), Some(gib)),
-        (Some(gib), "cgroup"),
+        (Some(default), "default"),
         "a typo must not silently disable the guard"
     );
-    assert_eq!(resolve_memory_limit(Some("oops"), None), (None, "off"));
+    assert_eq!(
+        resolve_memory_limit(Some("oops"), None),
+        (Some(default), "default")
+    );
 }
 
 #[test]

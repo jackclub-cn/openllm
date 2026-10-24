@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) struct UsageParser {
-    pub(in crate::proxy) buffer: Vec<u8>,
+    pub(in crate::proxy) buffer: SseLineBuffer,
     pub(in crate::proxy) usage: Option<Usage>,
     pub(in crate::proxy) output_chars: usize,
     pub(in crate::proxy) text: String,
@@ -12,7 +12,7 @@ pub(crate) struct UsageParser {
 impl UsageParser {
     pub(in crate::proxy) fn new(started_at: Instant) -> Self {
         Self {
-            buffer: Vec::new(),
+            buffer: SseLineBuffer::default(),
             usage: None,
             output_chars: 0,
             text: String::new(),
@@ -29,16 +29,13 @@ impl UsageParser {
     }
 
     pub(in crate::proxy) fn push(&mut self, chunk: &[u8]) {
-        self.buffer.extend_from_slice(chunk);
-        while let Some(position) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let line = self.buffer.drain(..=position).collect::<Vec<_>>();
+        for line in self.buffer.push(chunk) {
             self.parse_line(&line);
         }
     }
 
     pub(in crate::proxy) fn finish(&mut self) -> Option<Usage> {
-        if !self.buffer.is_empty() {
-            let line = std::mem::take(&mut self.buffer);
+        if let Some(line) = self.buffer.finish() {
             self.parse_line(&line);
         }
         let estimated =

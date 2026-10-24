@@ -130,6 +130,13 @@ pub async fn run_due_usage_retention(state: AppState) {
         }
     }
 
+    if let Err(error) = crate::capabilities::prune_expired(&state).await {
+        tracing::warn!(%error, "failed to prune expired provider capability profiles");
+    }
+    if let Err(error) = crate::quota::prune_expired(&state).await {
+        tracing::warn!(%error, "failed to prune expired provider quota snapshots");
+    }
+
     let raw = match sqlx::query_scalar::<_, String>("SELECT value FROM settings WHERE key = ?")
         .bind(SETTING_USAGE_RETENTION_DAYS)
         .fetch_optional(&state.pool)

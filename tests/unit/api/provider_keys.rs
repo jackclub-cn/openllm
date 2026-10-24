@@ -153,6 +153,12 @@ async fn provider_api_key_rotation_resets_stale_health_state() {
         key_id,
         std::time::Instant::now() + std::time::Duration::from_secs(60),
     );
+    state
+        .provider_key_touched
+        .lock()
+        .await
+        .insert(key_id, std::time::Instant::now());
+    state.provider_key_error_state.lock().await.insert(key_id);
 
     let Json(updated) = update_provider(
         State(state.clone()),
@@ -176,6 +182,20 @@ async fn provider_api_key_rotation_resets_stale_health_state() {
             .lock()
             .await
             .contains_key(&key_id)
+    );
+    assert!(
+        !state
+            .provider_key_touched
+            .lock()
+            .await
+            .contains_key(&key_id)
+    );
+    assert!(
+        !state
+            .provider_key_error_state
+            .lock()
+            .await
+            .contains(&key_id)
     );
     let stale_fields: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM provider_api_keys \
@@ -223,4 +243,128 @@ async fn provider_api_key_pool_accepts_legacy_single_key_input() {
     assert_eq!(created.api_keys.len(), 1);
     assert_eq!(created.api_keys[0].name, "Default");
     assert_eq!(created.api_keys[0].api_key_suffix, "gacy");
+}
+
+#[tokio::test]
+async fn deleting_a_provider_clears_runtime_caches_and_cursors() {
+    let state = provider_key_test_state().await;
+    let (_, Json(created)) = create_provider(
+        State(state.clone()),
+        Json(provider_input(Some("sk-delete"), Vec::new())),
+    )
+    .await
+    .unwrap();
+    let provider_id = created.id;
+    let key_id = created.api_keys[0].id;
+    let now = std::time::Instant::now();
+    state
+        .provider_failure_streak
+        .lock()
+        .await
+        .insert(provider_id, 2);
+    state.provider_probe.lock().await.insert(provider_id, now);
+    state
+        .provider_circuit_trips
+        .lock()
+        .await
+        .insert(provider_id, 3);
+    state
+        .provider_key_cursor
+        .lock()
+        .await
+        .insert(provider_id, 1);
+    state
+        .target_cooldown
+        .lock()
+        .await
+        .insert((provider_id, "model".to_string()), now);
+    state
+        .routing_p95_latency
+        .write()
+        .await
+        .insert((provider_id, "model".to_string()), 42.0);
+    state.provider_key_touched.lock().await.insert(key_id, now);
+    state.provider_key_error_state.lock().await.insert(key_id);
+    state.quota_snapshots.lock().await.insert(
+        ProviderQuotaSnapshotKey {
+            provider_id,
+            provider_key_id: Some(key_id),
+            model: "model".to_string(),
+            window_key: "5h".to_string(),
+            unit: "request".to_string(),
+            source: "manual".to_string(),
+        },
+        ProviderQuotaSnapshotRecord {
+            provider_id,
+            provider_key_id: Some(key_id),
+            model: "model".to_string(),
+            window_key: "5h".to_string(),
+            limit: Some(10.0),
+            used: Some(1.0),
+            remaining: Some(9.0),
+            unit: "request".to_string(),
+            reset_at: None,
+            source: "manual".to_string(),
+            confidence: "exact".to_string(),
+            observed_at: Utc::now().to_rfc3339(),
+            valid_until: (Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+        },
+    );
+    state
+        .capability_profiles
+        .lock()
+        .await
+        .record(crate::capabilities::CapabilityRecord {
+            key: crate::capabilities::CapabilityKey {
+                provider_id,
+                model: "model".to_string(),
+                endpoint: "/v1/responses".to_string(),
+                capability: crate::capabilities::CAPABILITY_TOOL_SEARCH.to_string(),
+            },
+            supported: false,
+            source: crate::capabilities::SOURCE_RUNTIME.to_string(),
+            confidence: "exact".to_string(),
+            profile_version: "runtime-v1".to_string(),
+            observed_at: Utc::now().to_rfc3339(),
+            valid_until: (Utc::now() + chrono::Duration::days(1)).to_rfc3339(),
+        });
+
+    delete_provider(State(state.clone()), Path(provider_id))
+        .await
+        .unwrap();
+
+    assert!(
+        state
+            .provider_failure_streak
+            .lock()
+            .await
+            .get(&provider_id)
+            .is_none()
+    );
+    assert!(
+        state
+            .provider_probe
+            .lock()
+            .await
+            .get(&provider_id)
+            .is_none()
+    );
+    assert!(
+        state
+            .provider_circuit_trips
+            .lock()
+            .await
+            .get(&provider_id)
+            .is_none()
+    );
+    assert!(
+        state
+            .provider_key_cursor
+            .lock()
+            .await
+            .get(&provider_id)
+            .is_none()
+    );
+    assert!(state.quota_snapshots.lock().await.is_empty());
+    assert_eq!(state.capability_profiles.lock().await.len(), 0);
 }

@@ -98,8 +98,10 @@ export default function DiagnosticRuntimeSettings({
                     {limits.memory_limit_source === 'cgroup'
                       ? '容器限制'
                       : limits.memory_limit_source === 'env'
-                      ? '手动设置'
-                      : '未开启'}
+                        ? '手动设置'
+                        : limits.memory_limit_source === 'default'
+                          ? '内置默认'
+                          : '未开启'}
                   </Descriptions.Item>
                 </Descriptions>
               ),

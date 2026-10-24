@@ -1,5 +1,59 @@
 use super::*;
 
+struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+impl Drop for DropSignal {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn busy_wait_sse_releases_a_silent_upstream_after_client_disconnect() {
+    let (dropped, dropped_rx) = tokio::sync::oneshot::channel();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let body = Body::from_stream(async_stream::stream! {
+        let _signal = DropSignal(Some(dropped));
+        let _ = started.send(());
+        futures_util::future::pending::<()>().await;
+        #[allow(unreachable_code)]
+        yield Ok::<Bytes, io::Error>(Bytes::new());
+    });
+    let response = stream_sse_until_response(
+        Duration::from_secs(1),
+        SseErrorProtocol::OpenAi,
+        async move { Ok(Response::new(body)) },
+    );
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("the SSE stream starts with a keep-alive")
+        .expect("the response body stays open")
+        .expect("the keep-alive is a valid frame");
+    assert_eq!(first, Bytes::from_static(SSE_KEEPALIVE_LINE));
+    tokio::time::timeout(Duration::from_secs(1), started_rx)
+        .await
+        .expect("the upstream body must be polled before disconnecting")
+        .expect("the upstream body start signal is sent");
+    drop(body);
+
+    tokio::time::timeout(Duration::from_secs(1), dropped_rx)
+        .await
+        .expect("a disconnected busy-wait stream must release its upstream body")
+        .expect("the upstream body drop signal is sent");
+}
+
+#[test]
+fn sse_line_buffer_discards_oversized_lines_and_recovers() {
+    let mut buffer = SseLineBuffer::default();
+    assert!(buffer.push(&vec![b'x'; MAX_SSE_LINE_BYTES + 1]).is_empty());
+
+    let lines = buffer.push(b"\ndata: {\"ok\":true}\n");
+    assert_eq!(lines, vec![b"data: {\"ok\":true}\n".to_vec()]);
+}
+
 #[tokio::test]
 async fn upstream_read_cancels_when_the_client_drops_the_stream() {
     let (tx, rx) = mpsc::channel(1);

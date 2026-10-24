@@ -362,8 +362,22 @@ pub async fn delete_provider(
     }
     state.provider_cooldown.lock().await.remove(&id);
     state.provider_failure_meta.lock().await.remove(&id);
+    state.provider_failure_streak.lock().await.remove(&id);
+    state.provider_probe.lock().await.remove(&id);
+    state.provider_circuit_trips.lock().await.remove(&id);
+    state.provider_key_cursor.lock().await.remove(&id);
+    state
+        .target_cooldown
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
     state
         .target_failure_meta
+        .lock()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
+    state
+        .target_slow
         .lock()
         .await
         .retain(|(provider_id, _), _| *provider_id != id);
@@ -372,8 +386,15 @@ pub async fn delete_provider(
         .lock()
         .await
         .retain(|(provider_id, _, _), _| *provider_id != id);
+    state
+        .routing_p95_latency
+        .write()
+        .await
+        .retain(|(provider_id, _), _| *provider_id != id);
     state.mark_provider_resilience_dirty(id);
     clear_provider_key_cooldowns(&state, provider_key_ids).await;
+    crate::capabilities::remove_provider(&state, id).await;
+    crate::quota::remove_provider(&state, id).await;
     state.provider_concurrency.lock().await.remove(&id);
     state
         .model_concurrency

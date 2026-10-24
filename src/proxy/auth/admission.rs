@@ -153,7 +153,7 @@ async fn charge_request_body(
 
     let mut stream = body.into_data_stream();
     let mut buffer: Vec<u8> = Vec::with_capacity(declared.unwrap_or(0).min(64 * 1024));
-    let mut total = guard.reserved();
+    let mut total = 0;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|_| BodyCharge::Read)?;
         total += chunk.len();

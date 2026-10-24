@@ -349,6 +349,7 @@ pub async fn delete_route(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("route not found".to_string()));
     }
+    state.round_robin.lock().await.remove(&id);
     if let Some(store) = state.session_affinity.as_ref() {
         store.clear_route(&state.pool, id).await;
     }

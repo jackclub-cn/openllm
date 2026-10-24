@@ -388,6 +388,7 @@ pub async fn delete_provider_pool(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound("provider pool not found".to_string()));
     }
+    state.allocation_ledger.lock().await.remove_pool(id);
     state.invalidate_pool_catalog().await;
     record_audit(
         &state,

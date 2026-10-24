@@ -454,8 +454,8 @@ pub(crate) async fn forward_to_target(
         .collect::<String>();
     let preview = response_preview(&response_bytes);
     let latency_ms = started.elapsed().as_millis() as i64;
-    // Detach: the caller should not wait on a SQLite write to receive the
-    // upstream response they already paid for.
+    // Detach the write itself; the bounded writer slot supplies backpressure
+    // if SQLite stops keeping up.
     log_usage_detached(
         state.clone(),
         OwnedUsageLogEntry {
@@ -475,7 +475,8 @@ pub(crate) async fn forward_to_target(
             error_message: None,
             response_preview: preview,
         },
-    );
+    )
+    .await;
 
     // Inject the receipt only when the body is a JSON object, and only after
     // usage logging has read the original bytes.

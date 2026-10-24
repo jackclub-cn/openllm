@@ -1,6 +1,6 @@
 use super::*;
 
-/// Opt-in global budget on the total bytes of in-flight request bodies.
+/// Global budget on the total bytes of in-flight request bodies.
 ///
 /// The gateway buffers each request body in memory, so the number of requests
 /// is a poor proxy for memory pressure: a handful of large coding-agent

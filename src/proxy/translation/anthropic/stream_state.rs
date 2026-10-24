@@ -12,8 +12,10 @@ pub(crate) struct AnthropicStreamState {
     pub(crate) finish_reason: Option<String>,
     pub(crate) input_tokens: i64,
     pub(crate) output_tokens: i64,
+    pub(crate) output_chars: usize,
     pub(crate) cache_read_tokens: i64,
     pub(crate) cache_write_tokens: i64,
+    /// Bounded output preview; never the complete generated response.
     pub(crate) text: String,
     pub(crate) first_token_ms: Option<i64>,
     pub(crate) response_terminated: bool,
@@ -173,7 +175,8 @@ pub(crate) async fn process_openai_line_for_anthropic(
                 index
             }
         };
-        state.text.push_str(text);
+        state.output_chars = state.output_chars.saturating_add(text.chars().count());
+        push_preview_text(&mut state.text, text);
         send_anthropic_event(
             tx,
             "content_block_delta",

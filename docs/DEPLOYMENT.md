@@ -221,4 +221,4 @@ curl -fsS -H "x-admin-token: $T" "http://127.0.0.1:8080/api/maintenance/upgrade-
 - **停止后 `curl` 立刻提示连接失败**：这是排空的正常表现，网关在收到关闭信号的同时就停止接受新连接；日志里的 `draining in-flight requests` 表示在途请求仍在收尾，正常结束应以退出码 `0` 收尾。
 - **`/api/ready` 一直 `503` 但 `/api/health` 是 `200`**：只可能出现在连接已经建立的情况下。持续如此说明进程处于排空状态却没有退出，检查是否有长连接让在途请求超过 `OPENLLM_SHUTDOWN_GRACE_SECS`，或数据库探测失败（body 会带原因）。
 - **流式响应一次性返回**：反向代理在缓冲，按第 3 节关闭缓冲；或客户端/中间件设置了整请求超时。
-- **被 OOM 杀掉**：容器里网关会自动读取 cgroup 上限并采样内存，超过 `OPENLLM_MEMORY_SHED_RATIO` 后对新请求返回 `503`；仍然被杀说明上限过低，或需要收紧 `OPENLLM_MAX_CONCURRENT_REQUESTS` / `OPENLLM_MAX_INFLIGHT_REQUEST_MIB`。
+- **被 OOM 杀掉**：网关默认以 `768 MiB` 或更小的 cgroup 上限作为内存边界，超过 `OPENLLM_MEMORY_SHED_RATIO` 后对新请求返回 `503`；仍然被杀说明上限过低，或需要收紧 `OPENLLM_MAX_CONCURRENT_REQUESTS` / `OPENLLM_MAX_INFLIGHT_REQUEST_MIB`。
